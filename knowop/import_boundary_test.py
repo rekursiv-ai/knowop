@@ -41,7 +41,7 @@ _ALLOWED: Final = (
     "pydantic",
     "websockets",
     "wrapt",
-    # The direct terminal link's optional extra, imported only where it is installed.
+    # Knowop's dependency for the direct terminal link.
     "aiortc",
     # Type checkers' own stubs, named under ``TYPE_CHECKING`` and never imported.
     "_typeshed",

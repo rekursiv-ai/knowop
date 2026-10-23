@@ -617,6 +617,7 @@ name = "knowop"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiortc" },
     { name = "bashlex" },
     { name = "pydantic" },
     { name = "trackinizer" },
@@ -624,11 +625,6 @@ dependencies = [
     { name = "watchdog", marker = "sys_platform != 'linux'" },
     { name = "websockets" },
     { name = "wrapt" },
-]
-
-[package.optional-dependencies]
-direct = [
-    { name = "aiortc" },
 ]
 
 [package.dev-dependencies]
@@ -695,7 +691,7 @@ typecheck = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiortc", marker = "extra == 'direct'", specifier = ">=1.15.0" },
+    { name = "aiortc", specifier = ">=1.15.0" },
     { name = "bashlex", specifier = ">=0.18" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "trackinizer", git = "https://github.com/rekursiv-ai/trackinizer?branch=main" },
@@ -704,7 +700,6 @@ requires-dist = [
     { name = "websockets", specifier = ">=15" },
     { name = "wrapt" },
 ]
-provides-extras = ["direct"]
 
 [package.metadata.requires-dev]
 debug = [
@@ -1261,7 +1256,7 @@ wheels = [
 [[package]]
 name = "trackinizer"
 version = "0.1.8"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#916ac35cf75811df909060940b5c12a483caa7cb" }
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#0d03718b0f61f8fbc7337945449a613b0b63d501" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },

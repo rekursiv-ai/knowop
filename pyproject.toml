@@ -36,6 +36,8 @@ dependencies = [
     "pydantic>=2.0",
     # the terminal host's relay to the server
     "websockets>=15",
+    # Include the direct terminal link by default (~25 MB of wheels on macOS).
+    "aiortc>=1.15.0",
     # lazy imports
     "wrapt",
     # shell parsing: the agent runner's session capture lifts a captured `cat` or
@@ -101,11 +103,6 @@ Repository = "https://github.com/rekursiv-ai/knowop"
 Source = "https://github.com/rekursiv-ai/knowop"
 Issues = "https://github.com/rekursiv-ai/knowop/issues"
 Changelog = "https://github.com/rekursiv-ai/knowop/releases"
-
-[project.optional-dependencies]
-# The direct terminal link: a WebRTC data channel between the browser and this
-# computer. The machine host uses it whenever it imports, and relays otherwise.
-direct = ["aiortc>=1.15.0"]
 
 [build-system]
 requires = ["hatchling"]

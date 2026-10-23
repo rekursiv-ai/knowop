@@ -78,14 +78,10 @@ knowop keeps one login and uses it for every command. It saves the key as a `tra
 profile, and `trax`'s own current profile stays as it was: knowop never acts on a
 server it did not log in to.
 
-## Extras
+## Direct terminal link
 
-The browser terminal relays through the server. `knowop[direct]` adds a direct link
-between the browser and this computer, so typing feels immediate:
-
-```bash
-uv tool install 'knowop[direct]'
-```
+Every install includes aiortc for a direct link between the browser and this
+computer. Terminals use the server relay when a direct link is unavailable.
 
 ## Layout
 
@@ -104,7 +100,7 @@ knowop calls the server through trackinizer's `Client`, as trax does, and never 
 ## Development
 
 ```bash
-uv sync --all-groups --all-extras
+uv sync --all-groups
 uv run pytest
 ```
 

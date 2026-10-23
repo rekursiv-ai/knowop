@@ -194,8 +194,6 @@ def _exec_host(name: str, url: str, joined: JoinResponse) -> exec_host.ExecHost:
     )
 
 
-# The link needs aiortc, which knowop does not depend on: a user whose terminal feels
-# slow installs it beside knowop.
 def _direct_link() -> PeerFactory | None:
     """Return the peer factory for a direct terminal link, and say which way it is."""
     if env("TRAX_MACHINE_TERMINAL_DIRECT") == "0":
@@ -204,9 +202,8 @@ def _direct_link() -> PeerFactory | None:
     factory = terminal_direct_aiortc.aiortc_peer_factory()
     if factory is None:
         echo(
-            "direct terminal link: off (relay only). Typing feels slow? "
-            "Install aiortc into knowop's Python environment, then restart "
-            "`knowop connect`.",
+            "direct terminal link: off (aiortc is unavailable). "
+            "Terminals still work through the relay.",
         )
     else:
         echo("direct terminal link: on")
