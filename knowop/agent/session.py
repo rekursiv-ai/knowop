@@ -79,6 +79,7 @@ from trackinizer.runs.adapters.gemini import GeminiAdapter
 from trackinizer.runs.adapters.iostream import IOStreamAdapter
 from trackinizer.runs.asks import answer_from_payload
 from trackinizer.runs.redact import Redactor, redactor_from_environ
+from trackinizer.trax.connection import connect
 from trackinizer.trax.profile import LOCALHOST_FALLBACK_URL
 from trackinizer.types.line_capture import LineCapture
 from trackinizer.wire.wire_sessions import (
@@ -108,7 +109,11 @@ from knowop.agent.commands import (
     printed_record,
     replaces_goal,
 )
-from knowop.agent.custom_types import Event
+from knowop.agent.custom_types import (
+    Event,
+    FlagValue,
+    RunRequest,
+)
 from knowop.agent.errors import (
     CiphertextDroppedError,
     NotResumableError,
@@ -1133,6 +1138,7 @@ def main(
     *,
     default_cli: str = "claude",
     client_factory: Callable[[], Client] | None = None,
+    connection: dict[str, FlagValue] | None = None,
     resume_path: Path | None = None,
     cli_session_id: str | None = None,
     profile: str | None = None,
@@ -1149,6 +1155,8 @@ def main(
       client_factory: Builds the Trackinizer client from the active profile.
         Invoked only when the run actually syncs, so a ``--no-sync`` or
         ``--out`` capture never resolves a profile or opens a socket.
+      connection: Plain connection flags to rebuild that factory in a detached
+        interpreter; omitted when no connection factory was supplied.
       resume_path: A materialized transcript this run continues. Not a flag:
         the file is written by the resume tail moments before, so there is no
         spelling of it a human would type. A resume typed after ``--`` is
@@ -1179,7 +1187,8 @@ def main(
         trax_argv = argv
         cli_argv = ()
     parser = build_parser(default_cli)
-    flags = cast(_Flags, parser.parse_args(trax_argv))
+    parsed = parser.parse_args(trax_argv)
+    flags = cast(_Flags, parsed)
     if flags.name is not None and not flags.detach:
         parser.error("--name names a --detach host")
     if flags.detach and flags.dry_run:
@@ -1190,8 +1199,36 @@ def main(
         parser.error("--attach writes into a server session, and this run syncs none")
     attach = attach or flags.attach
     run_name = (flags.name or flags.actor or flags.cli) if flags.detach else None
-    start = partial(
-        _run_flags,
+    if run_name is not None:
+        return detach.launch(
+            run_name,
+            command=shlex.join((flags.cli, *cli_argv)),
+            request=RunRequest(
+                flags=from_plain(
+                    {
+                        **vars(parsed),
+                        "out": None if flags.out is None else str(flags.out),
+                        "attach": None if flags.attach is None else str(flags.attach),
+                    },
+                    dict[str, FlagValue],
+                ),
+                cli_argv=list(cli_argv),
+                connection=(
+                    connection or {"profile": profile}
+                    if client_factory is not None
+                    else None
+                ),
+                resume_path=None if resume_path is None else str(resume_path),
+                cli_session_id=cli_session_id,
+                profile=profile,
+                attach=None if attach is None else str(attach),
+                prefix_bytes=prefix_bytes,
+                compact_after_load=compact_after_load,
+                run_name=run_name,
+            ),
+        )
+    return _run_flags(
+        None,
         flags=flags,
         cli_argv=cli_argv,
         client_factory=client_factory,
@@ -1203,13 +1240,41 @@ def main(
         compact_after_load=compact_after_load,
         run_name=run_name,
     )
-    if run_name is not None:
-        return detach.launch(
-            run_name,
-            command=shlex.join((flags.cli, *cli_argv)),
-            start=start,
-        )
-    return start(None)
+
+
+def host_start(request: RunRequest) -> Callable[[HostSpec | None], int]:
+    """Rebuild the normal parsed runner with a fresh connection factory.
+
+    Args:
+      request: Plain inputs read from the inherited JSON payload.
+
+    Returns:
+      start: The same runner the foreground CLI invokes, awaiting its host spec.
+
+    """
+    flags = argparse.Namespace(**request["flags"])
+    flags.out = from_plain(request["flags"]["out"], Path, default=None)
+    flags.attach = from_plain(request["flags"]["attach"], uuid.UUID, default=None)
+    connection = request["connection"]
+    return partial(
+        _run_flags,
+        flags=cast(_Flags, flags),
+        cli_argv=tuple(request["cli_argv"]),
+        client_factory=(
+            None
+            if connection is None
+            else partial(connect, argparse.Namespace(**connection))
+        ),
+        resume_path=(
+            None if request["resume_path"] is None else Path(request["resume_path"])
+        ),
+        cli_session_id=request["cli_session_id"],
+        profile=request["profile"],
+        attach=None if request["attach"] is None else uuid.UUID(request["attach"]),
+        prefix_bytes=request["prefix_bytes"],
+        compact_after_load=request["compact_after_load"],
+        run_name=request["run_name"],
+    )
 
 
 # A run attached to a chat starts from the chat's conversation, as a switch to its CLI

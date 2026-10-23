@@ -40,7 +40,10 @@ import re
 import select
 import shutil
 import socket
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 
 from trackinizer.lib.posix.attach import attach, stop, submit
@@ -52,6 +55,7 @@ from trackinizer.wire.wire_sessions import RUN_NAME_PATTERN
 from treekle import json_loads, to_plain
 
 from knowop.agent import headless
+from knowop.agent.custom_types import HostRequest, RunRequest
 from knowop.agent.program import PROGRAM
 
 
@@ -68,6 +72,7 @@ __all__ = [
     "build_parser",
     "launch",
     "main",
+    "run_host",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -155,18 +160,16 @@ def launch(
     name: str,
     *,
     command: str,
-    start: Callable[[HostSpec], int],
+    request: RunRequest,
 ) -> int:
-    """Start ``start`` in a detached host named ``name``; return once it accepts.
+    """Start ``request`` in a detached host named ``name``; return once it accepts.
 
     Args:
       name: The host's name; must not belong to a live host.
       command: The wrapped command line, recorded for ``knowop run ls``.
-      start: Runs the CLI served at the given spec, returning its status. It is
-        called in the host process, after this one has returned, so it opens any
-        connection the run needs: a caller that opened one before the fork would
-        hand the host frameworks macOS forbids a forked child. What it writes to
-        stderr before the host accepts is repeated here.
+      request: Plain runner inputs. The new interpreter rebuilds the runner and
+        opens its own connections. What it writes to stderr before the host
+        accepts is repeated here.
 
     Returns:
       exit_code: 0 once the host accepts; 1 when it failed or is not up yet.
@@ -179,27 +182,26 @@ def launch(
     paths.mkdir(parents=True, mode=0o700)
     address = socket_address(paths / "host.sock")
     control = socket_address(paths / "control.sock")
-    # Unflushed output would be written twice: once by this process and once by
-    # the host, which inherits the buffer.
-    sys.stdout.flush()
-    sys.stderr.flush()
     ready_r, ready_w = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(ready_r)
-        os._exit(
-            _detach(
-                paths,
-                address=address,
-                control=control,
+    try:
+        _spawn(
+            HostRequest(
+                paths=str(paths),
+                address=str(address),
+                control=str(control),
                 resume=resume,
                 command=command,
                 ready=ready_w,
-                start=start,
+                run=request,
             ),
+            ready=ready_w,
+            log=paths / "host.log",
         )
-    os.close(ready_w)
-    _ = os.waitpid(pid, 0)
+    except BaseException:
+        os.close(ready_r)
+        raise
+    finally:
+        os.close(ready_w)
     message = _await_ready(ready_r)
     if message == b"ok":
         # What the host said before it accepted, such as how much of a chat it
@@ -214,6 +216,34 @@ def launch(
     sys.stderr.write(f"{PROGRAM}: host {name!r} {reason}; its log follows\n")
     sys.stderr.write(_tail(paths / "host.log"))
     return 1
+
+
+def run_host(
+    fd: int,
+    *,
+    rebuild: Callable[[RunRequest], Callable[[HostSpec | None], int]],
+) -> int:
+    """Read and close the inherited JSON descriptor, then run its host.
+
+    Args:
+      fd: The launcher's inherited payload descriptor.
+      rebuild: The runner's fixed factory for rebuilding its start callable.
+
+    Returns:
+      exit_code: The hosted runner's status.
+
+    """
+    with os.fdopen(fd, "r") as source:
+        request = json_loads(source.read(), HostRequest)
+    return _detach(
+        Path(request["paths"]),
+        address=Path(request["address"]),
+        control=Path(request["control"]),
+        resume=request["resume"],
+        command=request["command"],
+        ready=request["ready"],
+        start=rebuild(request["run"]),
+    )
 
 
 def main(argv: Sequence[str], *, prog: str = PROGRAM) -> int:
@@ -312,9 +342,6 @@ def _paths(name: str) -> Path:
     return state_dir() / "rekursiv-ai" / "trax" / "run" / "hosts" / name
 
 
-# Runs in the forked child. Two forks, so the host is neither the launcher's child
-# (nothing waits on it, and it survives the launcher) nor a session leader (it can never
-# acquire a controlling terminal, so a closing terminal cannot SIGHUP it).
 def _detach(
     paths: Path,
     *,
@@ -325,10 +352,8 @@ def _detach(
     ready: int,
     start: Callable[[HostSpec], int],
 ) -> int:
-    """Leave the launcher's session, then serve as the host; return its status."""
-    _ = os.setsid()
-    if os.fork() > 0:
-        return 0
+    """Serve as the exec'd host in its new session; return its status."""
+    os.set_inheritable(ready, False)
     _redirect_stdio(paths / "host.log")
     record = HostRecord(
         name=paths.name,
@@ -745,3 +770,34 @@ def _tail(path: Path, *, lines: int = 20) -> str:
 def _now() -> str:
     """Return the current UTC time to the second, ISO formatted."""
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _spawn(request: HostRequest, *, ready: int, log: Path) -> None:
+    """Exec a host in a new session, passing JSON inputs and its readiness pipe."""
+    # macOS TLS/framework state cannot survive fork without exec. Pass plain
+    # inputs, never the launcher's running interpreter or clients.
+    with (
+        tempfile.TemporaryFile() as payload,
+        os.fdopen(
+            os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
+            "wb",
+        ) as out,
+    ):
+        _ = payload.write(json.dumps(to_plain(request)).encode())
+        _ = payload.seek(0)
+        process = subprocess.Popen(  # noqa: S603 -- Fixed interpreter and package; only an inherited fd is passed.
+            [
+                sys.executable,
+                "-m",
+                __name__.rsplit(".", 1)[0],
+                "--_host",
+                str(payload.fileno()),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=out,
+            start_new_session=True,
+            pass_fds=(payload.fileno(), ready),
+        )
+    # Reap while the launcher lives, without making its exit wait for the host.
+    threading.Thread(target=process.wait, daemon=True).start()

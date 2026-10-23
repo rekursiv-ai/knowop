@@ -32,8 +32,10 @@ from trackinizer.trax.client_cache import close_clients
 from trackinizer.trax.connection import connect, connect_flags
 from trackinizer.trax.profile import unmatched_server_hint
 from trackinizer.trax.render import echo
+from treekle import from_plain
 
-from knowop.agent import session
+from knowop.agent import detach, session
+from knowop.agent.custom_types import FlagValue
 from knowop.agent.errors import (
     CiphertextDroppedError,
     LossyConversionError,
@@ -109,6 +111,8 @@ def _run(cli: str, argv: Sequence[str]) -> int:
     # Drain pooled sockets at exit; httpx2 warns if a Client is garbage collected with
     # any still open.
     atexit.register(close_clients)
+    if len(argv) == 2 and argv[0] == "--_host":
+        return detach.run_host(int(argv[1]), rebuild=session.host_start)
     if (hint := unmatched_server_hint()) is not None:
         _ = sys.stderr.write(hint)
     try:
@@ -119,6 +123,7 @@ def _run(cli: str, argv: Sequence[str]) -> int:
             rest,
             default_cli=cli,
             client_factory=functools.partial(connect, connection),
+            connection=from_plain(vars(connection), dict[str, FlagValue]),
             profile=cast(_Connection, connection).profile,
         )
     except ClientError as err:
@@ -131,7 +136,7 @@ def _run(cli: str, argv: Sequence[str]) -> int:
 def _peel_connection(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
     """Split the leading ``--profile``, ``--host`` and ``--port`` from ``argv``."""
     end = 0
-    while end < len(argv) and argv[end].split("=", 1)[0] in _VALUE_FLAGS:
+    while end < len(argv) and argv[end].partition("=")[0] in _VALUE_FLAGS:
         end += 1 if "=" in argv[end] else 2
     parser = argparse.ArgumentParser(prog=PROGRAM, add_help=False)
     connect_flags(parser)
@@ -163,6 +168,7 @@ def _resume(cli: str, argv: Sequence[str], connection: argparse.Namespace) -> in
         [*runner_args, *argv[boundary:]],
         default_cli=cli,
         client_factory=functools.partial(connect, connection),
+        connection=from_plain(vars(connection), dict[str, FlagValue]),
         resume_path=written.path,
         cli_session_id=str(written.cli_session_id),
         profile=cast(_Connection, connection).profile,

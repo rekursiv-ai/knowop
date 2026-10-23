@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Self
+from unittest.mock import Mock
 
 import contextlib
 import json
@@ -23,11 +24,11 @@ from treekle import from_plain, json_loads, to_plain
 
 import pytest
 
-from knowop.agent import detach
+from knowop.agent import detach, session
+from knowop.agent.custom_types import HostRequest, RunRequest
 from knowop.agent.detach import (
     HeadlessSpec,
     HostRecord,
-    launch,
     main,
 )
 from knowop.agent.headless import Reply, Request
@@ -220,8 +221,110 @@ class TestReadiness:
         assert detach._await_ready(read_fd) == b""
 
 
+def test_launch_execs_a_new_interpreter_without_forking_python(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(os, "fork", _forbid_fork)
+
+    assert (
+        session.main(
+            [
+                "--detach",
+                "--no-sync",
+                "--name",
+                "exec-host",
+                "sh",
+                "--",
+                sys.executable,
+                "-c",
+                "input()",
+            ],
+        )
+        == 0
+    )
+    try:
+        assert "exec-host is running detached" in capsys.readouterr().err
+        record = detach._read_record(detach._paths("exec-host"))
+        assert record is not None
+        assert record.pid != os.getpid()
+        assert os.getsid(record.pid) == record.pid
+        assert record.cwd == str(Path.cwd())
+        assert (
+            stat.S_IMODE((detach._paths("exec-host") / "host.log").stat().st_mode)
+            == 0o600
+        )
+    finally:
+        assert main(["stop", "exec-host"]) == 0
+
+
+def _forbid_fork() -> int:
+    raise AssertionError("detached hosts must exec, never fork and run Python")
+
+
+def test_a_failed_spawn_closes_both_ends_of_the_ready_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    descriptors = os.pipe()
+    pipe = Mock(return_value=descriptors)
+    monkeypatch.setattr(os, "pipe", pipe)
+    monkeypatch.setattr(subprocess, "Popen", Mock(side_effect=OSError("cannot exec")))
+
+    with pytest.raises(OSError, match="cannot exec"):
+        _ = session.main(["--detach", "--no-sync", "--name", "failed-exec", "sh"])
+
+    pipe.assert_called_once_with()
+    for fd in descriptors:
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            _ = os.fstat(fd)
+
+
+def launch(name: str, *, command: str, start: Callable[[HostSpec], int]) -> int:
+    """Exercise host bookkeeping with an in-process runner at the spawn boundary."""
+    request = RunRequest(
+        flags={},
+        cli_argv=[],
+        connection=None,
+        resume_path=None,
+        cli_session_id=None,
+        profile=None,
+        attach=None,
+        prefix_bytes=0,
+        compact_after_load=False,
+        run_name=name,
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(detach, "_spawn", partial(_spawn_here, start))
+        return detach.launch(name, command=command, request=request)
+
+
+def _spawn_here(
+    start: Callable[[HostSpec], int],
+    request: HostRequest,
+    *,
+    ready: int,
+    log: Path,
+) -> None:
+    del log
+    saved = [os.dup(fd) for fd in (0, 1, 2)]
+    try:
+        _ = detach._detach(
+            Path(request["paths"]),
+            address=Path(request["address"]),
+            control=Path(request["control"]),
+            resume=request["resume"],
+            command=request["command"],
+            ready=os.dup(ready),
+            start=start,
+        )
+    finally:
+        for fd, copy in enumerate(saved):
+            _ = os.dup2(copy, fd)
+            os.close(copy)
+
+
 class TestTheHost:
-    """The forked host, run in this process: its record, its status, its log."""
+    """The host, run in this process: its record, its status, its log."""
 
     @pytest.mark.parametrize("how", ["returns", "refuses", "fails"])
     def test_the_launchers_child_records_the_host_and_exits_with_its_status(
@@ -231,19 +334,27 @@ class TestTheHost:
         caplog: pytest.LogCaptureFixture,
         how: str,
     ) -> None:
-        """Both forks take the child's side, and the host's stdio stays the test's."""
+        """The host's stdio stays the test's."""
         start, status, logged = _HOST_ENDS[how]
         redirected: list[Path] = []
-        monkeypatch.setattr(detach.os, "fork", lambda: 0)
-        monkeypatch.setattr(detach.os, "setsid", lambda: None)
-        monkeypatch.setattr(detach.os, "_exit", _raise_exit)
         monkeypatch.setattr(detach, "_redirect_stdio", redirected.append)
-
-        with pytest.raises(_OsExitError) as exited:
-            _ = launch("upsilon", command="sh -- true", start=start)
-
         paths = detach._paths("upsilon")
-        assert exited.value.status == status
+        paths.mkdir(parents=True)
+        read_fd, write_fd = os.pipe()
+        try:
+            actual = detach._detach(
+                paths,
+                address=socket_address(paths / "host.sock"),
+                control=socket_address(paths / "control.sock"),
+                resume="",
+                command="sh -- true",
+                ready=write_fd,
+                start=start,
+            )
+        finally:
+            os.close(read_fd)
+
+        assert actual == status
         assert redirected == [paths / "host.log"]
         record = detach._read_record(paths)
         assert record is not None
@@ -255,27 +366,6 @@ class TestTheHost:
         assert record.pid == os.getpid()
         assert record.ended is not None
         assert logged in capsys.readouterr().err + caplog.text
-
-    def test_the_first_child_leaves_at_once_so_its_own_child_is_the_host(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setattr(detach.os, "fork", lambda: 4242)
-        monkeypatch.setattr(detach.os, "setsid", lambda: None)
-
-        status = detach._detach(
-            tmp_path,
-            address=tmp_path / "host.sock",
-            control=tmp_path / "control.sock",
-            resume="",
-            command="sh",
-            ready=-1,
-            start=_never,
-        )
-
-        assert status == 0
-        assert detach._read_record(tmp_path) is None
 
     def test_listening_records_the_host_running_and_releases_the_launcher(
         self,
@@ -1467,19 +1557,6 @@ def _headless(
 def _refuse_signal(pid: int, signal: int) -> None:
     """Stand in for ``os.kill`` on a process of another user."""
     raise PermissionError(1, "Operation not permitted", f"{pid} {signal}")
-
-
-class _OsExitError(Exception):
-    """Raised where the host process would have called ``os._exit``."""
-
-    def __init__(self, status: int) -> None:
-        super().__init__(status)
-        self.status = status
-
-
-def _raise_exit(status: int) -> None:
-    """Stand in for ``os._exit``, which would end the test runner."""
-    raise _OsExitError(status)
 
 
 def _accept_then_end(spec: HostSpec) -> int:
