@@ -90,12 +90,16 @@ def committed(tmp_path_factory: pytest.TempPathFactory) -> Path:
     _git(repo, "init", "--quiet", "--initial-branch=main")
     _git(repo, "add", "-A")
     _git(repo, "commit", "--quiet", "-m", "one")
+    # A source repository may hold transient maintenance files during a clone.
+    (repo / ".git" / "objects" / "maintenance.lock").write_text("maintenance\n")
     return repo
 
 
 @pytest.fixture
 def repo(committed: Path, tmp_path: Path) -> Path:
-    shutil.copytree(committed, tmp_path / "repo", symlinks=True)
+    # The Git protocol excludes transient metadata that can vanish mid-copy;
+    # --no-local also avoids the filesystem-copy optimization for a local source.
+    _git(tmp_path, "clone", "--quiet", "--no-local", str(committed), "repo")
     return tmp_path / "repo"
 
 
@@ -112,6 +116,18 @@ def dirty(repo: Path) -> Path:
 def scratch(tmp_path: Path) -> Path:
     (tmp_path / "private").mkdir()
     return tmp_path / "private"
+
+
+def test_the_repo_fixture_does_not_copy_the_sources_maintenance_lock(
+    repo: Path,
+) -> None:
+    """A test checkout owns its Git metadata independently of the source repo."""
+    assert not (repo / ".git" / "objects" / "maintenance.lock").exists()
+    assert _git(repo, "ls-tree", "-r", "--name-only", "HEAD").split() == [
+        ".gitignore",
+        "a.txt",
+        "sub/b.txt",
+    ]
 
 
 def test_a_snapshot_holds_the_worktree_untracked_files_included_ignored_excluded(
