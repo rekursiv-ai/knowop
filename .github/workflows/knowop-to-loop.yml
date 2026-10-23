@@ -249,13 +249,13 @@ jobs:
             --report "$IMPORT_REPORT" \
             --record-on-validation-failure "${{ github.event_name == 'push' }}" \
             --refresh-public-lockfile \
-            --validation-command 'uv sync --frozen --all-groups --all-extras' \
+            --validation-command 'uv sync --frozen --all-groups' \
             --validation-command 'uv run pre-commit run --all-files --hook-stage pre-commit' \
             --validation-command 'uv run pre-commit run --all-files --hook-stage pre-push' \
             --validation-command 'uv run python -c "import knowop"' \
             --validation-command 'rm -rf dist' \
             --validation-command 'uv build --out-dir dist' \
-            --validation-command 'wheels=(dist/knowop-*.whl); wheel="${wheels[0]}"; uv run --isolated --with "$wheel" --with "trackinizer @ git+https://github.com/rekursiv-ai/trackinizer" python -P -c "import knowop; print(knowop.__file__)"' \
+            --validation-command 'wheels=(dist/knowop-*.whl); wheel="${wheels[0]}"; uv run --isolated --no-project --with "$wheel" --with "trackinizer @ git+https://github.com/rekursiv-ai/trackinizer" python -P -c "import aiortc; from knowop.shell.terminal_direct_aiortc import aiortc_peer_factory; assert aiortc_peer_factory() is not None"' \
             --open-pr false
 
       - name: Open or update target import PR

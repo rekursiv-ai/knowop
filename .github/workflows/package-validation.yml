@@ -49,10 +49,10 @@ jobs:
         run: |
           # Lint/type/test checks come from this package's own .pre-commit-config.yaml.
           # Restating each tool here means a newly added hook silently goes unrun.
-          uv sync --frozen --all-groups --all-extras
+          uv sync --frozen --all-groups
           uv run pre-commit run --all-files --hook-stage pre-commit
           uv run pre-commit run --all-files --hook-stage pre-push
           uv run python -c "import knowop"
           rm -rf dist
           uv build --out-dir dist
-          wheels=(dist/knowop-*.whl); wheel="${wheels[0]}"; uv run --isolated --with "$wheel" --with "trackinizer @ git+https://github.com/rekursiv-ai/trackinizer" python -P -c "import knowop; print(knowop.__file__)"
+          wheels=(dist/knowop-*.whl); wheel="${wheels[0]}"; uv run --isolated --no-project --with "$wheel" --with "trackinizer @ git+https://github.com/rekursiv-ai/trackinizer" python -P -c "import aiortc; from knowop.shell.terminal_direct_aiortc import aiortc_peer_factory; assert aiortc_peer_factory() is not None"

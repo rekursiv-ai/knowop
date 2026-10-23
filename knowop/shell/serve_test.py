@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, cast
+from unittest.mock import Mock
 
 import base64
 import io
 import os
+import select
 import threading
 import time
 import uuid
@@ -618,6 +620,8 @@ def test_a_pipe_nobody_writes_to_is_not_waited_on_for_a_token(
 
 
 def test_a_token_written_to_a_pipe_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    poller = Mock(wraps=select.poll())
+    monkeypatch.setattr(select, "poll", lambda: poller)
     read_end, write_end = os.pipe()
     _ = os.write(write_end, f"{_ENROLLMENT}\n".encode())
     try:
@@ -625,6 +629,8 @@ def test_a_token_written_to_a_pipe_is_read(monkeypatch: pytest.MonkeyPatch) -> N
             monkeypatch.setattr("sys.stdin", pipe)
 
             assert serve.piped_token() == _ENROLLMENT
+            poller.register.assert_called_once_with(read_end, select.POLLIN)
+            poller.poll.assert_called_once_with(3_000)
     finally:
         os.close(write_end)
 
@@ -697,7 +703,7 @@ def test_the_host_offers_a_direct_link_when_the_library_is_installed_and_says_so
     assert capsys.readouterr().out.splitlines()[0] == "direct terminal link: on"
 
 
-def test_the_host_stays_on_the_relay_and_names_the_fix_when_the_library_is_missing(
+def test_the_host_stays_on_the_relay_and_says_why_when_the_library_is_missing(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -706,9 +712,8 @@ def test_the_host_stays_on_the_relay_and_names_the_fix_when_the_library_is_missi
     assert host.direct is None
     [said, *_] = capsys.readouterr().out.splitlines()
     assert said == (
-        "direct terminal link: off (relay only). Typing feels slow? "
-        "Install aiortc into knowop's Python environment, then restart "
-        "`knowop connect`."
+        "direct terminal link: off (aiortc is unavailable). "
+        "Terminals still work through the relay."
     )
 
 

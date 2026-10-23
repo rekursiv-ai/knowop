@@ -50,8 +50,8 @@ knowop connect --name box-7 < enrollment-token   # join with a token, no login
 
 - **Terminals.** The person's browser opens a login shell on this computer. Closing
   the terminal ends the shell's process group; `tmux` and `nohup` jobs keep running.
-  `TRAX_MACHINE_TERMINAL_DIRECT=0` turns the direct link off; installing `aiortc`
-  into knowop's Python environment adds it.
+  Every install includes aiortc for the direct link.
+  `TRAX_MACHINE_TERMINAL_DIRECT=0` turns it off; terminals use the server relay.
 - **Commands.** The server's agent may run `bash -lc COMMAND` as you, in a process
   group of its own, with at most 600 seconds, standard input from the request, and
   each output stream cut at 1 MiB from the middle. A command killed at its timeout
