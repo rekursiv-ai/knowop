@@ -32,3 +32,4 @@ Security reports are especially useful for:
 - A job secret shown, logged or sent anywhere but the job it was given to.
 - `knowop` acting on a server or profile other than the one it logged in to.
 - Dependency or packaging issues that affect installed users.
+- Supply-chain concerns in the published wheel or its dependency set.

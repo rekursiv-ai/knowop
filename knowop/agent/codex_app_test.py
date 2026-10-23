@@ -853,8 +853,9 @@ def test_a_second_answer_to_one_ask_is_a_no_op(tmp_path: Path) -> None:
         await rig.driver.answer(Answer(ask_id=ask.id, option="accept"))
         await rig.driver.answer(Answer(ask_id=ask.id, option="decline"))
         await rig.driver.answer(Answer(ask_id="never-asked", option="accept"))
-        await rig.sent(5)
-        await asyncio.sleep(0.02)
+        # The fake logs and answers frames in the order it reads them, so once
+        # /compact is answered it has logged anything the answers above sent.
+        await rig.driver.command("/compact", "")
         await rig.driver.stop()
         return await _collect(events)
 
@@ -1231,10 +1232,13 @@ def test_a_request_the_interrupt_cleared_was_ended_by_the_run(tmp_path: Path) ->
         await rig.driver.send_line("go")
         await _ask(events)
         await rig.driver.interrupt()
-        await rig.sent(5)
-        await asyncio.sleep(0.05)
+        # The fake sends both ends after the interrupt's reply. A stop before they
+        # are read can kill it first, and the stop then releases ask 0 itself.
+        seen: list[_Event] = []
+        while len(_of(seen, Resolved)) < 2:
+            seen.append(await _next(events))
         await rig.driver.stop()
-        return await _collect(events)
+        return seen + await _collect(events)
 
     seen = rig.run(scenario())
     ended = {
@@ -1252,7 +1256,21 @@ def test_our_own_answer_is_not_reported_again_when_the_server_confirms_it(
         after={"turn/start": [_command()]},
         on_response={"0": [_resolved(0), _status()]},
     )
-    ask, after = rig.run(_asked(rig, option="accept"))
+
+    async def scenario() -> tuple[Ask, list[_Event]]:
+        await rig.start()
+        events = rig.driver.events()
+        await rig.driver.send_line("go")
+        ask = await _ask(events)
+        await rig.driver.answer(Answer(ask_id=ask.id, option="accept", who="jp"))
+        # The fake logs our answer before it confirms it, so a stop timed by the log
+        # can kill it first. Running comes from the status it sends after the
+        # confirmation: once that is read, so is the confirmation.
+        seen = [await _next(events) for _ in range(4)]
+        await rig.driver.stop()
+        return ask, seen + await _collect(events)
+
+    ask, after = rig.run(scenario())
     assert after == [
         StateChanged(state="requires_action"),
         Resolved(ask_id=ask.id, option="accept", by="chat", who="jp", decision="allow"),
