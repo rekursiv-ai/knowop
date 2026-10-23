@@ -78,6 +78,8 @@ typecheck = [
     "basedpyright>=1.40.1",
     "pyrefly>=1.4.0",
     "ty>=0.0.84",
+    # Extra.
+    "basedtyping>=0.1.10",
     "rekursiv-ai-typings>=0.1.6",
 ]
 "pre-commit" = [
@@ -602,11 +604,6 @@ reportUnusedCallResult = false             # Discarding return values is idiomat
 reportInvalidCast = false                  # All cast() calls are intentional.
 # NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
 
-# Extra.
-reportMissingModuleSource = false
-reportUnnecessaryTypeIgnoreComment = false # Public package drops source-tree-only stubs.
-# NEVER ADD MORE SUPPRESSIONS! SUPPRESS IN FILE!
-
 [tool.ty.environment]
 python-version = "3.12"  # Intentional; test at 3.12 for exports.
 extra-paths = ["typings"]
@@ -707,9 +704,6 @@ required-environments = [
     "sys_platform == 'linux' and platform_machine == 'aarch64'",
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
-
-[tool.uv.workspace]
-members = []
 
 [tool.uv.pip]
 compile-bytecode = true

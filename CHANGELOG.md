@@ -5,7 +5,7 @@ All notable knowop changes are documented here. This project follows
 
 ## Unreleased
 
-## 0.1.0
+## 0.1.0 - 2026-10-23
 
 ### Added
 
