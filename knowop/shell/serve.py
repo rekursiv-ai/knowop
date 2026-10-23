@@ -1,0 +1,278 @@
+"""Connect this computer: get an enrollment token, join, and serve until revoked.
+
+The enrollment token is the one the caller holds when it hands one in (a login it ran
+already enrolled the machine), else comes from stdin when one is piped in (a box that
+has no browser), else from the signed-in profile of the server, else from a login: the
+code a person approves in a browser returns a token for this very machine, so
+approving is the only step. The account signed in, by the profile's key or by the
+login's approval, decides which machine this computer serves: a credential is used
+only by the account it was saved for, which then asks for no token. A piped token is
+an admin's for the machine and names no person, so its credential is the machine's
+own.
+
+Once joined the host serves terminals (``terminal_host.py``) and commands
+(``exec_host.py``), in the foreground, until the machine is revoked, a newer connect
+of it takes over, or Ctrl-C releases it.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Final, TextIO
+from urllib.parse import urlsplit
+
+import functools
+import select
+import sys
+import time
+
+from trackinizer.client.client import Client
+from trackinizer.client.errors import ClientError
+from trackinizer.trax.context import env
+from trackinizer.trax.profile import profile_for_server, read_profile
+from trackinizer.trax.render import echo
+from treekle import from_plain
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from trackinizer.trax import login
+    from trackinizer.wire.wire_machine_host import JoinResponse
+
+    from knowop.shell import (
+        exec_host,
+        machine_host,
+        terminal_direct_aiortc,
+        terminal_host,
+    )
+    from knowop.shell.terminal_direct import PeerFactory
+    from knowop.shell.terminal_host import TerminalHost
+else:
+    from wrapt import lazy_import
+
+    # The host loop, the terminal and exec servers and the login poll bring pydantic,
+    # websockets and the wire models; ``knowop status`` needs none of them.
+    exec_host = lazy_import("knowop.shell.exec_host")
+    machine_host = lazy_import("knowop.shell.machine_host")
+    terminal_direct_aiortc = lazy_import(
+        "knowop.shell.terminal_direct_aiortc",
+    )
+    terminal_host = lazy_import("knowop.shell.terminal_host")
+    login = lazy_import("trackinizer.trax.login")
+
+
+__all__ = ["connect_machine", "piped_token"]
+
+_STDIN_WAIT_SEC: Final = 3.0
+"""How long a piped stdin may stay silent before it is taken to hold no token."""
+
+_PROFILE_PATH: Final = "/api/me/profile"
+"""The signed-in account's profile, whose ``email`` names it."""
+
+
+def connect_machine(
+    name: str,
+    *,
+    server: str,
+    signed_in: Callable[[], Client] | None,
+    sandbox: bool,
+    exec_commands: bool,
+    sleep: Callable[[float], None] = time.sleep,
+    token: str = "",
+) -> None:
+    """Join ``name`` on ``server`` and serve it until it is revoked or interrupted.
+
+    Ctrl-C releases the machine, which then reads offline at once, and the interrupt
+    goes on to the caller.
+
+    Args:
+      name: The machine's name, already checked against the name rules.
+      server: The server's normalized URL, which keeps its own credential for ``name``.
+      signed_in: Returns a client that holds a key for ``server``, or ``None`` when
+        no saved profile does.
+      sandbox: Whether this connect declares the computer a disposable sandbox.
+      exec_commands: Whether the host runs the commands the assistant sends.
+      sleep: Waits the given seconds between polls and heartbeats.
+      token: A one-use enrollment token for ``name`` the caller already holds, as a
+        login that enrolled the machine returns; used before any other.
+
+    Raises:
+      ClientError: The login was denied or expired, the token was refused, or the
+        server answered something a retry cannot change.
+
+    """
+    direct = _direct_link()
+    echo(f"serving: machine {name} at {server} ({_what_is_served(exec_commands)})")
+    account, read_token = _token_source(
+        name,
+        server=server,
+        signed_in=signed_in,
+        sleep=sleep,
+        token=token,
+    )
+    machine_host.connect(
+        name,
+        server=server,
+        client_for=lambda key: Client(server, api_key=key),
+        read_token=read_token,
+        sleep=sleep,
+        terminals_for=lambda joined: _terminal_host(
+            name,
+            server,
+            joined,
+            direct=direct,
+        ),
+        exec_for=(
+            (lambda joined: _exec_host(name, server, joined)) if exec_commands else None
+        ),
+        sandbox=sandbox,
+        account=account,
+    )
+
+
+# A token is read from stdin only when it is piped in: a person at a terminal has a
+# browser to approve a login in, and reading would wait on a keyboard.
+def piped_token() -> str:
+    """Return the first line piped to stdin, or empty when none is there to read.
+
+    A pipe that stays silent for a few seconds holds no token.
+
+    Returns:
+      token: The line, stripped of blanks; empty when none was piped.
+
+    """
+    stdin = sys.stdin
+    # No stdin at all (``<&-``), or a person at a terminal.
+    if stdin is None or stdin.isatty():
+        return ""
+    return str(stdin.readline()).strip() if _speaks_soon(stdin) else ""
+
+
+# A launcher may leave a pipe open that nothing writes to: an agent shell, a CI step,
+# ``ssh`` without ``-t``. Waiting on it would hang before the login code is ever shown.
+def _speaks_soon(stdin: TextIO) -> bool:
+    """Return whether stdin has data, or its end, within a few seconds."""
+    try:
+        descriptor = stdin.fileno()
+    except (OSError, ValueError):
+        # An in-memory stream has nothing to wait for.
+        return True
+    poller = select.poll()
+    poller.register(descriptor, select.POLLIN)
+    # Data, or the end of the stream: a hang-up is as good as a line.
+    return bool(poller.poll(_STDIN_WAIT_SEC * 1000))
+
+
+def _terminal_host(
+    name: str,
+    url: str,
+    joined: JoinResponse,
+    *,
+    direct: PeerFactory | None = None,
+) -> TerminalHost:
+    """Make the terminal server for a joined machine; its shells name the server."""
+    # A URL with credentials in it would be sent to every ssh server by ``SendEnv LC_*``.
+    trax_env = {} if "@" in urlsplit(url).netloc else {"LC_TRAX_SERVER": url}
+    if (profile := profile_for_server(url)) is not None:
+        trax_env["TRACKINIZER_PROFILE"] = profile
+    return terminal_host.TerminalHost(
+        name=name,
+        server_url=url,
+        credential=joined.credential,
+        client_for=lambda key: Client(url, api_key=key),
+        trax_env=trax_env,
+        direct=direct,
+    )
+
+
+def _exec_host(name: str, url: str, joined: JoinResponse) -> exec_host.ExecHost:
+    """Make the command server for a joined machine."""
+    return exec_host.ExecHost(
+        name=name,
+        credential=joined.credential,
+        client_for=lambda key: Client(url, api_key=key),
+    )
+
+
+# The link needs aiortc, which knowop does not depend on: a user whose terminal feels
+# slow installs it beside knowop.
+def _direct_link() -> PeerFactory | None:
+    """Return the peer factory for a direct terminal link, and say which way it is."""
+    if env("TRAX_MACHINE_TERMINAL_DIRECT") == "0":
+        echo("direct terminal link: off (TRAX_MACHINE_TERMINAL_DIRECT=0)")
+        return None
+    factory = terminal_direct_aiortc.aiortc_peer_factory()
+    if factory is None:
+        echo(
+            "direct terminal link: off (relay only). Typing feels slow? "
+            "Install aiortc into knowop's Python environment, then restart "
+            "`knowop connect`.",
+        )
+    else:
+        echo("direct terminal link: on")
+    return factory
+
+
+def _what_is_served(exec_commands: bool) -> str:
+    """Return the words that say what this host serves."""
+    return "terminals and commands" if exec_commands else "terminals"
+
+
+def _token_source(
+    name: str,
+    *,
+    server: str,
+    signed_in: Callable[[], Client] | None,
+    sleep: Callable[[float], None],
+    token: str,
+) -> tuple[str | None, Callable[[], str]]:
+    """Return the account ``name`` is served for, and how to get the token joining it."""
+    if token:
+        # The caller's own login returned it, so it belongs to the account signed in.
+        return (None if signed_in is None else _account_of(signed_in())), lambda: token
+    if piped := piped_token():
+        return None, lambda: piped
+    return _signed_in_as(name, server=server, signed_in=signed_in, sleep=sleep)
+
+
+# The server, asked with the key this computer holds, names the account, whether the
+# key was saved or the login just made it. The enrollment waits until a join needs it:
+# a credential already saved for the account needs no token, and an unused one would
+# stay open on the server.
+def _signed_in_as(
+    name: str,
+    *,
+    server: str,
+    signed_in: Callable[[], Client] | None,
+    sleep: Callable[[float], None],
+) -> tuple[str, Callable[[], str]]:
+    """Return the signed-in account, logging in when no key is saved, and its token."""
+    if signed_in is not None:
+        client = signed_in()
+        account = _account_of(client)
+        return account, functools.partial(_enroll, client, name, account=account)
+    result = login.login(server, machine=name, client="knowop", sleep=sleep)
+    with Client(server, api_key=read_profile(result.profile).api_key) as client:
+        return _account_of(client), lambda: result.machine_token
+
+
+def _account_of(client: Client) -> str:
+    """Return the email of the account ``client``'s key signs in as."""
+    profile = from_plain(client.get(_PROFILE_PATH), dict[str, object])
+    return from_plain(profile.get("email"), str)
+
+
+def _enroll(client: Client, name: str, *, account: str) -> str:
+    """Return a one-use token enrolling ``name`` for ``account``, or say who refused."""
+    try:
+        return client.enroll_machine(name).token
+    except ClientError as err:
+        if err.status_code != 403:
+            raise
+        # The server names no owner: a personal machine is seen by its owner alone.
+        raise ClientError(
+            f"machine {name} on {client.base_url} belongs to another account, not to "
+            f"{account}, who is signed in; connect under another name with "
+            f"`knowop connect --name NAME`, or ask an admin to free it with "
+            f"`knowop machine {name} del`",
+        ) from err
