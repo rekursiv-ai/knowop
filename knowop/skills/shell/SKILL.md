@@ -20,6 +20,7 @@ knowop connect                                # log in if needed, join, serve
 knowop connect https://trackinizer.example --name gx10
 knowop connect --sandbox                      # this computer is disposable
 knowop connect --no-exec                      # terminals only
+knowop connect --jobs                         # also run your knowop job --machine jobs
 knowop connect --name box-7 < enrollment-token   # join with a token, no login
 ```
 
@@ -63,6 +64,13 @@ knowop connect --name box-7 < enrollment-token   # join with a token, no login
   name, so the server's agent never reads a key from it. The log line is written
   when the command ends, and names the variables the request set; a command that
   takes the host down with it leaves none.
+- **Jobs.** `--jobs` also runs the jobs your account sends with `knowop job submit
+  --machine NAME`, and no one else's. Each fetches your pushed commit into a fresh
+  worktree and runs under a memory cap in a `systemd-run --user` scope with no swap,
+  so `--jobs` refuses a computer without systemd's user manager. A GPU that shares
+  the CPU's memory (GB10) is given to no job, since no cap bounds what CUDA takes
+  there. Jobs keep running when `knowop connect` stops; the next one adopts them.
+  `--job-results-max SIZE` (default 256M) caps the results one job sends back.
 - **Sandbox.** `--sandbox` declares the computer disposable, so agents started
   there by `knowop run` ask for no permissions. Every run records its answer, so a
   run without the flag withdraws it. Never declare a computer that holds work or

@@ -65,7 +65,11 @@ def _contents(directory: Path) -> dict[str, bytes]:
 @pytest.fixture(scope="module", autouse=True)
 def _git_identity(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     config = tmp_path_factory.mktemp("gitconfig") / "config"
-    config.write_text("[user]\n\tname = t\n\temail = t@example.com\n")
+    # Detached maintenance can race the snapshot tests that inspect .git.
+    config.write_text(
+        "[user]\n\tname = t\n\temail = t@example.com\n"
+        "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n",
+    )
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("GIT_CONFIG_GLOBAL", str(config))
         patch.setenv("GIT_CONFIG_NOSYSTEM", "1")
@@ -724,6 +728,18 @@ def test_a_bundle_that_cannot_be_written_is_one_plain_error(
 
     with pytest.raises(ClientError, match=r"^git bundle failed: \S"):
         job_source.bundle(snap, [], tmp_path / "no-such-dir" / "out.bundle")
+
+
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [("maintenance.auto", "false"), ("gc.auto", "0")],
+)
+def test_copied_repositories_disable_automatic_git_maintenance(
+    committed: Path,
+    key: str,
+    expected: str,
+) -> None:
+    assert _git(committed, "config", "--get", key) == expected
 
 
 if __name__ == "__main__":

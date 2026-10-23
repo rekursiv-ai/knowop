@@ -9,6 +9,11 @@ ends. It needs ``ssh``, ``ssh-keygen`` and ``git`` on ``PATH``.
 
 ``status``, ``cancel``, ``secrets`` and ``secret`` only read and change what the
 server holds; :mod:`job_records` runs them, with no ssh.
+
+``submit --machine NAME`` runs the job on a computer of your own that serves jobs
+(``knowop connect --jobs``) instead: :mod:`machine_job` names the commit you pushed,
+the machine fetches it, and ``logs`` and ``results`` of such a job are read through
+the server, with no ssh.
 """
 
 from __future__ import annotations
@@ -46,9 +51,15 @@ if TYPE_CHECKING:
 
     import pydantic
 
-    from knowop.jobs import job_fetch, job_source, job_ssh
+    from knowop.jobs import (
+        job_fetch,
+        job_source,
+        job_ssh,
+        machine_job,
+    )
     from knowop.jobs.job_source import BundleInfo, Snapshot
     from knowop.jobs.job_ssh import Gate, Runner, Tools
+    from knowop.shell import job_limits
 else:
     from wrapt import lazy_import
 
@@ -59,6 +70,8 @@ else:
     job_fetch = lazy_import("knowop.jobs.job_fetch")
     job_source = lazy_import("knowop.jobs.job_source")
     job_ssh = lazy_import("knowop.jobs.job_ssh")
+    machine_job = lazy_import("knowop.jobs.machine_job")
+    job_limits = lazy_import("knowop.shell.job_limits")
 
 
 JOB_WORD: Final = "job"
@@ -68,10 +81,12 @@ PROGRAM: Final = "knowop job"
 """The command's name, in help, usage and messages."""
 
 _SUBMIT: Final = (
-    f"{PROGRAM} submit [--gpus N] [--minutes M] [--label TEXT] [--follow] "
-    "[--include-untracked] -- CMD..."
+    f"{PROGRAM} submit [--machine NAME [--memory SIZE]] [--gpus N] [--minutes M] "
+    "[--label TEXT] [--follow] [--include-untracked] -- CMD..."
 )
 _UNTRACKED_SHOWN: Final = 10
+_MEMORY: Final = "32G"
+"""A machine job's memory cap when ``--memory`` names none."""
 
 
 class Rig:
@@ -107,7 +122,11 @@ class Job(Command):
             "over ssh, and prints the job id. "
             "'results' downloads the job's output straight from the node. The "
             "server only brokers the job and signs a one-job certificate; no code "
-            "or result bytes pass through it, and this computer keeps no key."
+            "or result bytes pass through it, and this computer keeps no key. "
+            "With --machine NAME, CMD runs instead on a computer of yours that runs "
+            "'knowop connect --jobs': it fetches the commit you pushed into a fresh "
+            "worktree and runs CMD there under a memory cap, and its log and results "
+            "come back through the server, which keeps none of them."
         ),
         arguments=(
             ("JOB", "a job id, as 'submit' printed it"),
@@ -115,8 +134,25 @@ class Job(Command):
             ("NAME", "HF_TOKEN or WANDB_API_KEY"),
         ),
         options=(
-            ("--gpus N", "GPUs for the job, 1 to 8 (default 1)"),
-            ("--minutes M", "wall-clock limit, 1 to 360 (default 10)"),
+            (
+                "--machine NAME",
+                (
+                    "with submit: run on your computer NAME, from the commit your "
+                    "branch was pushed at; the worktree must be clean"
+                ),
+            ),
+            (
+                "--memory SIZE",
+                f"with --machine: the job's memory cap, such as 8G (default {_MEMORY})",
+            ),
+            (
+                "--gpus N",
+                "GPUs for the job, 1 to 8; 0 too with --machine (default 1)",
+            ),
+            (
+                "--minutes M",
+                "wall-clock limit, 1 to 360; to 1440 with --machine (default 10)",
+            ),
             ("--label TEXT", "a short name for the job"),
             ("--follow", "with submit: stream the log until the job ends"),
             (
@@ -157,6 +193,11 @@ class Job(Command):
                 "the server, as they do for trax."
             ),
             "submit, logs and results need ssh, ssh-keygen and git on PATH.",
+            (
+                "A job on a machine writes its results to $KNOWOP_JOB_OUT; the "
+                "machine sends back at most what its owner allows (256M unless "
+                "'knowop connect --job-results-max' says otherwise)."
+            ),
         ),
     )
 
@@ -175,6 +216,8 @@ class Job(Command):
             label="",
             follow=False,
             include_untracked=False,
+            machine="",
+            memory=None,
             job=None,
             to=None,
             name="",
@@ -182,6 +225,8 @@ class Job(Command):
         )
         verbs = parser.add_subparsers(dest="action", required=True, metavar="VERB")
         submit = verbs.add_parser("submit", add_help=False)
+        submit.add_argument("--machine", default="")
+        submit.add_argument("--memory", default=None)
         submit.add_argument("--gpus", type=int, default=1)
         submit.add_argument("--minutes", type=int, default=10)
         submit.add_argument("--label", default="")
@@ -240,6 +285,22 @@ class Job(Command):
             raise ClientError(f"submit needs a command after --: {_SUBMIT}")
         job = flags.job
         match flags.action:
+            case "submit" if flags.machine:
+                cls.run_machine_submit(
+                    client_factory(),
+                    machine=flags.machine,
+                    command=flags.command,
+                    gpus=flags.gpus,
+                    memory=flags.memory or _MEMORY,
+                    minutes=flags.minutes,
+                    label=flags.label,
+                    follow=flags.follow,
+                    include_untracked=flags.include_untracked,
+                )
+            case "submit" if flags.memory is not None:
+                raise ClientError(
+                    "--memory caps a job on a machine: add --machine NAME",
+                )
             case "submit":
                 cls.run_submit(
                     _rig(client_factory),
@@ -259,9 +320,101 @@ class Job(Command):
             case "cancel" if isinstance(job, int):
                 job_records.run_cancel(client_factory(), job)
             case "logs" if isinstance(job, int):
-                cls.run_logs(_rig(client_factory), job, follow=flags.follow)
+                client = client_factory()
+                if job_records.machine_view(client, job) is not None:
+                    cls.run_machine_logs(client, job, follow=flags.follow)
+                else:
+                    cls.run_logs(_rig(client_factory), job, follow=flags.follow)
             case _ if isinstance(job, int):
-                cls.run_results(_rig(client_factory), job, to=flags.to)
+                client = client_factory()
+                if (view := job_records.machine_view(client, job)) is not None:
+                    machine_job.run_results(
+                        client,
+                        view,
+                        results=results_dir(client.base_url, job, flags.to),
+                    )
+                else:
+                    cls.run_results(_rig(client_factory), job, to=flags.to)
+
+    @classmethod
+    def run_machine_submit(
+        cls,
+        client: Client,
+        *,
+        machine: str,
+        command: Sequence[str],
+        gpus: int,
+        memory: str,
+        minutes: int,
+        label: str,
+        follow: bool,
+        include_untracked: bool,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Queue a job on one of your machines, print its id once taken, maybe follow.
+
+        Args:
+          client: The server.
+          machine: The machine's name.
+          command: The job's command line.
+          gpus: How many GPUs.
+          memory: The memory cap, such as ``32G``.
+          minutes: The wall-clock limit.
+          label: A short name for the job.
+          follow: Stream the log until the job ends.
+          include_untracked: Refused: a machine runs the pushed commit, no snapshot.
+          sleep: Waits between looks at the job.
+          clock: Monotonic seconds.
+
+        """
+        if include_untracked:
+            raise ClientError(
+                "a job on a machine runs the commit you pushed, so "
+                "--include-untracked has nothing to send",
+            )
+        try:
+            memory_mb = job_limits.parse_size(memory) // 2**20
+        except ValueError as error:
+            raise ClientError(f"--memory: {error}") from None
+        job = machine_job.run_submit(
+            client,
+            repo=cwd(),
+            machine=machine,
+            command=command,
+            gpus=gpus,
+            memory_mb=memory_mb,
+            minutes=minutes,
+            label=label,
+            sleep=sleep,
+            clock=clock,
+        )
+        echo(job)
+        if follow:
+            cls.run_machine_logs(client, job, follow=True)
+
+    @classmethod
+    def run_machine_logs(cls, client: Client, job: int, *, follow: bool) -> None:
+        """Print a machine job's log; with ``follow``, until the job ends.
+
+        Args:
+          client: The server.
+          job: The job's id.
+          follow: Keep printing until the job ends.
+
+        Raises:
+          SystemExit: 130 on Ctrl-C; the job runs on.
+
+        """
+        try:
+            machine_job.run_logs(
+                client,
+                job,
+                follow=follow,
+                sink=_TextSink(out_stream()),
+            )
+        except KeyboardInterrupt:
+            raise SystemExit(130) from None
 
     @classmethod
     def run_submit(
@@ -405,6 +558,8 @@ class _Flags(Protocol):
 
     action: str
     command: tuple[str, ...]
+    machine: str
+    memory: str | None
     gpus: int
     minutes: int
     label: str

@@ -702,7 +702,7 @@ def test_the_hosts_trax_server_credential_and_profile_never_reach_a_command(
 ) -> None:
     for name in ("TRACKINIZER_TOKEN", "TRACKINIZER_URL", "TRACKINIZER_PROFILE"):
         monkeypatch.setenv(name, "secret-" + name)
-    monkeypatch.setenv("TRAX_WORKSPACE", "w")
+    monkeypatch.setenv("TRAX_CANVAS", "w")
     monkeypatch.setenv("LC_TRAX_SERVER", "https://hidden.example")
     monkeypatch.setenv("KEPT_BY_THE_HOST", "kept")
 
@@ -710,7 +710,7 @@ def test_the_hosts_trax_server_credential_and_profile_never_reach_a_command(
         _request(
             "env | sort",
             cwd=tmp_path,
-            env={"TRAX_WORKSPACE": "from-the-request"},
+            env={"TRAX_CANVAS": "from-the-request"},
         ),
     )
 
@@ -719,7 +719,7 @@ def test_the_hosts_trax_server_credential_and_profile_never_reach_a_command(
     assert "hidden.example" not in shown
     assert "KEPT_BY_THE_HOST=kept" in shown
     # What the request sets is the server's own word, and it is not withheld.
-    assert "TRAX_WORKSPACE=from-the-request" in shown
+    assert "TRAX_CANVAS=from-the-request" in shown
 
 
 def test_a_log_that_cannot_be_written_never_holds_the_result_back(

@@ -30,10 +30,11 @@ from trackinizer.wire.wire_job import (
     StartBody,
     SubmitBody,
 )
+from trackinizer.wire.wire_machine_job import MachineJobList
 
 import pytest
 
-from knowop.jobs import job_source
+from knowop.jobs import job_records, job_source, machine_job
 from knowop.jobs.job import JOB_WORD, Job, Rig, results_dir
 from knowop.jobs.job_source import BundleInfo, Snapshot
 from knowop.jobs.job_ssh import SubprocessRunner, Tools
@@ -169,6 +170,19 @@ class _Server:
     def job_cancel(self, job_id: int) -> JobView:
         self.calls.append(("cancel", job_id))
         return _job("cancelled")
+
+    # Every job here is a GPU job: the server holds no machine job of the caller's.
+    def machine_job_view(self, job_id: int) -> JobView:
+        self.calls.append(("machine_job", job_id))
+        raise ClientError("-> 404", status_code=404)
+
+    def machine_job_cancel(self, job_id: int) -> JobView:
+        self.calls.append(("machine_cancel", job_id))
+        raise ClientError("-> 404", status_code=404)
+
+    def machine_job_list(self) -> MachineJobList:
+        self.calls.append(("machine_jobs", None))
+        return MachineJobList(jobs=[])
 
     def job_secret_names(self) -> SecretNames:
         return SecretNames(names=self.names)
@@ -543,17 +557,17 @@ def test_the_command_is_matched_by_the_word_job() -> None:
 
 
 @pytest.mark.parametrize(
-    ("rest", "call"),
+    ("rest", "calls"),
     [
-        (["status"], ("jobs", None)),
-        (["status", "7"], ("job", 7)),
-        (["cancel", "7"], ("cancel", 7)),
-        (["secret", "HF_TOKEN", "del"], ("delete_secret", "HF_TOKEN")),
+        (["status"], [("jobs", None), ("machine_jobs", None)]),
+        (["status", "7"], [("machine_job", 7), ("job", 7)]),
+        (["cancel", "7"], [("machine_cancel", 7), ("cancel", 7)]),
+        (["secret", "HF_TOKEN", "del"], [("delete_secret", "HF_TOKEN")]),
     ],
 )
 def test_a_verb_that_reaches_only_the_server_needs_no_ssh(
     rest: list[str],
-    call: tuple[str, object],
+    calls: list[tuple[str, object]],
     world: _Rig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -561,7 +575,7 @@ def test_a_verb_that_reaches_only_the_server_needs_no_ssh(
 
     Job.dispatch(JOB_WORD, rest, world.factory)
 
-    assert world.server.calls == [call]
+    assert world.server.calls == calls
 
 
 # -- submit.
@@ -690,7 +704,11 @@ def _repo_with_a_secret(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     repo.mkdir()
     (repo / "a.py").write_text("print(1)\n")
     config = tmp_path / "gitconfig"
-    config.write_text("[user]\n\tname = t\n\temail = t@example.com\n")
+    # Detached maintenance can outlive the commit and race the snapshot's reads.
+    config.write_text(
+        "[user]\n\tname = t\n\temail = t@example.com\n"
+        "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n",
+    )
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     for args in (["init", "--quiet"], ["add", "-A"], ["commit", "--quiet", "-m", "x"]):
@@ -1050,7 +1068,11 @@ def test_submit_end_to_end_on_a_real_repository(
     repo.mkdir()
     (repo / "a.py").write_text("print(1)\n")
     config = tmp_path / "gitconfig"
-    config.write_text("[user]\n\tname = t\n\temail = t@example.com\n")
+    # Detached maintenance can outlive the commit and race the snapshot's reads.
+    config.write_text(
+        "[user]\n\tname = t\n\temail = t@example.com\n"
+        "[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n",
+    )
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     for args in (["init", "--quiet"], ["add", "-A"], ["commit", "--quiet", "-m", "x"]):
@@ -1299,18 +1321,27 @@ def _everything_in_bin(name: str) -> str:
     return f"/bin/{name}"
 
 
-@pytest.mark.parametrize(
-    "rest",
-    [["submit", "--", "true"], ["logs", "7"], ["results", "7"]],
-)
 def test_a_missing_ssh_fails_before_the_server_hears_of_a_job(
-    rest: list[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(shutil, "which", _nothing_on_path)
 
     with pytest.raises(ClientError, match=r"^ssh was not found on PATH$"):
-        Job.dispatch(JOB_WORD, rest, _no_client)
+        Job.dispatch(JOB_WORD, ["submit", "--", "true"], _no_client)
+
+
+@pytest.mark.parametrize("rest", [["logs", "7"], ["results", "7"]])
+def test_a_missing_ssh_fails_once_the_job_is_found_to_be_a_gpu_jobs(
+    rest: list[str],
+    world: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", _nothing_on_path)
+
+    with pytest.raises(ClientError, match=r"^ssh was not found on PATH$"):
+        Job.dispatch(JOB_WORD, rest, world.factory)
+
+    assert world.server.calls == [("machine_job", 7)]
 
 
 def test_the_real_rig_runs_ssh_through_a_subprocess_runner(
@@ -1334,6 +1365,161 @@ def test_the_real_rig_runs_ssh_through_a_subprocess_runner(
     assert rig.clock is time.monotonic
     assert rig.tools == Tools(ssh="/bin/ssh", ssh_keygen="/bin/ssh-keygen")
     assert rig.client is world.server
+
+
+# -- A job on one of the person's own machines: no ssh, the pushed commit.
+
+
+class _MachineCalls:
+    """Stands in for ``machine_job``'s three flows, recording what each was given."""
+
+    def __init__(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        view_state: str = "",
+    ) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.view_state = view_state
+        monkeypatch.setattr(machine_job, "run_submit", self._submit)
+        monkeypatch.setattr(machine_job, "run_logs", self._logs)
+        monkeypatch.setattr(machine_job, "run_results", self._results)
+        monkeypatch.setattr(job_records, "machine_view", self._view)
+
+    def _submit(self, client: object, **fields: object) -> int:
+        del client
+        self.calls.append(("submit", fields))
+        return 9
+
+    def _logs(self, client: object, job: int, **fields: object) -> None:
+        del client
+        self.calls.append(("logs", {"job": job, **fields}))
+        sink = fields["sink"]
+        assert isinstance(sink, io.BytesIO)
+        _ = sink.write(b"line\n")
+
+    def _results(self, client: object, view: object, **fields: object) -> None:
+        del client
+        self.calls.append(("results", {"view": view, **fields}))
+
+    def _view(self, client: object, job: int) -> object:
+        del client
+        return f"view {job}" if self.view_state else None
+
+
+def test_submit_with_a_machine_names_the_pushed_commit_and_needs_no_ssh(
+    world: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("PATH", "")
+    machine = _MachineCalls(monkeypatch)
+
+    with _caller_in(tmp_path):
+        Job.dispatch(
+            JOB_WORD,
+            ["submit", "--machine", "gx10", "--memory", "8G", "--gpus", "0", "--", "x"],
+            world.factory,
+        )
+
+    [(verb, fields)] = machine.calls
+    assert verb == "submit"
+    assert fields == {
+        "repo": tmp_path,
+        "machine": "gx10",
+        "command": ("x",),
+        "gpus": 0,
+        "memory_mb": 8_192,
+        "minutes": 10,
+        "label": "",
+        "sleep": time.sleep,
+        "clock": time.monotonic,
+    }
+    assert capsys.readouterr().out == "9\n"
+    assert world.server.calls == []
+
+
+def test_submit_with_a_machine_caps_its_memory_at_32g_unless_told(
+    world: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    machine = _MachineCalls(monkeypatch)
+
+    Job.dispatch(
+        JOB_WORD,
+        ["submit", "--machine", "gx10", "--follow", "--", "x"],
+        world.factory,
+    )
+
+    assert [verb for verb, _ in machine.calls] == ["submit", "logs"]
+    assert machine.calls[0][1]["memory_mb"] == 32_768
+    assert machine.calls[1][1]["follow"] is True
+    assert capsys.readouterr().out == "9\nline\n"
+
+
+@pytest.mark.parametrize(
+    ("rest", "why"),
+    [
+        (["submit", "--memory", "8G", "--", "x"], "--memory caps a job on a machine"),
+        (
+            ["submit", "--machine", "gx10", "--include-untracked", "--", "x"],
+            "--include-untracked has nothing to send",
+        ),
+        (
+            ["submit", "--machine", "gx10", "--memory", "lots", "--", "x"],
+            "--memory: 'lots' is not a size",
+        ),
+    ],
+)
+def test_a_machine_submit_that_cannot_be_sent_is_refused(
+    rest: list[str],
+    why: str,
+    world: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machine = _MachineCalls(monkeypatch)
+
+    with pytest.raises(ClientError, match=why):
+        Job.dispatch(JOB_WORD, rest, world.factory)
+
+    assert machine.calls == []
+
+
+def test_logs_and_results_of_a_machine_job_come_by_relay_with_no_ssh(
+    world: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("PATH", "")
+    machine = _MachineCalls(monkeypatch, view_state="running")
+
+    Job.dispatch(JOB_WORD, ["logs", "9", "-f"], world.factory)
+    Job.dispatch(JOB_WORD, ["results", "9", "--to", str(tmp_path / "r")], world.factory)
+
+    assert capsys.readouterr().out == "line\n"
+    assert [verb for verb, _ in machine.calls] == ["logs", "results"]
+    assert (machine.calls[0][1]["job"], machine.calls[0][1]["follow"]) == (9, True)
+    assert machine.calls[1][1] == {"view": "view 9", "results": tmp_path / "r"}
+
+
+def test_a_machine_log_interrupted_exits_130(
+    world: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def interrupted(client: object, job: int, **fields: object) -> None:
+        del client, job, fields
+        raise KeyboardInterrupt
+
+    _ = _MachineCalls(monkeypatch, view_state="running")
+    monkeypatch.setattr(machine_job, "run_logs", interrupted)
+
+    with pytest.raises(SystemExit) as exited:
+        Job.dispatch(JOB_WORD, ["logs", "9"], world.factory)
+
+    assert exited.value.code == 130
 
 
 if __name__ == "__main__":

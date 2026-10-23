@@ -5,7 +5,7 @@ Three kinds of hook, one entry point:
 - ``SessionStart`` writes a marker once claude is past its startup dialogs, so the
   run knows when a line typed in lands in the composer rather than in a dialog. A
   line typed into the trust dialog picks its highlighted "No, exit" and claude exits.
-- ``UserPromptSubmit``, for a run placed on a station, tells the agent of the boxes
+- ``UserPromptSubmit``, for a run placed on a canvas, tells the agent of the boxes
   the person drew there. Claude Code runs it before each prompt the person types and
   adds what it prints to that prompt's context. The person types into the CLI, never
   through the server, so this is the only place the agent can hear of a box: the
@@ -37,7 +37,7 @@ import threading
 import uuid
 
 from trackinizer.lib.userdirs import state_dir
-from trackinizer.trax.context import workspace_from_env
+from trackinizer.trax.context import canvas_from_env
 from trackinizer.trax.daemon.protocol import socket_address
 from treekle import PlainTree, from_plain, json_loads
 
@@ -101,7 +101,7 @@ def prepare(
 
     Args:
       profile: The ``--profile`` the run was started with, if any.
-      boxes: Whether the run is placed on a station, so its prompts are told of the
+      boxes: Whether the run is placed on a canvas, so its prompts are told of the
         boxes drawn there.
       user: The settings the person passed to ``--settings``, merged in, since
         claude takes one; ``None`` when they passed none.
@@ -177,9 +177,9 @@ def settings_json(
     Args:
       seen: Where the hook keeps the newest box it told this run; the readiness
         marker goes beside it.
-      profile: The trax profile the hook reads the station with; ``None`` for the
+      profile: The trax profile the hook reads the canvas with; ``None`` for the
         environment's, as ``trax`` itself resolves it.
-      boxes: Whether to add the hook that tells each prompt of the station's boxes.
+      boxes: Whether to add the hook that tells each prompt of the canvas's boxes.
       user: Settings of the person's own to keep: every key, and every hook of
         theirs before ours on the same event.
       socket: The prompt bridge's socket, which the bridged events are handed to;
@@ -223,7 +223,7 @@ def render_boxes(state: dict[str, PlainTree], *, after: int) -> tuple[str, int]:
     """Word the boxes of ``state`` drawn after the one numbered ``after``.
 
     Args:
-      state: The station as the server returns it.
+      state: The canvas as the server returns it.
       after: The newest box already told.
 
     Returns:
@@ -320,17 +320,17 @@ def main(
         with contextlib.suppress(OSError):
             ready_marker(flags.seen).touch()
         return 0
-    station = workspace_from_env(os.environ)
-    if station is None:
+    canvas = canvas_from_env(os.environ)
+    if canvas is None:
         return 0
     found: list[dict[str, PlainTree]] = []
     reader = threading.Thread(
-        target=_read_station,
+        target=_read_canvas,
         name="box-hook-read",
         kwargs={
             "connect": connect,
             "profile": flags.profile,
-            "station": station,
+            "canvas": canvas,
             "found": found,
         },
         daemon=True,
@@ -351,18 +351,18 @@ def main(
     return 0
 
 
-def _read_station(
+def _read_canvas(
     *,
     connect: Callable[[Namespace], Client],
     profile: str | None,
-    station: uuid.UUID,
+    canvas: uuid.UUID,
     found: list[dict[str, PlainTree]],
 ) -> None:
-    """Append the station's state to ``found``; any failure leaves it empty."""
+    """Append the canvas's state to ``found``; any failure leaves it empty."""
     # Nothing here may hold up the person's prompt, whatever fails.
     with contextlib.suppress(Exception):
         client = connect(Namespace(profile=profile, host=None, port=None))
-        found.append(client.read_workspace(station))
+        found.append(client.read_canvas(canvas))
 
 
 def _hook_entry(argv: list[str], *, timeout: int = _HOOK_TIMEOUT_SEC) -> PlainTree:

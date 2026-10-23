@@ -77,6 +77,7 @@ from trackinizer.wire.wire_session_ir import (
     SlashCommandBody,
 )
 from trackinizer.wire.wire_sessions import (
+    CanvasMessageContext,
     ConsoleRelay,
     ConsoleTarget,
     InboundDrainItem,
@@ -85,7 +86,6 @@ from trackinizer.wire.wire_sessions import (
     SessionPlacement,
     SessionStart,
     SessionStartResponse,
-    WorkspaceMessageContext,
 )
 from treekle import from_plain, json_dumps, json_loads
 
@@ -1845,7 +1845,7 @@ class TestProjectDirectoryBornMidRun:
 
     Claude shards sessions per project (a hashed cwd) and gemini per project
     sha; neither directory exists before the CLI's first run in that
-    workspace. The watch is armed once, before the spawn, so whatever
+    canvas. The watch is armed once, before the spawn, so whatever
     ``session_dirs()`` returns has to be a tree the new directory appears
     UNDER -- a watch on today's leaves cannot adopt tomorrow's sibling, and
     the run captures nothing with no error anywhere.
@@ -3521,7 +3521,7 @@ class TestBoxHookLifetime:
 
         def place(*args: object, **kwargs: object) -> SessionPlacement:
             del args, kwargs
-            return SessionPlacement(workspace_id=uuid.UUID(int=2))
+            return SessionPlacement(canvas_id=uuid.UUID(int=2))
 
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         monkeypatch.setattr(session, "_open_sink", open_sink)
@@ -3630,11 +3630,11 @@ class TestSessionOwnerAndArgv:
         assert owner.session_id == "r1"
         assert _cli_argv(ClaudeAdapter(), config, owner) == ["claude"]
 
-    def test_a_claude_run_placed_on_a_station_is_handed_the_box_hook(self) -> None:
+    def test_a_claude_run_placed_on_a_canvas_is_handed_the_box_hook(self) -> None:
         argv, files = _with_box_hook(
             ["claude", "--model", "haiku"],
             adapter=ClaudeAdapter(),
-            placed={"TRAX_WORKSPACE": "c5286865-67b6-4bd8-ab51-e06e10c326c5"},
+            placed={"TRAX_CANVAS": "c5286865-67b6-4bd8-ab51-e06e10c326c5"},
             profile="prod",
         )
 
@@ -3675,7 +3675,7 @@ class TestSessionOwnerAndArgv:
         argv, files = _with_box_hook(
             ["claude", *given, "--model", "haiku"],
             adapter=ClaudeAdapter(),
-            placed={"TRAX_WORKSPACE": "w"},
+            placed={"TRAX_CANVAS": "w"},
             profile=None,
         )
 
@@ -3701,15 +3701,15 @@ class TestSessionOwnerAndArgv:
         args: list[str],
     ) -> None:
         argv = [adapter.cli_binary, *args]
-        placed = {"TRAX_WORKSPACE": "w"}
+        placed = {"TRAX_CANVAS": "w"}
 
         assert _with_box_hook(argv, adapter=adapter, placed=placed, profile=None) == (
             argv,
             None,
         )
 
-    def test_a_placed_claude_or_codex_is_told_its_station_by_its_own_flag(self) -> None:
-        placed = {"TRAX_WORKSPACE": "w"}
+    def test_a_placed_claude_or_codex_is_told_its_canvas_by_its_own_flag(self) -> None:
+        placed = {"TRAX_CANVAS": "w"}
         # A codex ``-c`` of another key, and one left dangling, are not the person's.
         codex_args = ["--no-daemon", "-c", 'model="o3"', "-c"]
 
@@ -3734,7 +3734,7 @@ class TestSessionOwnerAndArgv:
         assert codex[:2] == ["codex", "-c"]
         assert codex[3:] == codex_args
         assert tomllib.loads(codex[2]) == {"developer_instructions": _CANVAS_NOTE}
-        assert "$TRAX_WORKSPACE" in _CANVAS_NOTE
+        assert "$TRAX_CANVAS" in _CANVAS_NOTE
 
     def test_a_placed_cli_is_told_it_is_logged_and_how_to_log_results(self) -> None:
         """The note is a TOML string as it stands, so it holds no quote or backslash."""
@@ -3748,32 +3748,32 @@ class TestSessionOwnerAndArgv:
         ("adapter", "placed", "args"),
         [
             (ClaudeAdapter(), {}, []),
-            (CodexAdapter(), {"TRAX_WORKSTREAM": "s"}, []),
-            (GeminiAdapter(), {"TRAX_WORKSPACE": "w"}, []),
-            (ClaudeAdapter(), {"TRAX_WORKSPACE": "w"}, ["--append-system-prompt", "x"]),
+            (CodexAdapter(), {"TRAX_WORKSPACE": "s"}, []),
+            (GeminiAdapter(), {"TRAX_CANVAS": "w"}, []),
+            (ClaudeAdapter(), {"TRAX_CANVAS": "w"}, ["--append-system-prompt", "x"]),
             (
                 ClaudeAdapter(),
-                {"TRAX_WORKSPACE": "w"},
+                {"TRAX_CANVAS": "w"},
                 ["--append-system-prompt-file=f"],
             ),
             (
                 CodexAdapter(),
-                {"TRAX_WORKSPACE": "w"},
+                {"TRAX_CANVAS": "w"},
                 ["-c", 'developer_instructions="x"'],
             ),
             (
                 CodexAdapter(),
-                {"TRAX_WORKSPACE": "w"},
+                {"TRAX_CANVAS": "w"},
                 ["--config", "developer_instructions=1"],
             ),
             (
                 CodexAdapter(),
-                {"TRAX_WORKSPACE": "w"},
+                {"TRAX_CANVAS": "w"},
                 ['--config=developer_instructions="x"'],
             ),
         ],
     )
-    def test_no_note_without_a_station_for_gemini_or_over_the_persons_own(
+    def test_no_note_without_a_canvas_for_gemini_or_over_the_persons_own(
         self,
         adapter: Adapter,
         placed: dict[str, str],
@@ -4256,8 +4256,8 @@ class TestWrappedCliIsATopLevelSession:
                     "CLAUDE_CODE_SESSION_ID",
                     "TRAX_ACTOR",
                     "TRAX_ROOMS",
-                    "TRAX_WORKSTREAM",
                     "TRAX_WORKSPACE",
+                    "TRAX_CANVAS",
                 },
             ),
         ]
@@ -4551,7 +4551,7 @@ class TestSpawnWiring:
         assert env["TRAX_ACTOR"] == "scientist#2"
         assert sink.calls[:2] == ["cli_session_id r1", "open"]
 
-    def test_the_child_is_told_the_workstream_and_station_it_was_placed_in(
+    def test_the_child_is_told_the_workspace_and_canvas_it_was_placed_in(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
@@ -4563,7 +4563,7 @@ class TestSpawnWiring:
         ):
             assert run_git(["git", "-C", str(tmp_path), *argv], 4096).returncode == 0
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("LC_TRAX_WORKSPACE", str(uuid.UUID(int=5)))
+        monkeypatch.setenv("LC_TRAX_CANVAS", str(uuid.UUID(int=5)))
         client = _PlacingClient()
         wiring, _ = _wire(
             monkeypatch,
@@ -4573,7 +4573,7 @@ class TestSpawnWiring:
             sink=_PlacedSink(),
         )
         env = cast(dict[str, str], wiring.relay["env"])
-        assert (env["TRAX_WORKSTREAM"], env["TRAX_WORKSPACE"]) == (
+        assert (env["TRAX_WORKSPACE"], env["TRAX_CANVAS"]) == (
             str(uuid.UUID(int=7)),
             str(uuid.UUID(int=8)),
         )
@@ -4582,7 +4582,7 @@ class TestSpawnWiring:
             (
                 f"/api/sessions/{_SESSION}/place",
                 {
-                    "workspace": str(uuid.UUID(int=5)),
+                    "canvas": str(uuid.UUID(int=5)),
                     "git": {
                         "origin": "https://github.com/o/r.git",
                         "branch": "feature",
@@ -4609,7 +4609,7 @@ class TestSpawnWiring:
         )
         env = cast(dict[str, str], wiring.relay["env"])
         assert status == 0
-        assert "TRAX_WORKSPACE" not in env
+        assert "TRAX_CANVAS" not in env
         assert capsys.readouterr().err.count("running unplaced") == 1
 
     def test_a_local_capture_never_asks_to_be_placed(
@@ -5007,8 +5007,8 @@ class _PlacingClient:
         if self._refuse:
             raise ClientError("404 Not Found")
         return {
-            "workstream_id": str(uuid.UUID(int=7)),
-            "workspace_id": str(uuid.UUID(int=8)),
+            "workspace_id": str(uuid.UUID(int=7)),
+            "canvas_id": str(uuid.UUID(int=8)),
         }
 
 
@@ -5427,9 +5427,9 @@ class TestDeliverOne:
         )
         assert relay.submitted == [f"[lab] trackinizer: {envelope}"]
 
-    def test_workspace_context_rides_with_the_text(self) -> None:
+    def test_canvas_context_rides_with_the_text(self) -> None:
         relay = _RecordingRelay()
-        context = WorkspaceMessageContext(workspace_id=uuid.uuid4(), visible_visuals=[])
+        context = CanvasMessageContext(canvas_id=uuid.uuid4(), visible_visuals=[])
         session._deliver_one(
             cast(ThreadedRelay, relay),
             InboundDrainItem(text="look", source="alice@x", context=context),
@@ -7812,7 +7812,7 @@ class TestWhatDrivesAChatRun:
     ) -> None:
         argv = session._env_argv(
             ["codex", "-c", 'developer_instructions="note"'],
-            env={"TRAX_ACTOR": "scout#2", "TRAX_WORKSPACE": "w1"},
+            env={"TRAX_ACTOR": "scout#2", "TRAX_CANVAS": "w1"},
             drop={"TRAX_ROOMS", "TRAX_ACTOR"},
         )
 
@@ -7823,7 +7823,7 @@ class TestWhatDrivesAChatRun:
             "-u",
             "TRAX_ROOMS",
             "TRAX_ACTOR=scout#2",
-            "TRAX_WORKSPACE=w1",
+            "TRAX_CANVAS=w1",
             "codex",
             "-c",
             'developer_instructions="note"',
@@ -8186,14 +8186,14 @@ class TestDeliveringToAHeadlessRun:
 
     def test_a_line_carries_the_canvas_it_was_sent_from(self) -> None:
         run = _FakeRun()
-        context = WorkspaceMessageContext(workspace_id=uuid.uuid4(), visible_visuals=[])
+        context = CanvasMessageContext(canvas_id=uuid.uuid4(), visible_visuals=[])
 
         _deliver(InboundDrainItem(text="hello", context=context), run)
 
         [(_, told)] = run.told
         assert isinstance(told, str)
         assert told.startswith("hello\nTrackinizer context")
-        assert str(context.workspace_id) in told
+        assert str(context.canvas_id) in told
 
     def test_a_line_the_run_refuses_leaves_nothing_to_stamp(
         self,
@@ -8619,12 +8619,12 @@ def _note_command(
     delivered.append(("command", f"{item.text}|{reason}"))
 
 
-_WORKSTREAM: Final = "5e5e5e5e-0000-4000-8000-0000000000bb"
-_WORKSPACE: Final = "6f6f6f6f-0000-4000-8000-0000000000cc"
+_WORKSPACE: Final = "5e5e5e5e-0000-4000-8000-0000000000bb"
+_CANVAS: Final = "6f6f6f6f-0000-4000-8000-0000000000cc"
 
 
 class _PostRecorder:
-    """A client that keeps what is posted to it; it places a session on a station."""
+    """A client that keeps what is posted to it; it places a session on a canvas."""
 
     def __init__(self) -> None:
         self.posted: list[tuple[str, dict[str, object]]] = []
@@ -8637,7 +8637,7 @@ class _PostRecorder:
     ) -> dict[str, str]:
         self.posted.append((path, body or {}))
         if path.endswith("/place"):
-            return {"workstream_id": _WORKSTREAM, "workspace_id": _WORKSPACE}
+            return {"workspace_id": _WORKSPACE, "canvas_id": _CANVAS}
         return {}
 
     def states(self) -> list[tuple[object, object]]:
@@ -9279,7 +9279,7 @@ class TestAHeadlessRunsWiring:
             client=client,
         )
 
-        # The station the server placed the session on reaches the CLI's environment,
+        # The canvas the server placed the session on reaches the CLI's environment,
         # its settings and its instructions.
         assert [path for path, _ in client.posted if path.endswith("/place")] == [
             f"/api/sessions/{_CHAT}/place",
@@ -9289,8 +9289,8 @@ class TestAHeadlessRunsWiring:
         assert made["env"] == {
             "TRAX_ACTOR": "scout#2",
             "TRAX_ROOMS": "lab",
-            "TRAX_WORKSTREAM": _WORKSTREAM,
             "TRAX_WORKSPACE": _WORKSPACE,
+            "TRAX_CANVAS": _CANVAS,
         }
         assert isinstance(made["adapter"], ClaudeAdapter)
         assert cast(RunConfig, made["config"]).profile == "b2profile"
@@ -9747,10 +9747,10 @@ class TestATakeoverFromAHeadlessRun:
         assert host.scrollback == _spec(tmp_path).scrollback
         assert wiring.relays[0].kwargs["drop_env"] == (
             ClaudeAdapter.parent_session_env
-            | {"TRAX_ACTOR", "TRAX_ROOMS", "TRAX_WORKSTREAM", "TRAX_WORKSPACE"}
+            | {"TRAX_ACTOR", "TRAX_ROOMS", "TRAX_WORKSPACE", "TRAX_CANVAS"}
         )
 
-    def test_a_terminal_on_a_station_is_told_of_its_canvas(
+    def test_a_terminal_on_a_canvas_is_told_of_its_canvas(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
@@ -9762,7 +9762,7 @@ class TestATakeoverFromAHeadlessRun:
         _ = session._make_tui(
             replace(RunConfig(cli_name="claude"), host=_spec(tmp_path)),
             ClaudeAdapter(),
-            env={"TRAX_WORKSPACE": _WORKSPACE},
+            env={"TRAX_CANVAS": _CANVAS},
             session_id="s1",
             listening=lambda: None,
         )
@@ -9800,15 +9800,15 @@ def _write_session_file(adapter: Adapter, session_id: str) -> None:
     _ = (scope / name).write_text(_claude_line("before"))
 
 
-_STATION = uuid.UUID("c5286865-67b6-4bd8-ab51-e06e10c326c5")
+_MESSAGE_CANVAS = uuid.UUID("c5286865-67b6-4bd8-ab51-e06e10c326c5")
 _TRAILER = "\nTrackinizer context (verify with trax): "
 
 
-def _on(route: str, *, marks: bool = False) -> WorkspaceMessageContext:
+def _on(route: str, *, marks: bool = False) -> CanvasMessageContext:
     """Return the context of a line sent from ``route``, with a box when asked."""
-    return WorkspaceMessageContext.model_validate(
+    return CanvasMessageContext.model_validate(
         {
-            "workspace_id": _STATION,
+            "canvas_id": _MESSAGE_CANVAS,
             "visible_visuals": [],
             "page": {"route": route},
             "marks": [{"id": uuid.uuid4(), "author": "ann@x"}] if marks else [],
@@ -9995,8 +9995,8 @@ class TestChatLinesReadLikeTheCli:
     ) -> None:
         run = _FakeRun()
         inbound = InboundState(fallback_sec=0.0)
-        relay = WorkspaceMessageContext(
-            workspace_id=_STATION,
+        relay = CanvasMessageContext(
+            canvas_id=_MESSAGE_CANVAS,
             visible_visuals=[],
             relay=ConsoleRelay(
                 targets=[ConsoleTarget(actor="lead-2", room=None)],

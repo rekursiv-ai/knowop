@@ -39,8 +39,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BundleInfo",
+    "Git",
     "Snapshot",
     "bundle",
+    "clean_env",
     "plain_name",
     "snapshot",
     "worktree_top",
@@ -131,7 +133,7 @@ def snapshot(repo: Path, tmp: Path, *, allow_secret_names: bool = False) -> Snap
         untracked file has a secret's name and ``allow_secret_names`` is not set.
 
     """
-    top, common, index = _Git(cwd=repo, env=_clean_env())(
+    top, common, index = Git(cwd=repo, env=clean_env())(
         "rev-parse",
         "--path-format=absolute",
         "--show-toplevel",
@@ -139,7 +141,7 @@ def snapshot(repo: Path, tmp: Path, *, allow_secret_names: bool = False) -> Snap
         "--git-path",
         "index",
     ).splitlines()
-    _ = _Git(cwd=repo, env=_clean_env())("init", "--bare", str(tmp))
+    _ = Git(cwd=repo, env=clean_env())("init", "--bare", str(tmp))
     (tmp / "objects" / "info" / "alternates").write_text(
         f"{Path(common) / 'objects'}\n",
     )
@@ -148,10 +150,10 @@ def snapshot(repo: Path, tmp: Path, *, allow_secret_names: bool = False) -> Snap
     private_index = tmp / "index"
     with suppress(FileNotFoundError):
         _ = shutil.copyfile(index, private_index)
-    git = _Git(
+    git = Git(
         cwd=Path(top),
         env={
-            **_clean_env(),
+            **clean_env(),
             **_IDENTITY,
             "GIT_INDEX_FILE": str(private_index),
             # New objects land in the private store, which reads the user's through
@@ -219,7 +221,7 @@ def bundle(snap: Snapshot, bases: Sequence[str], out: Path) -> BundleInfo:
       ClientError: A git command failed.
 
     """
-    git = _Git(cwd=snap.private_git_dir, env=_clean_env())
+    git = Git(cwd=snap.private_git_dir, env=clean_env())
     ref = f"refs/trax/gpu/{snap.commit}"
     _ = git("update-ref", ref, snap.commit)
     held = _held(git, bases)
@@ -256,14 +258,14 @@ def worktree_top(directory: Path) -> Path | None:
 
     """
     try:
-        top = _Git(cwd=directory, env=_clean_env())("rev-parse", "--show-toplevel")
+        top = Git(cwd=directory, env=clean_env())("rev-parse", "--show-toplevel")
     except ClientError:
         return None
     return Path(top.strip()).resolve()
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
-class _Git:
+class Git:
     """Runs git in one directory with one environment."""
 
     cwd: Path
@@ -299,7 +301,12 @@ class _Git:
         return os.fsdecode(done.stdout)
 
 
-def _untracked(git: _Git) -> tuple[str, ...]:
+def clean_env() -> dict[str, str]:
+    """Return the environment without the variables that pick a repository."""
+    return {k: v for k, v in os.environ.items() if k not in _REPOSITORY_VARIABLES}
+
+
+def _untracked(git: Git) -> tuple[str, ...]:
     """List the untracked files that are not ignored, by path from the top."""
     listed = git("ls-files", "--others", "--exclude-standard", "-z")
     return tuple(sorted(name for name in listed.split("\0") if name))
@@ -325,7 +332,7 @@ def _looks_secret(name: str) -> bool:
     return any(fnmatch.fnmatchcase(base, pattern) for pattern in _SECRET_NAMES)
 
 
-def _head(git: _Git) -> tuple[str, str] | None:
+def _head(git: Git) -> tuple[str, str] | None:
     """Return ``HEAD``'s commit and tree, or ``None`` before the first commit."""
     done = git.run("rev-parse", "HEAD", "HEAD^{tree}")
     if done.returncode:
@@ -334,7 +341,7 @@ def _head(git: _Git) -> tuple[str, str] | None:
     return commit, tree
 
 
-def _held(git: _Git, bases: Sequence[str]) -> list[str]:
+def _held(git: Git, bases: Sequence[str]) -> list[str]:
     """Return the bases that are commits in this repository, in order."""
     wanted = [each for each in bases if re.fullmatch(r"[0-9a-f]{40}", each)]
     if not wanted:
@@ -349,8 +356,3 @@ def _held(git: _Git, bases: Sequence[str]) -> list[str]:
         for index, each in enumerate(wanted)
         if answer[index].split()[1] == "commit"
     ]
-
-
-def _clean_env() -> dict[str, str]:
-    """Return the environment without the variables that pick a repository."""
-    return {k: v for k, v in os.environ.items() if k not in _REPOSITORY_VARIABLES}

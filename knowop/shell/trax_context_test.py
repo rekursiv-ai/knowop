@@ -18,7 +18,7 @@ def test_the_routing_variables_and_every_trax_name_are_withheld(
         "TRACKINIZER_URL",
         "TRACKINIZER_TOKEN",
         "TRACKINIZER_PROFILE",
-        "TRAX_WORKSPACE",
+        "TRAX_CANVAS",
         "LC_TRAX_SERVER",
         "PATH_FROM_THE_USER",
     ):
@@ -30,7 +30,7 @@ def test_the_routing_variables_and_every_trax_name_are_withheld(
         "TRACKINIZER_URL",
         "TRACKINIZER_TOKEN",
         "TRACKINIZER_PROFILE",
-        "TRAX_WORKSPACE",
+        "TRAX_CANVAS",
         "LC_TRAX_SERVER",
     } <= withheld
     assert "PATH_FROM_THE_USER" not in withheld

@@ -1,7 +1,7 @@
-"""How a ``knowop run`` session finds its station and tells the child CLI about it.
+"""How a ``knowop run`` session finds its canvas and tells the child CLI about it.
 
 The server decides the placement (``POST /api/sessions/{id}/place``); this reads the
-two things only the client knows, the station the run was started from and its git
+two things only the client knows, the canvas the run was started from and its git
 checkout, and turns the answer into the child's environment.
 """
 
@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import sys
 
 from trackinizer.client.errors import ClientError
-from trackinizer.trax.context import workspace_from_env
+from trackinizer.trax.context import canvas_from_env
 from trackinizer.wire.wire_sessions import (
     GitRef,
     PlaceSession,
@@ -73,7 +73,7 @@ def place_run(
       placement: The server's answer, or ``None`` when it could not be had.
 
     """
-    body = PlaceSession(workspace=workspace_from_env(environ), git=git_ref(cwd))
+    body = PlaceSession(canvas=canvas_from_env(environ), git=git_ref(cwd))
     try:
         answer = client.post(
             session_place_path(session_id),
@@ -94,14 +94,14 @@ def placement_env(placement: SessionPlacement | None) -> dict[str, str]:
       placement: The server's answer, or ``None`` for a run that was not placed.
 
     Returns:
-      env: ``TRAX_WORKSTREAM`` and ``TRAX_WORKSPACE`` for each id the server named.
+      env: ``TRAX_WORKSPACE`` and ``TRAX_CANVAS`` for each id the server named.
 
     """
     env: dict[str, str] = {}
     if placement is None:
         return env
-    if placement.workstream_id is not None:
-        env["TRAX_WORKSTREAM"] = str(placement.workstream_id)
     if placement.workspace_id is not None:
         env["TRAX_WORKSPACE"] = str(placement.workspace_id)
+    if placement.canvas_id is not None:
+        env["TRAX_CANVAS"] = str(placement.canvas_id)
     return env

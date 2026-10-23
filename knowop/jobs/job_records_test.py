@@ -10,9 +10,11 @@ import sys
 
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.wire_job import JobList, JobView, SecretNames
+from trackinizer.wire.wire_machine_job import MachineJobList, MachineJobView
 
 import pytest
 
+from knowop.jobs import job_records
 from knowop.jobs.job import JOB_WORD, Job
 
 
@@ -47,14 +49,46 @@ def _job(state: str = "queued", **fields: object) -> JobView:
     )
 
 
+def _machine_job(state: str = "running", **fields: object) -> MachineJobView:
+    return MachineJobView.model_validate(
+        {
+            "id": 9,
+            "machine": "gx10",
+            "state": state,
+            "gpus": 0,
+            "memory_mb": 2_048,
+            "minutes": 5,
+            "label": "",
+            "argv": ["python", "train.py"],
+            "remote": "git@github.com:o/r.git",
+            "ref": "refs/heads/main",
+            "commit": _COMMIT,
+            "exit_code": None,
+            "reason": "",
+            "created_at": datetime(2026, 10, 23, 12, tzinfo=UTC),
+            "queued_at": None,
+            "started_at": None,
+            "ended_at": None,
+            **fields,
+        },
+    )
+
+
+def _refusal(status: int) -> ClientError:
+    return ClientError(f"-> {status}", status_code=status)
+
+
 class _Server:
-    """The server's ``job_*`` methods these verbs call, scripted, recording each call."""
+    """The server's job methods these verbs call, scripted, recording each call."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
         self.view = _job("queued")
         self.jobs = [_job("running"), _job("completed", id=6, node=None)]
         self.names: list[str] = []
+        self.machine_jobs: list[MachineJobView] = []
+        self.gpu_answer = 200
+        self.machine_answer = 200
 
     def job_view(self, job_id: int) -> JobView:
         self.calls.append(("job", job_id))
@@ -62,11 +96,35 @@ class _Server:
 
     def job_list(self) -> JobList:
         self.calls.append(("jobs", None))
+        if self.gpu_answer != 200:
+            raise _refusal(self.gpu_answer)
         return JobList(jobs=self.jobs)
 
     def job_cancel(self, job_id: int) -> JobView:
         self.calls.append(("cancel", job_id))
         return _job("cancelled")
+
+    def machine_job_view(self, job_id: int) -> MachineJobView:
+        self.calls.append(("machine_job", job_id))
+        return self._machine(job_id)
+
+    def machine_job_list(self) -> MachineJobList:
+        self.calls.append(("machine_jobs", None))
+        if self.machine_answer != 200:
+            raise _refusal(self.machine_answer)
+        return MachineJobList(jobs=self.machine_jobs)
+
+    def machine_job_cancel(self, job_id: int) -> MachineJobView:
+        self.calls.append(("machine_cancel", job_id))
+        return self._machine(job_id).model_copy(update={"state": "cancelled"})
+
+    def _machine(self, job_id: int) -> MachineJobView:
+        if self.machine_answer != 200:
+            raise _refusal(self.machine_answer)
+        for each in self.machine_jobs:
+            if each.id == job_id:
+                return each
+        raise _refusal(404)
 
     def job_secret_names(self) -> SecretNames:
         return SecretNames(names=self.names)
@@ -263,7 +321,7 @@ def test_status_of_one_job_shows_every_field(
         "charged:  4 gpu-min, usd 0.2\n"
         "reason:   finished\n"
     )
-    assert server.calls == [("job", 7)]
+    assert server.calls == [("machine_job", 7), ("job", 7)]
 
 
 def test_status_of_a_job_not_yet_started_shows_dashes(
@@ -302,8 +360,161 @@ def test_cancel_reports_the_state_the_server_gave(
 ) -> None:
     _run(server, "cancel", "7")
 
-    assert server.calls == [("cancel", 7)]
+    assert server.calls == [("machine_cancel", 7), ("cancel", 7)]
     assert capsys.readouterr().out == "job 7: cancelled\n"
+
+
+# -- Jobs on the person's own machines.
+
+
+def test_status_lists_gpu_and_machine_jobs_together_newest_first(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.machine_jobs = [_machine_job(), _machine_job("completed", id=5)]
+
+    _run(server, "status")
+
+    assert capsys.readouterr().out == (
+        "9  running    gx10        python train.py\n"
+        "7  running    gpu-node-b  python x.py\n"
+        "6  completed  -           python x.py\n"
+        "5  completed  gx10        python train.py\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("gpu", "machine", "listed"),
+    [
+        (503, 200, ["9"]),
+        (200, 404, ["7", "6"]),
+        (200, 401, ["7", "6"]),
+        (503, 503, []),
+    ],
+)
+def test_status_lists_what_a_server_that_runs_one_kind_holds(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+    gpu: int,
+    machine: int,
+    listed: list[str],
+) -> None:
+    server.machine_jobs = [_machine_job()]
+    server.gpu_answer, server.machine_answer = gpu, machine
+
+    _run(server, "status")
+
+    out = capsys.readouterr().out
+    assert [line.split()[0] for line in out.splitlines() if line[0].isdigit()] == listed
+    assert (out == "(no jobs)\n") is (not listed)
+
+
+def test_status_of_a_listing_that_fails_otherwise_says_so(server: _Server) -> None:
+    server.machine_answer = 500
+
+    with pytest.raises(ClientError, match="500"):
+        _run(server, "status")
+
+
+def test_a_key_both_kinds_of_route_refuse_is_said_to_be_refused(
+    server: _Server,
+) -> None:
+    server.gpu_answer = server.machine_answer = 401
+
+    with pytest.raises(ClientError, match="401"):
+        _run(server, "status")
+
+
+def test_a_box_credential_the_machine_routes_refuse_reaches_its_gpu_job(
+    server: _Server,
+) -> None:
+    # A campaign box's credential opens only the GPU job routes; elsewhere it is 401.
+    server.machine_answer = 401
+
+    _run(server, "status", "7")
+    _run(server, "cancel", "7")
+    view = job_records.machine_view(cast("Client", server), 7)
+
+    assert view is None
+    assert server.calls == [
+        ("machine_job", 7),
+        ("job", 7),
+        ("machine_cancel", 7),
+        ("cancel", 7),
+        ("machine_job", 7),
+    ]
+
+
+def test_status_of_a_machine_job_shows_its_machine_limits_and_commit(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.machine_jobs = [
+        _machine_job(
+            "failed",
+            exit_code=3,
+            reason="exit 3",
+            started_at=datetime(2026, 10, 23, 12, 1, tzinfo=UTC),
+            ended_at=datetime(2026, 10, 23, 12, 2, tzinfo=UTC),
+            label="smoke",
+        ),
+    ]
+
+    _run(server, "status", "9")
+
+    assert capsys.readouterr().out == (
+        "job:      9\n"
+        "state:    failed\n"
+        "machine:  gx10\n"
+        "limits:   0 GPUs, 2048 MiB, up to 5 min\n"
+        "label:    smoke\n"
+        "command:  python train.py\n"
+        f"commit:   {_COMMIT} (refs/heads/main at git@github.com:o/r.git)\n"
+        "created:  2026-10-23T12:00:00+00:00\n"
+        "started:  2026-10-23T12:01:00+00:00\n"
+        "ended:    2026-10-23T12:02:00+00:00\n"
+        "exit:     3\n"
+        "reason:   exit 3\n"
+    )
+    assert server.calls == [("machine_job", 9)]
+
+
+def test_status_of_a_machine_job_not_yet_ended_shows_dashes(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.machine_jobs = [_machine_job("requested")]
+
+    _run(server, "status", "9")
+
+    out = capsys.readouterr().out.splitlines()
+    assert out[4] == "label:    -"
+    assert out[8:] == ["started:  -", "ended:    -", "exit:     -", "reason:   -"]
+
+
+def test_cancel_of_a_machine_job_goes_to_its_machine(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.machine_jobs = [_machine_job()]
+
+    _run(server, "cancel", "9")
+
+    assert server.calls == [("machine_cancel", 9)]
+    assert capsys.readouterr().out == "job 9: cancelled\n"
+
+
+def test_a_failure_other_than_not_found_is_not_taken_for_a_gpu_job(
+    server: _Server,
+) -> None:
+    server.machine_answer = 500
+
+    with pytest.raises(ClientError, match="500"):
+        _run(server, "cancel", "9")
+    with pytest.raises(ClientError, match="500"):
+        _ = job_records.machine_view(cast("Client", server), 9)
+
+    assert ("cancel", 9) not in server.calls
 
 
 if __name__ == "__main__":

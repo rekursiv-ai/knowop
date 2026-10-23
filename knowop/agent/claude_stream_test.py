@@ -625,8 +625,8 @@ def test_an_mcp_elicitation_is_an_ask_the_person_accepts_or_declines() -> None:
             _request(
                 "elicitation",
                 mcp_server_name="docs",
-                title="Pick a workspace",
-                message="Which workspace?",
+                title="Pick a canvas",
+                message="Which canvas?",
                 mode="url",
                 url="https://example.test/pick",
                 requested_schema={"type": "object"},
@@ -637,9 +637,9 @@ def test_an_mcp_elicitation_is_an_ask_the_person_accepts_or_declines() -> None:
         id="r2",
         provider="claude",
         kind="elicitation",
-        title="Pick a workspace",
+        title="Pick a canvas",
         tool="docs",
-        reason="Which workspace?",
+        reason="Which canvas?",
         cwd="/work",
         input={
             "mode": "url",
@@ -652,13 +652,13 @@ def test_an_mcp_elicitation_is_an_ask_the_person_accepts_or_declines() -> None:
         ),
     )
     accepted = wire.answer(
-        Answer(ask_id="r2", option="allow_once", updated_input={"workspace": "w1"}),
+        Answer(ask_id="r2", option="allow_once", updated_input={"canvas": "w1"}),
     )
     assert accepted is not None
     assert accepted.frame == _response(
         "r2",
         action="accept",
-        content={"workspace": "w1"},
+        content={"canvas": "w1"},
     )
 
 

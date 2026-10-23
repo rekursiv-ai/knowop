@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
     from trackinizer.lib.agent.types.sessions import SystemMessage
 
-STATION = "c5286865-67b6-4bd8-ab51-e06e10c326c5"
+CANVAS = "c5286865-67b6-4bd8-ab51-e06e10c326c5"
 TILE = "2de97e19-2624-4e89-804e-f19e7248eec3"
 RECORD = "889ffcb2-cf44-43e7-9806-eb08428c6203"
 FIRST = "0a1b2c3d-0000-4000-8000-000000000001"
@@ -60,7 +60,7 @@ def _state(*marks: dict[str, PlainTree]) -> dict[str, PlainTree]:
     }
 
 
-class _Station(BaseHTTPRequestHandler):
+class _Canvas(BaseHTTPRequestHandler):
     state: ClassVar[dict[str, PlainTree]] = {}
     status: ClassVar[int] = HTTPStatus.OK
     delay_sec: ClassVar[float] = 0.0
@@ -81,13 +81,13 @@ class _Station(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def station(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_Station]]:
-    """Serve, on loopback, ``GET /api/workspaces/ID`` answers from ``state``."""
-    _Station.state = _state()
-    _Station.status = HTTPStatus.OK
-    _Station.delay_sec = 0.0
-    _Station.requests = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _Station)
+def canvas(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_Canvas]]:
+    """Serve, on loopback, ``GET /api/canvases/ID`` answers from ``state``."""
+    _Canvas.state = _state()
+    _Canvas.status = HTTPStatus.OK
+    _Canvas.delay_sec = 0.0
+    _Canvas.requests = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Canvas)
     thread = threading.Thread(
         target=server.serve_forever,
         kwargs={"poll_interval": 0.01},
@@ -95,8 +95,8 @@ def station(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_Station]]:
     )
     thread.start()
     monkeypatch.setenv("TRACKINIZER_URL", f"http://127.0.0.1:{server.server_port}")
-    monkeypatch.setenv("TRAX_WORKSPACE", STATION)
-    yield _Station
+    monkeypatch.setenv("TRAX_CANVAS", CANVAS)
+    yield _Canvas
     server.shutdown()
     server.server_close()
 
@@ -161,11 +161,11 @@ class TestMain:
 
     def test_it_prints_a_box_once_and_remembers_it(
         self,
-        station: type[_Station],
+        canvas: type[_Canvas],
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        station.state = _state(_mark(FIRST, 1))
+        canvas.state = _state(_mark(FIRST, 1))
         seen = tmp_path / "seen"
 
         assert hook.main(["--seen", str(seen)], connect=connect) == 0
@@ -176,16 +176,16 @@ class TestMain:
         assert FIRST in first
         assert second == ""
         assert seen.read_text() == "1"
-        assert station.requests == [f"/api/workspaces/{STATION}"] * 2
+        assert canvas.requests == [f"/api/canvases/{CANVAS}"] * 2
 
     def test_a_refusing_server_prints_nothing_and_leaves_the_mark(
         self,
-        station: type[_Station],
+        canvas: type[_Canvas],
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        station.state = _state(_mark(FIRST, 1))
-        station.status = HTTPStatus.FORBIDDEN
+        canvas.state = _state(_mark(FIRST, 1))
+        canvas.status = HTTPStatus.FORBIDDEN
         seen = tmp_path / "seen"
 
         assert hook.main(["--seen", str(seen)], connect=connect) == 0
@@ -193,20 +193,20 @@ class TestMain:
         assert capsys.readouterr().out == ""
         assert not seen.exists()
 
-    def test_no_station_means_no_request(
+    def test_no_canvas_means_no_request(
         self,
-        station: type[_Station],
+        canvas: type[_Canvas],
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        monkeypatch.delenv("TRAX_WORKSPACE")
-        monkeypatch.delenv("LC_TRAX_WORKSPACE", raising=False)
+        monkeypatch.delenv("TRAX_CANVAS")
+        monkeypatch.delenv("LC_TRAX_CANVAS", raising=False)
 
         assert hook.main(["--seen", str(tmp_path / "seen")], connect=connect) == 0
 
         assert capsys.readouterr().out == ""
-        assert station.requests == []
+        assert canvas.requests == []
 
     def test_an_unreachable_server_prints_nothing(
         self,
@@ -215,7 +215,7 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         monkeypatch.setenv("TRACKINIZER_URL", "http://127.0.0.1:9")
-        monkeypatch.setenv("TRAX_WORKSPACE", STATION)
+        monkeypatch.setenv("TRAX_CANVAS", CANVAS)
 
         assert hook.main(["--seen", str(tmp_path / "seen")], connect=connect) == 0
 
@@ -223,13 +223,13 @@ class TestMain:
 
     def test_a_slow_server_is_not_waited_for_and_never_holds_the_process(
         self,
-        station: type[_Station],
+        canvas: type[_Canvas],
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        station.state = _state(_mark(FIRST, 1))
-        station.delay_sec = 0.5
+        canvas.state = _state(_mark(FIRST, 1))
+        canvas.delay_sec = 0.5
         started: list[threading.Thread] = []
 
         class _Seen(threading.Thread):
@@ -354,9 +354,9 @@ class TestReadSettings:
 class TestSessionStart:
     """The readiness marker, written once claude is past its dialogs."""
 
-    def test_the_event_writes_the_marker_and_reads_no_station(
+    def test_the_event_writes_the_marker_and_reads_no_canvas(
         self,
-        station: type[_Station],
+        canvas: type[_Canvas],
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -370,7 +370,7 @@ class TestSessionStart:
         assert status == 0
         assert hook.ready_marker(seen).exists()
         assert capsys.readouterr().out == ""
-        assert station.requests == []
+        assert canvas.requests == []
 
     def test_a_marker_that_cannot_be_written_still_exits_0(
         self,

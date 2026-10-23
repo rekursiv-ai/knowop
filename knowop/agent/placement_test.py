@@ -8,7 +8,7 @@ import uuid
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.trax.context import workspace_from_env
+from trackinizer.trax.context import canvas_from_env
 from trackinizer.wire.wire_sessions import SessionPlacement
 
 import pytest
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-_STATION = uuid.UUID(int=5)
+_CANVAS = uuid.UUID(int=5)
 _SESSION = uuid.UUID(int=1)
 
 
@@ -38,7 +38,7 @@ class _Client:
         self.asked.append((path, body))
         if self._fail:
             raise ClientError("404 Not Found")
-        return {"workstream_id": str(uuid.UUID(int=2))}
+        return {"workspace_id": str(uuid.UUID(int=2))}
 
 
 def _git(cwd: Path, *argv: str) -> None:
@@ -56,13 +56,13 @@ def _own_git_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
 
 
-def test_the_station_comes_from_trax_workspace_before_its_ssh_twin() -> None:
-    both = {"TRAX_WORKSPACE": str(_STATION), "LC_TRAX_WORKSPACE": str(uuid.UUID(int=6))}
+def test_the_canvas_comes_from_trax_canvas_before_its_ssh_twin() -> None:
+    both = {"TRAX_CANVAS": str(_CANVAS), "LC_TRAX_CANVAS": str(uuid.UUID(int=6))}
 
-    assert workspace_from_env(both) == _STATION
-    assert workspace_from_env({"LC_TRAX_WORKSPACE": str(_STATION)}) == _STATION
-    assert workspace_from_env({"TRAX_WORKSPACE": "not-a-uuid"}) is None
-    assert workspace_from_env({}) is None
+    assert canvas_from_env(both) == _CANVAS
+    assert canvas_from_env({"LC_TRAX_CANVAS": str(_CANVAS)}) == _CANVAS
+    assert canvas_from_env({"TRAX_CANVAS": "not-a-uuid"}) is None
+    assert canvas_from_env({}) is None
 
 
 def test_a_checkout_on_a_branch_names_its_origin_and_branch(tmp_path: Path) -> None:
@@ -87,7 +87,7 @@ def test_no_ref_for_a_directory_that_is_not_a_checkout_on_a_branch(
     assert git_ref(tmp_path) is None  # Detached HEAD.
 
 
-def test_a_run_asks_the_server_with_its_station_and_checkout(tmp_path: Path) -> None:
+def test_a_run_asks_the_server_with_its_canvas_and_checkout(tmp_path: Path) -> None:
     client = _Client()
     _git(tmp_path, "init", "-q", "-b", "main")
     _git(tmp_path, "remote", "add", "origin", "https://github.com/o/r.git")
@@ -95,16 +95,16 @@ def test_a_run_asks_the_server_with_its_station_and_checkout(tmp_path: Path) -> 
     placed = place_run(
         cast(Client, client),
         session_id=_SESSION,
-        environ={"TRAX_WORKSPACE": str(_STATION)},
+        environ={"TRAX_CANVAS": str(_CANVAS)},
         cwd=tmp_path,
     )
 
-    assert placed == SessionPlacement(workstream_id=uuid.UUID(int=2))
+    assert placed == SessionPlacement(workspace_id=uuid.UUID(int=2))
     assert client.asked == [
         (
             f"/api/sessions/{_SESSION}/place",
             {
-                "workspace": str(_STATION),
+                "canvas": str(_CANVAS),
                 "git": {"origin": "https://github.com/o/r.git", "branch": "main"},
             },
         ),
@@ -130,8 +130,8 @@ def test_the_child_env_holds_only_what_the_server_placed() -> None:
     assert placement_env(None) == {}
     assert placement_env(SessionPlacement()) == {}
     assert placement_env(
-        SessionPlacement(workstream_id=uuid.UUID(int=2), workspace_id=_STATION),
-    ) == {"TRAX_WORKSTREAM": str(uuid.UUID(int=2)), "TRAX_WORKSPACE": str(_STATION)}
+        SessionPlacement(workspace_id=uuid.UUID(int=2), canvas_id=_CANVAS),
+    ) == {"TRAX_WORKSPACE": str(uuid.UUID(int=2)), "TRAX_CANVAS": str(_CANVAS)}
 
 
 if __name__ == "__main__":
