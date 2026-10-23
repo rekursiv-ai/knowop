@@ -16,11 +16,42 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 from trackinizer.types.streams import TraxRecord
 
 
-__all__ = ["Event"]
+__all__ = ["Event", "FlagValue", "HostRequest", "RunRequest"]
+
+
+type FlagValue = str | int | bool | list[str] | None
+
+
+class RunRequest(TypedDict):
+    """Plain inputs from which the detached interpreter rebuilds a runner."""
+
+    flags: dict[str, FlagValue]
+    cli_argv: list[str]
+    connection: dict[str, FlagValue] | None
+    resume_path: str | None
+    cli_session_id: str | None
+    profile: str | None
+    attach: str | None
+    prefix_bytes: int
+    compact_after_load: bool
+    run_name: str
+
+
+class HostRequest(TypedDict):
+    """Plain inputs passed through the detached host's inherited descriptor."""
+
+    paths: str
+    address: str
+    control: str
+    resume: str
+    command: str
+    ready: int
+    run: RunRequest
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

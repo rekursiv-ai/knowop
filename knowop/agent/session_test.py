@@ -24,6 +24,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, TextIO, cast, override
+from unittest.mock import Mock
 
 import asyncio
 import io
@@ -86,7 +87,7 @@ from trackinizer.wire.wire_sessions import (
     SessionStartResponse,
     WorkspaceMessageContext,
 )
-from treekle import from_plain, json_loads
+from treekle import from_plain, json_dumps, json_loads
 
 import pytest
 
@@ -99,7 +100,7 @@ from knowop.agent import (
 from knowop.agent.claude_stream import ClaudeStreamDriver
 from knowop.agent.codex_app import CodexAppDriver
 from knowop.agent.commands import command_record
-from knowop.agent.custom_types import Event
+from knowop.agent.custom_types import Event, RunRequest
 from knowop.agent.detach import HeadlessSpec
 from knowop.agent.headless import (
     HeadlessRun,
@@ -1503,12 +1504,12 @@ def _start_host(
     name: str,
     *,
     command: str,
-    start: Callable[[HostSpec | None], int],
+    request: RunRequest,
 ) -> int:
     """Start what a detached host named ``name`` would run, in this process."""
     del command
     hosts.append(name)
-    return start(None)
+    return session.host_start(request)(None)
 
 
 def _at_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
@@ -3269,12 +3270,140 @@ def _keep_host(
     name: str,
     *,
     command: str,
-    start: Callable[[HostSpec | None], int],
+    request: RunRequest,
 ) -> int:
     """Keep what a detached host would start, and launch nothing."""
     del name, command
-    hosted.append(start)
+    hosted.append(session.host_start(request))
     return 0
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("mode", ["sync", "no-sync", "out"])
+def test_json_host_rebuild_preserves_the_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cli_name: str,
+    mode: str,
+) -> None:
+    launcher = Mock(return_value=0)
+    parent_client = Mock(side_effect=AssertionError("connected before exec"))
+    client = Client(base_url="http://host.test:9100")
+    connect = Mock(return_value=client)
+    ran: list[RunConfig] = []
+    monkeypatch.setattr(detach, "launch", launcher)
+    monkeypatch.setattr(session, "connect", connect)
+    monkeypatch.setattr(session, "run", partial(_keep_run, ran))
+    out = tmp_path / "capture.jsonl" if mode == "out" else None
+    transcript = tmp_path / "transcript.jsonl"
+    mode_args = (
+        ["--attach", str(uuid.uuid4())]
+        if mode == "sync"
+        else ["--out", str(out)]
+        if mode == "out"
+        else ["--no-sync"]
+    )
+    try:
+        assert (
+            session.main(
+                [
+                    cli_name,
+                    "--detach",
+                    "--name",
+                    "host-json",
+                    "--as",
+                    "worker",
+                    "--room",
+                    "one",
+                    "--room",
+                    "two",
+                    "--private",
+                    "--diff",
+                    "--verbose",
+                    *mode_args,
+                    "--",
+                    "--model",
+                    "model-name",
+                ],
+                client_factory=parent_client,
+                connection={"profile": "remote", "host": "host.test", "port": 9100},
+                profile="remote",
+                resume_path=transcript,
+                cli_session_id="cli-session",
+                attach=_CHAT,
+                prefix_bytes=1234,
+                compact_after_load=True,
+            )
+            == 0
+        )
+        parent_client.assert_not_called()
+        connect.assert_not_called()
+        request = json_loads(
+            json_dumps(launcher.call_args.kwargs["request"]),
+            RunRequest,
+        )
+        host = _spec(tmp_path)
+        start = session.host_start(request)
+        connect.assert_not_called()
+        assert start(host) == 0
+        [config] = ran
+        assert config == RunConfig(
+            cli_name=cli_name,
+            cli_args=(
+                ("--model", "model-name")
+                if mode == "sync"
+                else (*resume_argv(cli_name, "cli-session"), "--model", "model-name")
+            ),
+            actor="worker",
+            rooms=("one", "two"),
+            private=True,
+            diff=True,
+            out_path=out,
+            verbose=True,
+            sync=mode != "no-sync",
+            client=client if mode == "sync" else None,
+            resume_path=transcript,
+            cli_session_id="cli-session",
+            attach=_CHAT,
+            prefix_bytes=1234,
+            compact_after_load=True,
+            profile="remote",
+            host=host,
+            run_name="host-json",
+            headless=mode == "sync",
+            instance=config.instance,
+        )
+        if mode == "sync":
+            connect.assert_called_once()
+            assert vars(connect.call_args.args[0]) == request["connection"]
+        else:
+            connect.assert_not_called()
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("actor", [None, "inherited"])
+@pytest.mark.parametrize("mode", ["--no-sync", "--dry-run"])
+def test_local_runs_keep_actor_defaults_without_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+    actor: str | None,
+    mode: str,
+) -> None:
+    monkeypatch.delenv("AGENTNAME", raising=False)
+    if actor is not None:
+        monkeypatch.setenv("AGENTNAME", actor)
+    ran: list[RunConfig] = []
+    client = Mock(side_effect=AssertionError("local capture connected"))
+    monkeypatch.setattr(session, "run", partial(_keep_run, ran))
+    assert session.main([mode], client_factory=client) == 0
+    [config] = ran
+    assert config.actor == ("Agent" if actor is None else actor)
+    assert config.rooms == ()
+    assert config.dry_run is (mode == "--dry-run")
+    assert config.verbose is False
+    assert config.diff is False
+    assert config.client is None
+    client.assert_not_called()
 
 
 def _refuse_private(*args: object, **kwargs: object) -> int:
@@ -7152,7 +7281,7 @@ class _ChatClient:
         return "AgentSession", _CHAT, {"self": {"seq": 7}}
 
     def read_session_parts(self, session_id: uuid.UUID) -> list[PartBody]:
-        del session_id
+        assert session_id == _CHAT
         self.asked += 1
         if not self._records:
             return []
@@ -7204,6 +7333,7 @@ class TestAnAttachedRunLoadsTheChat:
         hosted: list[Callable[[HostSpec | None], int]] = []
         monkeypatch.setattr(session, "run", partial(_keep_run, ran))
         monkeypatch.setattr(detach, "launch", partial(_keep_host, hosted))
+        monkeypatch.setattr(session, "connect", Mock(return_value=client))
 
         argv = ["--detach", "--attach", str(_CHAT), "claude"]
         assert session.main(argv, client_factory=lambda: cast(Client, client)) == 0
@@ -7379,6 +7509,7 @@ class TestAChatRunIsHeadless:
         hosted: list[Callable[[HostSpec | None], int]] = []
         monkeypatch.setattr(session, "run", partial(_keep_run, ran))
         monkeypatch.setattr(detach, "launch", partial(_keep_host, hosted))
+        monkeypatch.setattr(session, "connect", Mock(return_value=client))
         assert session.main(argv, client_factory=lambda: cast(Client, client)) == 0
         for start in hosted:
             assert start(host if host is not None else _spec(tmp_path)) == 0

@@ -1,21 +1,29 @@
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
+import argparse
+import ast
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import uuid
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.trax import profile
 from trackinizer.trax.profile import Profile
+from treekle import json_loads, to_plain
 
 import pytest
 
-from knowop.agent import cli, session
+from knowop.agent import cli, detach, session
+from knowop.agent.custom_types import HostRequest
 from knowop.agent.errors import (
     CiphertextDroppedError,
     LossyConversionError,
@@ -89,6 +97,140 @@ def test_rai_codex_runs_codex(entered: _Entered) -> None:
     assert entered.kwargs["default_cli"] == "codex"
 
 
+def test_detach_has_no_pickle_import() -> None:
+    tree = ast.parse(Path(detach.__file__).read_text())
+    imports = [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    ]
+    assert "pickle" not in imports
+
+
+def test_the_spawn_payload_is_plain_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests: list[HostRequest] = []
+    monkeypatch.setattr(subprocess, "Popen", partial(_read_spawn_payload, requests))
+    with pytest.raises(InterruptedError, match="payload checked"):
+        _ = cli.main(
+            [
+                "--profile",
+                "elsewhere",
+                "--host",
+                "host.test",
+                "--port",
+                "9100",
+                "--no-sync",
+                "--detach",
+                "--name",
+                "json-host",
+                "sh",
+                "--room",
+                "one",
+                "--room",
+                "two",
+                "--",
+                "echo",
+                "héllo",
+            ],
+        )
+    [request] = requests
+    assert request["command"] == "sh echo 'héllo'"
+    assert request["resume"] == ""
+    assert request["run"]["connection"] == {
+        "profile": "elsewhere",
+        "host": "host.test",
+        "port": 9100,
+    }
+    assert request["run"]["cli_argv"] == ["echo", "héllo"]
+    assert request["run"]["flags"] == {
+        "cli": "sh",
+        "out": None,
+        "verbose": False,
+        "dry_run": False,
+        "sync": False,
+        "actor": None,
+        "rooms": ["one", "two"],
+        "private": False,
+        "diff": False,
+        "detach": True,
+        "name": "json-host",
+        "attach": None,
+    }
+
+
+def _read_spawn_payload(
+    requests: list[HostRequest],
+    argv: list[str],
+    **kwargs: object,
+) -> None:
+    del kwargs
+    with os.fdopen(os.dup(int(argv[-1])), "r") as source:
+        text = source.read()
+        assert "py/" not in text
+        requests.append(json_loads(text, HostRequest))
+    raise InterruptedError("payload checked")
+
+
+def test_the_host_entry_reads_and_closes_its_private_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[HostRequest] = []
+    monkeypatch.setattr(subprocess, "Popen", partial(_read_spawn_payload, requests))
+    with pytest.raises(InterruptedError, match="payload checked"):
+        _ = cli.main(["--no-sync", "--detach", "--name", "json-host", "sh"])
+    [request] = requests
+    read_fd, write_fd = os.pipe()
+    request["ready"] = write_fd
+    redirected: list[Path] = []
+    monkeypatch.setattr(detach, "_redirect_stdio", redirected.append)
+    ran: list[session.RunConfig] = []
+    monkeypatch.setattr(session, "run", partial(_record_host_run, ran))
+    with tempfile.TemporaryFile() as payload:
+        _ = payload.write(json.dumps(to_plain(request)).encode())
+        _ = payload.seek(0)
+        inherited = os.dup(payload.fileno())
+        try:
+            assert cli.main(["--_host", str(inherited)]) == 7
+            assert os.read(read_fd, 2) == b"ok"
+        finally:
+            os.close(read_fd)
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            _ = os.fstat(inherited)
+    [config] = ran
+    assert config.cli_name == "sh"
+    assert config.run_name == "json-host"
+    assert config.client is None
+    assert isinstance(config.host, detach.HeadlessSpec)
+    assert str(config.host.address) == request["address"]
+    assert str(config.host.control) == request["control"]
+    assert config.host.resume == request["resume"]
+    record = detach._read_record(Path(request["paths"]))
+    assert record is not None
+    assert (record.state, record.exit_code) == ("exited", 7)
+    assert redirected == [Path(request["paths"]) / "host.log"]
+
+
+def _record_host_run(ran: list[session.RunConfig], config: session.RunConfig) -> int:
+    ran.append(config)
+    assert config.host is not None
+    assert config.host.on_listening is not None
+    config.host.on_listening()
+    return 7
+
+
+@pytest.mark.parametrize("text", ["{broken", "{}", '{"paths": 12}'])
+def test_an_invalid_host_payload_still_closes_its_descriptor(text: str) -> None:
+    with tempfile.TemporaryFile() as payload:
+        _ = payload.write(text.encode())
+        _ = payload.seek(0)
+        inherited = os.dup(payload.fileno())
+        with pytest.raises((ValueError, TypeError)):
+            _ = cli.main(["--_host", str(inherited)])
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            _ = os.fstat(inherited)
+
+
 def test_the_client_comes_from_the_active_profile(entered: _Entered) -> None:
     _ = cli.main(["claude"])
 
@@ -125,6 +267,28 @@ def test_a_flag_the_runner_owns_is_not_taken_for_a_connection_flag(
 
     assert entered.argv == ["--no-sync", "--", "--profile", "x"]
     assert entered.kwargs["profile"] is None
+
+
+def test_connection_flags_keep_equals_in_values_and_stop_at_the_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = Mock(
+        return_value=argparse.ArgumentParser(prog="knowop run", add_help=False),
+    )
+    monkeypatch.setattr(argparse, "ArgumentParser", parser)
+    tail = ["--no-sync", "--", "--profile=child"]
+
+    flags, rest = cli._peel_connection(
+        ["--profile=other=two", "--host", "example.test", "--port=9100", *tail],
+    )
+
+    assert flags == argparse.Namespace(
+        profile="other=two",
+        host="example.test",
+        port=9100,
+    )
+    assert rest == tail
+    parser.assert_called_once_with(prog="knowop run", add_help=False)
 
 
 def test_a_host_command_reaches_the_host_commands_and_names_the_program_run() -> None:
