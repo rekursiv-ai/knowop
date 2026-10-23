@@ -6,9 +6,9 @@ import json
 import uuid
 
 from trackinizer.wire.wire_sessions import (
+    CanvasMessageContext,
     ConsoleRelay,
     ConsoleTarget,
-    WorkspaceMessageContext,
 )
 
 import pytest
@@ -64,7 +64,7 @@ class TestRenderInboundKinds:
         assert rendered == "[sear] alice@x: go"
 
     def test_a_command_is_typed_bare_so_it_runs(self) -> None:
-        context = WorkspaceMessageContext(workspace_id=uuid.uuid4(), visible_visuals=[])
+        context = CanvasMessageContext(canvas_id=uuid.uuid4(), visible_visuals=[])
 
         rendered = render_inbound(
             "/compact",
@@ -129,9 +129,9 @@ class TestRenderInboundKinds:
         )
 
     def test_the_canvas_commands_work_without_a_record_id_on_the_line(self) -> None:
-        assert "trax workspace navigate '#/lookup/RECORD_UUID'" in CANVAS_COMMANDS
+        assert "trax canvas navigate '#/lookup/RECORD_UUID'" in CANVAS_COMMANDS
         assert "page.record.id" in CANVAS_COMMANDS
-        assert "$TRAX_WORKSPACE" in CANVAS_COMMANDS
+        assert "$TRAX_CANVAS" in CANVAS_COMMANDS
         assert "\n" not in CANVAS_COMMANDS
         assert '"' not in CANVAS_COMMANDS
         assert "\\" not in CANVAS_COMMANDS
@@ -139,9 +139,9 @@ class TestRenderInboundKinds:
     def test_boxes_since_the_last_line_are_listed_with_id_page_and_covers(
         self,
     ) -> None:
-        context = WorkspaceMessageContext.model_validate(
+        context = CanvasMessageContext.model_validate(
             {
-                "workspace_id": "c5286865-67b6-4bd8-ab51-e06e10c326c5",
+                "canvas_id": "c5286865-67b6-4bd8-ab51-e06e10c326c5",
                 "visible_visuals": [],
                 "marks": [
                     {
@@ -184,10 +184,10 @@ class TestRenderInboundKinds:
         )
 
 
-def _context() -> WorkspaceMessageContext:
-    return WorkspaceMessageContext.model_validate(
+def _context() -> CanvasMessageContext:
+    return CanvasMessageContext.model_validate(
         {
-            "workspace_id": "c5286865-67b6-4bd8-ab51-e06e10c326c5",
+            "canvas_id": "c5286865-67b6-4bd8-ab51-e06e10c326c5",
             "page": {
                 "route": "#/lookup/889ffcb2-cf44-43e7-9806-eb08428c6203",
                 "record": {
@@ -222,8 +222,8 @@ class TestRenderConsoleRelay:
     """A relay is a note of what the person told agents, not a canvas question."""
 
     def test_it_reads_as_a_note_with_no_canvas_commands(self) -> None:
-        context = WorkspaceMessageContext(
-            workspace_id=uuid.uuid4(),
+        context = CanvasMessageContext(
+            canvas_id=uuid.uuid4(),
             visible_visuals=[],
             conversation_id=uuid.uuid4(),
             relay=ConsoleRelay(

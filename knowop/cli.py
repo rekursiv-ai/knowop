@@ -56,6 +56,7 @@ if TYPE_CHECKING:
 
     from knowop.agent import cli as agent_cli
     from knowop.jobs import cli as jobs_cli
+    from knowop.shell import job_limits
 else:
     from wrapt import lazy_import
 
@@ -64,6 +65,7 @@ else:
     # pay at every start.
     agent_cli = lazy_import("knowop.agent.cli")
     jobs_cli = lazy_import("knowop.jobs.cli")
+    job_limits = lazy_import("knowop.shell.job_limits")
     login = lazy_import("trackinizer.trax.login")
 
 
@@ -133,6 +135,8 @@ class Flags(Protocol):
     name: str
     sandbox: bool
     no_exec: bool
+    jobs: bool
+    job_results_max: str
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -238,6 +242,24 @@ def _add_connect_arguments(parser: argparse.ArgumentParser) -> None:
         "--sandbox",
         action="store_true",
         help="declare a disposable computer, where agents act without asking",
+    )
+    parser.add_argument(
+        "--jobs",
+        action="store_true",
+        help=(
+            "also run the jobs your account sends here with knowop job submit "
+            "--machine NAME, each in a fresh worktree of its pushed commit under a "
+            "memory cap; needs systemd's user manager"
+        ),
+    )
+    parser.add_argument(
+        "--job-results-max",
+        default="256M",
+        metavar="SIZE",
+        help=(
+            "with --jobs: the most result bytes one job sends back (default "
+            "%(default)s); larger results stay on this computer"
+        ),
     )
 
 
@@ -400,10 +422,20 @@ def _serve(
             sandbox=flags.sandbox,
             exec_commands=not flags.no_exec,
             token=token,
+            jobs=flags.jobs,
+            results_max=_size(flags.job_results_max),
         )
     finally:
         for sig, handler in before.items():
             signal.signal(sig, handler)
+
+
+def _size(text: str) -> int:
+    """Return the bytes ``--job-results-max`` names, or refuse it plainly."""
+    try:
+        return job_limits.parse_size(text)
+    except ValueError as error:
+        raise ClientError(f"--job-results-max: {error}") from None
 
 
 def _interrupt(signum: int, frame: FrameType | None) -> NoReturn:

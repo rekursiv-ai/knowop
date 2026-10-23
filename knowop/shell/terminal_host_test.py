@@ -361,7 +361,7 @@ async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
         result.append(await _until_exit(ws))
 
     server, url = await _listening(handler)
-    workspace, workstream = uuid.uuid4(), uuid.uuid4()
+    canvas, workspace = uuid.uuid4(), uuid.uuid4()
     host = _host(
         url,
         "/bin/sh",
@@ -369,7 +369,7 @@ async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
         "env",
         trax_env={"LC_TRAX_SERVER": url, "TRACKINIZER_PROFILE": "hosted"},
     )
-    await _run(host, _opened(workspace=workspace, workstream=workstream))
+    await _run(host, _opened(canvas=canvas, workspace=workspace))
     server.close()
 
     lines = set(result[0][0].decode().split())
@@ -378,10 +378,10 @@ async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
         "COLORTERM=truecolor",
         f"LC_TRAX_SERVER={url}",
         "TRACKINIZER_PROFILE=hosted",
+        f"TRAX_CANVAS={canvas}",
+        f"LC_TRAX_CANVAS={canvas}",
         f"TRAX_WORKSPACE={workspace}",
         f"LC_TRAX_WORKSPACE={workspace}",
-        f"TRAX_WORKSTREAM={workstream}",
-        f"LC_TRAX_WORKSTREAM={workstream}",
     } <= lines
     assert not [line for line in lines if "sentinel" in line]
 
@@ -390,7 +390,7 @@ async def _run_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     trax_env: dict[str, str],
-    workspace: uuid.UUID,
+    canvas: uuid.UUID,
 ) -> set[str]:
     """Return the environment a run dumps; the fake knowop is ``env``."""
     trax = _fake_knowop(tmp_path, "env\n")
@@ -404,7 +404,7 @@ async def _run_env(
     host = _host(url, trax_env=trax_env)
     await _run(
         host,
-        _opened(command="claude", run_name="run-1a2b3c4d", workspace=workspace),
+        _opened(command="claude", run_name="run-1a2b3c4d", canvas=canvas),
     )
     server.close()
     return set(result[0][0].decode().split())
@@ -416,22 +416,22 @@ async def test_a_run_inherits_the_host_environment_like_a_typed_knowop_run(
 ) -> None:
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1/bus")
     monkeypatch.setenv("SENTINEL_FROM_HOST", "kept")
-    workspace = uuid.uuid4()
+    canvas = uuid.uuid4()
     lines = await _run_env(
         tmp_path,
         monkeypatch,
         {"TRACKINIZER_PROFILE": "hosted"},
-        workspace,
+        canvas,
     )
     assert {
         "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1/bus",
         "SENTINEL_FROM_HOST=kept",
         "TRACKINIZER_PROFILE=hosted",
-        f"TRAX_WORKSPACE={workspace}",
+        f"TRAX_CANVAS={canvas}",
     } <= lines
 
 
-async def test_the_stations_trax_context_replaces_any_the_host_inherited(
+async def test_the_canvases_trax_context_replaces_any_the_host_inherited(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -439,17 +439,17 @@ async def test_the_stations_trax_context_replaces_any_the_host_inherited(
     monkeypatch.setenv("TRACKINIZER_TOKEN", "sentinel-token")
     monkeypatch.setenv("TRACKINIZER_PROFILE", "elsewhere")
     monkeypatch.setenv("TRAX_ACTOR", "sentinel-actor")
-    monkeypatch.setenv("LC_TRAX_WORKSPACE", "sentinel-workspace")
-    workspace = uuid.uuid4()
+    monkeypatch.setenv("LC_TRAX_CANVAS", "sentinel-canvas")
+    canvas = uuid.uuid4()
     lines = await _run_env(
         tmp_path,
         monkeypatch,
         {"TRACKINIZER_PROFILE": "hosted"},
-        workspace,
+        canvas,
     )
     assert {
         "TRACKINIZER_PROFILE=hosted",
-        f"LC_TRAX_WORKSPACE={workspace}",
+        f"LC_TRAX_CANVAS={canvas}",
     } <= lines
     assert not [line for line in lines if "sentinel" in line or "elsewhere" in line]
 

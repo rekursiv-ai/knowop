@@ -443,12 +443,12 @@ class TerminalHost:
         }
         if (lang := os.environ.get("LANG")) is not None:
             env["LANG"] = lang
+        if opened.canvas is not None:
+            env["TRAX_CANVAS"] = str(opened.canvas)
+            env["LC_TRAX_CANVAS"] = str(opened.canvas)
         if opened.workspace is not None:
             env["TRAX_WORKSPACE"] = str(opened.workspace)
             env["LC_TRAX_WORKSPACE"] = str(opened.workspace)
-        if opened.workstream is not None:
-            env["TRAX_WORKSTREAM"] = str(opened.workstream)
-            env["LC_TRAX_WORKSTREAM"] = str(opened.workstream)
         return env
 
     def _log(

@@ -84,9 +84,9 @@ from trackinizer.trax.profile import LOCALHOST_FALLBACK_URL
 from trackinizer.types.line_capture import LineCapture
 from trackinizer.wire.wire_sessions import (
     RUN_ENDING_REFUSALS,
+    CanvasMessageContext,
     InboundDrainItem,
     SessionRunState,
-    WorkspaceMessageContext,
     session_run_state_path,
 )
 from treekle import PlainTree, from_plain, json_dumps, json_loads
@@ -264,17 +264,17 @@ _INSTALL: Final = {
 _HEADLESS_CLIS: Final = ("claude", "codex")
 
 
-# What a CLI placed on a station is told of it. Its own product may have a canvas too,
-# so "the canvas" is named as the station's. One line with no double quote or
+# What a CLI placed on a canvas is told of it. Its own product may have a canvas too,
+# so "the canvas" is named as the canvas's. One line with no double quote or
 # backslash, so it is a TOML string as it stands, for codex's ``-c``.
 _CANVAS_NOTE: Final = (
-    "You run under knowop run, placed on a Trackinizer station: when the person says "
-    "the canvas, they mean that station's, which $TRAX_WORKSPACE names "
-    "(the workstream is $TRAX_WORKSTREAM), not one of your own product's. "
-    "Read it with `trax workspace`; change it with `trax workspace show trax.subgraph "
-    "--record UUID` (or trax.timeline), `trax workspace navigate ROUTE`, "
-    "`trax workspace highlight UUID,UUID` and `trax workspace hide ID`; "
-    "`trax workspace --help` lists the rest. "
+    "You run under knowop run, placed on a Trackinizer canvas: when the person says "
+    "the canvas, they mean that canvas's, which $TRAX_CANVAS names "
+    "(the workspace is $TRAX_WORKSPACE), not one of your own product's. "
+    "Read it with `trax canvas`; change it with `trax canvas show trax.subgraph "
+    "--record UUID` (or trax.timeline), `trax canvas navigate ROUTE`, "
+    "`trax canvas highlight UUID,UUID` and `trax canvas hide ID`; "
+    "`trax canvas --help` lists the rest. "
     "This conversation is already logged to trax as the chat's AgentSession; "
     "file each result to trax with the `trax` CLI as a row, with `--as` set to "
     "$TRAX_ACTOR (`trax help` lists the grammar). "
@@ -588,7 +588,7 @@ class RunConfig:
     summarizes it."""
 
     profile: str | None = None
-    """The ``--profile`` the run was started with; the box hook reads the station
+    """The ``--profile`` the run was started with; the box hook reads the canvas
     through it."""
 
     quiesce_seconds: float = 1.0
@@ -752,7 +752,7 @@ class InboundState:
         self,
         *,
         source: str | None,
-        context: WorkspaceMessageContext | None,
+        context: CanvasMessageContext | None,
     ) -> Disclosure:
         """Return what a Chat line from ``source`` has to say that the CLI lacks.
 
@@ -790,7 +790,7 @@ class InboundState:
         source: str | None,
         room: str | None,
         kind: InboundKind,
-        context: WorkspaceMessageContext | None = None,
+        context: CanvasMessageContext | None = None,
     ) -> None:
         """Remember a line about to be typed, with who sent it, for :meth:`stamp`.
 
@@ -883,7 +883,7 @@ _TRAX_SENDER: Final = "trackinizer"
 class _Told:
     """What a run's Chat lines have told its CLI so far."""
 
-    context: WorkspaceMessageContext | None = None
+    context: CanvasMessageContext | None = None
     """The context the last line carried, as the model, without the marks."""
 
     owner: str | None = None
@@ -908,7 +908,7 @@ class _Told:
         self,
         *,
         source: str | None,
-        context: WorkspaceMessageContext | None,
+        context: CanvasMessageContext | None,
     ) -> _Told:
         """Return what the CLI has been told once a line from ``source`` is typed.
 
@@ -937,7 +937,7 @@ class _Told:
         )
 
 
-def _unmarked(context: WorkspaceMessageContext) -> WorkspaceMessageContext:
+def _unmarked(context: CanvasMessageContext) -> CanvasMessageContext:
     """Return ``context`` without its marks, which go with their line alone."""
     return context.model_copy(update={"marks": []})
 
@@ -1651,7 +1651,7 @@ def _spawn_and_drain(
         drain_thread=drain_thread,
     )
     # Placed before the fork, like the routing name, so the child's env holds its
-    # workstream and station from the start. A failure leaves it unplaced.
+    # workspace and canvas from the start. A failure leaves it unplaced.
     placement = (
         place_run(
             config.client,
@@ -1895,8 +1895,8 @@ def _dropped_env(adapter: Adapter) -> frozenset[str]:
     return adapter.parent_session_env | {
         "TRAX_ACTOR",
         "TRAX_ROOMS",
-        "TRAX_WORKSTREAM",
         "TRAX_WORKSPACE",
+        "TRAX_CANVAS",
     }
 
 
@@ -2452,7 +2452,7 @@ def _sets_codex_goals(args: tuple[str, ...]) -> bool:
 
 
 # Every claude run gets the ``SessionStart`` hook, which says when inbound may be typed
-# in. The box hook is told about boxes on the station the CLI was placed on, so it runs
+# in. The box hook is told about boxes on the canvas the CLI was placed on, so it runs
 # only when the child's environment names one. Claude takes one ``--settings``, so a
 # person's own is merged into ours and theirs leaves the argv; one that cannot be read
 # is left as they gave it, and the run then waits out the fallback for readiness.
@@ -2475,7 +2475,7 @@ def _with_box_hook(
         return argv, None
     files = hook.prepare(
         profile=profile,
-        boxes="TRAX_WORKSPACE" in placed,
+        boxes="TRAX_CANVAS" in placed,
         user=user,
         bridge=bridge,
     )
@@ -2603,8 +2603,8 @@ def _with_canvas_note(
     adapter: Adapter,
     placed: Mapping[str, str],
 ) -> list[str]:
-    """Return ``argv`` telling the CLI of the station it was placed on, if any."""
-    if "TRAX_WORKSPACE" not in placed:
+    """Return ``argv`` telling the CLI of the canvas it was placed on, if any."""
+    if "TRAX_CANVAS" not in placed:
         return argv
     given = tuple(argv[1:])
     if adapter.name == "claude" and not any(

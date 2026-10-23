@@ -3,7 +3,16 @@
 All notable knowop changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.1.2 - 2026-10-23
+
+### Changed
+
+- **Breaking:** use Canvas APIs and `TRAX_CANVAS` for chat placement, and
+  Workspace APIs and `TRAX_WORKSPACE` for macro efforts. Requires
+  `trackinizer>=0.1.10` and a server with the matching migration.
+- Version 0.1.1 does not include the Canvas/Workspace rename.
+
+## 0.1.1 - 2026-10-23
 
 ## 0.1.0 - 2026-10-23
 

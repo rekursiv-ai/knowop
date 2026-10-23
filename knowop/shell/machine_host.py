@@ -43,14 +43,15 @@ from trackinizer.lib.userdirs import state_dir
 from trackinizer.trax.connection import server_dir
 from trackinizer.trax.render import echo
 from trackinizer.wire.wire_machine_host import HEARTBEAT_SEC, JoinResponse
+from trackinizer.wire.wire_machine_job import JOBS_FACT
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
     from trackinizer.wire.wire_machine_host import Claim, HeartbeatResponse
-    from trackinizer.wire.wire_machines import Facts
+    from trackinizer.wire.wire_machines import Facts, FactValue
 
     import pydantic
 else:
@@ -107,7 +108,7 @@ class HostClient(Protocol):
 
 
 class Serving(Protocol):
-    """Serves a joined machine, terminals or commands: started once, stopped on any exit."""
+    """Serves a joined machine, terminals, commands or jobs: started once, stopped once."""
 
     def start(self, machine_id: uuid.UUID, instance: uuid.UUID) -> None:
         """Start listening for terminals to open."""
@@ -127,6 +128,8 @@ def connect(
     sleep: Callable[[float], None],
     terminals_for: Callable[[JoinResponse], Serving] | None = None,
     exec_for: Callable[[JoinResponse], Serving] | None = None,
+    jobs_for: Callable[[JoinResponse], Serving] | None = None,
+    job_facts: Mapping[str, FactValue] | None = None,
     sandbox: bool = False,
     account: str | None = None,
 ) -> None:
@@ -145,6 +148,10 @@ def connect(
         ``None`` serves none, whatever the server asks.
       exec_for: Makes the command server the same way; ``None`` serves none, and the
         facts do not say ``exec``.
+      jobs_for: Makes the job host the same way; ``None`` runs no jobs, and the facts
+        do not say ``jobs``.
+      job_facts: What the job host offers jobs (its GPUs and memory), reported beside
+        ``jobs: true`` when ``jobs_for`` is given.
       sandbox: Whether this connect declares the computer a sandbox. Every connect
         records its own answer once it holds a credential, so ``False`` withdraws
         an earlier declaration.
@@ -163,6 +170,7 @@ def connect(
     facts = host_facts(
         terminal=terminals_for is not None,
         exec_commands=exec_for is not None,
+        jobs=None if jobs_for is None else {} if job_facts is None else job_facts,
     )
     # Sent with the first heartbeat only, and not after a join, which stored them.
     unsent: Facts | None = facts
@@ -192,7 +200,7 @@ def connect(
         echo("sandbox: on (agents on this computer act without asking)")
     with ExitStack() as serving:
         # Started in this order and stopped in the reverse, and only those that started.
-        for make in (terminals_for, exec_for):
+        for make in (terminals_for, exec_for, jobs_for):
             if make is not None:
                 served = make(saved)
                 served.start(saved.machine_id, instance)
@@ -221,23 +229,32 @@ def connect(
                 raise
 
 
-def host_facts(*, terminal: bool = False, exec_commands: bool = False) -> Facts:
+def host_facts(
+    *,
+    terminal: bool = False,
+    exec_commands: bool = False,
+    jobs: Mapping[str, FactValue] | None = None,
+) -> Facts:
     """Return what this host reports about itself.
 
     Args:
       terminal: Whether this host serves terminals, which the facts then say.
       exec_commands: Whether this host runs commands the assistant sends, which the
         facts then say as ``exec``.
+      jobs: What this host offers jobs, when it runs them; the facts then say
+        ``jobs: true`` beside it.
 
     Returns:
       facts: Its OS and architecture, CPU count, memory in MB, the user it runs
         as, which of :data:`HOST_CLIS` are on ``PATH``, ``terminal: true`` when
-        it serves terminals and ``exec: true`` when it runs commands.
+        it serves terminals, ``exec: true`` when it runs commands, and ``jobs:
+        true`` with what it offers jobs when it runs them.
 
     """
     return {
         **({"terminal": True} if terminal else {}),
         **({"exec": True} if exec_commands else {}),
+        **({JOBS_FACT: True, **jobs} if jobs is not None else {}),
         "os": platform.system().lower(),
         "arch": platform.machine(),
         "cpus": os.cpu_count() or 0,

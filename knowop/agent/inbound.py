@@ -19,9 +19,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from trackinizer.wire.wire_sessions import (
+        CanvasMark,
+        CanvasMessageContext,
         InboundKind,
-        WorkspaceMark,
-        WorkspaceMessageContext,
     )
 
 
@@ -30,25 +30,25 @@ if TYPE_CHECKING:
 # The line after a compaction carries it again: the CLI may have lost the note.
 CANVAS_COMMANDS: Final = (
     "Canvas: run these commands; describing them does nothing. "
-    "`trax workspace` acts on your station, $TRAX_WORKSPACE (a line's Trackinizer "
-    "context names it as workspace_id). RECORD_UUID is the record on screen "
+    "`trax canvas` acts on your canvas, $TRAX_CANVAS (a line's Trackinizer "
+    "context names it as canvas_id). RECORD_UUID is the record on screen "
     "(page.record.id in that context) or any record's uuid. "
-    "Show a record: trax workspace navigate '#/lookup/RECORD_UUID'. "
-    "Show its graph: trax workspace show trax.subgraph --record RECORD_UUID "
+    "Show a record: trax canvas navigate '#/lookup/RECORD_UUID'. "
+    "Show its graph: trax canvas show trax.subgraph --record RECORD_UUID "
     "--placement side. "
-    "Show its timeline: trax workspace show trax.timeline --record RECORD_UUID. "
-    "Show an artifact: trax workspace show trax.artifact --record RECORD_UUID "
+    "Show its timeline: trax canvas show trax.timeline --record RECORD_UUID. "
+    "Show an artifact: trax canvas show trax.artifact --record RECORD_UUID "
     "--placement main. "
-    "Show its files and diffs: trax workspace show trax.files --record RECORD_UUID "
+    "Show its files and diffs: trax canvas show trax.files --record RECORD_UUID "
     "(narrow: --param path=DIR/ or a glob, --param changed=true, --param file=NAME). "
-    "Open a terminal on your machine: trax workspace show trax.terminal "
+    "Open a terminal on your machine: trax canvas show trax.terminal "
     "--param machine=NAME --param start=true. "
-    "Point at records: trax workspace highlight UUID[,UUID...] (highlight '' clears). "
-    "Go to a view: trax workspace navigate '#/list/Issue' (or '#/graph', "
+    "Point at records: trax canvas highlight UUID[,UUID...] (highlight '' clears). "
+    "Go to a view: trax canvas navigate '#/list/Issue' (or '#/graph', "
     "'#/activity', '#/console', '#/search/TEXT' with TEXT percent-encoded). "
-    "Hide your Chat window so they look at the page: trax workspace hide chat "
+    "Hide your Chat window so they look at the page: trax canvas hide chat "
     "(show chat brings it back). "
-    "Hide a visual: trax workspace hide INSTANCE_UUID (never the page)."
+    "Hide a visual: trax canvas hide INSTANCE_UUID (never the page)."
 )
 
 
@@ -100,7 +100,7 @@ def render_inbound(
     source: str | None,
     room: str | None,
     *,
-    context: WorkspaceMessageContext | None = None,
+    context: CanvasMessageContext | None = None,
     stream: bool = False,
     kind: Literal["line"] = "line",
     disclosure: Disclosure | None = None,
@@ -113,7 +113,7 @@ def render_inbound(
     source: str | None,
     room: str | None,
     *,
-    context: WorkspaceMessageContext | None = None,
+    context: CanvasMessageContext | None = None,
     stream: bool = False,
     kind: InboundKind,
     disclosure: Disclosure | None = None,
@@ -125,7 +125,7 @@ def render_inbound(
     source: str | None,
     room: str | None,
     *,
-    context: WorkspaceMessageContext | None = None,
+    context: CanvasMessageContext | None = None,
     stream: bool = False,
     kind: InboundKind = "line",
     disclosure: Disclosure | None = None,
@@ -256,7 +256,7 @@ def _envelope_agent_message(text: str) -> str | None:
 # A note's words are what its author wrote on the canvas, so they are quoted as data,
 # never read as a command.
 # Titles are what people wrote on the records, so they are quoted as data.
-def _render_marks(marks: Sequence[WorkspaceMark]) -> str:
+def _render_marks(marks: Sequence[CanvasMark]) -> str:
     """List the boxes drawn since the last line, one per line, with what they cover."""
     return render_box_lines(
         [

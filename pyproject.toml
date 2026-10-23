@@ -3,7 +3,7 @@
 
 [project]
 name = "knowop"
-version = "0.1.0"
+version = "0.1.2"
 description = "Log in to KnowOp, connect your computer, and run your agents and GPU jobs where Chat can reach them."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,10 +26,9 @@ classifiers = [
 dependencies = [
     # Prefer https://awesome-python.com deps over alternatives.
     # The server's client, login and profiles, the wire models, and the session
-    # records the agent runner captures into. 0.1.8 is the first release with the
-    # light install (no server stack), device login, and trax's run, machine and job
-    # verbs moved out to knowop.
-    "trackinizer>=0.1.8",
+    # records the agent runner captures into. 0.1.10 adds the Canvas wire models,
+    # API routes and placement environment used by this client.
+    "trackinizer>=0.1.10",
     # serialization
     "treekle>=0.3.0",
     # data models: the exec and terminal hosts read the server's requests with them
@@ -708,6 +707,6 @@ compile-bytecode = true
 [tool.uv.sources]
 rekursiv-ai-typings = { git = "https://github.com/rekursiv-ai/typings", branch = "main" }
 # knowop follows trackinizer's main, so a uv install from this repository resolves
-# trackinizer from its main branch. Wheel metadata keeps the `>=0.1.8` floor, which
+# trackinizer from its main branch. Wheel metadata keeps the `>=0.1.10` floor, which
 # publish-pypi.yml resolves from PyPI alone.
 trackinizer = { git = "https://github.com/rekursiv-ai/trackinizer", branch = "main" }

@@ -659,6 +659,56 @@ def test_a_host_that_serves_exec_alone_reports_exec_and_no_terminal() -> None:
     assert "terminal" not in host_facts(exec_commands=True)
 
 
+def test_a_host_that_runs_jobs_says_what_it_offers_and_stops_them_first() -> None:
+    _save()
+    host = _Host(beats=[_REVOKED])
+    offered = {"gpus": 2, "jobs_memory_mb": 61_440}
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        client_for=host,
+        read_token=_no_token,
+        sleep=lambda _: None,
+        exec_for=lambda _joined: _Terminals(host.calls, "exec"),
+        jobs_for=lambda _joined: _Terminals(host.calls, "jobs"),
+        job_facts=offered,
+    )
+
+    assert [call[0] for call in host.calls] == [
+        "exec-start",
+        "jobs-start",
+        "beat",
+        "jobs-stop",
+        "exec-stop",
+    ]
+    assert host.calls[2][4] == {
+        **host_facts(exec_commands=True),
+        "jobs": True,
+        "gpus": 2,
+        "jobs_memory_mb": 61_440,
+    }
+
+
+def test_a_host_that_runs_no_jobs_says_nothing_of_them() -> None:
+    _save()
+    host = _Host()
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        client_for=host,
+        read_token=_no_token,
+        sleep=lambda _: None,
+        job_facts={"gpus": 1},
+    )
+
+    sent = host.calls[0][4]
+    assert isinstance(sent, dict)
+    assert {"jobs", "gpus"}.isdisjoint(sent)
+    assert host_facts(jobs={})["jobs"] is True
+
+
 def test_an_exec_server_that_will_not_start_stops_the_terminals_already_running() -> (
     None
 ):

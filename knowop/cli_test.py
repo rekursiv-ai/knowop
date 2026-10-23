@@ -176,6 +176,8 @@ class _Served:
 
     exec_commands: bool
     sandbox: bool
+    jobs: bool = False
+    results_max: int = 256 * 2**20
 
 
 class _Host:
@@ -203,6 +205,8 @@ class _Host:
         exec_commands: bool,
         sleep: object = None,
         token: str = "",
+        jobs: bool = False,
+        results_max: int = 0,
     ) -> None:
         del sleep
         if isinstance(self.ending, BaseException):
@@ -219,6 +223,8 @@ class _Host:
                 token=token if self.reads_token else "",
                 exec_commands=exec_commands,
                 sandbox=sandbox,
+                jobs=jobs,
+                results_max=results_max,
             ),
         )
 
@@ -688,6 +694,27 @@ def test_connect_with_no_exec_serves_terminals_only(host: _Host) -> None:
     assert _knowop("connect", "--no-exec") == 0
 
     assert [served.exec_commands for served in host.connects] == [False]
+    assert [served.jobs for served in host.connects] == [False]
+
+
+def test_connect_with_jobs_runs_them_and_bounds_what_one_sends_back(
+    host: _Host,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("connect", "--jobs") == 0
+    assert _knowop("connect", "--jobs", "--no-exec", "--job-results-max", "1G") == 0
+    assert _knowop("connect", "--jobs", "--job-results-max", "lots") == 1
+
+    assert [(s.jobs, s.exec_commands, s.results_max) for s in host.connects] == [
+        (True, True, 256 * 2**20),
+        (True, False, 2**30),
+    ]
+    assert (
+        "knowop: --job-results-max: 'lots' is not a size such as 32G or 512M"
+        in capsys.readouterr().err
+    )
 
 
 def test_connect_to_another_server_logs_in_there_enrolling_this_computer(

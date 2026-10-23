@@ -1,6 +1,6 @@
 ---
 name: knowop-job
-description: ALWAYS invoke this skill to run a command on a GPU node from the repository you are in, or to read, stop or collect such a job -- knowop job submit, logs, results, status, cancel, secrets. Do not ssh to a node or copy code to it by hand -- invoke this skill first.
+description: ALWAYS invoke this skill to run a command on a GPU node or on a computer of your own from the repository you are in, or to read, stop or collect such a job -- knowop job submit, logs, results, status, cancel, secrets. Do not ssh to a node or copy code to it by hand -- invoke this skill first.
 argument-hint: "[submit|logs|results|status|cancel|secrets|secret] ..."
 user-invocable: true
 tools: Bash, Read
@@ -48,6 +48,21 @@ inside the repository is refused.
 `submit --follow` streams the log after printing the id. Exit codes: 0 on
 success, 1 when the server refuses the job or it ends badly, 2 for a refused
 command, 130 when you interrupt a log.
+
+## On a computer of your own
+
+`knowop job submit --machine NAME [--memory SIZE] [--gpus N] [--minutes M] --
+CMD...` runs CMD on your computer NAME, which must run `knowop connect --jobs`.
+
+- No snapshot: the computer fetches the commit your branch was pushed at. The
+  worktree must be clean and the branch's upstream at `HEAD`; push first.
+- The job runs in a fresh worktree under a memory cap (`--memory`, default 32G),
+  for at most `--minutes` (up to 1440). `--gpus 0` hides every GPU.
+- Write results to `$KNOWOP_JOB_OUT`. `logs` and `results` come back through the
+  server, which keeps none of them; the computer sends at most what its owner allows
+  (256M unless `--job-results-max` says otherwise), and over that `results` names the
+  folder they stay in.
+- `status`, `logs`, `results` and `cancel` take its id as for a GPU job. No ssh.
 
 ## Secrets
 

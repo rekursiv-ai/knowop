@@ -34,12 +34,14 @@ from trackinizer.wire.wire_machine_host import (
     HeartbeatResponse,
     JoinResponse,
 )
+from trackinizer.wire.wire_machine_job import MACHINE_WORK_PATH
 from treekle import json_loads
 
 import httpx2
 import pytest
 
 from knowop.shell import (
+    job_limits,
     machine_host,
     serve,
     terminal_direct_aiortc,
@@ -171,6 +173,9 @@ class _Server:
         ):
             self.over.wait(0.02)
             return httpx2.Response(200, content=b"null")
+        if path == MACHINE_WORK_PATH.format(machine_id=_MACHINE_ID):
+            self.over.wait(0.02)
+            return httpx2.Response(200, json={"work": None})
         raise AssertionError(f"unexpected request {method} {path}")
 
     def _next_command(self) -> httpx2.Response:
@@ -238,6 +243,7 @@ def _connect(
     sandbox: bool = False,
     exec_commands: bool = True,
     token: str = "",
+    jobs: bool = False,
 ) -> None:
     with pytest.raises(KeyboardInterrupt):
         serve.connect_machine(
@@ -248,7 +254,20 @@ def _connect(
             exec_commands=exec_commands,
             sleep=waits,
             token=token,
+            jobs=jobs,
         )
+
+
+def _cap(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    problem: str | None = None,
+    gpus: list[job_limits.Gpu] | None = None,
+) -> None:
+    """Answer the cap probe and the GPU reads without systemd or nvidia-smi."""
+    monkeypatch.setattr(job_limits, "cap_problem", lambda: problem)
+    monkeypatch.setattr(job_limits, "gpus", lambda: gpus or [])
+    monkeypatch.setattr(job_limits, "memory_budget_mb", lambda: 61_440)
 
 
 def test_a_computer_with_no_login_logs_in_joins_with_the_returned_token_and_serves(
@@ -278,6 +297,81 @@ def test_a_computer_with_no_login_logs_in_joins_with_the_returned_token_and_serv
     assert "BCDF-GHJK" in out
     assert "joined: machine dev-box" in out
     assert "serving: machine dev-box" in out
+
+
+def test_a_computer_that_runs_jobs_offers_its_capped_memory_and_its_own_gpus(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _Server()
+    _on(server, monkeypatch)
+    _stdin(monkeypatch, "")
+    _cap(
+        monkeypatch,
+        gpus=[
+            job_limits.Gpu(index=0, uuid="GPU-a", name="NVIDIA GB10", used_mb=None),
+            job_limits.Gpu(index=1, uuid="GPU-b", name="NVIDIA H100", used_mb=0),
+        ],
+    )
+
+    _connect(_Waits(server.asked("/exec/wait", "/work")), jobs=True)
+
+    [join] = server.calls("/api/machines/join")
+    facts = join[3]["facts"]
+    assert isinstance(facts, dict)
+    assert (facts["jobs"], facts["gpus"], facts["jobs_memory_mb"]) == (True, 1, 61_440)
+    works = server.calls("/work")
+    assert {call[2] for call in works} == {f"Bearer {_CREDENTIAL}"}
+    out = capsys.readouterr().out
+    assert (
+        "jobs: GPU 0 (NVIDIA GB10) shares the CPU's memory, which a memory cap does "
+        "not bound, so no job is given it"
+    ) in out
+    assert "jobs: on, up to 61440 MiB together, GPUs: 1" in out
+    assert "(terminals, commands and jobs)" in out
+
+
+def test_jobs_where_no_memory_cap_holds_are_refused_before_anything_is_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _Server()
+    _on(server, monkeypatch)
+    _cap(monkeypatch, problem="systemd-run --user could not start a capped scope")
+
+    with pytest.raises(ClientError, match="--jobs needs systemd's user manager"):
+        serve.connect_machine(
+            "dev-box",
+            server=_SERVER,
+            signed_in=None,
+            sandbox=False,
+            exec_commands=True,
+            jobs=True,
+        )
+
+    assert server.requests == []
+
+
+def test_a_computer_joined_by_a_piped_token_runs_no_ones_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _Server()
+    _on(server, monkeypatch)
+    _cap(monkeypatch)
+    _stdin(monkeypatch, f"{_ENROLLMENT}\n")
+
+    with pytest.raises(ClientError, match="runs the jobs of a signed-in account"):
+        serve.connect_machine(
+            "dev-box",
+            server=_SERVER,
+            signed_in=None,
+            sandbox=False,
+            exec_commands=False,
+            jobs=True,
+        )
+
+    assert server.calls("/api/machines/join") == []
+    assert "(terminals and jobs)" in capsys.readouterr().out
 
 
 def test_ctrl_c_releases_the_machine_before_the_interrupt_goes_on(

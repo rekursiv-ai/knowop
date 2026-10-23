@@ -21,7 +21,7 @@ _ROUTING_ENV: Final = frozenset(
 
 
 def inherited_trax_context() -> frozenset[str]:
-    """Return the host's variables that would route a child off this station.
+    """Return the host's variables that would route a child off this canvas.
 
     Returns:
       names: The routing variables set here, and every ``TRAX_*`` and ``LC_TRAX_*``

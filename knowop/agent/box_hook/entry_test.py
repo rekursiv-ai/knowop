@@ -14,8 +14,8 @@ if TYPE_CHECKING:
 def test_main_reads_its_flags_from_the_process_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("TRAX_WORKSPACE", raising=False)
-    monkeypatch.delenv("LC_TRAX_WORKSPACE", raising=False)
+    monkeypatch.delenv("TRAX_CANVAS", raising=False)
+    monkeypatch.delenv("LC_TRAX_CANVAS", raising=False)
     monkeypatch.setattr("sys.argv", ["hook", "--seen", "/nonexistent/seen"])
 
     assert entry.main() == 0

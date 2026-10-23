@@ -13,10 +13,16 @@ own.
 Once joined the host serves terminals (``terminal_host.py``) and commands
 (``exec_host.py``), in the foreground, until the machine is revoked, a newer connect
 of it takes over, or Ctrl-C releases it.
+
+With ``jobs`` it also runs the jobs its account submits with ``knowop job submit
+--machine`` (``job_host.py``). That needs a memory cap systemd enforces, which is
+proven before anything else, and a signed-in account: a computer joined by a piped
+token belongs to no person and runs no one's jobs.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, TextIO
 from urllib.parse import urlsplit
 
@@ -27,6 +33,8 @@ import time
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
+from trackinizer.lib.userdirs import data_dir
+from trackinizer.trax.connection import server_dir
 from trackinizer.trax.context import env
 from trackinizer.trax.profile import profile_for_server, read_profile
 from trackinizer.trax.render import echo
@@ -37,10 +45,15 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from trackinizer.trax import login
+    from trackinizer.wire import wire_machine_job
     from trackinizer.wire.wire_machine_host import JoinResponse
+    from trackinizer.wire.wire_machines import Facts
 
     from knowop.shell import (
         exec_host,
+        job_host,
+        job_limits,
+        job_repo,
         machine_host,
         terminal_direct_aiortc,
         terminal_host,
@@ -53,12 +66,16 @@ else:
     # The host loop, the terminal and exec servers and the login poll bring pydantic,
     # websockets and the wire models; ``knowop status`` needs none of them.
     exec_host = lazy_import("knowop.shell.exec_host")
+    job_host = lazy_import("knowop.shell.job_host")
+    job_limits = lazy_import("knowop.shell.job_limits")
+    job_repo = lazy_import("knowop.shell.job_repo")
     machine_host = lazy_import("knowop.shell.machine_host")
     terminal_direct_aiortc = lazy_import(
         "knowop.shell.terminal_direct_aiortc",
     )
     terminal_host = lazy_import("knowop.shell.terminal_host")
     login = lazy_import("trackinizer.trax.login")
+    wire_machine_job = lazy_import("trackinizer.wire.wire_machine_job")
 
 
 __all__ = ["connect_machine", "piped_token"]
@@ -79,6 +96,8 @@ def connect_machine(
     exec_commands: bool,
     sleep: Callable[[float], None] = time.sleep,
     token: str = "",
+    jobs: bool = False,
+    results_max: int = 256 * 2**20,
 ) -> None:
     """Join ``name`` on ``server`` and serve it until it is revoked or interrupted.
 
@@ -95,14 +114,21 @@ def connect_machine(
       sleep: Waits the given seconds between polls and heartbeats.
       token: A one-use enrollment token for ``name`` the caller already holds, as a
         login that enrolled the machine returns; used before any other.
+      jobs: Whether the host runs the jobs its account submits to it.
+      results_max: With ``jobs``, the most result bytes one job sends back.
 
     Raises:
-      ClientError: The login was denied or expired, the token was refused, or the
-        server answered something a retry cannot change.
+      ClientError: The login was denied or expired, the token was refused, the
+        server answered something a retry cannot change, or ``jobs`` was asked for
+        where no memory cap holds or no account is signed in.
 
     """
+    offer = _job_offer() if jobs else None
     direct = _direct_link()
-    echo(f"serving: machine {name} at {server} ({_what_is_served(exec_commands)})")
+    echo(
+        f"serving: machine {name} at {server} "
+        f"({_what_is_served(exec_commands, jobs=jobs)})",
+    )
     account, read_token = _token_source(
         name,
         server=server,
@@ -110,6 +136,21 @@ def connect_machine(
         sleep=sleep,
         token=token,
     )
+    jobs_for = None
+    if offer is not None:
+        if account is None:
+            raise ClientError(
+                "--jobs runs the jobs of a signed-in account; a computer joined by a "
+                "piped token runs none",
+            )
+        jobs_for = functools.partial(
+            _job_host,
+            name,
+            server,
+            account=account,
+            offer=offer,
+            results_max=results_max,
+        )
     machine_host.connect(
         name,
         server=server,
@@ -125,6 +166,8 @@ def connect_machine(
         exec_for=(
             (lambda joined: _exec_host(name, server, joined)) if exec_commands else None
         ),
+        jobs_for=jobs_for,
+        job_facts=None if offer is None else offer.facts,
         sandbox=sandbox,
         account=account,
     )
@@ -210,9 +253,86 @@ def _direct_link() -> PeerFactory | None:
     return factory
 
 
-def _what_is_served(exec_commands: bool) -> str:
+def _what_is_served(exec_commands: bool, *, jobs: bool) -> str:
     """Return the words that say what this host serves."""
-    return "terminals and commands" if exec_commands else "terminals"
+    served = [
+        "terminals",
+        *(["commands"] if exec_commands else []),
+        *(["jobs"] if jobs else []),
+    ]
+    if len(served) == 1:
+        return served[0]
+    return f"{', '.join(served[:-1])} and {served[-1]}"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _JobOffer:
+    """What this computer offers jobs, as its cap probe and GPUs found it."""
+
+    gpus: tuple[int, ...]
+    memory_mb: int
+
+    @property
+    def facts(self) -> Facts:
+        """The facts the host reports beside ``jobs: true``."""
+        return {
+            wire_machine_job.GPUS_FACT: len(self.gpus),
+            wire_machine_job.JOBS_MEMORY_FACT: self.memory_mb,
+        }
+
+
+# A GPU that shares the CPU's memory is named, so its owner knows why a GPU job is
+# refused here (see ``job_limits``).
+def _job_offer() -> _JobOffer:
+    """Prove the memory cap and find the GPUs a job may be given, or refuse ``--jobs``."""
+    problem = job_limits.cap_problem()
+    if problem is not None:
+        raise ClientError(
+            f"--jobs needs systemd's user manager to cap a job's memory, and {problem}",
+        )
+    found = job_limits.gpus()
+    for gpu in found:
+        if gpu.unified:
+            echo(
+                f"jobs: GPU {gpu.index} ({gpu.name}) shares the CPU's memory, which "
+                "a memory cap does not bound, so no job is given it",
+            )
+    offer = _JobOffer(
+        gpus=tuple(gpu.index for gpu in found if not gpu.unified),
+        memory_mb=job_limits.memory_budget_mb(),
+    )
+    echo(
+        f"jobs: on, up to {offer.memory_mb} MiB together, GPUs: "
+        f"{','.join(map(str, offer.gpus)) or 'none'}",
+    )
+    return offer
+
+
+def _job_host(
+    name: str,
+    url: str,
+    joined: JoinResponse,
+    *,
+    account: str,
+    offer: _JobOffer,
+    results_max: int,
+) -> job_host.JobHost:
+    """Make the job host for a joined machine."""
+    jobs = data_dir() / "rekursiv-ai" / "knowop" / "jobs"
+    return job_host.JobHost(
+        name=name,
+        server_url=url,
+        credential=joined.credential,
+        client_for=lambda key: Client(url, api_key=key),
+        account=account,
+        root=jobs / server_dir(url),
+        repos=job_repo.Repos(jobs / "repos"),
+        launcher=job_host.SystemdLauncher(),
+        gpus=offer.gpus,
+        idle_gpus=job_limits.idle_gpus,
+        memory_budget_mb=offer.memory_mb,
+        results_max=results_max,
+    )
 
 
 def _token_source(

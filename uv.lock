@@ -614,7 +614,7 @@ wheels = [
 
 [[package]]
 name = "knowop"
-version = "0.1.0"
+version = "0.1.2"
 source = { editable = "." }
 dependencies = [
     { name = "aiortc" },
@@ -1197,7 +1197,7 @@ wheels = [
 [[package]]
 name = "rekursiv-ai-typings"
 version = "0.1.8"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#8eecd0e842f307c7f9f6ba9f349c9cca8bda38f2" }
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#e0e6ff3dc208d4ad8b4281c4941b8bd791e95e76" }
 
 [[package]]
 name = "ruff"
@@ -1255,8 +1255,8 @@ wheels = [
 
 [[package]]
 name = "trackinizer"
-version = "0.1.8"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#7d2f877938fae144f3539596fbb68c5c53d237c2" }
+version = "0.1.10"
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#02446bca3be62bd51e94a648e34cfcdbe6aa12c2" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
