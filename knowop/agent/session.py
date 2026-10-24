@@ -2873,12 +2873,15 @@ def _inbound_poll_loop(
             # immediately is what keeps the channel continuously parked.
             continue
         except Exception as error:
+            # A 403 or a 404 is the server's verdict on this key or this session, which
+            # no later drain changes: retried, the run would wait unseen for ever.
             if isinstance(error, ClientError) and (
-                error.status_code == 409 and error.code in RUN_ENDING_REFUSALS
+                error.status_code in {403, 404}
+                or (error.status_code == 409 and error.code in RUN_ENDING_REFUSALS)
             ):
                 sys.stderr.write(
                     f"[{PROGRAM}] this chat no longer takes lines from this run "
-                    f"({error.code}); stopping the run\n",
+                    f"({error.code or error}); stopping the run\n",
                 )
                 # The session is the chat's, shared with the run it keeps: this
                 # run's exit must not end it, or it takes that run's lines with it.
@@ -2890,8 +2893,8 @@ def _inbound_poll_loop(
             # not a silent stop; repeats stay at DEBUG to avoid flooding.
             if not warned:
                 sys.stderr.write(
-                    f"[{PROGRAM}] inbound delivery failed; messages will not be "
-                    "delivered until it recovers\n",
+                    f"[{PROGRAM}] inbound delivery failed ({error}); messages will not "
+                    "be delivered until it recovers\n",
                 )
                 warned = True
             _logger.debug("inbound wait failed", exc_info=True)

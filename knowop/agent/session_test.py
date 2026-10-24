@@ -1299,6 +1299,7 @@ class TestARunSaysWhereItIs:
         [
             "provider_is_other_cli",
             "provider_is_assistant",
+            "provider_is_cli",
             "chat_run_live",
             "session_ended",
         ],
@@ -1324,6 +1325,63 @@ class TestARunSaysWhereItIs:
 
         assert (client.drains, relay.terminated) == (1, 1)
         assert code in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("status", "word"),
+        [
+            (403, "A chat session is drained by its opening key"),
+            (404, "Session not found"),
+        ],
+    )
+    def test_a_drain_refused_for_good_stops_the_run_with_the_servers_word(
+        self,
+        status: int,
+        word: str,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A 403 or a 404 is the server's verdict on the key or the session."""
+        refusal = ClientError(
+            f'GET /api/sessions/s/inbound -> {status}: {{"detail":"{word}"}}',
+            status_code=status,
+        )
+        client = _RefusingClient(refusal)
+        relay = _RecordingRelay()
+
+        _inbound_poll_loop(
+            cast(Client, client),
+            cast(Sink, _SessionSink()),
+            cast(ThreadedRelay, relay),
+            threading.Event(),
+            poll_interval=0.01,
+            cli="claude",
+        )
+
+        assert (client.drains, relay.terminated) == (1, 1)
+        assert word in capsys.readouterr().err
+
+    def test_a_failure_it_retries_says_what_failed_once(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        stop = threading.Event()
+        client = _RefusingClient(
+            ClientError("GET /api/sessions/s/inbound -> 503: busy", status_code=503),
+            stop_after=3,
+            stop=stop,
+        )
+
+        _inbound_poll_loop(
+            cast(Client, client),
+            cast(Sink, _SessionSink()),
+            cast(ThreadedRelay, _RecordingRelay()),
+            stop,
+            poll_interval=0.001,
+            cli="claude",
+        )
+
+        said = capsys.readouterr().err
+        assert said.count("inbound delivery failed") == 1
+        assert "503: busy" in said
 
     def test_a_refused_run_leaves_the_session_open_before_it_stops_the_cli(
         self,
