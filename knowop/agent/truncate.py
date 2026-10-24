@@ -15,6 +15,10 @@ for a long output:
 
   https://github.com/openai/codex/blob/main/codex-rs/utils/output-truncation/src/lib.rs
 
+A base64 image or document is never cut: half of one is neither the image nor
+text, and the API refuses a resumed conversation holding it. One over the share
+becomes a text block naming what went.
+
 A tool result gets :data:`MAX_TOOL_RESULT_BYTES`; any other kind
 :data:`MAX_RECORD_BYTES`, a backstop that ordinary prose never reaches. A record
 that fits is returned as it came, byte for byte.
@@ -212,6 +216,11 @@ def _cut_tree(
         return _cut_text(tree, cap=cap, omitted=omitted)
     if isinstance(tree, list):
         return [_cut_tree(item, cap=cap, omitted=omitted) for item in tree]
+    if (
+        isinstance(tree, dict)
+        and (named := _named_media(tree, cap=cap, omitted=omitted)) is not None
+    ):
+        return named
     # The codec stores bytes as base64 under this tag: a cut would leave neither the
     # bytes nor readable text.
     if isinstance(tree, dict) and "py/b64" not in tree:
@@ -219,6 +228,29 @@ def _cut_tree(
             key: _cut_tree(item, cap=cap, omitted=omitted) for key, item in tree.items()
         }
     return tree
+
+
+# A cut base64 image is no image: resuming one made the API refuse the whole
+# conversation. So a block too large to keep goes whole, as text the model can read.
+def _named_media(
+    block: dict[str, MutablePlainTree],
+    *,
+    cap: int,
+    omitted: list[int],
+) -> dict[str, MutablePlainTree] | None:
+    """Return a base64 media block over ``cap`` bytes as text naming it, else None."""
+    source = block.get("source")
+    if not isinstance(source, dict) or source.get("type") != "base64":
+        return None
+    data = source.get("data")
+    if not isinstance(data, str) or len(data.encode()) <= cap:
+        return None
+    omitted.append(len(data.encode()))
+    return {
+        "type": "text",
+        "text": f"[Trackinizer capture omitted this {block.get('type')} "
+        f"({source.get('media_type')}, {len(data.encode())} bytes of base64)]",
+    }
 
 
 def _cut_text(text: str, *, cap: int, omitted: list[int]) -> str:
