@@ -3,6 +3,15 @@
 All notable knowop changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- A `knowop run` whose chat refuses its drain for good (a 403, a 404, or one of
+  `RUN_ENDING_REFUSALS`, now with `provider_is_cli`) stops with one line naming the
+  server's reason, where it used to retry unseen for ever. A failure it retries
+  says what failed.
+
 ## 0.1.2 - 2026-10-23
 
 ### Changed
