@@ -29,6 +29,7 @@ reads the record when it starts an agent.
 from __future__ import annotations
 
 from contextlib import ExitStack, closing, suppress
+from functools import partial
 from importlib import metadata
 from typing import TYPE_CHECKING, Final, Protocol
 
@@ -47,7 +48,7 @@ from trackinizer.wire.wire_machine_job import JOBS_FACT
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
     from trackinizer.wire.wire_machine_host import Claim, HeartbeatResponse
@@ -198,35 +199,35 @@ def connect(
     set_sandbox(on=sandbox)
     if sandbox:
         echo("sandbox: on (agents on this computer act without asking)")
-    with ExitStack() as serving:
-        # Started in this order and stopped in the reverse, and only those that started.
-        for make in (terminals_for, exec_for, jobs_for):
-            if make is not None:
-                served = make(saved)
-                served.start(saved.machine_id, instance)
-                serving.callback(served.stop)
-        with closing(client_for(saved.credential)) as client:
-            try:
-                _heartbeat(
-                    client,
-                    name=name,
-                    machine_id=saved.machine_id,
+    with ExitStack() as serving, closing(client_for(saved.credential)) as client:
+        try:
+            _heartbeat(
+                client,
+                name=name,
+                machine_id=saved.machine_id,
+                instance=instance,
+                version=version,
+                facts=unsent,
+                sleep=sleep,
+                serve=partial(
+                    _serve,
+                    serving,
+                    (terminals_for, exec_for, jobs_for),
+                    joined=saved,
                     instance=instance,
-                    version=version,
-                    facts=unsent,
-                    sleep=sleep,
+                ),
+            )
+        except KeyboardInterrupt:
+            # Once and best effort: a server out of reach leaves the machine to
+            # read offline after 180 s of silence, as a crash does.
+            with suppress(ClientError):
+                client.heartbeat_machine(
+                    saved.machine_id,
+                    instance=instance,
+                    host_version=version,
+                    claim="release",
                 )
-            except KeyboardInterrupt:
-                # Once and best effort: a server out of reach leaves the machine to
-                # read offline after 180 s of silence, as a crash does.
-                with suppress(ClientError):
-                    client.heartbeat_machine(
-                        saved.machine_id,
-                        instance=instance,
-                        host_version=version,
-                        claim="release",
-                    )
-                raise
+            raise
 
 
 def host_facts(
@@ -289,8 +290,10 @@ def set_sandbox(*, on: bool) -> None:
 
 
 # The first heartbeat that lands takes the machine, so a restart never waits out the
-# host it replaced; every later one keeps it. A keep refused with 409 means a newer
-# host took the machine, and this one stops rather than fight it for the machine.
+# host it replaced; every later one keeps it. The servers start only then: the server
+# refuses a wait from an instance that does not hold the machine. A keep refused with
+# 409 means a newer host took the machine, and this one stops rather than fight it for
+# the machine.
 def _heartbeat(
     client: HostClient,
     *,
@@ -300,6 +303,7 @@ def _heartbeat(
     version: str,
     facts: Facts | None,
     sleep: Callable[[float], None],
+    serve: Callable[[], None],
 ) -> None:
     """Heartbeat until the machine is revoked or another host takes it over."""
     claim: Claim = "take"
@@ -324,10 +328,27 @@ def _heartbeat(
             failures += 1
             sleep(_retry_delay(err, failures=failures))
             continue
+        if claim == "take":
+            serve()
         unsent = None
         claim = "keep"
         failures = 0
         sleep(HEARTBEAT_SEC)
+
+
+def _serve(
+    serving: ExitStack,
+    makers: Sequence[Callable[[JoinResponse], Serving] | None],
+    *,
+    joined: JoinResponse,
+    instance: uuid.UUID,
+) -> None:
+    """Start each server in order; ``serving`` stops those that started, in reverse."""
+    for make in makers:
+        if make is not None:
+            served = make(joined)
+            served.start(joined.machine_id, instance)
+            serving.callback(served.stop)
 
 
 # A transport failure carries no status. Anything in the 4xx range is an answer a
