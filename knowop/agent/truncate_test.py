@@ -7,12 +7,15 @@ readers do, so a cut that only looked right in memory cannot pass.
 
 from __future__ import annotations
 
+from io import StringIO
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
+import base64
 import json
 import re
 
+from trackinizer.lib.agent.sessions import claude
 from trackinizer.lib.agent.types.sessions import (
     Attachment,
     ContextClear,
@@ -24,7 +27,7 @@ from trackinizer.lib.agent.types.sessions import (
 )
 from trackinizer.lib.agent.types.stored import to_stored
 from trackinizer.types.session_records import SessionRecordRow, search_text
-from trackinizer.types.streams import Stdout
+from trackinizer.types.streams import Stderr, Stdin, Stdout
 from trackinizer.wire.wire_session_ir import RecordBody
 from treekle import immutable
 
@@ -43,7 +46,11 @@ from knowop.agent.truncate import (
 
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from trackinizer.lib.agent.types.sessions import SessionRecord
     from trackinizer.types.streams import TraxRecord
+    from treekle import PlainTree
 
 
 # One cut string: what it kept, how much it says went, and what it kept after.
@@ -62,15 +69,82 @@ _LOG: Final = (
 the wire, which is how ~1 MB of output became 11.39 MB."""
 
 
-def _shell(output: str) -> ShellCommandResult:
+def _shell(output: str, *, image: PlainTree = None) -> ShellCommandResult:
     """Return a shell result holding ``output`` twice, as codex stores one."""
+    extra: dict[str, PlainTree] = {"aggregated_output": output}
+    if image is not None:
+        extra["image"] = image
     return ShellCommandResult(
         call_id="c",
         command=("bash", "-lc", "find . -exec sed -n '1,180p' {} \\;"),
         stdout=output,
         exit_code=0,
-        extra=immutable({"aggregated_output": output}),
+        extra=immutable(extra),
     )
+
+
+def _image(size: int) -> dict[str, PlainTree]:
+    """Return a PNG image block of ``size`` bytes, as the messages API spells one."""
+    data = base64.b64encode(bytes(range(256)) * (size // 256) + bytes(size % 256))
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": data.decode()},
+    }
+
+
+def _image_read(image: dict[str, PlainTree]) -> str:
+    """Return a claude session reading ``image``, every copy claude writes of it."""
+    source = image["source"]
+    assert isinstance(source, dict)
+    lines = [
+        {
+            "type": "assistant",
+            "uuid": "a",
+            "sessionId": "s",
+            "timestamp": "2026-10-24T00:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t",
+                        "name": "Read",
+                        "input": {"file_path": "/shot.png"},
+                    },
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "b",
+            "parentUuid": "a",
+            "sessionId": "s",
+            "timestamp": "2026-10-24T00:00:01Z",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"tool_use_id": "t", "type": "tool_result", "content": [image]},
+                ],
+            },
+            "toolUseResult": {
+                "type": "image",
+                "file": {"base64": source["data"], "type": "image/png"},
+            },
+        },
+    ]
+    return "".join(f"{json.dumps(line)}\n" for line in lines)
+
+
+def _base64_sources(tree: object) -> Iterator[str]:
+    """Yield the data of every base64 media source in a JSON tree."""
+    if isinstance(tree, list):
+        for item in tree:
+            yield from _base64_sources(item)
+    if isinstance(tree, dict):
+        if tree.get("type") == "base64" and isinstance(data := tree.get("data"), str):
+            yield data
+        for item in tree.values():
+            yield from _base64_sources(item)
 
 
 class TestARecordThatFitsIsUntouched:
@@ -182,6 +256,52 @@ class TestWhatIsNeverCut:
         assert isinstance(cut, UncategorizedToolResult)
         assert cut.attachments[0].data == data
         assert was_truncated(cut)
+
+
+class TestAnImageIsKeptWholeOrNamed:
+    """Half a base64 string is neither the image nor text, and the API refuses it."""
+
+    def test_an_image_within_the_share_is_kept_whole(self) -> None:
+        image = _image(30_000)
+        body = _body(_shell(_LOG * 4_000, image=image))
+
+        cut = bounded(body)
+
+        assert encoded_size(cut) <= MAX_TOOL_RESULT_BYTES
+        record = _read(cut)
+        assert isinstance(record, ShellCommandResult)
+        assert record.extra["image"] == immutable(image)
+
+    def test_an_image_over_the_share_becomes_text_naming_it(self) -> None:
+        image = _image(MAX_TOOL_RESULT_BYTES)
+
+        record = _read(bounded(_body(_shell("short", image=image))))
+
+        assert isinstance(record, ShellCommandResult)
+        assert record.extra["image"] == immutable(
+            {
+                "type": "text",
+                "text": "[Trackinizer capture omitted this image "
+                "(image/png, 349528 bytes of base64)]",
+            },
+        )
+        assert record.extra[NOTE] == immutable({"omitted_bytes": 349_528})
+
+    def test_a_resumed_image_read_holds_no_broken_base64(self) -> None:
+        """The incident: claude stores a read image three times, over the budget."""
+        captured: list[SessionRecord] = []
+        for record in claude.normalize(StringIO(_image_read(_image(119_209)))):
+            cut = without_note(_read(bounded(_body(record))))
+            assert not isinstance(cut, Stdin | Stdout | Stderr)
+            captured.append(cut)
+        resumed = StringIO()
+
+        claude.denormalize(captured, resumed)
+
+        for line in resumed.getvalue().splitlines():
+            for data in _base64_sources(json.loads(line)):
+                base64.b64decode(data, validate=True)
+        assert "Trackinizer capture omitted this image" in resumed.getvalue()
 
 
 class TestEveryKindHasABackstop:
