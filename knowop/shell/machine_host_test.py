@@ -609,16 +609,51 @@ def test_a_host_that_opted_in_reports_terminals_and_stops_them_before_it_returns
     )
 
     kinds = [call[0] for call in host.calls]
-    assert kinds == ["terminals-start", "beat", "beat", "terminals-stop"]
-    assert host.calls[1][4] == host_facts(terminal=True)
-    assert host.calls[0][1] == _MACHINE_ID
-    assert host.calls[0][2] == host.calls[1][2]
+    assert kinds == ["beat", "terminals-start", "beat", "terminals-stop"]
+    assert host.calls[0][4] == host_facts(terminal=True)
+    assert host.calls[1][1] == _MACHINE_ID
+    assert host.calls[1][2] == host.calls[0][2]
     assert [joined.credential for joined in served] == [_CREDENTIAL]
+
+
+def test_no_server_starts_before_a_heartbeat_has_taken_the_machine() -> None:
+    # The server refuses a wait from an instance that does not hold the machine, so a
+    # server started first would be refused until the take lands.
+    _save()
+    host = _Host(beats=[_REFUSED, None, _REVOKED])
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        client_for=host,
+        read_token=_no_token,
+        sleep=lambda _: None,
+        terminals_for=lambda _joined: _Terminals(host.calls),
+        exec_for=lambda _joined: _Terminals(host.calls, "exec"),
+        jobs_for=lambda _joined: _Terminals(host.calls, "jobs"),
+    )
+
+    assert [call[0] for call in host.calls] == [
+        "beat",
+        "beat",
+        "terminals-start",
+        "exec-start",
+        "jobs-start",
+        "beat",
+        "jobs-stop",
+        "exec-stop",
+        "terminals-stop",
+    ]
+    assert [call[5] for call in host.calls if call[0] == "beat"] == [
+        "take",
+        "take",
+        "keep",
+    ]
 
 
 def test_a_host_that_serves_exec_reports_it_and_stops_it_before_the_terminals() -> None:
     _save()
-    host = _Host(beats=[_REVOKED])
+    host = _Host(beats=[None, _REVOKED])
 
     connect(
         "box-1",
@@ -632,14 +667,15 @@ def test_a_host_that_serves_exec_reports_it_and_stops_it_before_the_terminals() 
 
     kinds = [call[0] for call in host.calls]
     assert kinds == [
+        "beat",
         "terminals-start",
         "exec-start",
         "beat",
         "exec-stop",
         "terminals-stop",
     ]
-    assert host.calls[2][4] == host_facts(terminal=True, exec_commands=True)
-    assert host.calls[1][1:] == host.calls[0][1:]
+    assert host.calls[0][4] == host_facts(terminal=True, exec_commands=True)
+    assert host.calls[2][1:] == host.calls[1][1:]
 
 
 def test_a_host_that_serves_exec_alone_reports_exec_and_no_terminal() -> None:
@@ -655,13 +691,13 @@ def test_a_host_that_serves_exec_alone_reports_exec_and_no_terminal() -> None:
         exec_for=lambda _joined: _Terminals(host.calls, "exec"),
     )
 
-    assert host.calls[1][4] == {**host_facts(), "exec": True}
+    assert host.calls[0][4] == {**host_facts(), "exec": True}
     assert "terminal" not in host_facts(exec_commands=True)
 
 
 def test_a_host_that_runs_jobs_says_what_it_offers_and_stops_them_first() -> None:
     _save()
-    host = _Host(beats=[_REVOKED])
+    host = _Host(beats=[None, _REVOKED])
     offered = {"gpus": 2, "jobs_memory_mb": 61_440}
 
     connect(
@@ -676,13 +712,14 @@ def test_a_host_that_runs_jobs_says_what_it_offers_and_stops_them_first() -> Non
     )
 
     assert [call[0] for call in host.calls] == [
+        "beat",
         "exec-start",
         "jobs-start",
         "beat",
         "jobs-stop",
         "exec-stop",
     ]
-    assert host.calls[2][4] == {
+    assert host.calls[0][4] == {
         **host_facts(exec_commands=True),
         "jobs": True,
         "gpus": 2,
@@ -713,7 +750,7 @@ def test_an_exec_server_that_will_not_start_stops_the_terminals_already_running(
     None
 ):
     _save()
-    host = _Host()
+    host = _Host(beats=[None])
 
     with pytest.raises(RuntimeError, match="no bash"):
         connect(
@@ -731,6 +768,7 @@ def test_an_exec_server_that_will_not_start_stops_the_terminals_already_running(
         )
 
     assert [call[0] for call in host.calls] == [
+        "beat",
         "terminals-start",
         "exec-start",
         "terminals-stop",
@@ -739,7 +777,7 @@ def test_an_exec_server_that_will_not_start_stops_the_terminals_already_running(
 
 def test_terminals_stop_when_the_host_ends_on_an_error_too() -> None:
     _save()
-    host = _Host(beats=[ClientError("-> 403", status_code=403)])
+    host = _Host(beats=[None, ClientError("-> 403", status_code=403)])
 
     with pytest.raises(ClientError):
         connect(
@@ -788,7 +826,7 @@ def test_a_host_a_newer_connect_took_over_stops_its_terminals_and_returns(
     )
 
     kinds = [call[0] for call in host.calls]
-    assert kinds == ["terminals-start", "beat", "beat", "terminals-stop"]
+    assert kinds == ["beat", "terminals-start", "beat", "terminals-stop"]
     assert slept == [HEARTBEAT_SEC]
     assert capsys.readouterr().out == (
         "taken over: machine box-1 is served by a newer connect\n"
@@ -816,7 +854,7 @@ def test_ctrl_c_releases_the_machine_once_then_stops_terminals_and_goes_on(
             terminals_for=lambda _joined: _Terminals(host.calls),
         )
 
-    _, beat, release, stop = host.calls
+    beat, _, release, stop = host.calls
     assert (beat[5], release[5]) == ("take", "release")
     assert release[2] == beat[2]
     assert stop == ("terminals-stop",)
