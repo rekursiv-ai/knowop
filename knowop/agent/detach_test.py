@@ -439,6 +439,61 @@ class TestCommands:
             ["beta", "starting"],
         ]
 
+    def test_the_live_hosts_are_this_computers_hosts_still_there(self) -> None:
+        here = socket.gethostname()
+        for name, state, machine in (
+            ("alpha", "exited", here),
+            ("beta", "starting", here),
+            ("gamma", "starting", f"not-{here}"),
+            ("delta", "starting", ""),
+        ):
+            root = detach._paths(name)
+            root.mkdir(parents=True)
+            detach._write_record(
+                root,
+                _record(root, name=name, state=state, pid=os.getpid(), machine=machine),
+            )
+
+        assert [host.name for host in detach.live_hosts()] == ["beta", "delta"]
+
+    @pytest.mark.parametrize(("failed", "status"), [(set(), 0), ({"beta"}, 1)])
+    def test_stop_all_stops_each_live_host_and_fails_when_one_did_not_stop(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        failed: set[str],
+        status: int,
+    ) -> None:
+        for name in ("beta", "delta"):
+            root = detach._paths(name)
+            root.mkdir(parents=True)
+            detach._write_record(
+                root,
+                _record(root, name=name, state="starting", pid=os.getpid()),
+            )
+        stopped: list[str] = []
+
+        def stop(name: str) -> int:
+            stopped.append(name)
+            return int(name in failed)
+
+        monkeypatch.setattr(detach, "_stop", stop)
+
+        assert main(["stop", "--all"]) == status
+        assert stopped == ["beta", "delta"]
+
+    def test_stop_all_with_no_hosts_succeeds_and_says_so(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        assert main(["stop", "--all"]) == 0
+        assert capsys.readouterr().err == (
+            "[knowop run] no host is running on this computer\n"
+        )
+
+    def test_stop_names_a_host_or_stops_them_all(self) -> None:
+        with pytest.raises(SystemExit, match="name a host, or stop them all"):
+            _ = main(["stop"])
+
     def test_ls_reads_the_directory_hosts_are_made_in(
         self,
         monkeypatch: pytest.MonkeyPatch,

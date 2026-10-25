@@ -40,8 +40,15 @@ knowop run claude       # Claude Code in this folder, recorded, reachable from C
 knowop run codex        # the same for Codex
 knowop job submit -- python train.py   # a job on a GPU node, from this repository
 knowop job submit --machine lab-box -- python train.py   # on your computer lab-box
-knowop status           # server, account, this computer's connection
+knowop status           # server, account, your machines and the runs live on each
+knowop disconnect       # stop this computer's runs, then disconnect it on the server
 ```
+
+A run reaches Chat with your account's key, not through `knowop connect`: it keeps
+running after Ctrl-C ends the connect, which then names the runs it leaves. The web
+app shows a machine connected while one of its runs is live. `knowop run stop --all`
+stops the runs on this computer; `knowop disconnect` also revokes its connect and
+stops every run of yours that names it, wherever it runs.
 
 A job can also run on a computer of your own: start it with `knowop connect --jobs`
 there, push your branch, and `knowop job submit --machine NAME -- CMD` from the
@@ -75,10 +82,11 @@ web app. A first `knowop run` logs in too.
 |---|---|
 | `knowop login [ORG\|URL]` | Logs in with a code approved in a browser and saves the key. |
 | `knowop connect [ORG\|URL] [--name N] [--no-exec] [--sandbox] [--jobs [--job-results-max SIZE]]` | Logs in first unless knowop is logged in to that server or a token is piped in, enrolling and confirming this computer in the same approval; then serves its terminal, and the assistant's commands unless `--no-exec`, until Ctrl-C. No server means knowop's own, else `https://alpha.knowop.ai`. `--sandbox` declares a disposable computer where agents act without asking. `--jobs` also runs your account's `knowop job submit --machine` jobs, each under a memory cap; it needs systemd's user manager. |
-| `knowop status` | Prints knowop's profile, the server, your account and role, and your computers with whether each is online. Exits 1 when not logged in. |
+| `knowop status` | Prints knowop's profile, the server, your account and role, your computers with whether each is online and the runs live on each, and the runs here that name no machine of yours. Exits 1 when not logged in. |
+| `knowop disconnect [NAME]` | Stops this computer's runs when NAME is this computer (the default), then disconnects NAME on the server: its connect is revoked and every run of yours that names it stops. `knowop connect` joins it again with no login. |
 | `knowop logout` | Revokes the key on the server and deletes the saved login. |
 | `knowop run claude\|codex [ARGS]` | Runs Claude Code or Codex in this folder, recorded and reachable from Chat. Says to run `knowop connect` when this computer is not connected. |
-| `knowop run attach\|ls\|log\|send\|stop NAME` | Reaches a run started with `--detach`. |
+| `knowop run attach\|ls\|log\|send\|stop NAME` | Reaches a run started with `--detach`. `knowop run stop --all` stops every one on this computer. |
 | `knowop run claude\|codex resume SESSION` | Re-enters a stored session. |
 | `knowop job submit\|logs\|results ...` | Runs a job on a GPU node from this repository, or with `--machine NAME` on a computer of yours, and reads its log and results. |
 | `knowop job status [JOB]\|cancel JOB\|secrets\|secret NAME set\|del` | Lists your jobs or shows one, stops one, and keeps the secrets a job may use. |

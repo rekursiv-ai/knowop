@@ -33,7 +33,7 @@ knowop connect --name box-7 < enrollment-token   # join with a token, no login
   it receives is saved as knowop's profile, and `knowop run` and `knowop job` use
   the same login.
 - Logged in already, it enrolls a new machine with the login's key; the person
-  then allows the machine in the web app's Machines menu.
+  then allows the machine on the web app's Machines page.
 - An enrollment token (`enr_...`) on standard input joins without a login. Put it
   there, never on the command line.
 - Later runs reuse the login and the machine's credential and ask for nothing. A

@@ -71,8 +71,10 @@ __all__ = [
     "HostRecord",
     "build_parser",
     "launch",
+    "live_hosts",
     "main",
     "run_host",
+    "stop_all",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -267,6 +269,10 @@ def main(argv: Sequence[str], *, prog: str = PROGRAM) -> int:
         return _log(flags.name, follow=flags.follow)
     if flags.command == "send":
         return _send(flags.name, " ".join(flags.text))
+    if flags.all:
+        return stop_all()
+    if not flags.name:
+        raise SystemExit(f"{prog} stop: name a host, or stop them all with --all")
     return _stop(flags.name)
 
 
@@ -287,119 +293,6 @@ def build_parser(prog: str = PROGRAM) -> argparse.ArgumentParser:
     )
     _add_arguments(parser)
     return parser
-
-
-class _Flags(Protocol):
-    """Parsed host-command flags."""
-
-    command: str
-    name: str
-    follow: bool
-    text: list[str]
-    all: bool
-
-
-def _add_arguments(parser: argparse.ArgumentParser) -> None:
-    """Register the host commands on ``parser``."""
-    commands = parser.add_subparsers(dest="command", required=True)
-    ls_parser = commands.add_parser("ls", help="List the live hosts and their state.")
-    ls_parser.add_argument(
-        "-a",
-        "--all",
-        action="store_true",
-        help="List every host, those that exited or were lost too.",
-    )
-    attach_parser = commands.add_parser(
-        "attach",
-        help="Drive a host from this terminal; Ctrl-\\ detaches.",
-    )
-    attach_parser.add_argument("name")
-    log_parser = commands.add_parser("log", help="Print a host's scrollback.")
-    log_parser.add_argument("name")
-    log_parser.add_argument(
-        "-f",
-        "--follow",
-        action="store_true",
-        help="Keep printing new output until the host exits.",
-    )
-    send_parser = commands.add_parser(
-        "send",
-        help="Type a message into a host and press Enter.",
-    )
-    send_parser.add_argument("name")
-    send_parser.add_argument("text", nargs="+")
-    stop_parser = commands.add_parser("stop", help="Stop a host and wait for it.")
-    stop_parser.add_argument("name")
-
-
-def _paths(name: str) -> Path:
-    """Return ``name``'s host directory, rejecting a name that is not a filename."""
-    if _NAME.fullmatch(name) is None:
-        raise SystemExit(
-            f"{PROGRAM}: invalid host name {name!r}; use letters, digits, and "
-            "._@#+=:- (at most 128, not starting with punctuation)",
-        )
-    return state_dir() / "rekursiv-ai" / "trax" / "run" / "hosts" / name
-
-
-def _detach(
-    paths: Path,
-    *,
-    address: Path,
-    control: Path,
-    resume: str,
-    command: str,
-    ready: int,
-    start: Callable[[HostSpec], int],
-) -> int:
-    """Serve as the exec'd host in its new session; return its status."""
-    os.set_inheritable(ready, False)
-    _redirect_stdio(paths / "host.log")
-    record = HostRecord(
-        name=paths.name,
-        command=command,
-        cwd=str(Path.cwd()),
-        pid=os.getpid(),
-        address=str(address),
-        started=_now(),
-        machine=socket.gethostname(),
-        control=str(control),
-    )
-    _write_record(paths, record)
-    readiness = _Readiness(ready)
-    status = 1
-    try:
-        status = start(
-            HeadlessSpec(
-                address=address,
-                scrollback=paths / "scrollback.log",
-                on_listening=partial(_listening, paths, record, readiness),
-                control=control,
-                resume=resume,
-                on_takeover=partial(_taken_over, paths),
-            ),
-        )
-    except SystemExit as exit_:
-        status = _exit_status(exit_.code)
-    except Exception:
-        # Nothing above this frame will report it: the host has no caller, and
-        # the launcher shows only the log.
-        _logger.exception("knowop run: the host failed")
-    finally:
-        readiness.close()
-        # Read again: the record now may hold a session the first one did not.
-        _write_record(
-            paths,
-            replace(
-                _read_record(paths) or record,
-                state="exited",
-                exit_code=status,
-                ended=_now(),
-            ),
-        )
-        sys.stdout.flush()
-        sys.stderr.flush()
-    return status
 
 
 class _Readiness:
@@ -424,60 +317,52 @@ class _Readiness:
         self._fd = -1
 
 
-# The runner's clean refusals (a binary not on PATH) arrive as a ``SystemExit`` with a
-# message, which only the interpreter's top level would print -- and the launcher shows
-# the log, so the reason must land there.
-def _exit_status(code: object) -> int:
-    """Return the status a ``SystemExit`` code means, logging a message code."""
-    if code is None:
-        return 0
-    if isinstance(code, int):
-        return code
-    sys.stderr.write(f"{code}\n")
-    return 1
+def live_hosts() -> list[HostRecord]:
+    """Return the hosts still there on this computer, by name.
+
+    Returns:
+      hosts: Each host starting, running or exiting here; a host another computer
+        sharing this home directory runs is not one.
+
+    """
+    here = socket.gethostname()
+    return [
+        record
+        for record in _records()
+        if (not record.machine or record.machine == here) and _state(record) in _LIVE
+    ]
 
 
-def _taken_over(paths: Path, session: str) -> None:
-    """Record the CLI session a person took the host over on."""
-    record = _read_record(paths)
-    if record is not None:
-        _write_record(paths, replace(record, session=session))
+def stop_all() -> int:
+    """Stop every host still there on this computer, one at a time.
+
+    Returns:
+      exit_code: 0 when each stopped, else 1.
+
+    """
+    hosts = live_hosts()
+    if not hosts:
+        sys.stderr.write(f"[{PROGRAM}] no host is running on this computer\n")
+    status = 0
+    for record in hosts:
+        status = max(status, _stop(record.name))
+    return status
 
 
-def _listening(paths: Path, record: HostRecord, readiness: _Readiness) -> None:
-    """Record the host as running, then release the launcher."""
-    _write_record(paths, replace(record, state="running"))
-    readiness.accept()
-
-
-def _redirect_stdio(log: Path) -> None:
-    """Point stdin at /dev/null and stdout and stderr at ``log``."""
-    null = os.open(os.devnull, os.O_RDONLY)
-    out = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    _ = os.dup2(null, 0)
-    _ = os.dup2(out, 1)
-    _ = os.dup2(out, 2)
-    os.close(null)
-    os.close(out)
-
-
-def _await_ready(fd: int) -> bytes | None:
-    """Return the host's readiness message, or None if it never answered."""
-    try:
-        readable, _, _ = select.select([fd], (), (), _READY_TIMEOUT_SEC)
-        return os.read(fd, 2) if readable else None
-    finally:
-        os.close(fd)
+def _records() -> list[HostRecord]:
+    """Return every host's record, by name; a directory with none is skipped."""
+    hosts = state_dir() / "rekursiv-ai" / "trax" / "run" / "hosts"
+    found = (
+        _read_record(directory)
+        for directory in sorted(hosts.iterdir() if hosts.is_dir() else ())
+    )
+    return [record for record in found if record is not None]
 
 
 def _ls(*, every: bool) -> int:
     """List the live hosts, or with ``every`` all of them, one per line."""
     rows = [("NAME", "STATE", "PID", "STARTED", "COMMAND")]
-    hosts = state_dir() / "rekursiv-ai" / "trax" / "run" / "hosts"
-    for directory in sorted(hosts.iterdir() if hosts.is_dir() else ()):
-        record = _read_record(directory)
-        if record is None:
-            continue
+    for record in _records():
         state = _state(record)
         if every or state in _LIVE:
             rows.append(
@@ -801,3 +686,168 @@ def _spawn(request: HostRequest, *, ready: int, log: Path) -> None:
         )
     # Reap while the launcher lives, without making its exit wait for the host.
     threading.Thread(target=process.wait, daemon=True).start()
+
+
+class _Flags(Protocol):
+    """Parsed host-command flags."""
+
+    command: str
+    name: str
+    follow: bool
+    text: list[str]
+    all: bool
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register the host commands on ``parser``."""
+    commands = parser.add_subparsers(dest="command", required=True)
+    ls_parser = commands.add_parser("ls", help="List the live hosts and their state.")
+    ls_parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="List every host, those that exited or were lost too.",
+    )
+    attach_parser = commands.add_parser(
+        "attach",
+        help="Drive a host from this terminal; Ctrl-\\ detaches.",
+    )
+    attach_parser.add_argument("name")
+    log_parser = commands.add_parser("log", help="Print a host's scrollback.")
+    log_parser.add_argument("name")
+    log_parser.add_argument(
+        "-f",
+        "--follow",
+        action="store_true",
+        help="Keep printing new output until the host exits.",
+    )
+    send_parser = commands.add_parser(
+        "send",
+        help="Type a message into a host and press Enter.",
+    )
+    send_parser.add_argument("name")
+    send_parser.add_argument("text", nargs="+")
+    stop_parser = commands.add_parser("stop", help="Stop a host and wait for it.")
+    stop_parser.add_argument("name", nargs="?", default="")
+    stop_parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="Stop every live host on this computer.",
+    )
+
+
+def _paths(name: str) -> Path:
+    """Return ``name``'s host directory, rejecting a name that is not a filename."""
+    if _NAME.fullmatch(name) is None:
+        raise SystemExit(
+            f"{PROGRAM}: invalid host name {name!r}; use letters, digits, and "
+            "._@#+=:- (at most 128, not starting with punctuation)",
+        )
+    return state_dir() / "rekursiv-ai" / "trax" / "run" / "hosts" / name
+
+
+def _detach(
+    paths: Path,
+    *,
+    address: Path,
+    control: Path,
+    resume: str,
+    command: str,
+    ready: int,
+    start: Callable[[HostSpec], int],
+) -> int:
+    """Serve as the exec'd host in its new session; return its status."""
+    os.set_inheritable(ready, False)
+    _redirect_stdio(paths / "host.log")
+    record = HostRecord(
+        name=paths.name,
+        command=command,
+        cwd=str(Path.cwd()),
+        pid=os.getpid(),
+        address=str(address),
+        started=_now(),
+        machine=socket.gethostname(),
+        control=str(control),
+    )
+    _write_record(paths, record)
+    readiness = _Readiness(ready)
+    status = 1
+    try:
+        status = start(
+            HeadlessSpec(
+                address=address,
+                scrollback=paths / "scrollback.log",
+                on_listening=partial(_listening, paths, record, readiness),
+                control=control,
+                resume=resume,
+                on_takeover=partial(_taken_over, paths),
+            ),
+        )
+    except SystemExit as exit_:
+        status = _exit_status(exit_.code)
+    except Exception:
+        # Nothing above this frame will report it: the host has no caller, and
+        # the launcher shows only the log.
+        _logger.exception("knowop run: the host failed")
+    finally:
+        readiness.close()
+        # Read again: the record now may hold a session the first one did not.
+        _write_record(
+            paths,
+            replace(
+                _read_record(paths) or record,
+                state="exited",
+                exit_code=status,
+                ended=_now(),
+            ),
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+    return status
+
+
+# The runner's clean refusals (a binary not on PATH) arrive as a ``SystemExit`` with a
+# message, which only the interpreter's top level would print -- and the launcher shows
+# the log, so the reason must land there.
+def _exit_status(code: object) -> int:
+    """Return the status a ``SystemExit`` code means, logging a message code."""
+    if code is None:
+        return 0
+    if isinstance(code, int):
+        return code
+    sys.stderr.write(f"{code}\n")
+    return 1
+
+
+def _taken_over(paths: Path, session: str) -> None:
+    """Record the CLI session a person took the host over on."""
+    record = _read_record(paths)
+    if record is not None:
+        _write_record(paths, replace(record, session=session))
+
+
+def _listening(paths: Path, record: HostRecord, readiness: _Readiness) -> None:
+    """Record the host as running, then release the launcher."""
+    _write_record(paths, replace(record, state="running"))
+    readiness.accept()
+
+
+def _redirect_stdio(log: Path) -> None:
+    """Point stdin at /dev/null and stdout and stderr at ``log``."""
+    null = os.open(os.devnull, os.O_RDONLY)
+    out = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    _ = os.dup2(null, 0)
+    _ = os.dup2(out, 1)
+    _ = os.dup2(out, 2)
+    os.close(null)
+    os.close(out)
+
+
+def _await_ready(fd: int) -> bytes | None:
+    """Return the host's readiness message, or None if it never answered."""
+    try:
+        readable, _, _ = select.select([fd], (), (), _READY_TIMEOUT_SEC)
+        return os.read(fd, 2) if readable else None
+    finally:
+        os.close(fd)

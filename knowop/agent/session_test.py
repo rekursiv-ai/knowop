@@ -1329,7 +1329,9 @@ class TestARunSaysWhereItIs:
     @pytest.mark.parametrize(
         ("status", "word"),
         [
+            (401, "Invalid API key"),
             (403, "A chat session is drained by its opening key"),
+            (403, "This run was stopped"),
             (404, "Session not found"),
         ],
     )
@@ -1339,7 +1341,7 @@ class TestARunSaysWhereItIs:
         word: str,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """A 403 or a 404 is the server's verdict on the key or the session."""
+        """A 401, a 403 or a 404 is the server's verdict on the key or the session."""
         refusal = ClientError(
             f'GET /api/sessions/s/inbound -> {status}: {{"detail":"{word}"}}',
             status_code=status,
