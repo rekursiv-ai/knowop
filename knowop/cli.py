@@ -106,6 +106,9 @@ def main(
         sys.stdout.reconfigure(line_buffering=True)
     args = list(sys.argv[1:] if argv is None else argv)
     try:
+        if not args:
+            _next_step()
+            return 0
         # Everything after ``run`` or ``job`` belongs to the runner, ``--help`` and
         # every other flag included; argparse would read them as knowop's own. Every
         # ``machine`` form is the registry's, its help pages too.
@@ -386,6 +389,30 @@ def _status() -> None:
     for host in detach.live_hosts():
         if host.name not in listed_runs:
             echo(f"here:    {host.name}  {' '.join(host.command.split()[:1])}")
+
+
+def _next_step() -> None:
+    """Print the next setup step for this computer, without starting a login."""
+    saved = _saved()
+    if saved is None:
+        echo("Not connected. Run:  knowop connect")
+        return
+    _, profile = saved
+    with Client(profile.url, api_key=profile.api_key) as http:
+        if (caller := _caller(http)) is None:
+            raise ClientError(
+                f"not logged in: {profile.url} refused the key; run knowop login",
+            )
+        email = from_plain(caller.get("email"), str)
+        here = host_name()
+        connected = any(
+            m.name == here and m.owner == email and m.status == "online"
+            for m in http.list_machines()
+        )
+    if connected:
+        echo(f"Connected as {here} to {profile.url}. Next:  knowop run claude")
+    else:
+        echo("Not connected. Run:  knowop connect")
 
 
 # This computer's runs first: once the server stops them, each is already ending,
