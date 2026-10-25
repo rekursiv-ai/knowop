@@ -2,7 +2,8 @@
 
 The server decides the placement (``POST /api/sessions/{id}/place``); this reads the
 two things only the client knows, the canvas the run was started from and its git
-checkout, and turns the answer into the child's environment.
+checkout, and turns the answer into the child's environment. A chat's session is
+never placed: it sits on its chat's canvas, which the caller's session list names.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import sys
+import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.trax.context import canvas_from_env
@@ -19,6 +21,7 @@ from trackinizer.wire.wire_sessions import (
     SessionPlacement,
     session_place_path,
 )
+from treekle import from_plain
 
 from knowop.agent.program import PROGRAM
 from knowop.agent.worktree_diff import run_git
@@ -27,8 +30,6 @@ from knowop.agent.worktree_diff import run_git
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
-
-    import uuid
 
     from trackinizer.client.client import Client
 
@@ -83,6 +84,46 @@ def place_run(
     except (ClientError, ValueError) as error:
         sys.stderr.write(
             f"[{PROGRAM}] could not place this session ({error}); running unplaced\n",
+        )
+        return None
+
+
+# The path is written out: ``SESSIONS_PATH`` is newer than trackinizer 0.1.10, the
+# release knowop's wheel requires, so naming it would fail the import on such an
+# install. Activity over one day suffices: the list keeps every open session, and the
+# run's attach has just reopened this one. A listed session names its canvas and that
+# canvas's workspace by a placement's field names, beside fields a placement ignores.
+def chat_placement(client: Client, *, session_id: uuid.UUID) -> SessionPlacement | None:
+    """Return the canvas a chat's session sits on, as the session list names it.
+
+    Args:
+      client: The run's client.
+      session_id: The chat's session, which the run attached to.
+
+    Returns:
+      placement: The canvas and its workspace, each ``None`` for a session on no
+        canvas; ``None`` when the list leaves the session out, or on a refusal, which
+        it warns of once.
+
+    """
+    try:
+        answer = from_plain(
+            client.get("/api/sessions", params={"days": 1}),
+            dict[str, object],
+        )
+        rows = from_plain(answer.get("sessions"), list[dict[str, object]], default=[])
+        return next(
+            (
+                SessionPlacement.model_validate(row)
+                for row in rows
+                if from_plain(row.get("id"), uuid.UUID) == session_id
+            ),
+            None,
+        )
+    except (ClientError, ValueError) as error:
+        sys.stderr.write(
+            f"[{PROGRAM}] could not find this chat's canvas ({error}); "
+            "running unplaced\n",
         )
         return None
 

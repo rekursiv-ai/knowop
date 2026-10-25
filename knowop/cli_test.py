@@ -64,6 +64,9 @@ _EMAIL: Final = "ada@example.com"
 _LOGIN_TOKEN: Final = "enr_" + "0" * 32 + "_" + "l" * 43
 _ENROLL_TOKEN: Final = "enr_" + "0" * 32 + "_" + "e" * 43
 _PROD: Final = Profile(url="https://prod.example", api_key="trax_" + "p" * 43)
+_CANVAS: Final = "11111111-1111-4111-8111-1111111111c1"
+_RECORD: Final = "22222222-2222-4222-8222-2222222222c2"
+_VISUAL: Final = "33333333-3333-4333-8333-3333333333c3"
 
 
 class _Server:
@@ -138,6 +141,18 @@ class _Server:
             return httpx2.Response(200, json={"ok": True})
         if route == ("GET", "/api/machines"):
             return httpx2.Response(200, json={"machines": self.machines})
+        if route == ("GET", f"/api/canvases/{_CANVAS}"):
+            return httpx2.Response(200, json={"id": _CANVAS, "revision": 3})
+        if route == ("POST", f"/api/canvases/{_CANVAS}/operations"):
+            shown = {"id": _VISUAL, "type": "trax.subgraph", "placement": "side"}
+            return httpx2.Response(
+                200,
+                json={
+                    "id": _CANVAS,
+                    "revision": 4,
+                    "visuals": [{**shown, "record_id": _RECORD}],
+                },
+            )
         for name in (str(machine["name"]) for machine in self.machines):
             if route == ("GET", f"/api/machines/{name}/runs"):
                 return httpx2.Response(200, json={"runs": self.runs.get(name, [])})
@@ -476,6 +491,7 @@ def test_every_verb_reaches_knowops_server_while_trax_points_at_another(
         ["run", "claude"],
         ["job", "logs", "7"],
         ["machine"],
+        ["canvas", _CANVAS],
     ):
         assert _knowop(*argv) == 0, argv
     assert _knowop("logout") == 0
@@ -1065,6 +1081,76 @@ def test_machine_help_needs_no_login_and_asks_the_server_nothing(
 
     assert capsys.readouterr().out.startswith("Usage: knowop machine")
     assert server.requests == []
+
+
+def test_canvas_shows_a_visual_on_the_runs_canvas_on_knowops_server(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """With knowop alone, a run drives the canvas its ``TRAX_CANVAS`` names."""
+    save_profile("prod", _PROD)
+    switch_profile("prod")
+    monkeypatch.setenv("TRACKINIZER_URL", _PROD.url)
+    monkeypatch.setenv("TRAX_CANVAS", _CANVAS)
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    shown = ["show", "trax.subgraph", "--record", _RECORD, "--placement", "side"]
+    assert _knowop("canvas", *shown) == 0
+
+    assert server.hosts() == {"acme.knowop.ai"}
+    assert server.paths()[-2:] == [
+        f"/api/canvases/{_CANVAS}",
+        f"/api/canvases/{_CANVAS}/operations",
+    ]
+    assert json_loads(server.requests[-1].content, dict[str, object]) == {
+        "revision": 3,
+        "operation": {
+            "kind": "show",
+            "visual_type": "trax.subgraph",
+            "placement": "side",
+            "record_id": _RECORD,
+        },
+    }
+    assert capsys.readouterr().out.splitlines() == [
+        f"canvas {_CANVAS} revision 4 focused none",
+        f"  trax.subgraph {_VISUAL} side record={_RECORD}",
+    ]
+
+
+def test_canvas_refuses_without_a_login_before_any_request(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("canvas", _CANVAS, "highlight", _RECORD) == 1
+
+    assert server.requests == []
+    assert capsys.readouterr().err == "knowop: not logged in; run knowop login\n"
+
+
+@pytest.mark.parametrize("argv", [["--help"], ["help"], ["show", "-h"]])
+def test_canvas_help_is_knowops_needs_no_login_and_asks_the_server_nothing(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+) -> None:
+    assert _knowop("canvas", *argv) == 0
+
+    out = capsys.readouterr().out
+    assert out.startswith("Usage: knowop canvas CANVAS_UUID")
+    assert "trax canvas" not in out
+    assert server.requests == []
+
+
+def test_knowops_help_lists_canvas_among_its_verbs(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        _knowop("--help")
+
+    assert exited.value.code == 0
+    assert "    canvas " in capsys.readouterr().out
 
 
 def test_a_first_run_logs_in_to_the_default_server_then_runs(

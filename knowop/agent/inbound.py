@@ -28,27 +28,32 @@ if TYPE_CHECKING:
 # What the run's start note tells the CLI about moving the canvas, once. One line with
 # no double quote or backslash, so it is a TOML string as it stands, for codex's ``-c``.
 # The line after a compaction carries it again: the CLI may have lost the note.
+#
+# ``knowop canvas``, never ``trax canvas``: a computer may have knowop alone. Asked for
+# a terminal, claude on such a Mac opened the Terminal app, which the person in Chat
+# cannot see.
 CANVAS_COMMANDS: Final = (
     "Canvas: run these commands; describing them does nothing. "
-    "`trax canvas` acts on your canvas, $TRAX_CANVAS (a line's Trackinizer "
+    "`knowop canvas` acts on your canvas, $TRAX_CANVAS (a line's Trackinizer "
     "context names it as canvas_id). RECORD_UUID is the record on screen "
     "(page.record.id in that context) or any record's uuid. "
-    "Show a record: trax canvas navigate '#/lookup/RECORD_UUID'. "
-    "Show its graph: trax canvas show trax.subgraph --record RECORD_UUID "
+    "Show a record: knowop canvas navigate '#/lookup/RECORD_UUID'. "
+    "Show its graph: knowop canvas show trax.subgraph --record RECORD_UUID "
     "--placement side. "
-    "Show its timeline: trax canvas show trax.timeline --record RECORD_UUID. "
-    "Show an artifact: trax canvas show trax.artifact --record RECORD_UUID "
+    "Show its timeline: knowop canvas show trax.timeline --record RECORD_UUID. "
+    "Show an artifact: knowop canvas show trax.artifact --record RECORD_UUID "
     "--placement main. "
-    "Show its files and diffs: trax canvas show trax.files --record RECORD_UUID "
+    "Show its files and diffs: knowop canvas show trax.files --record RECORD_UUID "
     "(narrow: --param path=DIR/ or a glob, --param changed=true, --param file=NAME). "
-    "Open a terminal on your machine: trax canvas show trax.terminal "
-    "--param machine=NAME --param start=true. "
-    "Point at records: trax canvas highlight UUID[,UUID...] (highlight '' clears). "
-    "Go to a view: trax canvas navigate '#/list/Issue' (or '#/graph', "
+    "When the person asks for a terminal, open one in their canvas: knowop canvas "
+    "show trax.terminal --param machine=NAME --param start=true (NAME is this "
+    "computer; `knowop status` lists it). Do not open a desktop terminal app. "
+    "Point at records: knowop canvas highlight UUID[,UUID...] (highlight '' clears). "
+    "Go to a view: knowop canvas navigate '#/list/Issue' (or '#/graph', "
     "'#/activity', '#/console', '#/search/TEXT' with TEXT percent-encoded). "
-    "Hide your Chat window so they look at the page: trax canvas hide chat "
+    "Hide your Chat window so they look at the page: knowop canvas hide chat "
     "(show chat brings it back). "
-    "Hide a visual: trax canvas hide INSTANCE_UUID (never the page)."
+    "Hide a visual: knowop canvas hide INSTANCE_UUID (never the page)."
 )
 
 
