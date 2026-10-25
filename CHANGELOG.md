@@ -3,7 +3,16 @@
 All notable knowop changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.1.3 - 2026-10-25
+
+### Added
+
+- `knowop` with no verb prints the next step, from the saved login and this
+  computer's live connection: `knowop connect` when it is not connected, else
+  `knowop run claude`. A refused key says to run `knowop login`.
+- `knowop disconnect [NAME]` stops this computer's runs, then disconnects NAME on
+  the server: its connect is revoked and every run of yours that names it stops.
+  `knowop run stop --all` stops every detached run on this computer.
 
 ### Changed
 
@@ -11,6 +20,16 @@ All notable knowop changes are documented here. This project follows
   `RUN_ENDING_REFUSALS`, now with `provider_is_cli`) stops with one line naming the
   server's reason, where it used to retry unseen for ever. A failure it retries
   says what failed.
+- `knowop status` lists the runs live on each of your machines, and the runs here
+  that name no machine of yours.
+
+### Fixed
+
+- A reconnect with a saved login starts its terminal, command and job listeners
+  only after its first heartbeat takes the machine, so the first wait no longer
+  fails with 403 "stale host instance".
+- Capture keeps a base64 image block whole, or replaces it with a text block naming
+  its size, so a resumed Claude session no longer fails with "invalid base64 data".
 
 ## 0.1.2 - 2026-10-23
 
