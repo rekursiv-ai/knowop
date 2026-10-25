@@ -3,7 +3,7 @@
 All notable knowop changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.1.4 - 2026-10-25
 
 ### Added
 
@@ -11,6 +11,9 @@ All notable knowop changes are documented here. This project follows
   on knowop's login. `$TRAX_CANVAS` names the canvas when the command names none,
   so an agent `knowop run` started drives the person's canvas on a computer with
   knowop alone.
+- `knowop connect` prints `knowop: this knowop is too old for SERVER: run uvx
+  knowop@latest connect SERVER` once, when the server's heartbeat answer says this
+  host is older than it supports, and keeps serving.
 
 ### Changed
 
@@ -21,6 +24,15 @@ All notable knowop changes are documented here. This project follows
   `TRAX_WORKSPACE` and the canvas note for the canvas its chat sits on, read from
   the server's session list. It warns and runs unplaced on a server without that
   list.
+- Requires pydantic 2.12, with which trackinizer's `Client` ignores a field a newer
+  server added to an answer, so `knowop connect` keeps serving terminals when the
+  server adds one to a terminal wait.
+
+### Fixed
+
+- `knowop status` and `knowop disconnect` no longer fail with `AttributeError`:
+  0.1.3 called `Client.machine_runs` and `Client.disconnect_machine`, which
+  trackinizer 0.1.10 lacks. Requires `trackinizer>=0.1.11`.
 
 ## 0.1.3 - 2026-10-25
 

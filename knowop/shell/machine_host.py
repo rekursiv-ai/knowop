@@ -12,7 +12,9 @@ heartbeats every 15 s until the server answers 410, which means the machine was
 revoked. Lost contact never stops it: a refused connection or a server error is
 retried, sooner at first. Its first heartbeat takes the machine from any host still
 holding it, so a restart starts serving at once; the host it replaced stops at its
-next heartbeat. Ctrl-C releases the machine, which then reads offline at once.
+next heartbeat. Ctrl-C releases the machine, which then reads offline at once. When a
+heartbeat's answer says ``host_outdated``, one line says how to upgrade, and the host
+keeps serving.
 
 It uses the machine's own credential, never the profile's key, so it runs in the
 calling process rather than in traxd.
@@ -204,6 +206,7 @@ def connect(
             _heartbeat(
                 client,
                 name=name,
+                server=server,
                 machine_id=saved.machine_id,
                 instance=instance,
                 version=version,
@@ -298,6 +301,7 @@ def _heartbeat(
     client: HostClient,
     *,
     name: str,
+    server: str,
     machine_id: uuid.UUID,
     instance: uuid.UUID,
     version: str,
@@ -309,9 +313,10 @@ def _heartbeat(
     claim: Claim = "take"
     unsent = facts
     failures = 0
+    told = False
     while True:
         try:
-            client.heartbeat_machine(
+            beat = client.heartbeat_machine(
                 machine_id,
                 instance=instance,
                 host_version=version,
@@ -330,6 +335,14 @@ def _heartbeat(
             continue
         if claim == "take":
             serve()
+        # Said once: the server repeats it on every heartbeat, four times a minute.
+        if beat.host_outdated and not told:
+            echo(
+                f"knowop: this knowop is too old for {server}: "
+                f"run uvx knowop@latest connect {server}",
+                err=True,
+            )
+            told = True
         unsent = None
         claim = "keep"
         failures = 0
