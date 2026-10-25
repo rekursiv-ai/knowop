@@ -130,7 +130,11 @@ from knowop.agent.inbound import (
     render_inbound,
     settings_from_payload,
 )
-from knowop.agent.placement import place_run, placement_env
+from knowop.agent.placement import (
+    chat_placement,
+    place_run,
+    placement_env,
+)
 from knowop.agent.program import PROGRAM
 from knowop.agent.prompt_bridge import PromptBridge
 from knowop.agent.sink import (
@@ -271,10 +275,10 @@ _CANVAS_NOTE: Final = (
     "You run under knowop run, placed on a Trackinizer canvas: when the person says "
     "the canvas, they mean that canvas's, which $TRAX_CANVAS names "
     "(the workspace is $TRAX_WORKSPACE), not one of your own product's. "
-    "Read it with `trax canvas`; change it with `trax canvas show trax.subgraph "
-    "--record UUID` (or trax.timeline), `trax canvas navigate ROUTE`, "
-    "`trax canvas highlight UUID,UUID` and `trax canvas hide ID`; "
-    "`trax canvas --help` lists the rest. "
+    "Read it with `knowop canvas`; change it with `knowop canvas show trax.subgraph "
+    "--record UUID` (or trax.timeline), `knowop canvas navigate ROUTE`, "
+    "`knowop canvas highlight UUID,UUID` and `knowop canvas hide ID`; "
+    "`knowop canvas --help` lists the rest. "
     "This conversation is already logged to trax as the chat's AgentSession; "
     "file each result to trax with the `trax` CLI as a row, with `--as` set to "
     "$TRAX_ACTOR (`trax help` lists the grammar). "
@@ -1652,20 +1656,11 @@ def _spawn_and_drain(
     )
     # Placed before the fork, like the routing name, so the child's env holds its
     # workspace and canvas from the start. A failure leaves it unplaced.
-    placement = (
-        place_run(
-            config.client,
-            session_id=sink.session_id,
-            environ=os.environ,
-            cwd=Path.cwd(),
-        )
-        if config.syncing and config.client is not None and sink.session_id is not None
-        else None
-    )
+    placed, hooked = _place(config, session_id=sink.session_id)
     argv, hook_files = _with_box_hook(
         argv,
         adapter=adapter,
-        placed=placement_env(placement),
+        placed=hooked,
         profile=config.profile,
         bridge=config.syncing,
     )
@@ -1684,7 +1679,7 @@ def _spawn_and_drain(
         emit=record,
         pending=inbound.prompt_pending,
     )
-    argv = _with_canvas_note(argv, adapter=adapter, placed=placement_env(placement))
+    argv = _with_canvas_note(argv, adapter=adapter, placed=placed)
     # Run the CLI on a PTY we own rather than letting it inherit the terminal:
     # owning the master fd is what lets the server splice messages into the
     # live session (the human still drives the native TUI). Byte-transparent,
@@ -1705,8 +1700,7 @@ def _spawn_and_drain(
     banner_reader = owner if adapter.name == "codex" else None
     relay = ThreadedRelay(
         argv,
-        env=_routing_env(config, granted_actor=granted_actor)
-        | placement_env(placement),
+        env=_routing_env(config, granted_actor=granted_actor) | placed,
         drop_env=_dropped_env(adapter),
         host=config.host,
         on_input=detector.feed,
@@ -1952,17 +1946,7 @@ def _headless_and_drain(
         stop=stop,
         drain_thread=drain_thread,
     )
-    placement = (
-        place_run(
-            config.client,
-            session_id=sink.session_id,
-            environ=os.environ,
-            cwd=Path.cwd(),
-        )
-        if config.syncing and config.client is not None and sink.session_id is not None
-        else None
-    )
-    placed = placement_env(placement)
+    placed, hooked = _place(config, session_id=sink.session_id)
     env = _routing_env(config, granted_actor=granted_actor) | placed
     argv, hook_files = _with_box_hook(
         [
@@ -1974,7 +1958,7 @@ def _headless_and_drain(
             ),
         ],
         adapter=adapter,
-        placed=placed,
+        placed=hooked,
         profile=config.profile,
     )
     argv = _with_canvas_note(argv, adapter=adapter, placed=placed)
@@ -2451,9 +2435,32 @@ def _sets_codex_goals(args: tuple[str, ...]) -> bool:
     )
 
 
+# The server never places a chat's session, so a run attached to one would hear of no
+# canvas: its chat's canvas comes from the session list instead. The box hook is left
+# off for it: Chat's lines carry the boxes drawn there, and the hook would repeat them.
+def _place(
+    config: RunConfig,
+    *,
+    session_id: uuid.UUID | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Place the run's session; return the child's variables and the box hook's."""
+    if not config.syncing or config.client is None or session_id is None:
+        return {}, {}
+    placement = place_run(
+        config.client,
+        session_id=session_id,
+        environ=os.environ,
+        cwd=Path.cwd(),
+    )
+    placed = placement_env(placement)
+    if config.attach is None or placement is None or "TRAX_CANVAS" in placed:
+        return placed, placed
+    return placement_env(chat_placement(config.client, session_id=session_id)), {}
+
+
 # Every claude run gets the ``SessionStart`` hook, which says when inbound may be typed
 # in. The box hook is told about boxes on the canvas the CLI was placed on, so it runs
-# only when the child's environment names one. Claude takes one ``--settings``, so a
+# only when ``placed`` names one (see ``_place``). Claude takes one ``--settings``, so a
 # person's own is merged into ours and theirs leaves the argv; one that cannot be read
 # is left as they gave it, and the run then waits out the fallback for readiness.
 # ``bridge`` adds the hooks that hand claude's prompts to the run's prompt bridge: only

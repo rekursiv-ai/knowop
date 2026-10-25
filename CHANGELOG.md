@@ -3,6 +3,25 @@
 All notable knowop changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- `knowop canvas` reads and changes a canvas with the grammar of `trax canvas`,
+  on knowop's login. `$TRAX_CANVAS` names the canvas when the command names none,
+  so an agent `knowop run` started drives the person's canvas on a computer with
+  knowop alone.
+
+### Changed
+
+- A run's canvas note names `knowop canvas` where it named `trax canvas`. It says
+  to open a terminal the person asks for in their canvas (`trax.terminal`), not in
+  a desktop terminal app.
+- A run attached to a chat (`--attach SESSION`) gets `TRAX_CANVAS`,
+  `TRAX_WORKSPACE` and the canvas note for the canvas its chat sits on, read from
+  the server's session list. It warns and runs unplaced on a server without that
+  list.
+
 ## 0.1.3 - 2026-10-25
 
 ### Added

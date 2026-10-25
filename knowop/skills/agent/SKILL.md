@@ -89,8 +89,10 @@ moved out of trax.
 - Messages sent to the session (`trax send @NAME ...`, or Chat) are typed into
   the CLI once it is ready for them.
 - A run placed on a canvas gets `$TRAX_CANVAS`, `$TRAX_WORKSPACE` and
-  `$TRAX_ACTOR`, and is told its canvas is the canvas's; the canvas and the
-  rows are `trax`'s to read and write (see the trax skill).
+  `$TRAX_ACTOR`, and is told its canvas is the canvas's; a run attached to a
+  chat (`--attach SESSION`) gets those of the canvas its chat sits on.
+  `knowop canvas` reads and changes the canvas with the grammar of
+  `trax canvas`; the rows are `trax`'s to read and write (see the trax skill).
 - A sandbox computer (`knowop connect --sandbox`) starts agents with
   no permission prompts, unless the person passed the CLI's own permission
   flags.

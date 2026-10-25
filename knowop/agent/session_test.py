@@ -123,6 +123,7 @@ from knowop.agent.session import (
     _existing_session_files,
     _inbound_poll_loop,
     _open_sink,
+    _place,
     _process_chunk,
     _routing_env,
     _session_owner,
@@ -3804,6 +3805,12 @@ class TestSessionOwnerAndArgv:
         assert '"' not in _CANVAS_NOTE
         assert "\\" not in _CANVAS_NOTE
 
+    def test_a_placed_cli_drives_its_canvas_with_knowop_alone(self) -> None:
+        """A computer with only knowop installed has no ``trax`` to run them with."""
+        assert "Read it with `knowop canvas`" in _CANVAS_NOTE
+        assert "`knowop canvas --help` lists the rest" in _CANVAS_NOTE
+        assert "trax canvas" not in _CANVAS_NOTE
+
     @pytest.mark.parametrize(
         ("adapter", "placed", "args"),
         [
@@ -4687,6 +4694,62 @@ class TestSpawnWiring:
         )
         assert client.asked == []
 
+    def test_a_run_attached_to_a_chat_is_told_the_canvas_the_chat_sits_on(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """The server places no chat's session; its session list names the canvas."""
+        server = _ChatServer(_SESSION)
+        wiring, _ = _wire(
+            monkeypatch,
+            tmp_path,
+            RunConfig(cli_name="claude", client=cast(Client, server), attach=_SESSION),
+            ClaudeAdapter(),
+            sink=_PlacedSink(),
+        )
+        env = cast(dict[str, str], wiring.relay["env"])
+        assert (env["TRAX_WORKSPACE"], env["TRAX_CANVAS"]) == (_WORKSPACE, _CANVAS)
+        assert wiring.argv[1:3] == ["--append-system-prompt", _CANVAS_NOTE]
+        assert server.posted == [f"/api/sessions/{_SESSION}/place"]
+        assert server.listed == [{"days": 1}]
+
+    def test_a_chats_canvas_arms_no_box_hook_but_a_placed_canvas_does(self) -> None:
+        """A chat's lines carry its canvas's boxes; a box hook would repeat them."""
+        chat = RunConfig(cli_name="claude", client=cast(Client, _ChatServer(_SESSION)))
+        placed = {"TRAX_WORKSPACE": _WORKSPACE, "TRAX_CANVAS": _CANVAS}
+
+        assert _place(replace(chat, attach=_SESSION), session_id=_SESSION) == (
+            placed,
+            {},
+        )
+        assert _place(
+            replace(chat, client=cast(Client, _ChatServer(_SESSION, places=True))),
+            session_id=_SESSION,
+        ) == (placed, placed)
+
+    def test_only_an_attached_run_the_server_left_unplaced_reads_the_list(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        fresh = _ChatServer(_SESSION)
+        placed = _ChatServer(_SESSION, places=True)
+        # No ``get``: a read of the session list would fail the test.
+        refused = _PlacingClient(refuse=True)
+        unopened = _ChatServer(_SESSION)
+
+        for client, attach in ((fresh, None), (placed, _SESSION), (refused, _SESSION)):
+            config = RunConfig(cli_name="claude", client=cast(Client, client))
+            _ = _place(replace(config, attach=attach), session_id=_SESSION)
+        clientless = RunConfig(cli_name="claude", attach=_SESSION)
+        unopened_run = replace(clientless, client=cast(Client, unopened))
+
+        assert _place(clientless, session_id=_SESSION) == ({}, {})
+        assert _place(unopened_run, session_id=None) == ({}, {})
+        assert (fresh.listed, placed.listed, unopened.listed) == ([], [], [])
+        assert unopened.posted == []
+        assert capsys.readouterr().err.count("running unplaced") == 1
+
     def test_a_fresh_run_names_no_session_before_open(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -5069,6 +5132,43 @@ class _PlacingClient:
         return {
             "workspace_id": str(uuid.UUID(int=7)),
             "canvas_id": str(uuid.UUID(int=8)),
+        }
+
+
+class _ChatServer:
+    """A server that lists a chat's session on its chat's canvas.
+
+    It places no chat's session, as the real one does not, unless ``places``.
+    """
+
+    def __init__(self, session_id: uuid.UUID, *, places: bool = False) -> None:
+        self.posted: list[str] = []
+        self.listed: list[Mapping[str, object] | None] = []
+        self._session_id = session_id
+        self._places = places
+
+    def post(self, path: str, *, body: object = None) -> dict[str, object]:
+        del body
+        self.posted.append(path)
+        placed: dict[str, object] = {"workspace_id": _WORKSPACE, "canvas_id": _CANVAS}
+        return placed if self._places and path.endswith("/place") else {}
+
+    def get(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        assert path == "/api/sessions"
+        self.listed.append(params)
+        listed = {"id": str(self._session_id), "title": "chat", "live": True}
+        return {
+            "sessions": [
+                {"id": str(uuid.UUID(int=3)), "canvas_id": None, "workspace_id": None},
+                {**listed, "canvas_id": _CANVAS, "workspace_id": _WORKSPACE},
+            ],
+            "issues": [],
+            "more": False,
         }
 
 
@@ -9390,6 +9490,36 @@ class TestAHeadlessRunsWiring:
         )
         [event] = cast(deque[Event], wiring.drain["run_records"])
         assert event.path.name.startswith("prompts-")
+
+    def test_a_chats_run_is_told_the_canvas_its_chat_sits_on(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """As ``knowop run claude --detach --attach SESSION`` starts it."""
+        server = _ChatServer(_CHAT)
+
+        wiring, _ = _wire_headless(
+            monkeypatch,
+            tmp_path,
+            replace(_headless_config(actor="scout"), attach=_CHAT, profile="b2profile"),
+            ClaudeAdapter(),
+            [_ScriptedDriver()],
+            sink=_OpenedSink(),
+            client=server,
+        )
+
+        [made] = wiring.made
+        assert made["env"] == {
+            "TRAX_ACTOR": "scout#2",
+            "TRAX_WORKSPACE": _WORKSPACE,
+            "TRAX_CANVAS": _CANVAS,
+        }
+        argv = cast(list[str], made["argv"])
+        assert argv[argv.index("--append-system-prompt") + 1] == _CANVAS_NOTE
+        # Chat's lines carry the canvas's boxes, so no box hook tells them again.
+        assert "UserPromptSubmit" not in cast(str, made["settings"])
+        assert server.listed == [{"days": 1}]
 
     def test_a_session_the_run_resumes_is_named_to_the_sink_before_it_opens(
         self,

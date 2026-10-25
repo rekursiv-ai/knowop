@@ -12,6 +12,7 @@ Examples:
                           run a job on a GPU node from this repository
   knowop job status       list your jobs
   knowop machine          list the machines campaigns may run on
+  knowop canvas           read the canvas a run sits on; --help shows how to change it
   knowop status           profile, server, account, role, machines and their runs
   knowop disconnect       stop this computer's runs and connect, everywhere
 
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
 
     from trackinizer.trax import login
 
+    from knowop import canvas
     from knowop.agent import (
         cli as agent_cli,
         detach,
@@ -66,8 +68,9 @@ else:
 
     # Only ``login``, ``connect`` and a first ``run`` reach the login, and only ``run``
     # and ``job`` the runners. Their imports cost ~100 ms or more that ``status`` would
-    # pay at every start.
+    # pay at every start. Only ``canvas`` reaches trax's verbs, ~20 ms more.
     agent_cli = lazy_import("knowop.agent.cli")
+    canvas = lazy_import("knowop.canvas")
     detach = lazy_import("knowop.agent.detach")
     jobs_cli = lazy_import("knowop.jobs.cli")
     job_limits = lazy_import("knowop.shell.job_limits")
@@ -79,6 +82,9 @@ _DEFAULT_SERVER: Final = "https://alpha.knowop.ai"
 
 _HOST_WORDS: Final = frozenset({"attach", "ls", "log", "send", "stop"})
 """The ``run`` words that reach a detached run on this computer instead of starting one."""
+
+_CANVAS_WORD: Final = "canvas"
+"""The verb trax's canvas command runs under, on knowop's login."""
 
 
 def main(
@@ -111,8 +117,8 @@ def main(
             return 0
         # Everything after ``run`` or ``job`` belongs to the runner, ``--help`` and
         # every other flag included; argparse would read them as knowop's own. Every
-        # ``machine`` form is the registry's, its help pages too.
-        if args[:1] == [MACHINE_WORD] or (
+        # ``machine`` and ``canvas`` form is that verb's, its help pages too.
+        if args[:1] in ([MACHINE_WORD], [_CANVAS_WORD]) or (
             args[:1] in (["run"], ["job"]) and args[1:] not in (["-h"], ["--help"])
         ):
             return _hand_off(args[0], args[1:], sleep=sleep, clock=clock)
@@ -232,6 +238,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     verbs.add_parser(
         MACHINE_WORD,
         help="list, show, set and delete the machines campaigns may run on",
+    )
+    # Only listed here too: ``main`` hands every ``canvas`` form to trax's verb.
+    verbs.add_parser(
+        _CANVAS_WORD,
+        help="read and change the canvas an agent run sits on, as trax canvas does",
     )
 
 
@@ -546,10 +557,10 @@ def _hand_off(
     sleep: Callable[[float], None],
     clock: Callable[[], float],
 ) -> int:
-    """Run ``run``, ``job`` or ``machine`` as knowop's account; return its exit code."""
-    if verb == MACHINE_WORD:
+    """Run a verb ``main`` hands off as knowop's account; return its exit code."""
+    if verb in (MACHINE_WORD, _CANVAS_WORD):
         # The login is read only when a form asks the server: help needs none.
-        Machines.dispatch(
+        (Machines if verb == MACHINE_WORD else canvas.Canvas).dispatch(
             verb,
             args,
             lambda: connect(argparse.Namespace(profile=_profile()[0])),

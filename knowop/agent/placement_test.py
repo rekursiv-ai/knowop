@@ -14,6 +14,7 @@ from trackinizer.wire.wire_sessions import SessionPlacement
 import pytest
 
 from knowop.agent.placement import (
+    chat_placement,
     git_ref,
     place_run,
     placement_env,
@@ -22,11 +23,13 @@ from knowop.agent.worktree_diff import run_git
 
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
 
 _CANVAS = uuid.UUID(int=5)
 _SESSION = uuid.UUID(int=1)
+_WORKSPACE = uuid.UUID(int=2)
 
 
 class _Client:
@@ -39,6 +42,37 @@ class _Client:
         if self._fail:
             raise ClientError("404 Not Found")
         return {"workspace_id": str(uuid.UUID(int=2))}
+
+
+class _Lister:
+    """A client whose session list holds ``sessions``, or that refuses to list."""
+
+    def __init__(self, sessions: list[dict[str, object]] | None) -> None:
+        self.asked: list[tuple[str, object]] = []
+        self._sessions = sessions
+
+    def get(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        self.asked.append((path, params))
+        if self._sessions is None:
+            raise ClientError("404 Not Found")
+        return {"sessions": self._sessions, "issues": [], "more": False}
+
+
+def _listed(session_id: uuid.UUID, *, canvas: uuid.UUID | None) -> dict[str, object]:
+    """Return a session as the session list names it, with the fields it is read for."""
+    return {
+        "id": str(session_id),
+        "title": "chat",
+        "conversation_id": str(uuid.UUID(int=9)),
+        "canvas_id": None if canvas is None else str(canvas),
+        "workspace_id": None if canvas is None else str(_WORKSPACE),
+        "live": True,
+    }
 
 
 def _git(cwd: Path, *argv: str) -> None:
@@ -121,6 +155,39 @@ def test_a_failed_ask_warns_and_leaves_the_run_unplaced(
         environ={},
         cwd=tmp_path,
     )
+
+    assert placed is None
+    assert "running unplaced" in capsys.readouterr().err
+
+
+def test_a_chats_session_sits_on_the_canvas_its_session_list_names() -> None:
+    client = _Lister(
+        [
+            _listed(uuid.UUID(int=3), canvas=uuid.UUID(int=4)),
+            _listed(_SESSION, canvas=_CANVAS),
+        ],
+    )
+
+    placed = chat_placement(cast(Client, client), session_id=_SESSION)
+
+    assert placed == SessionPlacement(workspace_id=_WORKSPACE, canvas_id=_CANVAS)
+    assert client.asked == [("/api/sessions", {"days": 1})]
+
+
+def test_a_session_on_no_canvas_or_left_off_the_list_has_no_canvas() -> None:
+    unplaced = _Lister([_listed(_SESSION, canvas=None)])
+    elsewhere = _Lister([_listed(uuid.UUID(int=3), canvas=_CANVAS)])
+
+    assert chat_placement(cast(Client, unplaced), session_id=_SESSION) == (
+        SessionPlacement()
+    )
+    assert chat_placement(cast(Client, elsewhere), session_id=_SESSION) is None
+
+
+def test_a_refused_list_warns_and_leaves_the_run_unplaced(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    placed = chat_placement(cast(Client, _Lister(None)), session_id=_SESSION)
 
     assert placed is None
     assert "running unplaced" in capsys.readouterr().err

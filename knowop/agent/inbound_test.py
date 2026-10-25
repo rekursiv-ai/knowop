@@ -129,12 +129,25 @@ class TestRenderInboundKinds:
         )
 
     def test_the_canvas_commands_work_without_a_record_id_on_the_line(self) -> None:
-        assert "trax canvas navigate '#/lookup/RECORD_UUID'" in CANVAS_COMMANDS
+        assert "knowop canvas navigate '#/lookup/RECORD_UUID'" in CANVAS_COMMANDS
         assert "page.record.id" in CANVAS_COMMANDS
         assert "$TRAX_CANVAS" in CANVAS_COMMANDS
         assert "\n" not in CANVAS_COMMANDS
         assert '"' not in CANVAS_COMMANDS
         assert "\\" not in CANVAS_COMMANDS
+
+    def test_the_canvas_commands_need_knowop_alone(self) -> None:
+        """A computer with only knowop installed has no ``trax`` to run them with."""
+        assert "trax canvas" not in CANVAS_COMMANDS
+        assert "`knowop canvas` acts on your canvas" in CANVAS_COMMANDS
+
+    def test_a_terminal_asked_for_opens_in_the_canvas(self) -> None:
+        assert (
+            "When the person asks for a terminal, open one in their canvas: knowop "
+            "canvas show trax.terminal --param machine=NAME --param start=true (NAME "
+            "is this computer; `knowop status` lists it). Do not open a desktop "
+            "terminal app."
+        ) in CANVAS_COMMANDS
 
     def test_boxes_since_the_last_line_are_listed_with_id_page_and_covers(
         self,

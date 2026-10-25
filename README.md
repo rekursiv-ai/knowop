@@ -91,6 +91,7 @@ web app. A first `knowop run` logs in too.
 | `knowop job submit\|logs\|results ...` | Runs a job on a GPU node from this repository, or with `--machine NAME` on a computer of yours, and reads its log and results. |
 | `knowop job status [JOB]\|cancel JOB\|secrets\|secret NAME set\|del` | Lists your jobs or shows one, stops one, and keeps the secrets a job may use. |
 | `knowop machine [NAME ...]` | Lists, shows, sets, labels and deletes the machines campaigns may run on. |
+| `knowop canvas [CANVAS_UUID] [show TYPE\|navigate ROUTE\|highlight UUID,...\|hide ID\|KEY to VALUE ...]` | Reads and changes a canvas with the grammar of `trax canvas`. In a run that `knowop run` placed on a canvas, `$TRAX_CANVAS` names it, so an agent drives the person's canvas with knowop alone. |
 | `knowop --version` | Prints the version; `unknown` from a checkout. |
 
 Every command takes `--help`; `knowop run claude --help` and `knowop job submit
@@ -114,6 +115,7 @@ computer. Terminals use the server relay when a direct link is unavailable.
 | `agent/` | The agent runner `knowop run` hands to. Its `__main__.py` and `codex.py` run it by module, on trax's connection, for unattended plumbing. |
 | `jobs/` | The job runner `knowop job` hands to. |
 | `machines.py` | The machine registry `knowop machine` reads and writes. |
+| `canvas.py` | `knowop canvas`: trax's canvas command, named as knowop's. |
 | `skills/` | Each package's instructions for agents. |
 
 knowop calls the server through trackinizer's `Client`, as trax does, and never runs
