@@ -1242,6 +1242,76 @@ def test_version_names_the_command_and_unknown_from_a_checkout(
     assert capsys.readouterr().out == printed
 
 
+def test_bare_knowop_gives_the_first_step_without_logging_in(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop() == 0
+
+    assert capsys.readouterr() == ("Not connected. Run:  knowop connect\n", "")
+    assert server.requests == []
+
+
+def test_bare_knowop_names_this_connected_computer_and_the_next_step(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop() == 0
+
+    assert capsys.readouterr() == (
+        "Connected as ada-mac to https://acme.knowop.ai. Next:  knowop run claude\n",
+        "",
+    )
+
+
+@pytest.mark.parametrize("here", ["offline", "never", "revoked", ""])
+def test_bare_knowop_does_not_count_another_computers_connection(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+    here: str,
+) -> None:
+    server.machines = [
+        _machine("gpu1", status="online", owner=_EMAIL),
+        *([_machine("ada-mac", status=here, owner=_EMAIL)] if here else []),
+    ]
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop() == 0
+
+    assert capsys.readouterr() == ("Not connected. Run:  knowop connect\n", "")
+
+
+def test_bare_knowop_does_not_count_another_persons_computer(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.machines = [_machine("ada-mac", status="online", owner="bob@example.com")]
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop() == 0
+
+    assert capsys.readouterr() == ("Not connected. Run:  knowop connect\n", "")
+
+
+def test_bare_knowop_reports_a_revoked_login_instead_of_saying_connected(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    server.revoked = True
+    capsys.readouterr()
+
+    assert _knowop() == 1
+
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "knowop login" in err
+
+
 def _knowop(*argv: str) -> int:
     """Run ``knowop`` with ``argv``, its login polling on a clock that never waits."""
     time = _Time()
