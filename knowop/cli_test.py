@@ -43,7 +43,11 @@ import httpx2
 import pytest
 
 from knowop import cli
-from knowop.agent import cli as agent_cli
+from knowop.agent import (
+    cli as agent_cli,
+    detach,
+)
+from knowop.agent.detach import HostRecord
 from knowop.jobs import cli as jobs_cli
 from knowop.shell import serve
 
@@ -79,6 +83,10 @@ class _Server:
         ]
         """What ``/api/machines`` lists: the caller's two, and another person's."""
         self.machine: object = None
+        self.runs: dict[str, list[dict[str, object]]] = {}
+        """Each machine's live runs, as its runs route lists them."""
+        self.disconnected: list[str] = []
+        """Each machine disconnected, in order."""
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
@@ -130,6 +138,12 @@ class _Server:
             return httpx2.Response(200, json={"ok": True})
         if route == ("GET", "/api/machines"):
             return httpx2.Response(200, json={"machines": self.machines})
+        for name in (str(machine["name"]) for machine in self.machines):
+            if route == ("GET", f"/api/machines/{name}/runs"):
+                return httpx2.Response(200, json={"runs": self.runs.get(name, [])})
+            if route == ("POST", f"/api/machines/{name}/disconnect"):
+                self.disconnected.append(name)
+                return httpx2.Response(200, json={"runs": self.runs.pop(name, [])})
         if route == ("POST", ENROLL_PATH):
             return httpx2.Response(
                 201,
@@ -497,6 +511,30 @@ def test_status_names_the_profile_server_account_role_and_the_accounts_machines(
     ]
 
 
+def test_status_lists_each_machines_runs_and_the_runs_here_it_names_on_none(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.runs["gpu1"] = [_run("chat-1a2b3c4d")]
+    monkeypatch.setattr(
+        detach,
+        "live_hosts",
+        lambda: [_host("chat-1a2b3c4d"), _host("scratch")],
+    )
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("status") == 0
+
+    assert capsys.readouterr().out.splitlines()[4:] == [
+        "machine: ada-mac online (this computer)",
+        "machine: gpu1 offline, 1 run live",
+        "  run:   chat-1a2b3c4d  claude  ~/work",
+        "here:    scratch  claude",
+    ]
+
+
 def test_status_without_a_login_exits_1_with_one_line(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
@@ -635,6 +673,61 @@ def test_logout_without_a_login_exits_1(server: _Server) -> None:
     assert _knowop("logout") == 1
 
     assert server.requests == []
+
+
+def test_disconnect_stops_the_runs_here_before_it_disconnects_this_computer(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.runs["ada-mac"] = [_run("chat-1a2b3c4d")]
+    assert _knowop("login", "acme") == 0
+    asked: list[int] = []
+
+    def stop_all() -> int:
+        asked.append(len(server.requests))
+        return 0
+
+    monkeypatch.setattr(detach, "stop_all", stop_all)
+    before = len(server.requests)
+    capsys.readouterr()
+
+    assert _knowop("disconnect") == 0
+
+    assert (asked, server.disconnected) == ([before], ["ada-mac"])
+    assert capsys.readouterr().out.splitlines() == [
+        "stopped: run chat-1a2b3c4d (claude)",
+        (
+            "disconnected: machine ada-mac; its connect stops at its next heartbeat, and "
+            "knowop connect joins it again"
+        ),
+    ]
+
+
+def test_disconnect_of_another_machine_leaves_the_runs_here(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(detach, "stop_all", _never_runs("stop_all"))
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("disconnect", "gpu1") == 0
+
+    assert server.disconnected == ["gpu1"]
+
+
+def test_disconnect_stops_short_of_the_server_when_a_run_here_does_not_stop(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(detach, "stop_all", lambda: 1)
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("disconnect") == 1
+
+    assert server.disconnected == []
+    assert "a run here did not stop" in capsys.readouterr().err
 
 
 def test_connect_without_a_login_enrolls_this_computer_in_the_same_approval(
@@ -798,6 +891,24 @@ def test_ctrl_c_stops_connect_with_130(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _knowop("login", "acme") == 0
 
     assert _knowop("connect") == 130
+
+
+def test_ctrl_c_names_the_runs_it_leaves_reaching_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The machine reads offline once its connect lets go; a detached run does not."""
+    monkeypatch.setattr(serve, "connect_machine", _Host(ending=KeyboardInterrupt()))
+    monkeypatch.setattr(detach, "live_hosts", lambda: [_host("chat-1a2b3c4d")])
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("connect") == 130
+
+    assert capsys.readouterr().err == (
+        "knowop: still reaching the server from here: chat-1a2b3c4d; stop them with "
+        "knowop run stop --all, or everything with knowop disconnect\n"
+    )
 
 
 @pytest.mark.parametrize("ending", [signal.SIGTERM, signal.SIGHUP])
@@ -1163,6 +1274,30 @@ def _machine(name: str, *, status: str, owner: str) -> dict[str, object]:
         "last_heartbeat": None,
         "owner": owner,
     }
+
+
+def _run(name: str) -> dict[str, object]:
+    """Return a live claude run, as a machine's runs route lists it."""
+    return {
+        "session_id": "11111111-1111-1111-1111-111111111111",
+        "cli": "claude",
+        "run": name,
+        "cwd": "~/work",
+        "state": "idle",
+    }
+
+
+def _host(name: str) -> HostRecord:
+    """Return the record of a detached claude run on this computer."""
+    return HostRecord(
+        name=name,
+        command="claude --model opus",
+        cwd="/work",
+        pid=1,
+        address="/run/host.sock",
+        started="2026-10-24T12:00:00+00:00",
+        state="running",
+    )
 
 
 def _transport_of(server: _Server) -> Callable[..., httpx2.MockTransport]:

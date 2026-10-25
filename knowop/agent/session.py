@@ -2873,10 +2873,11 @@ def _inbound_poll_loop(
             # immediately is what keeps the channel continuously parked.
             continue
         except Exception as error:
-            # A 403 or a 404 is the server's verdict on this key or this session, which
-            # no later drain changes: retried, the run would wait unseen for ever.
+            # A 401 (the key was revoked), a 403 or a 404 is the server's verdict on this
+            # key or this session, which no later drain changes: retried, the run would
+            # wait unseen for ever.
             if isinstance(error, ClientError) and (
-                error.status_code in {403, 404}
+                error.status_code in {401, 403, 404}
                 or (error.status_code == 409 and error.code in RUN_ENDING_REFUSALS)
             ):
                 sys.stderr.write(

@@ -12,7 +12,8 @@ Examples:
                           run a job on a GPU node from this repository
   knowop job status       list your jobs
   knowop machine          list the machines campaigns may run on
-  knowop status           profile, server, account, role and machines
+  knowop status           profile, server, account, role, machines and their runs
+  knowop disconnect       stop this computer's runs and connect, everywhere
 
 """
 
@@ -54,7 +55,10 @@ if TYPE_CHECKING:
 
     from trackinizer.trax import login
 
-    from knowop.agent import cli as agent_cli
+    from knowop.agent import (
+        cli as agent_cli,
+        detach,
+    )
     from knowop.jobs import cli as jobs_cli
     from knowop.shell import job_limits
 else:
@@ -64,6 +68,7 @@ else:
     # and ``job`` the runners. Their imports cost ~100 ms or more that ``status`` would
     # pay at every start.
     agent_cli = lazy_import("knowop.agent.cli")
+    detach = lazy_import("knowop.agent.detach")
     jobs_cli = lazy_import("knowop.jobs.cli")
     job_limits = lazy_import("knowop.shell.job_limits")
     login = lazy_import("trackinizer.trax.login")
@@ -164,7 +169,22 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     verbs.add_parser(
         "status",
-        help="show knowop's profile, server, account, role and machines",
+        help="show knowop's profile, server, account, role, machines and their runs",
+    )
+    verbs.add_parser(
+        "disconnect",
+        help="stop this computer's runs, then disconnect its machine on the server",
+        description=(
+            "Stop every detached run on this computer, then disconnect the machine on "
+            "the server: its connect is revoked, and every run of yours that names it "
+            "is stopped, here or anywhere. knowop connect joins it again, with no "
+            "login; knowop logout also revokes this computer's key."
+        ),
+    ).add_argument(
+        "name",
+        nargs="?",
+        default="",
+        help="the machine; default this computer's short host name",
     )
     _add_connect_arguments(
         verbs.add_parser(
@@ -277,6 +297,8 @@ def _run(
             _log_out()
         case "status":
             _status()
+        case "disconnect":
+            _disconnect(flags.name)
         case _:
             # ``connect``: ``main`` hands ``run`` and ``job`` off before parsing, and
             # argparse refuses any other word.
@@ -347,13 +369,42 @@ def _status() -> None:
                 raise
             echo("machine: listing machines needs the writer role")
             return
+        own = [machine for machine in listed if machine.owner == email]
+        runs = {machine.name: http.machine_runs(machine.name) for machine in own}
     here = host_name()
-    own = [machine for machine in listed if machine.owner == email]
     for machine in own:
         mark = " (this computer)" if machine.name == here else ""
-        echo(f"machine: {machine.name} {machine.status}{mark}")
+        live = len(runs[machine.name])
+        count = f", {live} run{'' if live == 1 else 's'} live" if live else ""
+        echo(f"machine: {machine.name} {machine.status}{count}{mark}")
+        for run in runs[machine.name]:
+            echo(f"  run:   {run.run or run.session_id}  {run.cli}  {run.cwd or ''}")
     if not own:
         echo("machine: none; run knowop connect")
+    # A run the server places on no machine of this account's still runs here.
+    listed_runs = {run.run for each in runs.values() for run in each}
+    for host in detach.live_hosts():
+        if host.name not in listed_runs:
+            echo(f"here:    {host.name}  {' '.join(host.command.split()[:1])}")
+
+
+# This computer's runs first: once the server stops them, each is already ending,
+# and a stop here would race its exit.
+def _disconnect(name: str) -> None:
+    """Stop this computer's runs when it is the machine, then disconnect the machine."""
+    machine = name or host_name()
+    check_name(machine)
+    _, profile = _profile()
+    if machine == host_name() and detach.stop_all() != 0:
+        raise ClientError("a run here did not stop; see knowop run ls")
+    with Client(profile.url, api_key=profile.api_key) as http:
+        stopped = http.disconnect_machine(machine)
+    for run in stopped:
+        echo(f"stopped: run {run.run or run.session_id} ({run.cli})")
+    echo(
+        f"disconnected: machine {machine}; its connect stops at its next heartbeat, "
+        "and knowop connect joins it again",
+    )
 
 
 def _connect(
@@ -425,9 +476,26 @@ def _serve(
             jobs=flags.jobs,
             results_max=_size(flags.job_results_max),
         )
+    except KeyboardInterrupt:
+        _say_runs_left()
+        raise
     finally:
         for sig, handler in before.items():
             signal.signal(sig, handler)
+
+
+# The machine reads offline once its connect lets go, but a detached run reaches the
+# server with the account's key, not the machine's: it is not stopped with the connect.
+def _say_runs_left() -> None:
+    """Name the detached runs still live on this computer, and how to stop them."""
+    hosts = detach.live_hosts()
+    if hosts:
+        names = ", ".join(host.name for host in hosts)
+        echo(
+            f"knowop: still reaching the server from here: {names}; stop them with "
+            "knowop run stop --all, or everything with knowop disconnect",
+            err=True,
+        )
 
 
 def _size(text: str) -> int:
