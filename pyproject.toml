@@ -3,7 +3,7 @@
 
 [project]
 name = "knowop"
-version = "0.1.3"
+version = "0.1.4"
 description = "Log in to KnowOp, connect your computer, and run your agents and GPU jobs where Chat can reach them."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,13 +26,16 @@ classifiers = [
 dependencies = [
     # Prefer https://awesome-python.com deps over alternatives.
     # The server's client, login and profiles, the wire models, and the session
-    # records the agent runner captures into. 0.1.10 adds the Canvas wire models,
-    # API routes and placement environment used by this client.
-    "trackinizer>=0.1.10",
+    # records the agent runner captures into. 0.1.11 adds `Client.machine_runs` and
+    # `Client.disconnect_machine`, which `knowop status` and `knowop disconnect` call,
+    # and the `Client` that ignores a field a newer server adds to an answer.
+    "trackinizer>=0.1.11",
     # serialization
     "treekle>=0.3.0",
-    # data models: the exec and terminal hosts read the server's requests with them
-    "pydantic>=2.0",
+    # data models: the exec and terminal hosts read the server's requests with them.
+    # 2.12 adds `model_validate(..., extra=)`, with which trackinizer's `Client` ignores
+    # a field a newer server added to an answer.
+    "pydantic>=2.12",
     # the terminal host's relay to the server
     "websockets>=15",
     # Include the direct terminal link by default (~25 MB of wheels on macOS).

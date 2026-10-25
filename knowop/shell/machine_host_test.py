@@ -58,7 +58,7 @@ class _Host:
     def __init__(
         self,
         *,
-        beats: Sequence[ClientError | None] = (_REVOKED,),
+        beats: Sequence[ClientError | HeartbeatResponse | None] = (_REVOKED,),
         join_error: ClientError | None = None,
     ) -> None:
         self.beats = list(beats)
@@ -96,9 +96,9 @@ class _Host:
     ) -> HeartbeatResponse:
         self.calls.append(("beat", machine_id, instance, host_version, facts, claim))
         outcome = self.beats.pop(0)
-        if outcome is not None:
+        if isinstance(outcome, ClientError):
             raise outcome
-        return HeartbeatResponse(server_time=_NOW)
+        return HeartbeatResponse(server_time=_NOW) if outcome is None else outcome
 
     def close(self) -> None:
         self.closed += 1
@@ -415,6 +415,28 @@ def test_lost_contact_is_retried_sooner_at_first_and_never_ends_the_host(
     assert [call[5] for call in host.calls] == [*["take"] * 6, "keep", "keep"]
     assert host.calls[6][4] is None
     assert capsys.readouterr().err.count("retrying") == 6
+
+
+def test_a_host_the_server_calls_outdated_says_how_to_upgrade_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _save()
+    outdated = HeartbeatResponse(server_time=_NOW, host_outdated=True)
+
+    _connect(_Host(beats=[outdated, _REFUSED, outdated, outdated, _REVOKED]))
+
+    line = f"knowop: this knowop is too old for {_SERVER}: run uvx knowop@latest"
+    assert capsys.readouterr().err.splitlines().count(f"{line} connect {_SERVER}") == 1
+
+
+def test_a_host_the_server_does_not_call_outdated_says_nothing_of_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _save()
+
+    _connect(_Host(beats=[None, None, _REVOKED]))
+
+    assert "too old" not in capsys.readouterr().err
 
 
 def test_hours_offline_never_overflow_the_backoff() -> None:
