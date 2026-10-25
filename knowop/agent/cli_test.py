@@ -167,7 +167,9 @@ def _read_spawn_payload(
     del kwargs
     with os.fdopen(os.dup(int(argv[-1])), "r") as source:
         text = source.read()
-        assert "py/" not in text
+        # A jsonpickle tag is a key, so match its opening quote: bare ``py/``
+        # also matches a state path under a tmp dir named like ``...hurkttpy/``.
+        assert '"py/' not in text
         requests.append(json_loads(text, HostRequest))
     raise InterruptedError("payload checked")
 
