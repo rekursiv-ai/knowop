@@ -16,12 +16,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
+from trackinizer.client.conversation import PartReader
 from trackinizer.types.streams import TraxRecord
 
 
-__all__ = ["Event", "FlagValue", "HostRequest", "RunRequest"]
+if TYPE_CHECKING:
+    from uuid import UUID
+
+    from trackinizer.types.inquiries import Inquiry
+    from trackinizer.wire.refs import Ref
+    from treekle import PlainTree
+
+
+__all__ = ["Event", "FlagValue", "HostRequest", "ResumeClient", "RunRequest"]
 
 
 type FlagValue = str | int | bool | list[str] | None
@@ -86,3 +95,14 @@ class Event:
     def kind(self) -> str:
         """The record's class name, which selects its type on decode."""
         return type(self.record).__name__
+
+
+class ResumeClient(PartReader, Protocol):
+    """What re-entering a session needs of a client: ``Client``, or a narrower one."""
+
+    def get_inquiry(
+        self,
+        ref: Ref,
+    ) -> tuple[Inquiry.InquiryKind, UUID, dict[str, PlainTree]]:
+        """Fetch an inquiry's detail view, which names the session's seq."""
+        ...

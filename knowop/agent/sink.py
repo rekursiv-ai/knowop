@@ -65,12 +65,16 @@ from knowop.agent.worktree_diff import WORKTREE_DIFF_PART
 
 
 if TYPE_CHECKING:
-    from trackinizer.client.client import Client
     from trackinizer.lib.agent.sessions.tail import Tail
     from trackinizer.runs.adapters.custom_types import Adapter
     from trackinizer.runs.redact import Redactor
     from trackinizer.sagent.session.types import FileEditResult
     from trackinizer.types.streams import TraxRecord
+    from trackinizer.wire.wire_session_ir import AppendRecordsResponse
+    from trackinizer.wire.wire_sessions import (
+        SessionEndResponse,
+        SessionStartResponse,
+    )
 
     from knowop.agent.slash import SlashCommand
 
@@ -519,6 +523,35 @@ class PrivateNotHeldError(RuntimeError):
         super().__init__(f"{reason}; nothing was sent")
 
 
+class SessionClient(Protocol):
+    """What a :class:`TrackinizerSink` needs of a client: ``Client``, or a narrower one."""
+
+    def session_start(self, body: SessionStart) -> SessionStartResponse:
+        """Open a capture session; return the server-minted identity."""
+        ...
+
+    def append_records(
+        self,
+        session_id: UUID,
+        *,
+        name: str = "",
+        manifest: ManifestBody | None = None,
+        records: Sequence[RecordBody] = (),
+        restart: bool = False,
+        slash_commands: Sequence[SlashCommandBody] = (),
+    ) -> AppendRecordsResponse:
+        """Append one file's records and the commands typed since the last append."""
+        ...
+
+    def session_end(
+        self,
+        session_id: UUID,
+        body: SessionEnd | None = None,
+    ) -> SessionEndResponse:
+        """Close a capture session."""
+        ...
+
+
 class TrackinizerSink(Sink):
     """Open a Session, batch events to the ingest API, close on exit.
 
@@ -564,7 +597,7 @@ class TrackinizerSink(Sink):
 
     def __init__(
         self,
-        client: Client,
+        client: SessionClient,
         cli: str,
         *,
         actor: str | None = None,
@@ -696,8 +729,7 @@ class TrackinizerSink(Sink):
 
     @override
     def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
-        self._ensure_session()
-        session_id = cast("UUID", self._session_id)
+        session_id = self._ensure_session()
         if self._diff_ir_id is None:
             self._diff_ir_id = uuid4()
         bodies = [
@@ -759,9 +791,9 @@ class TrackinizerSink(Sink):
         if cli_session_id and self._cli_session_id is None and self._attach is None:
             self._cli_session_id = cli_session_id
 
-    def _ensure_session(self) -> None:
+    def _ensure_session(self) -> UUID:
         if self._session_id is not None:
-            return
+            return self._session_id
         if self._refusal:
             raise PrivateNotHeldError(self._refusal)
         resp = self._client.session_start(
@@ -812,6 +844,7 @@ class TrackinizerSink(Sink):
                 f"[{PROGRAM}] routing name '{self._actor}' was taken; "
                 f"using '{resp.actor}'\n",
             )
+        return resp.id
 
     @override
     def pending(self) -> list[tuple[Path, RecordBody]]:
@@ -846,8 +879,7 @@ class TrackinizerSink(Sink):
         """Send each file's records as its own batch."""
         if not (self._buffer or self._slash):
             return
-        self._ensure_session()
-        session_id = cast("UUID", self._session_id)
+        session_id = self._ensure_session()
         by_path: dict[Path, list[tuple[RecordBody, int]]] = {}
         for path, body, size in self._buffer:
             by_path.setdefault(path, []).append((body, size))

@@ -43,6 +43,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Final, Literal, Protocol, cast
+from uuid import UUID
 
 import argparse
 import asyncio
@@ -112,6 +113,7 @@ from knowop.agent.commands import (
 from knowop.agent.custom_types import (
     Event,
     FlagValue,
+    ResumeClient,
     RunRequest,
 )
 from knowop.agent.errors import (
@@ -131,6 +133,8 @@ from knowop.agent.inbound import (
     settings_from_payload,
 )
 from knowop.agent.placement import (
+    PlacementClient,
+    SessionLister,
     chat_placement,
     place_run,
     placement_env,
@@ -142,6 +146,7 @@ from knowop.agent.sink import (
     LockedSink,
     PrivateNotHeldError,
     ResilientSink,
+    SessionClient,
     Sink,
     TrackinizerSink,
 )
@@ -500,6 +505,40 @@ class _Stats:
         return ", ".join(f"{k}={v}" for k, v in sorted(self.counts.items()))
 
 
+class _InboundClient(Protocol):
+    """What the inbound poll needs of a client: ``Client``, or a narrower one."""
+
+    def drain_inbound(
+        self,
+        session_id: UUID,
+        *,
+        wait_sec: float = 0.0,
+        run: str | None = None,
+        machine: str | None = None,
+        cwd: str | None = None,
+        cli: str | None = None,
+        instance: str | None = None,
+    ) -> list[InboundDrainItem]:
+        """Drain the session's pending inbound messages, oldest first."""
+        ...
+
+
+class RunClient(
+    SessionClient,
+    ResumeClient,
+    PlacementClient,
+    SessionLister,
+    _InboundClient,
+    Protocol,
+):
+    """Everything a run asks of its server: ``Client``, or a narrower one."""
+
+    @property
+    def base_url(self) -> str:
+        """The server the run syncs to."""
+        ...
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RunConfig:
     """Settings for one ``knowop run`` invocation."""
@@ -544,7 +583,7 @@ class RunConfig:
     a local JSONL file with no network.
     """
 
-    client: Client | None = None
+    client: RunClient | None = None
     """Resolved Trackinizer client for ``sync``; carries URL, actor, token.
 
     Built by the CLI from the active profile so ``knowop run`` reaches the
@@ -574,7 +613,7 @@ class RunConfig:
     rather than opening a second one.
     """
 
-    attach: uuid.UUID | None = None
+    attach: UUID | None = None
     """An existing AgentSession this run re-opens (``--attach``), writing its files as
     new parts of it. The session keeps its own CLI session id -- a chat's is
     ``chat:<id>`` for its whole life -- so the run neither names one at open nor
@@ -1101,7 +1140,7 @@ def build_parser(default_cli: str = "claude") -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--attach",
-        type=uuid.UUID,
+        type=UUID,
         default=None,
         metavar="UUID",
         help=(
@@ -1141,12 +1180,12 @@ def main(
     argv: Sequence[str],
     *,
     default_cli: str = "claude",
-    client_factory: Callable[[], Client] | None = None,
+    client_factory: Callable[[], RunClient] | None = None,
     connection: dict[str, FlagValue] | None = None,
     resume_path: Path | None = None,
     cli_session_id: str | None = None,
     profile: str | None = None,
-    attach: uuid.UUID | None = None,
+    attach: UUID | None = None,
     prefix_bytes: int = 0,
     compact_after_load: bool = False,
 ) -> int:
@@ -1258,7 +1297,7 @@ def host_start(request: RunRequest) -> Callable[[HostSpec | None], int]:
     """
     flags = argparse.Namespace(**request["flags"])
     flags.out = from_plain(request["flags"]["out"], Path, default=None)
-    flags.attach = from_plain(request["flags"]["attach"], uuid.UUID, default=None)
+    flags.attach = from_plain(request["flags"]["attach"], UUID, default=None)
     connection = request["connection"]
     return partial(
         _run_flags,
@@ -1274,7 +1313,7 @@ def host_start(request: RunRequest) -> Callable[[HostSpec | None], int]:
         ),
         cli_session_id=request["cli_session_id"],
         profile=request["profile"],
-        attach=None if request["attach"] is None else uuid.UUID(request["attach"]),
+        attach=None if request["attach"] is None else UUID(request["attach"]),
         prefix_bytes=request["prefix_bytes"],
         compact_after_load=request["compact_after_load"],
         run_name=request["run_name"],
@@ -1289,8 +1328,8 @@ def host_start(request: RunRequest) -> Callable[[HostSpec | None], int]:
 # start, so the line still lands on the person's terminal. The client is not closed,
 # since the factory may hand out one it keeps.
 def _load_window(
-    client: Client,
-    session_id: uuid.UUID,
+    client: ResumeClient,
+    session_id: UUID,
     cli: str,
 ) -> tuple[Path | None, str | None, int, bool]:
     """Write the chat's conversation for ``cli``; return its file, id, size and fit."""
@@ -1374,11 +1413,11 @@ def _run_flags(
     *,
     flags: _Flags,
     cli_argv: tuple[str, ...],
-    client_factory: Callable[[], Client] | None,
+    client_factory: Callable[[], RunClient] | None,
     resume_path: Path | None,
     cli_session_id: str | None,
     profile: str | None,
-    attach: uuid.UUID | None,
+    attach: UUID | None,
     prefix_bytes: int,
     compact_after_load: bool,
     run_name: str | None,
@@ -1757,6 +1796,7 @@ def _spawn_and_drain(
         rc = relay.run()
         if rc == 0 and banner_reader is not None:
             banner_reader.finish_output()
+        return rc
     finally:
         # Before the quiesce, so the ends of the prompts it lets go of are drained.
         if bridge is not None:
@@ -1773,7 +1813,6 @@ def _spawn_and_drain(
             stream_capture.close()
 
         _wind_down(config, stop, drain_thread, poll_thread, sink)
-    return rc
 
 
 # Set once the kernel watch is armed. ``Thread.start`` returns when the thread is
@@ -2037,7 +2076,12 @@ def _headless_and_drain(
 # The server shows it, and never trusts it: a report from any run but the one holding the
 # session's lease changes nothing there, so a report made before the first drain is lost
 # and harmless.
-def _report_state(client: Client, sink: Sink, instance: str, state: HostState) -> None:
+def _report_state(
+    client: RunClient,
+    sink: Sink,
+    instance: str,
+    state: HostState,
+) -> None:
     """Tell the server where the run stands."""
     session_id = sink.session_id
     if session_id is None:
@@ -2441,7 +2485,7 @@ def _sets_codex_goals(args: tuple[str, ...]) -> bool:
 def _place(
     config: RunConfig,
     *,
-    session_id: uuid.UUID | None,
+    session_id: UUID | None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Place the run's session; return the child's variables and the box hook's."""
     if not config.syncing or config.client is None or session_id is None:
@@ -2740,6 +2784,35 @@ def _shown_cwd(cwd: Path) -> str | None:
     return shown
 
 
+class _InboundSink(Protocol):
+    """What the inbound poll needs of the run's sink: ``Sink``, or a narrower one."""
+
+    @property
+    def session_id(self) -> UUID | None:
+        """The server session the drains name, once it is open."""
+        ...
+
+    def keep_session_open(self) -> None:
+        """Leave the server session open when the run ends."""
+        ...
+
+
+class _Typist(Protocol):
+    """What typing inbound needs of the relay: ``ThreadedRelay``, or a narrower one."""
+
+    def submit(self, text: str) -> None:
+        """Type ``text`` into the child and submit it."""
+        ...
+
+    def write(self, data: bytes) -> None:
+        """Send raw keys to the child."""
+        ...
+
+    def terminate(self) -> None:
+        """Stop the child."""
+        ...
+
+
 # The server HOLDS each request until a message arrives, so this is one parked request
 # per session rather than one round trip every interval, and a message reaches the CLI
 # when it is sent rather than up to an interval later. The request returns empty at its
@@ -2782,9 +2855,9 @@ def _shown_cwd(cwd: Path) -> str | None:
 # a line goes to its driver, an answer to the ask it names. It has no dialog to hold a
 # line back from, so it holds none.
 def _inbound_poll_loop(
-    client: Client,
-    sink: Sink,
-    relay: ThreadedRelay | HeadlessRun,
+    client: _InboundClient,
+    sink: _InboundSink,
+    relay: _Typist | HeadlessRun,
     stop: threading.Event,
     *,
     poll_interval: float = 0.5,
@@ -2933,7 +3006,7 @@ def _trusting(inbound: InboundState | None) -> bool:
 # An answer is never typed: the trust gate or the prompt bridge takes it, whichever
 # holds the card it names. Typed, its Enter would pick whatever the dialog highlighted.
 def _deliver_one(
-    relay: ThreadedRelay,
+    relay: _Typist,
     item: InboundDrainItem,
     *,
     stream: bool,
@@ -3008,7 +3081,7 @@ def _disclosure(item: InboundDrainItem, *, inbound: InboundState | None) -> Disc
 #
 # Codex logs no clear, so a typed ``/goal clear`` closes the watch here.
 def _deliver_command(
-    relay: ThreadedRelay,
+    relay: _Typist,
     item: InboundDrainItem,
     *,
     cli: str,
@@ -3924,4 +3997,4 @@ class _Flags(Protocol):
     diff: bool
     detach: bool
     name: str | None
-    attach: uuid.UUID | None
+    attach: UUID | None

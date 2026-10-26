@@ -58,8 +58,9 @@ from knowop.agent.truncate import was_truncated, without_note
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
-    from trackinizer.client.client import Client
     from trackinizer.wire.wire_session_ir import PartBody
+
+    from knowop.agent.custom_types import ResumeClient
 
 
 __all__ = ["Resumed", "prepare_resume"]
@@ -85,7 +86,7 @@ class Resumed(Materialized):
 
 
 def prepare_resume(
-    client: Client,
+    client: ResumeClient,
     session_id: UUID,
     target: str,
     *,
@@ -136,7 +137,7 @@ def prepare_resume(
 # A single part the target already speaks is replayed as it was captured: the provider's
 # own file, with its own sealed reasoning, is the one thing a provider is sure to accept.
 def _same_format(
-    client: Client,
+    client: ResumeClient,
     session_id: UUID,
     target: str,
     part: PartBody,
@@ -214,7 +215,7 @@ def _same_format(
 # provider-neutral conversation, so it is foreign to the target and states that
 # encoding, which is what makes claude synthesize the identity it needs.
 def _merged(
-    client: Client,
+    client: ResumeClient,
     session_id: UUID,
     target: str,
     *,
@@ -293,7 +294,7 @@ def _resumed(
 
 # The note names the session the way a person types it, so it is asked only when the
 # note is written: a window that leaves nothing out costs no request.
-def _seq(client: Client, session_id: UUID) -> int:
+def _seq(client: ResumeClient, session_id: UUID) -> int:
     """Return the session's seq, which ``trax agentsession N records`` takes."""
     _kind, _target_id, view = client.get_inquiry(UuidRef(uuid=session_id))
     return from_plain(from_plain(view["self"], dict[str, object])["seq"], int)
