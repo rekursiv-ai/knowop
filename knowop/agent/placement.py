@@ -8,10 +8,10 @@ never placed: it sits on its chat's canvas, which the caller's session list name
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
+from uuid import UUID
 
 import sys
-import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.trax.context import canvas_from_env
@@ -31,7 +31,28 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
-    from trackinizer.client.client import Client
+    from treekle import PlainTree
+
+
+class PlacementClient(Protocol):
+    """What placing a run needs of a client: ``Client``, or a narrower one."""
+
+    def post(self, path: str, *, body: object = None) -> PlainTree:
+        """POST ``body`` to ``path``; return the decoded answer."""
+        ...
+
+
+class SessionLister(Protocol):
+    """What finding a chat's canvas needs of a client: ``Client``, or a narrower one."""
+
+    def get(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, object] | None = None,
+    ) -> PlainTree:
+        """GET ``path`` with ``params``; return the decoded answer."""
+        ...
 
 
 def git_ref(cwd: Path) -> GitRef | None:
@@ -56,9 +77,9 @@ def git_ref(cwd: Path) -> GitRef | None:
 
 
 def place_run(
-    client: Client,
+    client: PlacementClient,
     *,
-    session_id: uuid.UUID,
+    session_id: UUID,
     environ: Mapping[str, str],
     cwd: Path,
 ) -> SessionPlacement | None:
@@ -93,7 +114,11 @@ def place_run(
 # install. Activity over one day suffices: the list keeps every open session, and the
 # run's attach has just reopened this one. A listed session names its canvas and that
 # canvas's workspace by a placement's field names, beside fields a placement ignores.
-def chat_placement(client: Client, *, session_id: uuid.UUID) -> SessionPlacement | None:
+def chat_placement(
+    client: SessionLister,
+    *,
+    session_id: UUID,
+) -> SessionPlacement | None:
     """Return the canvas a chat's session sits on, as the session list names it.
 
     Args:
@@ -116,7 +141,7 @@ def chat_placement(client: Client, *, session_id: uuid.UUID) -> SessionPlacement
             (
                 SessionPlacement.model_validate(row)
                 for row in rows
-                if from_plain(row.get("id"), uuid.UUID) == session_id
+                if from_plain(row.get("id"), UUID) == session_id
             ),
             None,
         )

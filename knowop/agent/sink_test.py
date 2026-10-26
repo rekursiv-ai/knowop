@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, TypeGuard, cast, override
+from typing import TYPE_CHECKING, Final, TypeGuard, override
 from uuid import UUID, uuid4
 
 import asyncio
@@ -289,15 +289,15 @@ class _FakeClient:
         *,
         name: str = "",
         manifest: ManifestBody | None = None,
-        records: object = (),
+        records: Sequence[RecordBody] = (),
         restart: bool = False,
-        slash_commands: object = (),
+        slash_commands: Sequence[SlashCommandBody] = (),
     ) -> AppendRecordsResponse:
-        bodies = list(cast(list[RecordBody], records))
+        bodies = list(records)
         self.appended.append((session_id, name, bodies, restart))
         if manifest is not None:
             self.manifests.append(manifest)
-        self.slash.extend(cast(list[SlashCommandBody], slash_commands))
+        self.slash.extend(slash_commands)
         return AppendRecordsResponse(part=0, written=len(bodies), skipped=0)
 
     def session_end(
@@ -351,7 +351,7 @@ class TestFileSinkWriteBody:
 class TestTrackinizerSink:
     def test_lazy_start_batch_and_end(self) -> None:
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "codex", batch_size=2)
+        sink = TrackinizerSink(client, "codex", batch_size=2)
         # No records yet -> no session opened.
         assert client.started == []
 
@@ -380,7 +380,7 @@ class TestTrackinizerSink:
         part, so the buffer is grouped by path before it is sent.
         """
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=50)
+        sink = TrackinizerSink(client, "claude", batch_size=50)
         sink.emit("claude", _event("a1", path=_PART))
         sink.emit("claude", _event("b1", path=_OTHER))
         sink.close()
@@ -397,7 +397,7 @@ class TestTrackinizerSink:
         did not restart must not be overwritten alongside it.
         """
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=50)
+        sink = TrackinizerSink(client, "claude", batch_size=50)
         sink.emit("claude", _event("a", path=_PART, restart=True))
         sink.emit("claude", _event("b", path=_OTHER))
         sink.close()
@@ -411,7 +411,7 @@ class TestTrackinizerSink:
         rewrites rows the runner has no newer version of.
         """
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=1)
+        sink = TrackinizerSink(client, "claude", batch_size=1)
         sink.emit("claude", _event("a", restart=True))
         sink.emit("claude", _event("b"))
         assert [restart for _, _, _, restart in client.appended] == [True, False]
@@ -419,7 +419,7 @@ class TestTrackinizerSink:
     def test_manifest_counts_the_records_the_part_holds(self) -> None:
         """``records`` bounds every reader (``idx < records``), so it must grow."""
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=2)
+        sink = TrackinizerSink(client, "claude", batch_size=2)
         sink.emit("claude", _event("one"))
         sink.emit("claude", _event("two"))
         assert client.manifests[0].records == 2
@@ -433,14 +433,14 @@ class TestTrackinizerSink:
         id on every flush, and the last one written would win arbitrarily.
         """
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=1)
+        sink = TrackinizerSink(client, "claude", batch_size=1)
         sink.emit("claude", _event("one"))
         sink.emit("claude", _event("two"))
         assert client.manifests[0].ir_id == client.manifests[1].ir_id
 
     def test_no_records_opens_no_session(self) -> None:
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink = TrackinizerSink(client, "claude")
         sink.close()
         assert client.started == []
         assert client.ended == []
@@ -453,7 +453,7 @@ class TestTrackinizerSink:
         """
         client = _FakeClient()
         client.granted_actor = "scientist#2"  # `server` renegotiated.
-        sink = TrackinizerSink(cast(Client, client), "claude", actor="scientist")
+        sink = TrackinizerSink(client, "claude", actor="scientist")
         sink.emit("claude", _event("hi"))
         sink.sync()
         assert client.started[0].actor == "scientist"
@@ -461,7 +461,7 @@ class TestTrackinizerSink:
 
     def test_granted_actor_is_none_before_session_opens(self) -> None:
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", actor="scientist")
+        sink = TrackinizerSink(client, "claude", actor="scientist")
         assert sink.granted_actor is None
 
     def test_open_eagerly_returns_granted_handle(self) -> None:
@@ -472,7 +472,7 @@ class TestTrackinizerSink:
         """
         client = _FakeClient()
         client.granted_actor = "scientist#2"
-        sink = TrackinizerSink(cast(Client, client), "claude", actor="scientist")
+        sink = TrackinizerSink(client, "claude", actor="scientist")
         granted = sink.open()
         assert granted == "scientist#2"
         assert len(client.started) == 1  # Opened without a record.
@@ -488,7 +488,7 @@ class TestTrackinizerSink:
         """
         client = _FakeClient()
         client.start_seq = 5  # Legacy continuation point; must be ignored.
-        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink = TrackinizerSink(client, "claude")
         sink.open()
         sink.emit("claude", _event("resumed"))
         sink.close()
@@ -507,7 +507,7 @@ class TestTrackinizerSink:
         session becomes correlatable on the next ``--resume``.
         """
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink = TrackinizerSink(client, "claude")
         sink.open()
         sink.set_cli_session_id("claude-abc-123")
         sink.close()
@@ -529,7 +529,7 @@ class TestTrackinizerSink:
         now = [100.0]
         client = _FakeClient()
         sink = TrackinizerSink(
-            cast(Client, client),
+            client,
             "claude",
             batch_size=50,
             flush_interval_sec=1.0,
@@ -553,7 +553,7 @@ class TestTrackinizerSink:
     ) -> None:
         now = [0.0]
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", clock=lambda: now[0])
+        sink = TrackinizerSink(client, "claude", clock=lambda: now[0])
         for n in range(49):
             sink.emit("claude", _event(str(n)))
         assert client.appended == []
@@ -570,7 +570,7 @@ class TestTrackinizerSink:
 
     def test_flush_on_empty_buffer_is_noop(self) -> None:
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink = TrackinizerSink(client, "claude")
         sink.flush()
         # Nothing buffered -> no session opened, nothing sent.
         assert client.started == []
@@ -581,7 +581,7 @@ class TestTrackinizerSink:
         now = [0.0]
         client = _FakeClient()
         sink = TrackinizerSink(
-            cast(Client, client),
+            client,
             "claude",
             batch_size=50,
             flush_interval_sec=1.0,
@@ -606,12 +606,12 @@ class TestTrackinizerSink:
     def test_positions_are_per_session_not_global(self) -> None:
         """Each session numbers each of its parts from 0."""
         client_a = _FakeClient()
-        first = TrackinizerSink(cast(Client, client_a), "codex", batch_size=1)
+        first = TrackinizerSink(client_a, "codex", batch_size=1)
         first.emit("codex", _event("a"))
         first.emit("codex", _event("b"))
 
         client_b = _FakeClient()
-        second = TrackinizerSink(cast(Client, client_b), "codex", batch_size=1)
+        second = TrackinizerSink(client_b, "codex", batch_size=1)
         second.emit("codex", _event("c"))
 
         assert [b.idx for _, _, bodies, _ in client_a.appended for b in bodies] == [
@@ -624,7 +624,7 @@ class TestTrackinizerSink:
     def test_close_stamps_ended_timestamp(self) -> None:
         """``close`` must record when the session ended, not a bare ``None``."""
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "codex")
+        sink = TrackinizerSink(client, "codex")
         sink.emit("codex", _event("hi"))
         sink.close()
         assert len(client.end_bodies) == 1
@@ -638,7 +638,7 @@ class TestAPrivateRun:
 
     def test_a_server_that_hides_it_takes_the_run(self) -> None:
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", private=True)
+        sink = TrackinizerSink(client, "claude", private=True)
 
         sink.open()
         sink.emit("claude", _event("hidden"))
@@ -652,7 +652,7 @@ class TestAPrivateRun:
         ``if self._refusal`` guard, so assert the value: it is what lets a sink
         that has met no refusal open instead of re-raising a stored one.
         """
-        sink = TrackinizerSink(cast(Client, _FakeClient()), "claude", private=True)
+        sink = TrackinizerSink(_FakeClient(), "claude", private=True)
         assert sink._refusal == ""
         sink.open()  # Empty reason -> opens rather than raising PrivateNotHeldError.
         assert sink.session_id is not None
@@ -671,7 +671,7 @@ class TestAPrivateRun:
         client = _FakeClient()
         client.hides, client.audience = False, answered
         primary = TrackinizerSink(
-            cast(Client, client),
+            client,
             "claude",
             private=True,
             instance="b" * 32,
@@ -711,7 +711,7 @@ class TestTrackinizerSinkManifestMetadata:
         the per-file reader, so only the path that builds one has it.
         """
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=1)
+        sink = TrackinizerSink(client, "claude", batch_size=1)
         line = (
             b'{"type":"user","sessionId":"s1","message":'
             b'{"role":"user","content":"calf\\u00e9"}}\n'
@@ -740,7 +740,7 @@ class TestTrackinizerSinkManifestMetadata:
         pinned one.
         """
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=1)
+        sink = TrackinizerSink(client, "claude", batch_size=1)
         adapter = ClaudeAdapter()
         _ = sink.feed(
             adapter,
@@ -776,7 +776,7 @@ class TestTrackinizerSinkSlashCommands:
     def test_a_command_commits_with_the_records_around_it(self) -> None:
         """One request, so a crash cannot store one half of the transcript."""
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=50)
+        sink = TrackinizerSink(client, "claude", batch_size=50)
         sink.emit("claude", _event("before"))
         sink.emit_slash_command(SlashCommand(command="model", args="opus"), _AT)
         sink.close()
@@ -791,7 +791,7 @@ class TestTrackinizerSinkSlashCommands:
         without resolving one.
         """
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink = TrackinizerSink(client, "claude")
         sink.emit_slash_command(SlashCommand(command="exit"), _AT)
         sink.close()
         assert [name for _, name, _, _ in client.appended] == [""]
@@ -805,7 +805,7 @@ class TestTrackinizerSinkSlashCommands:
         shows the human typing twice.
         """
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=50)
+        sink = TrackinizerSink(client, "claude", batch_size=50)
         sink.emit("claude", _event("a", path=_PART))
         sink.emit("claude", _event("b", path=_OTHER))
         sink.emit_slash_command(SlashCommand(command="exit"), _AT)
@@ -816,7 +816,7 @@ class TestTrackinizerSinkSlashCommands:
     def test_a_command_alone_opens_the_session(self) -> None:
         """The human typed something, so there is a session to record it in."""
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink = TrackinizerSink(client, "claude")
         sink.emit_slash_command(SlashCommand(command="exit"), _AT)
         sink.sync()
         assert len(client.started) == 1
@@ -830,7 +830,7 @@ class TestTrackinizerSinkSlashCommands:
         now = [0.0]
         client = _FakeClient()
         sink = TrackinizerSink(
-            cast(Client, client),
+            client,
             "claude",
             batch_size=50,
             flush_interval_sec=1.0,
@@ -859,9 +859,9 @@ class _FlakyFlushClient(_FakeClient):
         *,
         name: str = "",
         manifest: ManifestBody | None = None,
-        records: object = (),
+        records: Sequence[RecordBody] = (),
         restart: bool = False,
-        slash_commands: object = (),
+        slash_commands: Sequence[SlashCommandBody] = (),
     ) -> AppendRecordsResponse:
         self.append_attempts += 1
         if self.append_attempts == 1:
@@ -909,9 +909,9 @@ class _OutageClient(_FakeClient):
         *,
         name: str = "",
         manifest: ManifestBody | None = None,
-        records: object = (),
+        records: Sequence[RecordBody] = (),
         restart: bool = False,
-        slash_commands: object = (),
+        slash_commands: Sequence[SlashCommandBody] = (),
     ) -> AppendRecordsResponse:
         self._answer()
         return super().append_records(
@@ -1137,7 +1137,7 @@ class TestCatchUp:
             2,
         )
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), cli="claude", batch_size=100)
+        sink = TrackinizerSink(client, cli="claude", batch_size=100)
         sink.emit_slash_command(SlashCommand(command="exit"), _AT)
         for n in range(5):
             sink.emit("claude", _event(str(n)))
@@ -1166,7 +1166,7 @@ def _catching_up(
 ) -> ResilientSink:
     """Return a sink that sends each record at once, retrying as the runner does."""
     primary = TrackinizerSink(
-        cast(Client, client),
+        client,
         cli="claude",
         flush_interval_sec=0.0,
     )
@@ -1182,7 +1182,7 @@ class TestTrackinizerSinkCloseFlushOrdering:
 
     def test_failed_flush_keeps_buffer_for_retry(self) -> None:
         client = _FlakyFlushClient()
-        sink = TrackinizerSink(cast(Client, client), "codex")
+        sink = TrackinizerSink(client, "codex")
         sink.emit("codex", _event("hi"))
 
         # First close flushes, the flush raises; the record is not yet lost.
@@ -1206,7 +1206,7 @@ class TestTrackinizerSinkCloseFlushOrdering:
         under.
         """
         client = _FlakyFlushClient()
-        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink = TrackinizerSink(client, "claude")
         sink.emit("claude", _event("hi"))
         sink.emit_slash_command(SlashCommand(command="exit"), _AT)
 
@@ -1226,7 +1226,7 @@ class TestTrackinizerSinkCloseFlushOrdering:
         push keeps feeding a queue nobody drains (a phantom live session).
         """
         client = _FlakyFlushClient()
-        primary = TrackinizerSink(cast(Client, client), "claude")
+        primary = TrackinizerSink(client, "claude")
         sink = ResilientSink(primary, fallback_path=tmp_path / "fb.jsonl")
         sink.emit("claude", _event("one"))
 
@@ -1254,7 +1254,7 @@ class TestAKeptOpenSessionIsNotEnded:
         wrapped: str,
     ) -> None:
         client = _FakeClient()
-        sink: Sink = TrackinizerSink(cast(Client, client), "claude")
+        sink: Sink = TrackinizerSink(client, "claude")
         if wrapped != "bare":
             sink = ResilientSink(sink, fallback_path=tmp_path / "fb.jsonl")
         if wrapped == "locked":
@@ -1273,7 +1273,7 @@ class TestAKeptOpenSessionIsNotEnded:
     ) -> None:
         client = _FlakyFlushClient()
         sink = ResilientSink(
-            TrackinizerSink(cast(Client, client), "claude"),
+            TrackinizerSink(client, "claude"),
             fallback_path=tmp_path / "fb.jsonl",
         )
         sink.emit("claude", _event("one"))
@@ -1286,7 +1286,7 @@ class TestAKeptOpenSessionIsNotEnded:
 
     def test_a_sink_not_told_to_keep_the_session_open_ends_it(self) -> None:
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink = TrackinizerSink(client, "claude")
         sink.emit("claude", _event("hi"))
 
         sink.close()
@@ -1297,7 +1297,7 @@ class TestAKeptOpenSessionIsNotEnded:
     def test_the_end_names_the_runs_cli(self, cli: str) -> None:
         """The server keeps the chat open when a run of a CLI it left ends it."""
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), cli)
+        sink = TrackinizerSink(client, cli)
         sink.emit(cli, _event("hi"))
 
         sink.close()
@@ -1309,7 +1309,7 @@ class TestAKeptOpenSessionIsNotEnded:
     def test_the_end_names_the_run_its_drains_name(self) -> None:
         """The server tells the end of a run a reattach replaced by its instance."""
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", instance="a" * 32)
+        sink = TrackinizerSink(client, "claude", instance="a" * 32)
         sink.emit("claude", _event("hi"))
 
         sink.close()
@@ -1503,7 +1503,7 @@ class TestResilientSink:
         the fallback. They must be replayed to the local file.
         """
         client = _FlakyFlushClient()  # `first` append_records raises.
-        primary = TrackinizerSink(cast(Client, client), "claude", batch_size=50)
+        primary = TrackinizerSink(client, "claude", batch_size=50)
         fallback_path = tmp_path / "fallback.jsonl"
         sink = ResilientSink(primary, fallback_path=fallback_path)
 
@@ -1527,7 +1527,7 @@ class TestResilientSink:
         recovery reading both would see the turn twice.
         """
         client = _FlakyFlushClient()
-        primary = TrackinizerSink(cast(Client, client), "claude", batch_size=50)
+        primary = TrackinizerSink(client, "claude", batch_size=50)
         fallback_path = tmp_path / "fallback.jsonl"
         sink = ResilientSink(primary, fallback_path=fallback_path)
         sink.emit("claude", _event("one"))
@@ -1553,7 +1553,7 @@ class TestResilientSink:
         """
         client = _FlakyFlushClient()
         primary = TrackinizerSink(
-            cast(Client, client),
+            client,
             "claude",
             batch_size=50,
             flush_interval_sec=0.0,
@@ -1578,7 +1578,7 @@ class TestResilientSink:
     ) -> None:
         client = _UnreachableClient()
         primary = TrackinizerSink(
-            cast(Client, client),
+            client,
             "claude",
             batch_size=50,
             flush_interval_sec=0.0,
@@ -1650,7 +1650,7 @@ class TestResilientSink:
         position. Two rows for one turn.
         """
         client = _FlakyFlushClient()  # The first append_records raises.
-        primary = TrackinizerSink(cast(Client, client), "claude", batch_size=1)
+        primary = TrackinizerSink(client, "claude", batch_size=1)
         fallback_path = tmp_path / "fallback.jsonl"
         sink = ResilientSink(primary, fallback_path=fallback_path)
 
@@ -1720,7 +1720,7 @@ class TestResilientSink:
 
     def test_healthy_primary_never_touches_fallback(self, tmp_path: Path) -> None:
         client = _FakeClient()
-        wrapped = TrackinizerSink(cast(Client, client), "claude")
+        wrapped = TrackinizerSink(client, "claude")
         fallback_path = tmp_path / "unused.jsonl"
         sink = ResilientSink(wrapped, fallback_path=fallback_path)
 
@@ -1855,7 +1855,7 @@ class TestLoadedHistoryIsNotUploaded:
         client = _FakeClient()
         sink = LockedSink(
             ResilientSink(
-                TrackinizerSink(cast(Client, client), "sh"),
+                TrackinizerSink(client, "sh"),
                 fallback_path=Path("/nonexistent/fallback.jsonl"),
             ),
         )
@@ -1920,7 +1920,7 @@ class TestAttachedRun:
     def test_the_start_names_the_session_and_no_cli_session_id(self) -> None:
         client = _FakeClient()
         attach = uuid4()
-        sink = TrackinizerSink(cast(Client, client), "claude", attach=attach)
+        sink = TrackinizerSink(client, "claude", attach=attach)
 
         sink.set_cli_session_id("claude-abc-123")
         _ = sink.open()
@@ -1936,7 +1936,7 @@ class TestAttachedRun:
 
     def test_a_run_not_attached_sends_no_attach(self) -> None:
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude")
+        sink = TrackinizerSink(client, "claude")
 
         _ = sink.open()
 
@@ -2054,7 +2054,7 @@ def _instant_sink(
 ) -> TrackinizerSink:
     """Return a server sink that sends each record as soon as it is flushed."""
     return TrackinizerSink(
-        cast(Client, client),
+        client,
         cli="claude",
         flush_interval_sec=0.0,
         redactor=redactor,
@@ -2132,7 +2132,7 @@ class TestLockedSink:
 
     def test_delegates_session_id_and_emit(self) -> None:
         client = _FakeClient()
-        inner = TrackinizerSink(cast(Client, client), "codex")
+        inner = TrackinizerSink(client, "codex")
         sink = LockedSink(inner)
         assert sink.session_id is None
         sink.emit("codex", _event("hi"))
@@ -2226,7 +2226,7 @@ def test_consecutive_restart_chunks(
 ) -> None:
     client = _FakeClient()
     output = io.StringIO()
-    primary = TrackinizerSink(cast(Client, client), "sh", batch_size=batch_size)
+    primary = TrackinizerSink(client, "sh", batch_size=batch_size)
     sink: Sink = FileSink(output) if destination == "file" else primary
     if destination == "locked":
         sink = LockedSink(primary)
@@ -2289,9 +2289,7 @@ def test_repeated_claude_replacement_pipeline(tmp_path: Path, *, server: bool) -
     output = io.StringIO()
     client = _FakeClient()
     sink: Sink = (
-        TrackinizerSink(cast(Client, client), "claude", batch_size=1)
-        if server
-        else FileSink(output)
+        TrackinizerSink(client, "claude", batch_size=1) if server else FileSink(output)
     )
     readers: list[Tail[TraxRecord]] = []
     try:
@@ -2360,7 +2358,7 @@ def test_restart_flush_failure_preserves_old_positions_in_fallback(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = _FlakyFlushClient()
-    primary = TrackinizerSink(cast(Client, client), "sh")
+    primary = TrackinizerSink(client, "sh")
     fallback = tmp_path / "fallback.jsonl"
     sink = ResilientSink(primary, fallback_path=fallback)
     try:
@@ -2390,9 +2388,7 @@ def test_empty_restart_chunk_resets_only_its_part(*, server: bool) -> None:
     output = io.StringIO()
     client = _FakeClient()
     sink: Sink = (
-        TrackinizerSink(cast(Client, client), "sh", batch_size=1)
-        if server
-        else FileSink(output)
+        TrackinizerSink(client, "sh", batch_size=1) if server else FileSink(output)
     )
     try:
         sink.emit("sh", _event("one"))
@@ -2435,7 +2431,7 @@ def test_empty_restart_chunk_resets_only_its_part(*, server: bool) -> None:
 
 def test_locked_sink_delegates_restart_and_lifecycle() -> None:
     client = _FakeClient()
-    inner = TrackinizerSink(cast(Client, client), "sh", batch_size=1)
+    inner = TrackinizerSink(client, "sh", batch_size=1)
     sink = LockedSink(inner)
     sink.open()
     sink.set_cli_session_id("native-id")
@@ -2456,7 +2452,7 @@ def test_locked_sink_delegates_restart_and_lifecycle() -> None:
 @pytest.mark.parametrize("batch_size", [1, 2, 50])
 def test_replacement_overwrites_every_reused_position(batch_size: int) -> None:
     client = _FakeClient()
-    sink = TrackinizerSink(cast(Client, client), "sh", batch_size=batch_size)
+    sink = TrackinizerSink(client, "sh", batch_size=batch_size)
     try:
         for version, line_count in enumerate((3, 1, 2, 4)):
             for line in range(line_count):
@@ -2534,7 +2530,7 @@ class TestRedaction:
         client = _FlakyFlushClient()
         fallback_path = tmp_path / "fallback.jsonl"
         sink = ResilientSink(
-            TrackinizerSink(cast(Client, client), "claude", redactor=_REDACTOR),
+            TrackinizerSink(client, "claude", redactor=_REDACTOR),
             fallback_path=fallback_path,
             redactor=_REDACTOR,
         )
@@ -2705,7 +2701,7 @@ class TestTheBatchBytesBound:
 
     def test_a_record_larger_than_a_batch_goes_alone(self) -> None:
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_bytes=1_000)
+        sink = TrackinizerSink(client, "claude", batch_bytes=1_000)
         sink.emit("claude", _event("small"))
         sink.emit("claude", _event("x" * 2_000))
         sink.emit("claude", _event("small"))
@@ -2836,11 +2832,11 @@ class _RefusingClient(_FakeClient):
         *,
         name: str = "",
         manifest: ManifestBody | None = None,
-        records: object = (),
+        records: Sequence[RecordBody] = (),
         restart: bool = False,
-        slash_commands: object = (),
+        slash_commands: Sequence[SlashCommandBody] = (),
     ) -> AppendRecordsResponse:
-        if any("\x00" in body.text for body in cast(list[RecordBody], records)):
+        if any("\x00" in body.text for body in records):
             raise ClientError("cannot store", status_code=422)
         return super().append_records(
             session_id,
@@ -2866,7 +2862,7 @@ class TestARefusedRecord:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         client = _RefusingClient()
-        sink = TrackinizerSink(cast(Client, client), "claude", batch_size=50)
+        sink = TrackinizerSink(client, "claude", batch_size=50)
         for text in ("one", "binary \x00 output", "three", "four"):
             sink.emit("claude", _event(text))
         sink.emit_slash_command(SlashCommand(command="model", args="opus"), _AT)
@@ -2890,7 +2886,7 @@ class TestARefusedRecord:
         client = _RefusingClient()
         fallback = tmp_path / "run.jsonl"
         sink = ResilientSink(
-            TrackinizerSink(cast(Client, client), "claude", batch_size=2),
+            TrackinizerSink(client, "claude", batch_size=2),
             fallback_path=fallback,
         )
         for text in ("one", "binary \x00 output", "three", "four"):
@@ -2910,7 +2906,7 @@ class TestRunRecords:
 
     def test_a_run_record_is_sent_at_once_on_a_formatless_part(self) -> None:
         client = _FakeClient()
-        sink = TrackinizerSink(cast(Client, client), cli="claude")
+        sink = TrackinizerSink(client, cli="claude")
         sink.emit("claude", _event("turn"))
 
         sink.emit_run_record(
@@ -2950,7 +2946,7 @@ class TestRunRecords:
         client = _FakeClient()
         sink = LockedSink(
             ResilientSink(
-                TrackinizerSink(cast(Client, client), cli="claude"),
+                TrackinizerSink(client, cli="claude"),
                 fallback_path=tmp_path / "fallback.jsonl",
             ),
         )

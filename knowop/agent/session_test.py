@@ -25,6 +25,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, TextIO, cast, override
 from unittest.mock import Mock
+from uuid import UUID
 
 import asyncio
 import io
@@ -72,6 +73,7 @@ from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.chat_commands import Command, classify
 from trackinizer.wire.wire_session_ir import (
     AppendRecordsResponse,
+    ManifestBody,
     PartBody,
     RecordBody,
     SlashCommandBody,
@@ -112,10 +114,12 @@ from knowop.agent.inbound import (
     CANVAS_COMMANDS,
     render_inbound,
 )
+from knowop.agent.placement import place_run
 from knowop.agent.prompt_bridge import PromptBridge
 from knowop.agent.session import (
     _CANVAS_NOTE,
     InboundState,
+    RunClient,
     RunConfig,
     _cli_argv,
     _drain_filesystem_loop,
@@ -158,6 +162,7 @@ _CWD: Final = Path(__file__).resolve().parent
 if TYPE_CHECKING:
     from trackinizer.runs.adapters.custom_types import Adapter
     from trackinizer.runs.asks import Driver
+    from trackinizer.types.inquiries import Inquiry
     from trackinizer.types.streams import TraxRecord
     from treekle import PlainTree
 
@@ -209,7 +214,7 @@ class _RecordingSink(Sink):
 
     @property
     @override
-    def session_id(self) -> uuid.UUID | None:
+    def session_id(self) -> UUID | None:
         return None
 
     @override
@@ -1216,7 +1221,7 @@ class TestARunSaysWhereItIs:
             tmp_path,
             RunConfig(
                 cli_name="claude",
-                client=cast(Client, object()),
+                client=_NoServer(),
                 run_name="chat-1a2b3c4d",
             ),
             ClaudeAdapter(),
@@ -1230,9 +1235,9 @@ class TestARunSaysWhereItIs:
         client = _WhereClient(stop)
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, _RecordingRelay()),
+            client,
+            _SessionSink(),
+            _RecordingRelay(),
             stop,
             run_name="chat-1a2b3c4d",
             machine="gx10",
@@ -1255,9 +1260,9 @@ class TestARunSaysWhereItIs:
         client = _WhereClient(stop, drains=3)
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, _RecordingRelay()),
+            client,
+            _SessionSink(),
+            _RecordingRelay(),
             stop,
             poll_interval=0.001,
             cli="codex",
@@ -1272,9 +1277,9 @@ class TestARunSaysWhereItIs:
             stop = threading.Event()
             client = _WhereClient(stop)
             _inbound_poll_loop(
-                cast(Client, client),
-                cast(Sink, _SessionSink()),
-                cast(ThreadedRelay, _RecordingRelay()),
+                client,
+                _SessionSink(),
+                _RecordingRelay(),
                 stop,
                 cli="claude",
             )
@@ -1287,9 +1292,9 @@ class TestARunSaysWhereItIs:
         client = _WhereClient(stop)
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, _RecordingRelay()),
+            client,
+            _SessionSink(),
+            _RecordingRelay(),
             stop,
         )
 
@@ -1316,9 +1321,9 @@ class TestARunSaysWhereItIs:
         relay = _RecordingRelay()
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, sink),
-            cast(ThreadedRelay, relay),
+            client,
+            sink,
+            relay,
             stop,
             poll_interval=0.01,
             cli="claude",
@@ -1351,9 +1356,9 @@ class TestARunSaysWhereItIs:
         relay = _RecordingRelay()
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, relay),
+            client,
+            _SessionSink(),
+            relay,
             threading.Event(),
             poll_interval=0.01,
             cli="claude",
@@ -1374,9 +1379,9 @@ class TestARunSaysWhereItIs:
         )
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, _RecordingRelay()),
+            client,
+            _SessionSink(),
+            _RecordingRelay(),
             stop,
             poll_interval=0.001,
             cli="claude",
@@ -1395,9 +1400,9 @@ class TestARunSaysWhereItIs:
         relay = _TerminateSeesKeptOpen(sink)
 
         _inbound_poll_loop(
-            cast(Client, _RefusingClient(refusal)),
-            cast(Sink, sink),
-            cast(ThreadedRelay, relay),
+            _RefusingClient(refusal),
+            sink,
+            relay,
             threading.Event(),
             cli="claude",
         )
@@ -1423,9 +1428,9 @@ class TestARunSaysWhereItIs:
         relay = _RecordingRelay()
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, sink),
-            cast(ThreadedRelay, relay),
+            client,
+            sink,
+            relay,
             stop,
             poll_interval=0.001,
             cli="claude",
@@ -1449,9 +1454,9 @@ class TestARunSaysWhereItIs:
         started = time.monotonic()
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, relay),
+            client,
+            _SessionSink(),
+            relay,
             stop,
             poll_interval=0.03,
             cli="claude",
@@ -1519,7 +1524,7 @@ class _WhereClient:
 
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -1548,7 +1553,7 @@ class _RefusingClient:
 
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -3215,7 +3220,82 @@ class TestDryRunDrain:
         assert rc == 0
 
 
-class _BorrowedClient:
+class _NoServer:
+    """A server the test keeps offline: every request the run makes fails it."""
+
+    base_url = "http://no-server.test"
+
+    def session_start(self, body: SessionStart) -> SessionStartResponse:
+        del body
+        raise AssertionError("session_start reached the offline server.")
+
+    def append_records(
+        self,
+        session_id: UUID,
+        *,
+        name: str = "",
+        manifest: ManifestBody | None = None,
+        records: Sequence[RecordBody] = (),
+        restart: bool = False,
+        slash_commands: Sequence[SlashCommandBody] = (),
+    ) -> AppendRecordsResponse:
+        del session_id, name, manifest, records, restart, slash_commands
+        raise AssertionError("append_records reached the offline server.")
+
+    def session_end(
+        self,
+        session_id: UUID,
+        body: SessionEnd | None = None,
+    ) -> SessionEndResponse:
+        del session_id, body
+        raise AssertionError("session_end reached the offline server.")
+
+    def post(self, path: str, *, body: object = None) -> PlainTree:
+        del path, body
+        raise AssertionError("post reached the offline server.")
+
+    def get(
+        self,
+        path: str,
+        *,
+        params: Mapping[str, object] | None = None,
+    ) -> PlainTree:
+        del path, params
+        raise AssertionError("get reached the offline server.")
+
+    def drain_inbound(
+        self,
+        session_id: UUID,
+        *,
+        wait_sec: float = 0.0,
+        **where: str | None,
+    ) -> list[InboundDrainItem]:
+        del session_id, wait_sec, where
+        raise AssertionError("drain_inbound reached the offline server.")
+
+    def read_session_parts(self, session_id: UUID) -> list[PartBody]:
+        del session_id
+        raise AssertionError("read_session_parts reached the offline server.")
+
+    def read_session_records(
+        self,
+        session_id: UUID,
+        *,
+        part: int = 0,
+        plaintext_only: bool = False,
+    ) -> list[RecordBody]:
+        del session_id, part, plaintext_only
+        raise AssertionError("read_session_records reached the offline server.")
+
+    def get_inquiry(
+        self,
+        ref: object,
+    ) -> tuple[Inquiry.InquiryKind, UUID, dict[str, PlainTree]]:
+        del ref
+        raise AssertionError("get_inquiry reached the offline server.")
+
+
+class _BorrowedClient(_NoServer):
     """A shared client whose lifetime is owned outside one ``knowop run``."""
 
     def __init__(self) -> None:
@@ -3238,7 +3318,7 @@ class TestRunPreservesClient:
         the closed instance cached, so the next invocation cannot send.
         """
         client = _BorrowedClient()
-        config = RunConfig(cli_name="codex", dry_run=True, client=cast(Client, client))
+        config = RunConfig(cli_name="codex", dry_run=True, client=client)
 
         # Stub the drain so no session files are scanned and the run returns at
         # once; the client ownership boundary is the only thing under test.
@@ -3285,7 +3365,7 @@ class TestAPrivateRun:
         """An older server answers no audience: the run stops before the CLI starts."""
         config = RunConfig(
             cli_name="sh",
-            client=cast(Client, _UploadsClient()),
+            client=_UploadsClient(),
             private=True,
         )
 
@@ -3295,7 +3375,7 @@ class TestAPrivateRun:
     def test_the_runs_session_end_names_the_instance_its_drains_name(self) -> None:
         """The server tells a replaced run's exit by the id its drains named."""
         client = _UploadsClient()
-        config = RunConfig(cli_name="sh", client=cast(Client, client))
+        config = RunConfig(cli_name="sh", client=client)
         sink = _open_sink(config, IOStreamAdapter())
         _ = sink.open()
 
@@ -3313,7 +3393,7 @@ class TestAPrivateRun:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         client = _BorrowedClient()
-        config = RunConfig(cli_name="codex", dry_run=True, client=cast(Client, client))
+        config = RunConfig(cli_name="codex", dry_run=True, client=client)
         monkeypatch.setattr(session, "_dry_run_drain", _refuse_private)
 
         assert run(config) == 2
@@ -3400,7 +3480,7 @@ def test_json_host_rebuild_preserves_the_run(
         parent_client.assert_not_called()
         connect.assert_not_called()
         request = json_loads(
-            json_dumps(launcher.call_args.kwargs["request"]),
+            json_dumps(cast(object, launcher.call_args.kwargs["request"])),
             RunRequest,
         )
         host = _spec(tmp_path)
@@ -3436,7 +3516,9 @@ def test_json_host_rebuild_preserves_the_run(
         )
         if mode == "sync":
             connect.assert_called_once()
-            assert vars(connect.call_args.args[0]) == request["connection"]
+            assert (
+                vars(cast(object, connect.call_args.args[0])) == request["connection"]
+            )
         else:
             connect.assert_not_called()
     finally:
@@ -3551,8 +3633,8 @@ class TestBoxHookLifetime:
         class _Placed(_RecordingSink):
             @property
             @override
-            def session_id(self) -> uuid.UUID | None:
-                return uuid.UUID(int=1)
+            def session_id(self) -> UUID | None:
+                return UUID(int=1)
 
         class _Relay:
             def __init__(self, argv: Sequence[str], **kwargs: object) -> None:
@@ -3582,7 +3664,7 @@ class TestBoxHookLifetime:
 
         def place(*args: object, **kwargs: object) -> SessionPlacement:
             del args, kwargs
-            return SessionPlacement(canvas_id=uuid.UUID(int=2))
+            return SessionPlacement(canvas_id=UUID(int=2))
 
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
         monkeypatch.setattr(session, "_open_sink", open_sink)
@@ -3616,7 +3698,7 @@ class TestSessionOwnerAndArgv:
         owner = _session_owner(ClaudeAdapter(), config)
         assert owner is not None
         assert owner.session_id is not None
-        assert str(uuid.UUID(owner.session_id)) == owner.session_id
+        assert str(UUID(owner.session_id)) == owner.session_id
         assert _cli_argv(ClaudeAdapter(), config, owner) == [
             "claude",
             "--session-id",
@@ -3917,7 +3999,7 @@ class TestSessionOwnerAndArgv:
         assert _cli_argv(GeminiAdapter(), config, None) == ["gemini", "-p", "x"]
 
 
-_CHAT_RUN: Final = uuid.UUID("44444444-4444-4444-8444-444444444444")
+_CHAT_RUN: Final = UUID("44444444-4444-4444-8444-444444444444")
 """The AgentSession a Chat run writes into, as ``--attach`` names it."""
 
 _SKIP_DIALOG: Final = '{"skipDangerousModePermissionPrompt":true}'
@@ -3928,7 +4010,7 @@ def _spawned(
     cli: str,
     *,
     cli_args: tuple[str, ...],
-    attach: uuid.UUID | None,
+    attach: UUID | None,
 ) -> list[str]:
     """Return the argv a run of ``cli`` spawns, with no session owner."""
     adapter = {
@@ -4100,7 +4182,7 @@ class TestChatRunApprovals:
     )
     def test_claude_on_a_sandbox_bypasses_permissions_without_the_dialog(
         self,
-        attach: uuid.UUID | None,
+        attach: UUID | None,
         args: tuple[str, ...],
     ) -> None:
         # Bypass mode opens a startup dialog whose default is "No, exit"; the inline
@@ -4191,7 +4273,7 @@ class TestChatRunApprovals:
     @pytest.mark.parametrize("attach", [None, _CHAT_RUN], ids=["plain", "chat"])
     def test_codex_on_a_sandbox_skips_approvals(
         self,
-        attach: uuid.UUID | None,
+        attach: UUID | None,
     ) -> None:
         machine_host.set_sandbox(on=True)
         assert _spawned("codex", cli_args=("exec", "hi"), attach=attach) == [
@@ -4630,26 +4712,26 @@ class TestSpawnWiring:
         ):
             assert run_git(["git", "-C", str(tmp_path), *argv], 4096).returncode == 0
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("LC_TRAX_CANVAS", str(uuid.UUID(int=5)))
+        monkeypatch.setenv("LC_TRAX_CANVAS", str(UUID(int=5)))
         client = _PlacingClient()
         wiring, _ = _wire(
             monkeypatch,
             tmp_path,
-            RunConfig(cli_name="claude", client=cast(Client, client)),
+            RunConfig(cli_name="claude", client=client),
             ClaudeAdapter(),
             sink=_PlacedSink(),
         )
         env = cast(dict[str, str], wiring.relay["env"])
         assert (env["TRAX_WORKSPACE"], env["TRAX_CANVAS"]) == (
-            str(uuid.UUID(int=7)),
-            str(uuid.UUID(int=8)),
+            str(UUID(int=7)),
+            str(UUID(int=8)),
         )
         assert wiring.argv[1:3] == ["--append-system-prompt", _CANVAS_NOTE]
         assert client.asked == [
             (
                 f"/api/sessions/{_SESSION}/place",
                 {
-                    "canvas": str(uuid.UUID(int=5)),
+                    "canvas": str(UUID(int=5)),
                     "git": {
                         "origin": "https://github.com/o/r.git",
                         "branch": "feature",
@@ -4669,7 +4751,7 @@ class TestSpawnWiring:
             tmp_path,
             RunConfig(
                 cli_name="claude",
-                client=cast(Client, _PlacingClient(refuse=True)),
+                client=_PlacingClient(refuse=True),
             ),
             ClaudeAdapter(),
             sink=_PlacedSink(),
@@ -4688,7 +4770,7 @@ class TestSpawnWiring:
         _ = _wire(
             monkeypatch,
             tmp_path,
-            RunConfig(cli_name="claude", sync=False, client=cast(Client, client)),
+            RunConfig(cli_name="claude", sync=False, client=client),
             ClaudeAdapter(),
             sink=_PlacedSink(),
         )
@@ -4704,7 +4786,7 @@ class TestSpawnWiring:
         wiring, _ = _wire(
             monkeypatch,
             tmp_path,
-            RunConfig(cli_name="claude", client=cast(Client, server), attach=_SESSION),
+            RunConfig(cli_name="claude", client=server, attach=_SESSION),
             ClaudeAdapter(),
             sink=_PlacedSink(),
         )
@@ -4716,7 +4798,7 @@ class TestSpawnWiring:
 
     def test_a_chats_canvas_arms_no_box_hook_but_a_placed_canvas_does(self) -> None:
         """A chat's lines carry its canvas's boxes; a box hook would repeat them."""
-        chat = RunConfig(cli_name="claude", client=cast(Client, _ChatServer(_SESSION)))
+        chat = RunConfig(cli_name="claude", client=_ChatServer(_SESSION))
         placed = {"TRAX_WORKSPACE": _WORKSPACE, "TRAX_CANVAS": _CANVAS}
 
         assert _place(replace(chat, attach=_SESSION), session_id=_SESSION) == (
@@ -4724,7 +4806,7 @@ class TestSpawnWiring:
             {},
         )
         assert _place(
-            replace(chat, client=cast(Client, _ChatServer(_SESSION, places=True))),
+            replace(chat, client=_ChatServer(_SESSION, places=True)),
             session_id=_SESSION,
         ) == (placed, placed)
 
@@ -4734,15 +4816,15 @@ class TestSpawnWiring:
     ) -> None:
         fresh = _ChatServer(_SESSION)
         placed = _ChatServer(_SESSION, places=True)
-        # No ``get``: a read of the session list would fail the test.
+        # Its ``get`` raises: a read of the session list would fail the test.
         refused = _PlacingClient(refuse=True)
         unopened = _ChatServer(_SESSION)
 
         for client, attach in ((fresh, None), (placed, _SESSION), (refused, _SESSION)):
-            config = RunConfig(cli_name="claude", client=cast(Client, client))
+            config = RunConfig(cli_name="claude", client=client)
             _ = _place(replace(config, attach=attach), session_id=_SESSION)
         clientless = RunConfig(cli_name="claude", attach=_SESSION)
-        unopened_run = replace(clientless, client=cast(Client, unopened))
+        unopened_run = replace(clientless, client=unopened)
 
         assert _place(clientless, session_id=_SESSION) == ({}, {})
         assert _place(unopened_run, session_id=None) == ({}, {})
@@ -4958,7 +5040,7 @@ class TestSpawnWiring:
         adapter: Callable[[], Adapter],
         stream: bool,
     ) -> None:
-        client = cast(Client, object())
+        client = _NoServer()
         sink = _RecordingSink()
         monkeypatch.setattr("socket.gethostname", lambda: "gx10.lan")
         _at_home(monkeypatch, tmp_path.parent)
@@ -5014,7 +5096,7 @@ class TestSpawnWiring:
             tmp_path,
             RunConfig(
                 cli_name="claude",
-                client=cast(Client, object()),
+                client=_NoServer(),
                 out_path=tmp_path / "local.jsonl",
             ),
             ClaudeAdapter(),
@@ -5070,7 +5152,7 @@ class TestSpawnWiring:
             _ = session._spawn_and_drain(
                 RunConfig(
                     cli_name="claude",
-                    client=cast(Client, object()),
+                    client=_NoServer(),
                     quiesce_seconds=0.0,
                 ),
                 ClaudeAdapter(),
@@ -5111,65 +5193,71 @@ class _PlacedSink(_RecordingSink):
 
     @property
     @override
-    def session_id(self) -> uuid.UUID:
+    def session_id(self) -> UUID:
         return _SESSION
 
 
-_SESSION = uuid.UUID("00000000-0000-0000-0000-0000000000a1")
+_SESSION = UUID("00000000-0000-0000-0000-0000000000a1")
 
 
-class _PlacingClient:
+class _PlacingClient(_NoServer):
     """A client whose server places a session, or refuses to; records what it was asked."""
 
     def __init__(self, *, refuse: bool = False) -> None:
         self.asked: list[tuple[str, object]] = []
         self._refuse = refuse
 
+    @override
     def post(self, path: str, *, body: object = None) -> dict[str, str]:
         self.asked.append((path, body))
         if self._refuse:
             raise ClientError("404 Not Found")
         return {
-            "workspace_id": str(uuid.UUID(int=7)),
-            "canvas_id": str(uuid.UUID(int=8)),
+            "workspace_id": str(UUID(int=7)),
+            "canvas_id": str(UUID(int=8)),
         }
 
 
-class _ChatServer:
+class _ChatServer(_NoServer):
     """A server that lists a chat's session on its chat's canvas.
 
     It places no chat's session, as the real one does not, unless ``places``.
     """
 
-    def __init__(self, session_id: uuid.UUID, *, places: bool = False) -> None:
+    def __init__(self, session_id: UUID, *, places: bool = False) -> None:
         self.posted: list[str] = []
         self.listed: list[Mapping[str, object] | None] = []
         self._session_id = session_id
         self._places = places
 
-    def post(self, path: str, *, body: object = None) -> dict[str, object]:
+    @override
+    def post(self, path: str, *, body: object = None) -> PlainTree:
         del body
         self.posted.append(path)
-        placed: dict[str, object] = {"workspace_id": _WORKSPACE, "canvas_id": _CANVAS}
-        return placed if self._places and path.endswith("/place") else {}
+        placed: dict[str, PlainTree] = {}
+        if self._places and path.endswith("/place"):
+            placed = {"workspace_id": _WORKSPACE, "canvas_id": _CANVAS}
+        return placed
 
+    @override
     def get(
         self,
         path: str,
         *,
         params: Mapping[str, object] | None = None,
-    ) -> dict[str, object]:
+    ) -> PlainTree:
         assert path == "/api/sessions"
         self.listed.append(params)
         listed = {"id": str(self._session_id), "title": "chat", "live": True}
-        return {
+        answer: dict[str, PlainTree] = {
             "sessions": [
-                {"id": str(uuid.UUID(int=3)), "canvas_id": None, "workspace_id": None},
+                {"id": str(UUID(int=3)), "canvas_id": None, "workspace_id": None},
                 {**listed, "canvas_id": _CANVAS, "workspace_id": _WORKSPACE},
             ],
             "issues": [],
             "more": False,
         }
+        return answer
 
 
 def _never_found(
@@ -5272,7 +5360,7 @@ class TestExitDoesNotWaitOutTheInboundHold:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         server = _HoldingServer()
-        client = cast(Client, server)
+        client = server
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
         monkeypatch.setattr(session, "ThreadedRelay", partial(_ExitsOnceParked, server))
         monkeypatch.setattr(session, "_drain_filesystem_loop", _drain_until_stop)
@@ -5292,7 +5380,7 @@ class TestExitDoesNotWaitOutTheInboundHold:
         assert "inbound poll thread did not stop" not in capsys.readouterr().err
 
 
-class _HoldingServer:
+class _HoldingServer(_NoServer):
     """Holds each inbound wait until the session ends, as the server route does."""
 
     def __init__(self) -> None:
@@ -5301,25 +5389,29 @@ class _HoldingServer:
         self.ended = threading.Event()
         self.holds: list[str] = []
 
+    @override
     def session_start(self, body: SessionStart) -> SessionStartResponse:
         return SessionStartResponse(id=self.session, seq=0, actor=body.actor)
 
+    @override
     def post(self, path: str, *, body: object = None) -> dict[str, str]:
         del path, body
         return {}
 
+    @override
     def session_end(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         body: SessionEnd | None = None,
     ) -> SessionEndResponse:
         del body
         self.ended.set()
         return SessionEndResponse(id=session_id)
 
+    @override
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -5365,7 +5457,7 @@ class TestARefusedRunLeavesTheChatsSessionOpen:
         tmp_path: Path,
     ) -> None:
         server = _RefusingServer()
-        client = cast(Client, server)
+        client = server
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
         monkeypatch.setattr(session, "ThreadedRelay", _StopsWhenTold)
         monkeypatch.setattr(session, "_drain_filesystem_loop", _drain_until_stop)
@@ -5394,7 +5486,7 @@ class _RefusingServer(_HoldingServer):
     @override
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -5434,9 +5526,9 @@ class TestInboundIsWaitDriven:
 
         worker = threading.Thread(
             target=lambda: _inbound_poll_loop(
-                cast(Client, client),
-                cast(Sink, _SessionSink()),
-                cast(ThreadedRelay, _RecordingRelay()),
+                client,
+                _SessionSink(),
+                _RecordingRelay(),
                 stop,
             ),
             daemon=True,
@@ -5475,9 +5567,9 @@ class TestInboundIsWaitDriven:
         def _run() -> None:
             drain_thread.append(threading.get_ident())
             _inbound_poll_loop(
-                cast(Client, client),
-                cast(Sink, _SessionSink()),
-                cast(ThreadedRelay, _RecordingRelay()),
+                client,
+                _SessionSink(),
+                _RecordingRelay(),
                 stop,
             )
 
@@ -5509,9 +5601,9 @@ class TestInboundIsWaitDriven:
 
         worker = threading.Thread(
             target=lambda: _inbound_poll_loop(
-                cast(Client, client),
-                cast(Sink, _SessionSink()),
-                cast(ThreadedRelay, _RecordingRelay()),
+                client,
+                _SessionSink(),
+                _RecordingRelay(),
                 stop,
                 poll_interval=0.05,
             ),
@@ -5551,9 +5643,9 @@ class TestInboundBatchSurvivesOneBadMessage:
 
         worker = threading.Thread(
             target=lambda: _inbound_poll_loop(
-                cast(Client, client),
-                cast(Sink, _SessionSink()),
-                cast(ThreadedRelay, relay),
+                client,
+                _SessionSink(),
+                relay,
                 stop,
                 poll_interval=0.01,
             ),
@@ -5580,7 +5672,7 @@ class TestDeliverOne:
         relay = _RecordingRelay()
         envelope = '{"agent_message": "go"}'
         session._deliver_one(
-            cast(ThreadedRelay, relay),
+            relay,
             InboundDrainItem(text=envelope, source="trackinizer", room="lab"),
             stream=True,
             cli="sh",
@@ -5591,7 +5683,7 @@ class TestDeliverOne:
         relay = _RecordingRelay()
         context = CanvasMessageContext(canvas_id=uuid.uuid4(), visible_visuals=[])
         session._deliver_one(
-            cast(ThreadedRelay, relay),
+            relay,
             InboundDrainItem(text="look", source="alice@x", context=context),
             stream=False,
             cli="claude",
@@ -5626,7 +5718,7 @@ class TestDeliverOne:
         with caplog.at_level("INFO", logger=session.__name__):
             for item in items:
                 session._deliver_one(
-                    cast(ThreadedRelay, relay),
+                    relay,
                     item,
                     stream=False,
                     cli="claude",
@@ -5648,7 +5740,7 @@ class TestDeliverOne:
         """The sender believes it was delivered, so the loss must be traceable."""
         with caplog.at_level("WARNING", logger=session.__name__):
             session._deliver_one(
-                cast(ThreadedRelay, _PickyRelay(reject="poison")),
+                _PickyRelay(reject="poison"),
                 InboundDrainItem(text="poison"),
                 stream=False,
                 cli="claude",
@@ -5674,7 +5766,7 @@ class TestInboundSurvivesACaptureDegrade:
         client = _UploadOutageClient(["still listening"])
         fallback_path = tmp_path / "fallback.jsonl"
         sink = ResilientSink(
-            TrackinizerSink(cast(Client, client), "claude", flush_interval_sec=0.0),
+            TrackinizerSink(client, "claude", flush_interval_sec=0.0),
             fallback_path=fallback_path,
         )
         sink.emit(
@@ -5687,9 +5779,9 @@ class TestInboundSurvivesACaptureDegrade:
 
         worker = threading.Thread(
             target=lambda: _inbound_poll_loop(
-                cast(Client, client),
+                client,
                 sink,
-                cast(ThreadedRelay, relay),
+                relay,
                 stop,
                 poll_interval=0.01,
             ),
@@ -5717,7 +5809,7 @@ class TestInboundAfterALateOpen:
         now = [0.0]
         sink = ResilientSink(
             TrackinizerSink(
-                cast(Client, client),
+                client,
                 cli="claude",
                 flush_interval_sec=0.0,
             ),
@@ -5734,9 +5826,9 @@ class TestInboundAfterALateOpen:
         stop = threading.Event()
         worker = threading.Thread(
             target=lambda: _inbound_poll_loop(
-                cast(Client, client),
+                client,
                 sink,
-                cast(ThreadedRelay, relay),
+                relay,
                 stop,
                 poll_interval=0.01,
             ),
@@ -5769,7 +5861,7 @@ class _BatchClient:
 
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -5789,23 +5881,31 @@ class _UploadOutageClient(_BatchClient):
     def __init__(self, texts: list[str]) -> None:
         super().__init__(texts)
         self.session = uuid.uuid4()
-        self.drained_for: set[uuid.UUID] = set()
+        self.drained_for: set[UUID] = set()
 
     def session_start(self, body: SessionStart) -> SessionStartResponse:
         return SessionStartResponse(id=self.session, seq=0, actor=body.actor)
 
     def append_records(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         **fields: object,
     ) -> AppendRecordsResponse:
         del session_id, fields
         raise RuntimeError("upload failed")
 
+    def session_end(
+        self,
+        session_id: UUID,
+        body: SessionEnd | None = None,
+    ) -> SessionEndResponse:
+        del body
+        return SessionEndResponse(id=session_id)
+
     @override
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -5831,7 +5931,7 @@ class _ServerComesBackClient(_UploadOutageClient):
     @override
     def append_records(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         **fields: object,
     ) -> AppendRecordsResponse:
         if not self.up:
@@ -5843,7 +5943,7 @@ class _ServerComesBackClient(_UploadOutageClient):
 class _SessionSink:
     """A sink whose session is already open, so inbound has an id to use."""
 
-    session_id = uuid.UUID("11111111-2222-3333-4444-555555555555")
+    session_id = UUID("11111111-2222-3333-4444-555555555555")
 
     def __init__(self) -> None:
         self.kept_open = False
@@ -5926,7 +6026,7 @@ class _WaitingClient:
 
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -5949,7 +6049,7 @@ class _FailingClient:
 
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -5984,7 +6084,7 @@ class TestResumeArgv:
         assert resume_argv("codex", None) == ()
 
 
-class _UploadsClient:
+class _UploadsClient(_NoServer):
     """A server that takes every upload, keeping each body it was sent as JSON."""
 
     base_url = "http://uploads.test"
@@ -5993,24 +6093,30 @@ class _UploadsClient:
         self.sent: list[str] = []
         self.ends: list[SessionEnd | None] = []
 
+    @override
     def session_start(self, body: SessionStart) -> SessionStartResponse:
         return SessionStartResponse(id=uuid.uuid4(), seq=0, actor=body.actor)
 
+    @override
     def append_records(
         self,
-        session_id: uuid.UUID,
-        **fields: object,
+        session_id: UUID,
+        *,
+        name: str = "",
+        manifest: ManifestBody | None = None,
+        records: Sequence[RecordBody] = (),
+        restart: bool = False,
+        slash_commands: Sequence[SlashCommandBody] = (),
     ) -> AppendRecordsResponse:
-        del session_id
-        records = cast(list[RecordBody], fields["records"])
+        del session_id, name, manifest, restart
         self.sent.extend(body.model_dump_json() for body in records)
-        slash = cast(list[SlashCommandBody], fields["slash_commands"])
-        self.sent.extend(body.model_dump_json() for body in slash)
+        self.sent.extend(body.model_dump_json() for body in slash_commands)
         return AppendRecordsResponse(part=0, written=len(records), skipped=0)
 
+    @override
     def session_end(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         body: SessionEnd | None = None,
     ) -> SessionEndResponse:
         self.ends.append(body)
@@ -6054,14 +6160,14 @@ class TestOpenSinkRedactsDeliveredSecrets:
 
         monkeypatch.setattr(session, "_default_out_path", default_out_path)
         up = _UploadsClient()
-        config = RunConfig(cli_name="sh", client=cast(Client, up))
+        config = RunConfig(cli_name="sh", client=up)
         self._capture(_open_sink(config, IOStreamAdapter()), tmp_path / "a.log")
         assert not fallback.exists()
         assert up.sent
         assert "secretvalue1" not in "".join(up.sent)
         assert "[redacted:K]" in "".join(up.sent)
 
-        down = RunConfig(cli_name="sh", client=cast(Client, _DownClient()))
+        down = RunConfig(cli_name="sh", client=_DownClient())
         self._capture(_open_sink(down, IOStreamAdapter()), tmp_path / "b.log")
         stored = fallback.read_text(encoding="utf-8")
         assert "[redacted:K]" in stored
@@ -6093,7 +6199,7 @@ class TestOpenSinkRedactsDeliveredSecrets:
         sink.close()
 
 
-_CHAT: Final = uuid.UUID("0a1b2c3d-0000-4000-8000-0000000000aa")
+_CHAT: Final = UUID("0a1b2c3d-0000-4000-8000-0000000000aa")
 
 
 class TestAttach:
@@ -6320,9 +6426,9 @@ class TestInboundReadiness:
         client = _MarkerCheckingClient(marker, stop)
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, _RecordingRelay()),
+            client,
+            _SessionSink(),
+            _RecordingRelay(),
             stop,
             poll_interval=0.5,
             inbound=state,
@@ -6342,9 +6448,9 @@ class TestInboundReadiness:
         client = _MarkerCheckingClient(tmp_path / "never", stop)
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, _RecordingRelay()),
+            client,
+            _SessionSink(),
+            _RecordingRelay(),
             stop,
             poll_interval=0.5,
             inbound=state,
@@ -6383,7 +6489,7 @@ class TestDeliveredLinesAreStamped:
         state = InboundState(fallback_sec=0.0)
         relay = _RecordingRelay()
         session._deliver_one(
-            cast(ThreadedRelay, relay),
+            relay,
             InboundDrainItem(text="hello\n  there", source="alice@x", room="lab"),
             stream=False,
             cli="claude",
@@ -6418,7 +6524,7 @@ class TestDeliveredLinesAreStamped:
     def test_a_line_that_was_not_typed_is_forgotten(self) -> None:
         state = InboundState(fallback_sec=0.0)
         session._deliver_one(
-            cast(ThreadedRelay, _PickyRelay(reject="alice@x: poison")),
+            _PickyRelay(reject="alice@x: poison"),
             InboundDrainItem(text="poison", source="alice@x"),
             stream=False,
             cli="claude",
@@ -6526,7 +6632,7 @@ class _MarkerCheckingClient:
 
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -6567,7 +6673,7 @@ class TestPromptBridge:
         try:
             caplog.set_level("INFO", logger=session.__name__)
             session._deliver_one(
-                cast(ThreadedRelay, relay),
+                relay,
                 InboundDrainItem(
                     text="Yes",
                     kind="answer",
@@ -6613,9 +6719,9 @@ class TestPromptBridge:
         )
         try:
             _inbound_poll_loop(
-                cast(Client, client),
-                cast(Sink, _SessionSink()),
-                cast(ThreadedRelay, relay),
+                client,
+                _SessionSink(),
+                relay,
                 stop,
                 poll_interval=0.01,
                 wait_sec=25.0,
@@ -6875,7 +6981,7 @@ class _ScriptedClient:
 
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -6942,9 +7048,9 @@ class TestATrustCardHoldsTheRun:
         )
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, relay),
+            client,
+            _SessionSink(),
+            relay,
             stop,
             poll_interval=0.01,
             wait_sec=25.0,
@@ -7021,7 +7127,7 @@ class TestATrustCardHoldsTheRun:
         wiring, _ = _wire(
             monkeypatch,
             tmp_path,
-            RunConfig(cli_name="claude", client=cast(Client, object())),
+            RunConfig(cli_name="claude", client=_NoServer()),
             ClaudeAdapter(),
             relay=_CardCheckingRelay,
         )
@@ -7057,7 +7163,7 @@ class TestATrustCardHoldsTheRun:
             _ = _wire(
                 monkeypatch,
                 tmp_path,
-                RunConfig(cli_name="claude", client=cast(Client, object())),
+                RunConfig(cli_name="claude", client=_NoServer()),
                 ClaudeAdapter(),
                 relay=_FailingWiringRelay,
                 wiring=wiring,
@@ -7092,7 +7198,7 @@ class TestATrustCardHoldsTheRun:
         wiring, _ = _wire(
             monkeypatch,
             tmp_path,
-            RunConfig(cli_name="codex", client=cast(Client, object())),
+            RunConfig(cli_name="codex", client=_NoServer()),
             CodexAdapter(),
             output=output,
         )
@@ -7178,7 +7284,7 @@ class TestChatCommands:
         records: list[SystemMessage] = []
 
         session._deliver_one(
-            cast(ThreadedRelay, relay),
+            relay,
             InboundDrainItem(
                 text=command.text,
                 kind="command",
@@ -7194,7 +7300,7 @@ class TestChatCommands:
         [record] = records
         stored = RecordBody.of(
             SessionRecordRow.of(
-                session_id=uuid.UUID(int=0),
+                session_id=UUID(int=0),
                 part=1,
                 idx=2,
                 record=replace(record, timestamp="2026-10-20T00:00:01+00:00"),
@@ -7211,7 +7317,7 @@ class TestChatCommands:
         records: list[SystemMessage] = []
 
         session._deliver_one(
-            cast(ThreadedRelay, relay),
+            relay,
             InboundDrainItem(
                 text="/goal ship it",
                 kind="command",
@@ -7286,7 +7392,7 @@ class TestChatCommands:
         )
 
         session._deliver_one(
-            cast(ThreadedRelay, relay),
+            relay,
             InboundDrainItem(text="/goal b", kind="command"),
             stream=False,
             inbound=state,
@@ -7302,7 +7408,7 @@ class TestChatCommands:
         records: list[SystemMessage] = []
 
         session._deliver_one(
-            cast(ThreadedRelay, relay),
+            relay,
             InboundDrainItem(text=text, kind="command", source="ann@x"),
             stream=False,
             inbound=InboundState(fallback_sec=0.0),
@@ -7324,7 +7430,7 @@ class TestChatCommands:
         relay = _RecordingRelay()
 
         session._deliver_one(
-            cast(ThreadedRelay, relay),
+            relay,
             InboundDrainItem(text="/rename probe", kind="command"),
             stream=False,
             inbound=InboundState(fallback_sec=0.0),
@@ -7340,7 +7446,7 @@ class TestChatCommands:
         records: list[SystemMessage] = []
         with caplog.at_level("WARNING", logger=session.__name__):
             session._deliver_one(
-                cast(ThreadedRelay, _PickyRelay(reject="/goal x")),
+                _PickyRelay(reject="/goal x"),
                 InboundDrainItem(text="/goal x", kind="command"),
                 stream=False,
                 cli="claude",
@@ -7377,9 +7483,9 @@ class TestChatCommands:
         )
 
         _inbound_poll_loop(
-            cast(Client, client),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, relay),
+            client,
+            _SessionSink(),
+            relay,
             stop,
             poll_interval=0.01,
             inbound=state,
@@ -7410,7 +7516,7 @@ class TestChatCommands:
             tmp_path,
             RunConfig(
                 cli_name="claude",
-                client=cast(Client, object()),
+                client=_NoServer(),
                 compact_after_load=True,
             ),
             ClaudeAdapter(),
@@ -7428,19 +7534,24 @@ def _trusted_and_ready(state: InboundState, marker: Path) -> None:
     marker.touch()
 
 
-class _ChatClient:
+class _ChatClient(_NoServer):
     """Serves a chat whose one part claude wrote, or a chat with no part at all."""
 
     def __init__(self, *, lines: Sequence[str] = ()) -> None:
         self._records = list(claude.normalize(io.StringIO("".join(lines))))
         self.asked = 0
 
-    def get_inquiry(self, ref: object) -> tuple[str, uuid.UUID, dict[str, object]]:
+    @override
+    def get_inquiry(
+        self,
+        ref: object,
+    ) -> tuple[Inquiry.InquiryKind, UUID, dict[str, PlainTree]]:
         """Name the chat's session by its seq, which a window's note asks for."""
         del ref
         return "AgentSession", _CHAT, {"self": {"seq": 7}}
 
-    def read_session_parts(self, session_id: uuid.UUID) -> list[PartBody]:
+    @override
+    def read_session_parts(self, session_id: UUID) -> list[PartBody]:
         assert session_id == _CHAT
         self.asked += 1
         if not self._records:
@@ -7454,13 +7565,15 @@ class _ChatClient:
             ),
         ]
 
+    @override
     def read_session_records(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         part: int = 0,
-        **_: object,
+        plaintext_only: bool = False,
     ) -> list[RecordBody]:
+        del plaintext_only
         return [
             RecordBody.of(
                 SessionRecordRow.of(
@@ -7496,7 +7609,7 @@ class TestAnAttachedRunLoadsTheChat:
         monkeypatch.setattr(session, "connect", Mock(return_value=client))
 
         argv = ["--detach", "--attach", str(_CHAT), "claude"]
-        assert session.main(argv, client_factory=lambda: cast(Client, client)) == 0
+        assert session.main(argv, client_factory=lambda: client) == 0
         assert client.asked == 0
 
         [start] = hosted
@@ -7642,7 +7755,7 @@ def _keep_attached(
     """Return the config ``knowop run argv`` would run against ``client``."""
     ran: list[RunConfig] = []
     monkeypatch.setattr(session, "run", partial(_keep_run, ran))
-    assert session.main(argv, client_factory=lambda: cast(Client, client)) == 0
+    assert session.main(argv, client_factory=lambda: client) == 0
     (config,) = ran
     return config
 
@@ -7670,7 +7783,7 @@ class TestAChatRunIsHeadless:
         monkeypatch.setattr(session, "run", partial(_keep_run, ran))
         monkeypatch.setattr(detach, "launch", partial(_keep_host, hosted))
         monkeypatch.setattr(session, "connect", Mock(return_value=client))
-        assert session.main(argv, client_factory=lambda: cast(Client, client)) == 0
+        assert session.main(argv, client_factory=lambda: client) == 0
         for start in hosted:
             assert start(host if host is not None else _spec(tmp_path)) == 0
         [config] = ran
@@ -8717,7 +8830,7 @@ class TestDeliveringToAHeadlessRun:
         run = _NotedRun(stop, [])
 
         _inbound_poll_loop(
-            cast(Client, server),
+            server,
             _SessionOnlySink(),
             run,
             stop,
@@ -8742,7 +8855,7 @@ class TestDeliveringToAHeadlessRun:
         sink = _SessionOnlySink()
 
         _inbound_poll_loop(
-            cast(Client, server),
+            server,
             sink,
             run,
             server.stop,
@@ -8783,19 +8896,15 @@ _WORKSPACE: Final = "5e5e5e5e-0000-4000-8000-0000000000bb"
 _CANVAS: Final = "6f6f6f6f-0000-4000-8000-0000000000cc"
 
 
-class _PostRecorder:
+class _PostRecorder(_NoServer):
     """A client that keeps what is posted to it; it places a session on a canvas."""
 
     def __init__(self) -> None:
         self.posted: list[tuple[str, dict[str, object]]] = []
 
-    def post(
-        self,
-        path: str,
-        *,
-        body: dict[str, object] | None = None,
-    ) -> dict[str, str]:
-        self.posted.append((path, body or {}))
+    @override
+    def post(self, path: str, *, body: object = None) -> dict[str, str]:
+        self.posted.append((path, from_plain(body, dict[str, object], default={})))
         if path.endswith("/place"):
             return {"workspace_id": _WORKSPACE, "canvas_id": _CANVAS}
         return {}
@@ -8824,7 +8933,7 @@ class _OneBatchServer:
 
     def drain_inbound(
         self,
-        session_id: uuid.UUID,
+        session_id: UUID,
         *,
         wait_sec: float = 0.0,
         **where: str | None,
@@ -8847,7 +8956,7 @@ class _OpenedSink(_RecordingSink):
 
     @property
     @override
-    def session_id(self) -> uuid.UUID | None:
+    def session_id(self) -> UUID | None:
         return _CHAT
 
     @override
@@ -8860,7 +8969,7 @@ class _SessionOnlySink(_RecordingSink):
 
     @property
     @override
-    def session_id(self) -> uuid.UUID | None:
+    def session_id(self) -> UUID | None:
         return _CHAT
 
     @override
@@ -9061,7 +9170,7 @@ def _wire_headless(
     script: Callable[[HeadlessRun], None] | None = None,
     sink: Sink | None = None,
     sandboxed: bool = False,
-    client: object | None = None,
+    client: RunClient | None = None,
     host: Literal["terminal", "plain", "none"] = "terminal",
     clientless: bool = False,
 ) -> tuple[_HeadlessWiring, int]:
@@ -9100,7 +9209,7 @@ def _wire_headless(
         replace(
             config,
             headless=True,
-            client=None if clientless else cast(Client, client or object()),
+            client=None if clientless else client or _NoServer(),
             host=hosts[host],
             run_name="chat-1",
             quiesce_seconds=0.0,
@@ -9123,11 +9232,11 @@ def _take_over_then_stop(control: Path) -> None:
 
 
 def _spy_on_placing(
-    placed: list[tuple[object, uuid.UUID, Path]],
+    placed: list[tuple[object, UUID, Path]],
     place: Callable[..., SessionPlacement | None],
     client: object,
     *,
-    session_id: uuid.UUID,
+    session_id: UUID,
     environ: Mapping[str, str],
     cwd: Path,
 ) -> SessionPlacement | None:
@@ -9417,11 +9526,11 @@ class TestAHeadlessRunsWiring:
         sink = _OpenedSink()
         opener = _RecordingOpener("the diff")
         monkeypatch.setattr(session, "open_worktree_diff", opener)
-        placed: list[tuple[object, uuid.UUID, Path]] = []
+        placed: list[tuple[object, UUID, Path]] = []
         monkeypatch.setattr(
             session,
             "place_run",
-            partial(_spy_on_placing, placed, session.place_run),
+            partial(_spy_on_placing, placed, place_run),
         )
         config = replace(
             _headless_config(actor="scout", rooms=("lab",)),
@@ -9990,7 +10099,7 @@ def _write_session_file(adapter: Adapter, session_id: str) -> None:
     _ = (scope / name).write_text(_claude_line("before"))
 
 
-_MESSAGE_CANVAS = uuid.UUID("c5286865-67b6-4bd8-ab51-e06e10c326c5")
+_MESSAGE_CANVAS = UUID("c5286865-67b6-4bd8-ab51-e06e10c326c5")
 _TRAILER = "\nTrackinizer context (verify with trax): "
 
 
@@ -10303,6 +10412,20 @@ class TestWhoHoldsARollout:
         assert not session._path_held_by_lsof(7, tmp_path / "held.jsonl")
 
 
+class _UndrainedClient:
+    """A server the stopped loop must never ask."""
+
+    def drain_inbound(
+        self,
+        session_id: UUID,
+        *,
+        wait_sec: float = 0.0,
+        **where: str | None,
+    ) -> list[InboundDrainItem]:
+        del session_id, wait_sec, where
+        raise AssertionError("The stopped loop drained the server.")
+
+
 class TestTheInboundLoopStops:
     """The poll loop ends when stopped while it waits, whatever it waits for."""
 
@@ -10310,9 +10433,9 @@ class TestTheInboundLoopStops:
         relay = _RecordingRelay()
 
         _inbound_poll_loop(
-            cast(Client, object()),
-            cast(Sink, _NoSessionSink()),
-            cast(ThreadedRelay, relay),
+            _UndrainedClient(),
+            _NoSessionSink(),
+            relay,
             _StopOnItsFirstWait(),
             poll_interval=0.5,
         )
@@ -10328,9 +10451,9 @@ class TestTheInboundLoopStops:
         )
 
         _inbound_poll_loop(
-            cast(Client, object()),
-            cast(Sink, _SessionSink()),
-            cast(ThreadedRelay, relay),
+            _UndrainedClient(),
+            _SessionSink(),
+            relay,
             _StopOnItsFirstWait(),
             poll_interval=0.5,
             inbound=state,
@@ -10440,7 +10563,10 @@ _DEAD_PID: Final = 2**22 + 1
 class _NoSessionSink:
     """A sink whose session the server has not opened yet."""
 
-    session_id: uuid.UUID | None = None
+    session_id: UUID | None = None
+
+    def keep_session_open(self) -> None:
+        """Nothing to keep: the session never opened."""
 
 
 class _StopOnItsFirstWait(threading.Event):
@@ -10470,10 +10596,6 @@ def _cannot_run(*args: object, **kwargs: object) -> object:
 
 def _lsof_found(name: str) -> str:
     return f"/usr/sbin/{name}"
-
-
-def _never_found(name: str) -> None:
-    del name
 
 
 def _lsof_lists(held: Path, argv: Sequence[str], **kwargs: object) -> object:

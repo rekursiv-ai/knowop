@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, override
+from typing import IO, TYPE_CHECKING, Protocol, override
 
 import base64
 import io
@@ -40,8 +40,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from _typeshed import WriteableBuffer
-    from trackinizer.client.client import Client
-    from trackinizer.wire.wire_machine_job import MachineJobView
+    from trackinizer.wire.wire_machine_job import MachineJobView, ReadReply
 
     import pydantic
 else:
@@ -51,7 +50,38 @@ else:
     pydantic = lazy_import("pydantic")
 
 
-__all__ = ["Pushed", "pushed", "run_logs", "run_results", "run_submit"]
+__all__ = [
+    "MachineJobClient",
+    "Pushed",
+    "pushed",
+    "run_logs",
+    "run_results",
+    "run_submit",
+]
+
+
+class MachineJobClient(Protocol):
+    """What a machine job needs of a client: ``Client``, or a narrower one."""
+
+    def machine_job_submit(self, body: MachineJobSubmit) -> MachineJobView:
+        """Queue a job on one of the caller's machines."""
+        ...
+
+    def machine_job_view(self, job_id: int) -> MachineJobView:
+        """Return the job as it stands."""
+        ...
+
+    def machine_job_log(self, job_id: int, *, offset: int, wait: float) -> ReadReply:
+        """Read the job's log from ``offset``, waiting up to ``wait`` seconds."""
+        ...
+
+    def machine_job_manifest(self, job_id: int) -> ReadReply:
+        """Read the job's result manifest."""
+        ...
+
+    def machine_job_file(self, job_id: int, path: str, *, offset: int) -> ReadReply:
+        """Read one result file from ``offset``."""
+        ...
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -122,7 +152,7 @@ def pushed(repo: Path) -> Pushed:
 
 
 def run_submit(
-    client: Client,
+    client: MachineJobClient,
     *,
     repo: Path,
     machine: str,
@@ -205,7 +235,13 @@ def run_submit(
     return view.id
 
 
-def run_logs(client: Client, job: int, *, follow: bool, sink: IO[bytes]) -> None:
+def run_logs(
+    client: MachineJobClient,
+    job: int,
+    *,
+    follow: bool,
+    sink: IO[bytes],
+) -> None:
     """Copy a machine job's log to ``sink``; with ``follow``, until the job ends.
 
     Args:
@@ -234,7 +270,12 @@ def run_logs(client: Client, job: int, *, follow: bool, sink: IO[bytes]) -> None
             return
 
 
-def run_results(client: Client, view: MachineJobView, *, results: Path) -> None:
+def run_results(
+    client: MachineJobClient,
+    view: MachineJobView,
+    *,
+    results: Path,
+) -> None:
     """Download a machine job's results into ``results/out``, checking every file.
 
     Args:
@@ -298,7 +339,12 @@ def _chunk(reply: Chunk | ResultManifest | ReadRefused) -> Chunk:
 class _Relay:
     """The results' source for ``job_fetch``: a tar stream of files read by relay."""
 
-    def __init__(self, client: Client, job: int, sizes: dict[str, int]) -> None:
+    def __init__(
+        self,
+        client: MachineJobClient,
+        job: int,
+        sizes: dict[str, int],
+    ) -> None:
         self._client = client
         self._job = job
         self._sizes = sizes
@@ -321,7 +367,13 @@ class _Relay:
 class _RemoteFile(io.RawIOBase):
     """One result file, fetched from the machine 1 MiB at a time as it is consumed."""
 
-    def __init__(self, client: Client, job: int, path: str, size: int) -> None:
+    def __init__(
+        self,
+        client: MachineJobClient,
+        job: int,
+        path: str,
+        size: int,
+    ) -> None:
         super().__init__()
         self._client = client
         self._job = job

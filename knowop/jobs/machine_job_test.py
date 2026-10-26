@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import base64
 import hashlib
@@ -39,8 +39,6 @@ from knowop.shell.job_folder import Ended, JobFolder
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
-
-    from trackinizer.client.client import Client
 
 
 _REMOTE = "https://example.invalid/o/r.git"
@@ -341,7 +339,7 @@ class _Clock:
 
 def _submit(machine: _Machine, repo: Path, clock: _Clock, *, gpus: int = 0) -> int:
     return run_submit(
-        cast("Client", machine),
+        machine,
         repo=repo,
         machine="gx10",
         command=("python", "train.py"),
@@ -430,7 +428,7 @@ def test_logs_print_what_the_log_holds_now(machine: _Machine) -> None:
     machine.folder.note("one")
     sink = io.BytesIO()
 
-    run_logs(cast("Client", machine), 9, follow=False, sink=sink)
+    run_logs(machine, 9, follow=False, sink=sink)
 
     assert sink.getvalue() == b"knowop: one\n"
     assert machine.reads == [("log", 0)]
@@ -440,7 +438,7 @@ def test_logs_follow_until_the_job_ends(machine: _Machine) -> None:
     machine.grow = [b"two", b"three"]
     sink = io.BytesIO()
 
-    run_logs(cast("Client", machine), 9, follow=True, sink=sink)
+    run_logs(machine, 9, follow=True, sink=sink)
 
     assert sink.getvalue() == b"knowop: two\nknowop: three\n"
     assert [offset for _, offset in machine.reads] == [0, 0, 12]
@@ -461,7 +459,7 @@ def test_logs_the_machine_will_not_give_say_why(
     machine.log_reply = ReadReply(reply=reply)
 
     with pytest.raises(ClientError, match=why):
-        run_logs(cast("Client", machine), 9, follow=False, sink=io.BytesIO())
+        run_logs(machine, 9, follow=False, sink=io.BytesIO())
 
 
 def _results(machine: _Machine) -> None:
@@ -479,9 +477,9 @@ def test_results_download_every_file_checked_and_keep_the_job_beside_them(
     view = _view("completed", exit_code=0)
     results = tmp_path / "results"
 
-    run_results(cast("Client", machine), view, results=results)
+    run_results(machine, view, results=results)
     first = capsys.readouterr().out
-    run_results(cast("Client", machine), view, results=results)
+    run_results(machine, view, results=results)
 
     assert (results / "out" / "d" / "a.txt").read_bytes() == b"alpha"
     assert (results / "out" / "b.bin").read_bytes() == bytes(range(256)) * 3
@@ -502,7 +500,7 @@ def test_a_large_result_is_read_in_chunks_of_a_mebibyte(
     _ = (machine.folder.out / "big.bin").write_bytes(data)
     machine.results_max = 2**21
 
-    run_results(cast("Client", machine), _view("completed"), results=tmp_path / "r")
+    run_results(machine, _view("completed"), results=tmp_path / "r")
 
     assert (tmp_path / "r" / "out" / "big.bin").read_bytes() == data
     assert [offset for name, offset in machine.reads if name == "big.bin"] == [0, 2**20]
@@ -512,7 +510,7 @@ def test_a_remote_result_reads_as_a_stream_that_ends_at_its_size(
     machine: _Machine,
 ) -> None:
     _ = (machine.folder.out / "a.bin").write_bytes(b"abc")
-    remote = machine_job._RemoteFile(cast("Client", machine), 9, "a.bin", 3)
+    remote = machine_job._RemoteFile(machine, 9, "a.bin", 3)
 
     with io.BufferedReader(remote) as stream:
         assert (stream.read(), stream.read()) == (b"abc", b"")
@@ -531,7 +529,7 @@ def test_results_over_the_machines_limit_are_refused_with_where_they_stay(
         ClientError,
         match=r"over the 100 bytes gx10 sends back; they stay",
     ):
-        run_results(cast("Client", machine), _view("completed"), results=tmp_path / "r")
+        run_results(machine, _view("completed"), results=tmp_path / "r")
 
     assert not (tmp_path / "r").exists()
 
@@ -544,7 +542,7 @@ def test_a_result_whose_bytes_changed_on_the_way_is_discarded(
     machine.corrupt = "d/a.txt"
 
     with pytest.raises(IntegrityError, match="does not match its sha256"):
-        run_results(cast("Client", machine), _view("completed"), results=tmp_path / "r")
+        run_results(machine, _view("completed"), results=tmp_path / "r")
 
     assert not (tmp_path / "r" / "out" / "d" / "a.txt").exists()
 
@@ -560,7 +558,7 @@ def test_a_result_that_shrank_after_its_listing_is_said_plainly(
     machine.listing = ReadReply(reply=listing)
 
     with pytest.raises(ClientError, match=r"b\.bin ended before its 768 bytes"):
-        run_results(cast("Client", machine), _view("completed"), results=tmp_path / "r")
+        run_results(machine, _view("completed"), results=tmp_path / "r")
 
 
 def test_a_manifest_answered_with_a_chunk_is_refused(
@@ -570,7 +568,7 @@ def test_a_manifest_answered_with_a_chunk_is_refused(
     machine.listing = ReadReply(reply=Chunk(data_b64="", offset=0, size=0, ended=True))
 
     with pytest.raises(ClientError, match="answered a manifest with something else"):
-        run_results(cast("Client", machine), _view("completed"), results=tmp_path / "r")
+        run_results(machine, _view("completed"), results=tmp_path / "r")
 
 
 if __name__ == "__main__":
