@@ -53,6 +53,7 @@ _PUBLIC = f"ssh-ed25519 {_BLOB}"
 _CERT = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAx"
 _COMMIT = "a" * 40
 _BASE = "b" * 40
+_HEAD = "c" * 40
 _URL = "https://trax.example"
 _TOOLS = Tools(ssh="ssh", ssh_keygen="ssh-keygen")
 
@@ -309,6 +310,8 @@ def _fake_source(
     size: int = 12,
     base: str | None = None,
     untracked: tuple[str, ...] = (),
+    head: str = "",
+    shallow: bool = False,
 ) -> list[list[str]]:
     """Replace git: the snapshot is a commit, the bundle a 12-byte file."""
     bundled: list[list[str]] = []
@@ -332,6 +335,8 @@ def _fake_source(
             private_git_dir=private,
             files=5,
             untracked=untracked,
+            head=head,
+            shallow=shallow,
         )
 
     def bundle(snap: Snapshot, bases: Sequence[str], out: Path) -> BundleInfo:
@@ -663,6 +668,49 @@ def test_submit_says_which_untracked_files_the_snapshot_took(
     assert lines[:2] == [
         "snapshot: 5 files at aaaaaaaaaaaa",
         "untracked files sent (2): new.py, sub/c.txt",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("head", "line"),
+    [
+        ("", "snapshot: 5 files at aaaaaaaaaaaa"),
+        (_COMMIT, "snapshot: 5 files at aaaaaaaaaaaa"),
+        (_HEAD, "snapshot: 5 files at aaaaaaaaaaaa (HEAD cccccccccccc)"),
+    ],
+    ids=["no head", "clean", "own commit"],
+)
+def test_submit_names_head_when_the_snapshot_is_a_commit_of_its_own(
+    world: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    head: str,
+    line: str,
+) -> None:
+    _ = _fake_source(monkeypatch, tmp_path, head=head)
+
+    _submit(world)
+
+    assert capsys.readouterr().err.splitlines()[0] == line
+
+
+def test_submit_says_once_that_a_shallow_clone_goes_whole_as_its_own_commit(
+    world: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _ = _fake_source(monkeypatch, tmp_path, head=_HEAD, shallow=True)
+
+    _submit(world)
+
+    assert capsys.readouterr().err.splitlines()[:4] == [
+        "snapshot: 5 files at aaaaaaaaaaaa (HEAD cccccccccccc)",
+        "job 7: requested, waiting for a node",
+        "shallow clone: sending a full snapshot of HEAD cccccccccccc as its own commit",
+        "bundle: 12 bytes, full",
     ]
 
 

@@ -4,7 +4,9 @@ The snapshot is a git commit of the worktree's exact bytes, untracked files
 included and ignored files left out. It is built in a private object store with a
 private index, so the user's index, ``HEAD``, refs and objects are never written.
 The bundle holds only what the node lacks: it is cut on top of commits the node
-says it already has.
+says it already has. A node takes a commit only with all of its history, which a
+shallow clone lacks, so a shallow clone's snapshot is a commit with no parent, sent
+whole.
 
 An untracked file is in the snapshot because the user did not ignore it, which is not
 the same as meaning to send it. A key, a ``.env`` or a credentials file that nobody
@@ -89,7 +91,8 @@ class Snapshot:
     """A commit of the worktree, and the private repository that holds it."""
 
     commit: str
-    """The snapshot commit; ``HEAD`` itself when the worktree is clean."""
+    """The snapshot commit; ``HEAD`` itself when the worktree is clean and not a
+    shallow clone."""
 
     private_git_dir: Path
     """A bare repository whose alternates point at the user's objects."""
@@ -100,6 +103,13 @@ class Snapshot:
     untracked: tuple[str, ...] = ()
     """The untracked files that are not ignored, which the snapshot added to the
     commit, by path from the worktree's top."""
+
+    head: str = ""
+    """The ``HEAD`` the snapshot was taken of; empty before the first commit."""
+
+    shallow: bool = False
+    """The worktree is a shallow clone, so the commit has no parent and is sent
+    whole."""
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -133,14 +143,16 @@ def snapshot(repo: Path, tmp: Path, *, allow_secret_names: bool = False) -> Snap
         untracked file has a secret's name and ``allow_secret_names`` is not set.
 
     """
-    top, common, index = Git(cwd=repo, env=clean_env())(
+    top, common, index, shallow_repository = Git(cwd=repo, env=clean_env())(
         "rev-parse",
         "--path-format=absolute",
         "--show-toplevel",
         "--git-common-dir",
         "--git-path",
         "index",
+        "--is-shallow-repository",
     ).splitlines()
+    shallow = shallow_repository == "true"
     _ = Git(cwd=repo, env=clean_env())("init", "--bare", str(tmp))
     (tmp / "objects" / "info" / "alternates").write_text(
         f"{Path(common) / 'objects'}\n",
@@ -170,10 +182,12 @@ def snapshot(repo: Path, tmp: Path, *, allow_secret_names: bool = False) -> Snap
     _ = git(*unsplit, "add", "-A")
     tree = git(*unsplit, "write-tree").strip()
     head = _head(git)
-    if head is not None and head[1] == tree:
+    if head is not None and head[1] == tree and not shallow:
         commit = head[0]
     else:
-        parent = [] if head is None else ["-p", head[0]]
+        # A node takes a commit only with all of its history, and a shallow clone
+        # lacks what lies below its HEAD: a commit on that HEAD could never be sent.
+        parent = [] if head is None or shallow else ["-p", head[0]]
         base = "an empty repository" if head is None else head[0]
         commit = git(
             "commit-tree",
@@ -189,6 +203,8 @@ def snapshot(repo: Path, tmp: Path, *, allow_secret_names: bool = False) -> Snap
         private_git_dir=tmp,
         files=files,
         untracked=untracked,
+        head="" if head is None else head[0],
+        shallow=shallow,
     )
 
 
@@ -211,7 +227,8 @@ def bundle(snap: Snapshot, bases: Sequence[str], out: Path) -> BundleInfo:
 
     Args:
       snap: The snapshot to send.
-      bases: Commits the node holds, newest first; unknown ones are ignored.
+      bases: Commits the node holds, newest first; unknown ones are ignored, and all
+        of them for a shallow clone's snapshot.
       out: Where the bundle is written.
 
     Returns:
@@ -224,7 +241,8 @@ def bundle(snap: Snapshot, bases: Sequence[str], out: Path) -> BundleInfo:
     git = Git(cwd=snap.private_git_dir, env=clean_env())
     ref = f"refs/trax/gpu/{snap.commit}"
     _ = git("update-ref", ref, snap.commit)
-    held = _held(git, bases)
+    # A shallow clone's snapshot has no parent, so no base lies under it to cut on.
+    held: list[str] = [] if snap.shallow else _held(git, bases)
     kept = [each for each in held if each != snap.commit]
     if snap.commit in held:
         # The node already has this commit, so its parents are on the node too.
@@ -234,7 +252,8 @@ def bundle(snap: Snapshot, bases: Sequence[str], out: Path) -> BundleInfo:
     except ClientError:
         if not kept:
             raise
-        # A base that descends from the snapshot leaves nothing to send.
+        # Git refuses some cuts, such as on a base that descends from the snapshot,
+        # which leaves nothing to send; a full bundle needs no base.
         kept.clear()
         _ = git("bundle", "create", str(out), ref)
     with out.open("rb") as file:

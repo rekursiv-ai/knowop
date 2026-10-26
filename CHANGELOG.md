@@ -3,6 +3,16 @@
 All notable knowop changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- `knowop job submit` works from a shallow clone (`git clone --depth 1`). It
+  failed after the node was granted, with `git bundle failed: error: Could not
+  read <parent>`, because the clone lacks the history below its `HEAD`. Its
+  snapshot is now a commit of its own with no parent, sent as a full bundle;
+  submit says so, and the `snapshot:` line names the `HEAD` it was taken of.
+
 ## 0.1.5 - 2026-10-26
 
 ### Changed
