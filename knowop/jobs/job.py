@@ -449,7 +449,13 @@ class Job(Command):
                 Path(scratch),
                 allow_secret_names=include_untracked,
             )
-            echo(f"snapshot: {snap.files} files at {snap.commit[:12]}", err=True)
+            of_head = (
+                "" if snap.head in {"", snap.commit} else f" (HEAD {snap.head[:12]})"
+            )
+            echo(
+                f"snapshot: {snap.files} files at {snap.commit[:12]}{of_head}",
+                err=True,
+            )
             _say_untracked(snap)
             with job_ssh.one_time_key(rig.runner, tools=rig.tools) as key:
                 body = _submit_body(
@@ -716,6 +722,12 @@ def _upload(
     grant: Grant,
 ) -> BundleInfo:
     """Send the snapshot as a thin bundle, or a full one if the node rejects it."""
+    if snap.shallow:
+        echo(
+            f"shallow clone: sending a full snapshot of HEAD {snap.head[:12]} "
+            "as its own commit",
+            err=True,
+        )
     info = _bundle(snap, gate.bases(), scratch / "thin.bundle", grant)
     try:
         reply = gate.upload(info.path, sha256=info.sha256, commit=snap.commit)

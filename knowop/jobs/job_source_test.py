@@ -116,6 +116,25 @@ def dirty(repo: Path) -> Path:
     return repo
 
 
+@pytest.fixture(scope="module")
+def history(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build a repo with two commits, so a clone of depth one lacks the first."""
+    repo = tmp_path_factory.mktemp("history")
+    _git(repo, "init", "--quiet", "--initial-branch=main")
+    for text in ("one\n", "two\n"):
+        (repo / "a.txt").write_text(text)
+        _git(repo, "add", "a.txt")
+        _git(repo, "commit", "--quiet", "-m", text)
+    return repo
+
+
+@pytest.fixture
+def shallow(history: Path, tmp_path: Path) -> Path:
+    # Git ignores --depth when it clones a local path; a file:// URL makes it shallow.
+    _git(tmp_path, "clone", "--quiet", "--depth", "1", history.as_uri(), "shallow")
+    return tmp_path / "shallow"
+
+
 @pytest.fixture
 def scratch(tmp_path: Path) -> Path:
     (tmp_path / "private").mkdir()
@@ -150,6 +169,7 @@ def test_a_snapshot_holds_the_worktree_untracked_files_included_ignored_excluded
     )
     assert snap.files == 5
     assert snap.private_git_dir == scratch
+    assert (snap.head, snap.shallow) == (_git(dirty, "rev-parse", "HEAD"), False)
 
 
 def test_a_snapshot_leaves_the_users_repository_untouched(
@@ -201,6 +221,28 @@ def test_a_clean_tree_reuses_head_and_writes_no_commit(
 
     assert snap.commit == head
     assert snap.files == 3
+    assert (snap.head, snap.shallow) == (head, False)
+
+
+# A node takes a commit only with all of its history, and a shallow clone lacks the
+# parent of its HEAD, so no bundle of a commit on that HEAD could unpack there.
+@pytest.mark.parametrize("text", ["two\n", "two changed\n"], ids=["clean", "dirty"])
+def test_a_shallow_clones_snapshot_is_a_commit_with_no_parent(
+    shallow: Path,
+    scratch: Path,
+    text: str,
+) -> None:
+    (shallow / "a.txt").write_text(text)
+    head = _git(shallow, "rev-parse", "HEAD")
+
+    snap = job_source.snapshot(shallow, scratch)
+
+    assert (snap.head, snap.shallow) == (head, True)
+    assert _git(scratch, "rev-list", "--parents", "-n1", snap.commit) == snap.commit
+    assert _git(scratch, "show", f"{snap.commit}:a.txt") == text.strip()
+    assert _git(scratch, "log", "-1", "--format=%s", snap.commit) == (
+        f"knowop job snapshot of {head}"
+    )
 
 
 def test_a_snapshot_works_from_a_subdirectory_and_a_linked_worktree(
@@ -231,6 +273,7 @@ def test_a_repository_with_no_commit_snapshots_as_a_root_commit(
 
     assert _git(scratch, "rev-list", "--parents", "-n1", snap.commit) == snap.commit
     assert snap.files == 1
+    assert (snap.head, snap.shallow) == ("", False)
 
 
 def test_a_directory_outside_any_repository_is_refused(
@@ -728,6 +771,34 @@ def test_a_bundle_that_cannot_be_written_is_one_plain_error(
 
     with pytest.raises(ClientError, match=r"^git bundle failed: \S"):
         job_source.bundle(snap, [], tmp_path / "no-such-dir" / "out.bundle")
+
+
+@pytest.mark.parametrize("held", ["nothing", "head", "the snapshot"])
+def test_a_shallow_clones_snapshot_is_bundled_whole_and_unpacks_in_an_empty_repo(
+    shallow: Path,
+    scratch: Path,
+    tmp_path: Path,
+    held: str,
+) -> None:
+    head = _git(shallow, "rev-parse", "HEAD")
+    snap = job_source.snapshot(shallow, scratch)
+    bases = {"nothing": [], "head": [head], "the snapshot": [snap.commit]}[held]
+
+    info = job_source.bundle(snap, bases, tmp_path / "out.bundle")
+
+    assert info.base is None
+    assert _unbundled(tmp_path, bundle=info.path, commit=snap.commit) == snap.commit
+
+
+def _unbundled(tmp_path: Path, *, bundle: Path, commit: str) -> str:
+    """Fetch the bundle into an empty repo, checked as a node's gate checks it."""
+    node = tmp_path / "node"
+    _git(tmp_path, "init", "--quiet", "--bare", str(node))
+    checked = ("-c", "transfer.fsckObjects=true")
+    _git(node, *checked, "bundle", "verify", "--quiet", str(bundle))
+    ref = f"refs/trax/gpu/{commit}:refs/job/head"
+    _git(node, *checked, "fetch", "--quiet", str(bundle), ref)
+    return _git(node, "rev-parse", "refs/job/head")
 
 
 @pytest.mark.parametrize(
