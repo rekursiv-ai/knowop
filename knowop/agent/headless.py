@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol
 
 import asyncio
 import contextlib
-import json
 import logging
 import queue
 import signal
@@ -37,7 +36,7 @@ import threading
 
 from trackinizer.runs import asks
 from trackinizer.runs.asks import Driver
-from treekle import json_loads, to_plain
+from treekle import json_dumps, json_loads
 
 from knowop.agent.program import PROGRAM
 
@@ -46,8 +45,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Coroutine
     from pathlib import Path
 
-    from trackinizer.lib.agent.types.sessions import SystemMessage
     from trackinizer.runs.asks import Answer
+    from trackinizer.sagent.session.types import SystemMessage
 
 
 __all__ = [
@@ -554,9 +553,9 @@ class HeadlessRun:
             # A liveness probe connects and leaves without a word.
             if line:
                 answer = await self._answer(json_loads(line.decode(), Request))
-                writer.write(json.dumps(to_plain(answer)).encode() + b"\n")
+                writer.write(json_dumps(answer, target=Reply).encode() + b"\n")
         except ValueError:
-            writer.write(json.dumps(to_plain(_UNREADABLE)).encode() + b"\n")
+            writer.write(json_dumps(_UNREADABLE, target=Reply).encode() + b"\n")
         finally:
             writer.close()
 
@@ -684,7 +683,7 @@ async def _ask(address: Path, asked: Request, timeout_sec: float) -> Reply:
     """Write one request line and read the one reply line."""
     reader, writer = await asyncio.open_unix_connection(address)
     try:
-        writer.write(json.dumps(to_plain(asked)).encode() + b"\n")
+        writer.write(json_dumps(asked, target=Request).encode() + b"\n")
         async with asyncio.timeout(timeout_sec):
             line = await reader.readline()
     finally:

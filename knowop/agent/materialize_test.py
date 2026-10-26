@@ -15,7 +15,9 @@ import subprocess
 from trackinizer.lib.agent.sessions import claude, codex
 from trackinizer.lib.agent.sessions.convert import detect_format
 from trackinizer.lib.agent.sessions.tail import Tail
-from trackinizer.lib.agent.types.sessions import (
+from trackinizer.runs.adapters.claude import ClaudeAdapter
+from trackinizer.runs.adapters.codex import CodexAdapter
+from trackinizer.sagent.session.types import (
     AssistantMessage,
     IncompleteRecord,
     SessionRecord,
@@ -24,8 +26,6 @@ from trackinizer.lib.agent.types.sessions import (
     UncategorizedRecord,
     UserMessage,
 )
-from trackinizer.runs.adapters.claude import ClaudeAdapter
-from trackinizer.runs.adapters.codex import CodexAdapter
 from trackinizer.trax.forward import RUN_CLIS
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.types.streams import Stderr, Stdin, Stdout, TraxRecord

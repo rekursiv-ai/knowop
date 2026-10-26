@@ -6,6 +6,7 @@ injected: no test reads the person's own claude or codex config.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
@@ -33,9 +34,7 @@ from knowop.agent.trust import (
 _CWD: Final = Path(__file__).resolve().parent
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from trackinizer.lib.agent.types.sessions import SystemMessage
+    from trackinizer.sagent.session.types import SystemMessage
 
 
 # The trust card as Chat reads it, and the answer Chat posts for it: copies of the files
@@ -315,7 +314,7 @@ class _Card:
         )
         self.gate.open(cli, "~/proj", machine="gx10", remembered=cli == "codex")
         card = self.records[0].extra["$interaction"]
-        assert isinstance(card, dict)
+        assert isinstance(card, Mapping)
         self.id = card["id"]
 
     def answer(self, decision: str, *, prompt_id: object = None) -> bool:

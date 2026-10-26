@@ -43,7 +43,7 @@ class SlashCommand:
 
     Handled inside the CLI -- it changes CLI state, not model context -- so the
     model never sees it and it is absent from the session log. It is therefore
-    NOT a :data:`~trackinizer.lib.agent.types.sessions.SessionRecord`: a record has an
+    NOT a :data:`~trackinizer.sagent.session.types.SessionRecord`: a record has an
     ``idx``, its position in the file's normalized stream, and a command that
     was never written to that file has none. It is captured by observing the
     human's keystrokes on the PTY (the only place it is visible) and stored

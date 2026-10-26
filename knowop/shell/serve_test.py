@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 _SERVER: Final = "https://know.example"
 _MACHINE_ID: Final = uuid.UUID(int=7)
 _CREDENTIAL: Final = "trax_machine_" + "1" * 32 + "_" + "C" * 43
+_REVOKED_CREDENTIAL: Final = "trax_machine_" + "2" * 32 + "_" + "R" * 43
 _ENROLLMENT: Final = "enr_" + "0" * 32 + "_" + "e" * 43
 _LOGIN_KEY: Final = "trax_" + "k" * 43
 _PROFILE_KEY: Final = "trax_" + "p" * 43
@@ -81,10 +82,13 @@ class _Server:
         commands: list[ExecWait] | None = None,
         poll: DeviceToken | None = None,
         enroll_status: int = 201,
+        revoked: str = "",
     ) -> None:
         self.poll = poll
         self.enroll_status = enroll_status
         """What an enrollment answers when ada asks: 201 enrolls, else a refusal."""
+        self.revoked = revoked
+        """The machine credential whose heartbeats answer 410, as after a disconnect."""
         self.requests: list[tuple[str, str, str, dict[str, object]]] = []
         self.commands = list(commands or [])
         self.results: list[ExecResult] = []
@@ -159,6 +163,8 @@ class _Server:
         if path == wire_machine_host.JOIN_PATH:
             joined = JoinResponse(machine_id=_MACHINE_ID, credential=_CREDENTIAL)
             return httpx2.Response(200, content=joined.model_dump_json())
+        if path.endswith("/heartbeat") and auth == f"Bearer {self.revoked}":
+            return httpx2.Response(410, json={"detail": "machine_revoked"})
         if path.endswith("/heartbeat"):
             beat = HeartbeatResponse(server_time=datetime(2030, 1, 1, tzinfo=UTC))
             return httpx2.Response(200, content=beat.model_dump_json())
@@ -568,6 +574,47 @@ def test_a_later_run_reuses_the_machine_credential_and_asks_for_nothing(
     facts = take[3]["facts"]
     assert isinstance(facts, dict)
     assert facts["exec"] is True
+
+
+def test_a_computer_disconnected_since_its_last_connect_joins_again_with_no_login(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The Machines page disconnected it; the next connect enrolls with the key."""
+    saved = (
+        state_dir()
+        / "rekursiv-ai"
+        / "trax"
+        / "machines"
+        / server_dir(_SERVER)
+        / "ada@example.com"
+        / "dev-box.credential"
+    )
+    saved.parent.mkdir(parents=True)
+    stale = JoinResponse(machine_id=_MACHINE_ID, credential=_REVOKED_CREDENTIAL)
+    saved.write_text(stale.model_dump_json())
+    server = _Server(revoked=_REVOKED_CREDENTIAL)
+    _on(server, monkeypatch)
+    _stdin(monkeypatch, "")
+    keyed = Client(_SERVER, api_key=_PROFILE_KEY)
+
+    _connect(_Waits(server.asked("/exec/wait")), signed_in=lambda: keyed)
+
+    assert server.calls("/auth/device/code") == []
+    [enroll] = server.calls("/api/machines/enroll")
+    assert enroll[2] == f"Bearer {_PROFILE_KEY}"
+    [join] = server.calls("/api/machines/join")
+    assert join[3]["token"] == _ENROLLMENT
+    assert [(beat[2], beat[3]["claim"]) for beat in server.calls("/heartbeat")] == [
+        (f"Bearer {_REVOKED_CREDENTIAL}", "take"),
+        (f"Bearer {_CREDENTIAL}", "take"),
+        (f"Bearer {_CREDENTIAL}", "release"),
+    ]
+    assert JoinResponse.model_validate_json(saved.read_text()).credential == _CREDENTIAL
+    assert (
+        "rejoined: machine dev-box as ada@example.com; the server refused its saved "
+        "credential"
+    ) in capsys.readouterr().out.splitlines()
 
 
 def test_no_exec_serves_no_commands_and_does_not_say_it_does(

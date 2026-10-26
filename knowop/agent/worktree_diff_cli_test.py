@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import os
 
-from trackinizer.lib.agent.types.sessions import FileEditResult
+from trackinizer.sagent.session.types import FileEditResult
 
 import pytest
 

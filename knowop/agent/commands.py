@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Final, Literal
 
 import threading
 
-from trackinizer.lib.agent.types.sessions import (
+from trackinizer.sagent.session.types import (
     ContextState,
     SystemMessage,
     UncategorizedRecord,

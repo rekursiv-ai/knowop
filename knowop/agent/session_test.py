@@ -46,7 +46,16 @@ from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.agent.sessions import claude, codex
 from trackinizer.lib.agent.sessions.tail import Tail
-from trackinizer.lib.agent.types.sessions import (
+from trackinizer.lib.posix import follow
+from trackinizer.lib.posix.follow import follow_tree
+from trackinizer.lib.posix.host import HostSpec
+from trackinizer.lib.posix.relay import ThreadedRelay
+from trackinizer.runs.adapters.claude import ClaudeAdapter
+from trackinizer.runs.adapters.codex import CodexAdapter
+from trackinizer.runs.adapters.gemini import GeminiAdapter
+from trackinizer.runs.adapters.iostream import IOStreamAdapter
+from trackinizer.runs.asks import Answer, Ask, Resolved, StateChanged
+from trackinizer.sagent.session.types import (
     AssistantMessage,
     ContextCompaction,
     ContextState,
@@ -57,15 +66,6 @@ from trackinizer.lib.agent.types.sessions import (
     UncategorizedRecord,
     UserMessage,
 )
-from trackinizer.lib.posix import follow
-from trackinizer.lib.posix.follow import follow_tree
-from trackinizer.lib.posix.host import HostSpec
-from trackinizer.lib.posix.relay import ThreadedRelay
-from trackinizer.runs.adapters.claude import ClaudeAdapter
-from trackinizer.runs.adapters.codex import CodexAdapter
-from trackinizer.runs.adapters.gemini import GeminiAdapter
-from trackinizer.runs.adapters.iostream import IOStreamAdapter
-from trackinizer.runs.asks import Answer, Ask, Resolved, StateChanged
 from trackinizer.trax.daemon.protocol import socket_address
 from trackinizer.trax.profile import LOCALHOST_FALLBACK_URL
 from trackinizer.types.session_records import SessionRecordRow

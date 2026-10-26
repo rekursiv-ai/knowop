@@ -20,7 +20,7 @@ import threading
 import time
 
 from trackinizer.trax.daemon.protocol import socket_address
-from treekle import from_plain, json_loads, to_plain
+from treekle import from_plain, json_dumps, json_loads, to_plain
 
 import pytest
 
@@ -1559,7 +1559,7 @@ class _Control:
                     if isinstance(self._reply, Reply)
                     else self._reply[asked.op]
                 )
-                stream.write(json.dumps(to_plain(reply)).encode() + b"\n")
+                stream.write(json_dumps(reply).encode() + b"\n")
                 stream.flush()
 
 

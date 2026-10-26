@@ -7,7 +7,6 @@ from unittest.mock import Mock
 
 import argparse
 import ast
-import json
 import os
 import subprocess
 import sys
@@ -18,7 +17,7 @@ from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.trax import profile
 from trackinizer.trax.profile import Profile
-from treekle import json_loads, to_plain
+from treekle import json_dumps, json_loads
 
 import pytest
 
@@ -189,7 +188,7 @@ def test_the_host_entry_reads_and_closes_its_private_descriptor(
     ran: list[session.RunConfig] = []
     monkeypatch.setattr(session, "run", partial(_record_host_run, ran))
     with tempfile.TemporaryFile() as payload:
-        _ = payload.write(json.dumps(to_plain(request)).encode())
+        _ = payload.write(json_dumps(request).encode())
         _ = payload.seek(0)
         inherited = os.dup(payload.fileno())
         try:

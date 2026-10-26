@@ -8,7 +8,7 @@ from io import StringIO
 import json
 
 from trackinizer.lib.agent.sessions import claude, codex
-from trackinizer.lib.agent.types.sessions import (
+from trackinizer.sagent.session.types import (
     AssistantMessage,
     ContextState,
     SessionRecord,

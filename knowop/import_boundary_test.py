@@ -30,8 +30,10 @@ _PACKAGE: Final = __name__.rpartition(".")[0]
 _ALLOWED: Final = (
     _PACKAGE,
     "trackinizer",
-    # The lib modules trackinizer's export carries: the session records the agent
-    # runner writes, the pty plumbing the hosts use, and the per-user folders.
+    # The modules trackinizer's export carries: the session records the agent
+    # runner writes, their readers, the pty plumbing the hosts use, and the
+    # per-user folders.
+    "trackinizer.sagent.session",
     "trackinizer.lib.agent",
     "trackinizer.lib.posix",
     "trackinizer.lib.userdirs",

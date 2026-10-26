@@ -5,7 +5,7 @@ where it came from. It lives here rather than beside the ``Adapter`` protocol
 because the sinks never touch an adapter -- keeping it in ``adapters/`` made
 every sink import the adapter package for one dataclass.
 
-The act itself is the shared IR record (``trackinizer.lib.agent.types.sessions``)
+The act itself is the shared IR record (``trackinizer.sagent.session.types``)
 widened by the scrape's stream records (:data:`TraxRecord`): one vocabulary
 reads a session, stores it, and writes it back out as any CLI's native format.
 

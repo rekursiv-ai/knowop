@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import re
@@ -52,7 +51,7 @@ from trackinizer.lib.posix.terminal import write_all
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.trax.daemon.protocol import socket_address
 from trackinizer.wire.wire_sessions import RUN_NAME_PATTERN
-from treekle import json_loads, to_plain
+from treekle import json_dumps, json_loads
 
 from knowop.agent import headless
 from knowop.agent.custom_types import HostRequest, RunRequest
@@ -598,7 +597,7 @@ def _read_record(paths: Path) -> HostRecord | None:
 def _write_record(paths: Path, record: HostRecord) -> None:
     """Persist ``record`` as the host's ``host.json``."""
     staged = paths / "host.json.tmp"
-    _ = staged.write_text(json.dumps(to_plain(record), indent=2) + "\n")
+    _ = staged.write_text(json_dumps(record, target=HostRecord, indent=2) + "\n")
     _ = staged.replace(paths / "host.json")
 
 
@@ -668,7 +667,7 @@ def _spawn(request: HostRequest, *, ready: int, log: Path) -> None:
             "wb",
         ) as out,
     ):
-        _ = payload.write(json.dumps(to_plain(request)).encode())
+        _ = payload.write(json_dumps(request, target=HostRequest).encode())
         _ = payload.seek(0)
         process = subprocess.Popen(  # noqa: S603 -- Fixed interpreter and package; only an inherited fd is passed.
             [
