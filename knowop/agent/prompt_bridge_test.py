@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-    from trackinizer.lib.agent.types.sessions import SystemMessage
+    from trackinizer.sagent.session.types import SystemMessage
 
 
 _JOIN_SEC = 2.0

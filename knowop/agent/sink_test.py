@@ -16,7 +16,12 @@ import threading
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.agent.types.sessions import (
+from trackinizer.lib.posix.follow import follow_tree
+from trackinizer.runs.adapters.claude import ClaudeAdapter
+from trackinizer.runs.adapters.codex import CodexAdapter
+from trackinizer.runs.adapters.iostream import IOStreamAdapter
+from trackinizer.runs.redact import Redactor
+from trackinizer.sagent.session.types import (
     AgentStatusResult,
     AgentToAgentMessage,
     AssistantMessage,
@@ -41,11 +46,6 @@ from trackinizer.lib.agent.types.sessions import (
     WebSearchResult,
     WebSearchResults,
 )
-from trackinizer.lib.posix.follow import follow_tree
-from trackinizer.runs.adapters.claude import ClaudeAdapter
-from trackinizer.runs.adapters.codex import CodexAdapter
-from trackinizer.runs.adapters.iostream import IOStreamAdapter
-from trackinizer.runs.redact import Redactor
 from trackinizer.types.line_capture import LineCapture
 from trackinizer.types.session_records import _BY_KIND, SessionRecordRow
 from trackinizer.types.streams import Stderr, Stdin, Stdout

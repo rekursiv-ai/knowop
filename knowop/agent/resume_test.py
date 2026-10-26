@@ -20,7 +20,7 @@ from trackinizer.lib.agent.sessions import (
     sagent,
 )
 from trackinizer.lib.agent.sessions.tail import Tail
-from trackinizer.lib.agent.types.sessions import (
+from trackinizer.sagent.session.types import (
     AgentToAgentMessage,
     AssistantMessage,
     ContextClear,
@@ -62,7 +62,7 @@ from knowop.agent.truncate import (
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from trackinizer.lib.agent.types.sessions import SessionRecord
+    from trackinizer.sagent.session.types import SessionRecord
     from trackinizer.types.streams import TraxRecord
 
 

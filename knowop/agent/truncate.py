@@ -38,15 +38,15 @@ from uuid import UUID
 import json
 import re
 
-from trackinizer.lib.agent.types.sessions import (
+from trackinizer.sagent.session.types import (
+    CONCRETE_TYPES,
     IncompleteRecord,
     ToolResult,
     UncategorizedRecord,
 )
-from trackinizer.lib.agent.types.stored import from_stored, to_stored
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.types.streams import Stderr, Stdin, Stdout
-from treekle import immutable, mutable
+from treekle import from_plain, immutable, mutable, to_plain
 
 
 if TYPE_CHECKING:
@@ -187,9 +187,15 @@ def without_note[R: TraxRecord](record: R) -> R:
 def _cut(body: RecordBody, record: TraxRecord, *, cap: int) -> RecordBody:
     """Return ``body`` holding ``record`` with every string over ``cap`` bytes cut."""
     omitted: list[int] = []
-    cut = from_stored(
-        _cut_tree(to_stored(record), cap=cap, omitted=omitted),
+    tree = to_plain(
+        record,
+        sort=False,
+        default_concrete_types=CONCRETE_TYPES,
+    )
+    cut = from_plain(
+        _cut_tree(tree, cap=cap, omitted=omitted),
         type(record),
+        default_concrete_types=CONCRETE_TYPES,
     )
     if not omitted:
         return body

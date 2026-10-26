@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
-    from trackinizer.lib.agent.types.sessions import SystemMessage
+    from trackinizer.sagent.session.types import SystemMessage
 
 CANVAS = "c5286865-67b6-4bd8-ab51-e06e10c326c5"
 TILE = "2de97e19-2624-4e89-804e-f19e7248eec3"

@@ -31,7 +31,7 @@ import tomllib
 import unicodedata
 import uuid
 
-from trackinizer.lib.agent.types.sessions import SystemMessage
+from trackinizer.sagent.session.types import SystemMessage
 from treekle import PlainTree, from_plain, json_loads
 
 

@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import asyncio
-import json
 import logging
 import re
 import sys
@@ -25,7 +24,7 @@ from trackinizer.runs.asks import (
     Resolved,
     StateChanged,
 )
-from treekle import PlainTree, from_plain, json_loads, to_plain
+from treekle import PlainTree, from_plain, json_dumps, json_loads
 
 import pytest
 
@@ -223,15 +222,13 @@ class _Rig:
         self.log.touch()
         script = tmp_path / "script.json"
         script.write_text(
-            json.dumps(
-                to_plain(
-                    {
-                        "log": str(self.log),
-                        "replies": {**_REPLIES, **(replies or {})},
-                        "after": after or {},
-                        "on_response": on_response or {},
-                    },
-                ),
+            json_dumps(
+                {
+                    "log": str(self.log),
+                    "replies": {**_REPLIES, **(replies or {})},
+                    "after": after or {},
+                    "on_response": on_response or {},
+                },
             ),
         )
         self.cwd = tmp_path

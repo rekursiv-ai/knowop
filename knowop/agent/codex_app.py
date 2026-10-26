@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING, Final, Literal
 
 import asyncio
 import contextlib
-import json
 import logging
 import uuid
 
@@ -52,7 +51,7 @@ from trackinizer.runs.asks import (
     RunState,
     StateChanged,
 )
-from treekle import PlainTree, from_plain, json_loads, to_plain
+from treekle import PlainTree, from_plain, json_dumps, json_loads
 
 
 if TYPE_CHECKING:
@@ -376,7 +375,7 @@ class CodexAppDriver:
 
     async def _send(self, frame: _Tree) -> None:
         piped = self._piped
-        data = json.dumps(to_plain(frame)).encode() + b"\n"
+        data = json_dumps(frame).encode() + b"\n"
         if piped is None or not await piped.write(data):
             raise CodexAppError("the codex app-server is not running")
 

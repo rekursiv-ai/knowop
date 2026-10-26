@@ -41,15 +41,15 @@ from trackinizer.lib.agent.sessions import (
     claude,
     codex,
 )
-from trackinizer.lib.agent.types.sessions import (
+from trackinizer.runs.adapters.claude import ClaudeAdapter
+from trackinizer.runs.adapters.codex import CodexAdapter
+from trackinizer.sagent.session.types import (
     IncompleteRecord,
     SessionRecord,
     Thinking,
     TurnContext,
     UncategorizedRecord,
 )
-from trackinizer.runs.adapters.claude import ClaudeAdapter
-from trackinizer.runs.adapters.codex import CodexAdapter
 from treekle import PlainTree, from_plain, immutable, mutable
 
 from knowop.agent.errors import (

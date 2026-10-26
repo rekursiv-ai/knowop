@@ -174,7 +174,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     verbs.add_parser(
         "logout",
-        help="revoke knowop's key on the server and delete its profile",
+        help="log this computer out, revoke knowop's key and delete its profile",
     )
     verbs.add_parser(
         "status",
@@ -345,12 +345,15 @@ def _server(target: str) -> str:
 
 
 def _log_out() -> None:
-    """Revoke knowop's key on its server, then delete its profile."""
+    """Log this computer's machine out, revoke knowop's key, then delete its profile."""
     name, profile = _profile()
     with Client(profile.url, api_key=profile.api_key) as http:
         if (caller := _caller(http)) is not None:
             key = from_plain(caller.get("api_key_id"), uuid.UUID)
-            http.post(f"/api/me/tokens/{key}/revoke")
+            _log_out_machine(http, host_name())
+            # Logging the machine out revokes the keys its logins made, this one among them.
+            if _caller(http) is not None:
+                http.post(f"/api/me/tokens/{key}/revoke")
     # ``del_profile`` refuses the profile trax has pinned, and a pin naming a deleted
     # profile would fail every later trax command. Unpinned, trax falls back to its
     # ``default`` profile.
@@ -361,6 +364,22 @@ def _log_out() -> None:
     (config_dir() / "rekursiv-ai" / "knowop" / "profile").unlink(missing_ok=True)
     revoked = "revoked its key" if caller is not None else "its key was revoked already"
     echo(f"logged out: {revoked}; deleted profile {name}")
+
+
+# A machine of another account by this computer's name, or none, is not this one's: it
+# reads as no machine, and the key alone is revoked.
+def _log_out_machine(http: Client, machine: str) -> None:
+    """Log ``machine`` out on the server when it is the caller's, and say what stopped."""
+    try:
+        out = http.logout_machine(machine)
+    except ClientError as error:
+        if error.status_code != 404:
+            raise
+        return
+    runs = ", ".join(run.run or str(run.session_id) for run in out.runs) or "none"
+    echo(
+        f"logged out: machine {machine}; runs stopped: {runs}; keys revoked: {out.keys}",
+    )
 
 
 def _status() -> None:

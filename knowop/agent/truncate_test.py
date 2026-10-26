@@ -16,7 +16,8 @@ import json
 import re
 
 from trackinizer.lib.agent.sessions import claude
-from trackinizer.lib.agent.types.sessions import (
+from trackinizer.sagent.session.types import (
+    CONCRETE_TYPES,
     Attachment,
     ContextClear,
     IncompleteRecord,
@@ -25,11 +26,10 @@ from trackinizer.lib.agent.types.sessions import (
     UncategorizedToolResult,
     UserMessage,
 )
-from trackinizer.lib.agent.types.stored import to_stored
 from trackinizer.types.session_records import SessionRecordRow, search_text
 from trackinizer.types.streams import Stderr, Stdin, Stdout
 from trackinizer.wire.wire_session_ir import RecordBody
-from treekle import immutable
+from treekle import immutable, json_dumps
 
 import httpx2
 import pytest
@@ -48,7 +48,7 @@ from knowop.agent.truncate import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from trackinizer.lib.agent.types.sessions import SessionRecord
+    from trackinizer.sagent.session.types import SessionRecord
     from trackinizer.types.streams import TraxRecord
     from treekle import PlainTree
 
@@ -361,7 +361,11 @@ class TestTheLossyNote:
         """A writer replays an uncategorized payload verbatim, note and all."""
         cut = _read(bounded(_body(record)))
 
-        stored = json.dumps(to_stored(without_note(cut)))
+        stored = json_dumps(
+            without_note(cut),
+            sort=False,
+            default_concrete_types=CONCRETE_TYPES,
+        )
 
         assert NOTE not in stored
         assert "Trackinizer capture truncated" in stored

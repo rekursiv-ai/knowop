@@ -62,12 +62,6 @@ import uuid
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.agent.types.sessions import (
-    ContextCompaction,
-    ContextState,
-    SystemMessage,
-    UserMessage,
-)
 from trackinizer.lib.posix.follow import follow_dir, follow_tree
 from trackinizer.lib.posix.host import HostSpec
 from trackinizer.lib.posix.relay import ThreadedRelay
@@ -79,6 +73,12 @@ from trackinizer.runs.adapters.gemini import GeminiAdapter
 from trackinizer.runs.adapters.iostream import IOStreamAdapter
 from trackinizer.runs.asks import answer_from_payload
 from trackinizer.runs.redact import Redactor, redactor_from_environ
+from trackinizer.sagent.session.types import (
+    ContextCompaction,
+    ContextState,
+    SystemMessage,
+    UserMessage,
+)
 from trackinizer.trax.connection import connect
 from trackinizer.trax.profile import LOCALHOST_FALLBACK_URL
 from trackinizer.types.line_capture import LineCapture

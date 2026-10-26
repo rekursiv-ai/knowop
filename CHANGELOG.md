@@ -3,6 +3,28 @@
 All notable knowop changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 0.1.5 - 2026-10-26
+
+### Changed
+
+- Requires trackinizer 0.1.12 and treekle 0.3.3. The session records the agent
+  runner captures are `trackinizer.sagent.session.types` classes, no longer
+  `trackinizer.lib.agent.types.sessions`, and are stored in treekle 0.3.3's form.
+- Agent messages and host records are written with treekle's typed
+  serialization, and a loaded record is rebuilt through its constructor, so its
+  validation runs.
+
+### Fixed
+
+- `knowop connect` joins again after a disconnect. A saved machine credential the
+  server refuses at the first heartbeat, revoked (a Disconnect on the Machines
+  page, `knowop disconnect`) or unknown (the machine was deleted), is deleted, and
+  the connect joins once more, with knowop's login or the piped token, and prints
+  `rejoined: machine NAME`. Before, every later connect printed `revoked` and
+  exited until the credential file was removed by hand. A refused join says what to
+  run: `knowop login`, then `knowop connect`, or a new enrollment token. A revoke
+  while serving still stops the connect, and now deletes its credential.
+
 ## 0.1.4 - 2026-10-25
 
 ### Added

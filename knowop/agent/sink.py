@@ -67,9 +67,9 @@ from knowop.agent.worktree_diff import WORKTREE_DIFF_PART
 if TYPE_CHECKING:
     from trackinizer.client.client import Client
     from trackinizer.lib.agent.sessions.tail import Tail
-    from trackinizer.lib.agent.types.sessions import FileEditResult
     from trackinizer.runs.adapters.custom_types import Adapter
     from trackinizer.runs.redact import Redactor
+    from trackinizer.sagent.session.types import FileEditResult
     from trackinizer.types.streams import TraxRecord
 
     from knowop.agent.slash import SlashCommand

@@ -7,8 +7,8 @@ session's records (:func:`~knowop.agent.sink.Sink.emit_worktree_diff`)
 and read by exactly the transcript's readers.
 
 What is diffed is only the paths the session's own
-:class:`~trackinizer.lib.agent.types.sessions.FileEditResult` /
-:class:`~trackinizer.lib.agent.types.sessions.FileWriteResult` records name, inside the
+:class:`~trackinizer.sagent.session.types.FileEditResult` /
+:class:`~trackinizer.sagent.session.types.FileWriteResult` records name, inside the
 tree -- so another agent's edits in a shared tree are never attributed here, and
 a credential file (:func:`held`) is neither listed nor diffed.
 
@@ -32,7 +32,7 @@ import stat
 import subprocess
 
 from trackinizer.lib.agent.sessions.udiff import parse_udiff
-from trackinizer.lib.agent.types.sessions import FileEditResult, FileWriteResult, Splice
+from trackinizer.sagent.session.types import FileEditResult, FileWriteResult, Splice
 
 
 if TYPE_CHECKING:

@@ -35,7 +35,7 @@ from knowop.shell.machine_host import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from trackinizer.wire.wire_machine_host import Claim
     from trackinizer.wire.wire_machines import Facts
@@ -43,22 +43,29 @@ if TYPE_CHECKING:
 
 _MACHINE_ID: Final = uuid.UUID("11111111-1111-1111-1111-111111111111")
 _CREDENTIAL: Final = "trax_machine_" + "1" * 32 + "_" + "C" * 43
+_OTHER_CREDENTIAL: Final = "trax_machine_" + "2" * 32 + "_" + "D" * 43
+"""A credential other than the one the scripted join returns."""
 _TOKEN: Final = "enr_" + "0" * 32 + "_" + "S" * 43
 _NOW: Final = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
 _SERVER: Final = "https://trax.example"
 
 _REVOKED: Final = ClientError("-> 410", status_code=410)
+_UNKNOWN: Final = ClientError("-> 401", status_code=401)
 _TAKEN: Final = ClientError("-> 409", status_code=409, code="another_host_connected")
 _REFUSED: Final = ClientError("POST /x failed: connection refused")
 
 
 class _Host:
-    """A scripted server: each heartbeat takes the next outcome in turn."""
+    """A scripted server: each heartbeat takes the next outcome in turn.
+
+    By default one heartbeat lands, and the next finds a newer connect took over,
+    which ends the host and leaves its credential saved.
+    """
 
     def __init__(
         self,
         *,
-        beats: Sequence[ClientError | HeartbeatResponse | None] = (_REVOKED,),
+        beats: Sequence[ClientError | HeartbeatResponse | None] = (None, _TAKEN),
         join_error: ClientError | None = None,
     ) -> None:
         self.beats = list(beats)
@@ -104,20 +111,24 @@ class _Host:
         self.closed += 1
 
 
-def _save() -> None:
-    """Save box-1's credential, as a first ``connect`` would have."""
-    path = (
-        state_dir()
-        / "rekursiv-ai"
-        / "trax"
-        / "machines"
-        / "trax.example"
-        / "box-1.credential"
-    )
-    path.parent.mkdir(parents=True)
+# ``""`` is no account: the path then skips that directory, as ``connect`` does.
+def _save(*, credential: str = _CREDENTIAL, account: str = "") -> None:
+    """Save box-1's credential for ``account``, as a first ``connect`` would have."""
+    machines = state_dir() / "rekursiv-ai" / "trax" / "machines" / "trax.example"
+    path = machines / account / "box-1.credential"
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        JoinResponse(machine_id=_MACHINE_ID, credential=_CREDENTIAL).model_dump_json(),
+        JoinResponse(machine_id=_MACHINE_ID, credential=credential).model_dump_json(),
     )
+
+
+def _held(account: str = "") -> str | None:
+    """Return the credential saved for box-1 and ``account``; ``None`` when none is."""
+    machines = state_dir() / "rekursiv-ai" / "trax" / "machines" / "trax.example"
+    path = machines / account / "box-1.credential"
+    if not path.exists():
+        return None
+    return JoinResponse.model_validate_json(path.read_text()).credential
 
 
 def _connect(host: _Host, *, stdin: str = f"{_TOKEN}\n") -> list[float]:
@@ -167,7 +178,7 @@ def test_a_first_connect_with_sandbox_records_it_beside_the_credentials_and_says
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == "joined: machine box-1"
     assert lines[1].startswith("sandbox: on (")
-    assert lines[2:] == ["revoked: machine box-1"]
+    assert lines[2:] == ["taken over: machine box-1 is served by a newer connect"]
 
 
 def test_a_saved_credential_connect_with_sandbox_records_it_too(
@@ -224,7 +235,7 @@ def test_clearing_a_declaration_that_was_never_made_creates_nothing() -> None:
 def test_a_first_connect_joins_with_the_stdin_token_and_saves_the_credential(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    host = _Host(beats=[None, None, _REVOKED])
+    host = _Host(beats=[None, None, _TAKEN])
 
     slept = _connect(host)
 
@@ -248,7 +259,10 @@ def test_a_first_connect_joins_with_the_stdin_token_and_saves_the_credential(
         ).read_text(),
     )
     assert (saved.machine_id, saved.credential) == (_MACHINE_ID, _CREDENTIAL)
-    assert capsys.readouterr().out == "joined: machine box-1\nrevoked: machine box-1\n"
+    assert capsys.readouterr().out.splitlines() == [
+        "joined: machine box-1",
+        "taken over: machine box-1 is served by a newer connect",
+    ]
 
 
 def test_the_saved_credential_is_readable_by_this_user_only() -> None:
@@ -323,7 +337,7 @@ def test_an_accounts_own_saved_credential_skips_the_join() -> None:
         account="ada@x.y",
     )
 
-    assert [call[0] for call in host.calls] == ["beat"]
+    assert [call[0] for call in host.calls] == ["beat", "beat"]
     assert host.keys == [_CREDENTIAL]
 
 
@@ -350,7 +364,7 @@ def test_a_credential_saved_by_anyone_else_is_never_used(saved_by: str | None) -
 
     # Bob's own enrollment joins: the server, not a file on this computer, decides
     # whether bob may hold box-1.
-    assert [call[0] for call in host.calls] == ["join", "beat"]
+    assert [call[0] for call in host.calls] == ["join", "beat", "beat"]
     machines = state_dir() / "rekursiv-ai" / "trax" / "machines" / "trax.example"
     assert (machines / "bob@x.y" / "box-1.credential").is_file()
 
@@ -442,7 +456,7 @@ def test_a_host_the_server_does_not_call_outdated_says_nothing_of_it(
 def test_hours_offline_never_overflow_the_backoff() -> None:
     _save()
     refused = ClientError("POST /x failed: connection refused")
-    host = _Host(beats=[*[refused] * 1_100, _REVOKED])
+    host = _Host(beats=[*[refused] * 1_100, None, _REVOKED])
     delays: list[float] = []
 
     connect(
@@ -453,14 +467,16 @@ def test_hours_offline_never_overflow_the_backoff() -> None:
         sleep=delays.append,
     )
 
-    assert len(delays) == 1_100
+    assert len(delays) == 1_101
     assert set(delays[4:]) == {float(HEARTBEAT_SEC)}
 
 
+# A 401 before any heartbeat landed is a saved credential the server forgot, which
+# the connect replaces (see the tests of joining again); once serving, it ends the host.
 @pytest.mark.parametrize("status", [401, 404, 422])
 def test_an_answer_a_retry_cannot_change_ends_the_host(status: int) -> None:
     _save()
-    host = _Host(beats=[ClientError(f"-> {status}", status_code=status)])
+    host = _Host(beats=[None, ClientError(f"-> {status}", status_code=status)])
 
     with pytest.raises(ClientError) as err:
         connect(
@@ -472,6 +488,7 @@ def test_an_answer_a_retry_cannot_change_ends_the_host(status: int) -> None:
         )
 
     assert err.value.status_code == status
+    assert _held() == _CREDENTIAL
 
 
 def test_an_empty_stdin_never_joins() -> None:
@@ -532,6 +549,176 @@ def test_a_corrupt_credential_file_is_named_without_quoting_it() -> None:
     assert str(path) in str(err.value)
     assert _CREDENTIAL not in str(err.value)
     assert err.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("refusal", "account", "said"),
+    [
+        (_REVOKED, "ada@x.y", "rejoined: machine box-1 as ada@x.y"),
+        (_UNKNOWN, "ada@x.y", "rejoined: machine box-1 as ada@x.y"),
+        (_REVOKED, "", "rejoined: machine box-1"),
+    ],
+    ids=["revoked", "unknown", "piped token"],
+)
+def test_a_saved_credential_refused_before_it_served_is_replaced_by_a_join(
+    refusal: ClientError,
+    account: str,
+    said: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A disconnect, or a deleted machine, since the last connect: this one joins."""
+    _save(credential=_OTHER_CREDENTIAL, account=account)
+    host = _Host(beats=[refusal, None, _TAKEN])
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        client_for=host,
+        read_token=lambda: _TOKEN,
+        sleep=lambda _: None,
+        account=account or None,
+    )
+
+    assert [call[0] for call in host.calls] == ["beat", "join", "beat", "beat"]
+    assert host.calls[1][2] == _TOKEN
+    assert host.keys == [_OTHER_CREDENTIAL, "", _CREDENTIAL]
+    # The join stored the facts, so the heartbeats after it do not repeat them.
+    assert [call[4] for call in host.calls[2:]] == [None, None]
+    assert [call[5] for call in host.calls[2:]] == ["take", "keep"]
+    assert _held(account) == _CREDENTIAL
+    assert capsys.readouterr().out.splitlines()[0] == (
+        f"{said}; the server refused its saved credential"
+    )
+
+
+def _refuse_enrollment() -> str:
+    raise ClientError("POST /api/machines/enroll -> 401", status_code=401)
+
+
+@pytest.mark.parametrize(
+    ("account", "read_token", "join_error", "asked", "hint"),
+    [
+        (
+            "ada@x.y",
+            lambda: _TOKEN,
+            ClientError("-> 401", status_code=401),
+            ["beat", "join"],
+            "run knowop login, then knowop connect",
+        ),
+        (
+            "ada@x.y",
+            _refuse_enrollment,
+            None,
+            ["beat"],
+            "run knowop login, then knowop connect",
+        ),
+        (
+            "",
+            lambda: _TOKEN,
+            ClientError("-> 401", status_code=401),
+            ["beat", "join"],
+            "pipe a new enrollment token to knowop connect",
+        ),
+    ],
+    ids=["join refused", "enrollment refused", "piped token refused"],
+)
+def test_a_refused_rejoin_says_what_to_run_and_leaves_no_credential(
+    account: str,
+    read_token: Callable[[], str],
+    join_error: ClientError | None,
+    asked: list[str],
+    hint: str,
+) -> None:
+    _save(credential=_OTHER_CREDENTIAL, account=account)
+    host = _Host(beats=[_REVOKED], join_error=join_error)
+
+    with pytest.raises(ClientError) as err:
+        connect(
+            "box-1",
+            server=_SERVER,
+            client_for=host,
+            read_token=read_token,
+            sleep=lambda _: None,
+            account=account or None,
+        )
+
+    assert str(err.value) == f"machine box-1 could not join {_SERVER} again; {hint}"
+    assert err.value.status_code == 401
+    assert _held(account) is None
+    assert [call[0] for call in host.calls] == asked
+
+
+def test_a_rejoin_that_fails_another_way_says_what_the_server_said() -> None:
+    _save(credential=_OTHER_CREDENTIAL)
+    down = ClientError("-> 503", status_code=503)
+
+    with pytest.raises(ClientError) as err:
+        _connect(_Host(beats=[_REVOKED], join_error=down))
+
+    assert err.value is down
+    assert _held() is None
+
+
+def test_a_credential_refused_right_after_a_rejoin_ends_the_host_without_another(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _save(credential=_OTHER_CREDENTIAL)
+    host = _Host(beats=[_REVOKED, _REVOKED, None, _TAKEN])
+
+    _connect(host)
+
+    assert [call[0] for call in host.calls] == ["beat", "join", "beat"]
+    assert _held() is None
+    assert capsys.readouterr().out.splitlines()[1:] == ["revoked: machine box-1"]
+
+
+def test_a_credential_revoked_right_after_a_first_join_is_forgotten_not_joined_again(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host = _Host(beats=[_REVOKED, None, _TAKEN])
+
+    _connect(host)
+
+    assert [call[0] for call in host.calls] == ["join", "beat"]
+    assert _held() is None
+    assert capsys.readouterr().out == "joined: machine box-1\nrevoked: machine box-1\n"
+
+
+def test_a_machine_revoked_while_it_serves_ends_the_host_and_forgets_the_credential(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _save()
+    host = _Host(beats=[None, _REVOKED])
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        client_for=host,
+        read_token=_no_token,
+        sleep=lambda _: None,
+    )
+
+    assert [call[0] for call in host.calls] == ["beat", "beat"]
+    assert _held() is None
+    assert capsys.readouterr().out == "revoked: machine box-1\n"
+
+
+def test_a_credential_another_connect_saved_meanwhile_outlives_the_revoke() -> None:
+    _save()
+
+    def another_connect_joins(seconds: float) -> None:
+        del seconds
+        _save(credential=_OTHER_CREDENTIAL)
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        client_for=_Host(beats=[None, _REVOKED]),
+        read_token=_no_token,
+        sleep=another_connect_joins,
+    )
+
+    assert _held() == _OTHER_CREDENTIAL
 
 
 def test_host_facts_fit_the_join_contract() -> None:
@@ -827,7 +1014,7 @@ def test_a_host_that_did_not_opt_in_serves_no_terminals_and_says_so() -> None:
     )
 
     assert "terminal" not in host_facts()
-    assert [call[0] for call in host.calls] == ["beat"]
+    assert [call[0] for call in host.calls] == ["beat", "beat"]
     assert host.calls[0][4] == host_facts()
 
 
@@ -885,7 +1072,7 @@ def test_ctrl_c_releases_the_machine_once_then_stops_terminals_and_goes_on(
 
 def test_another_server_joins_the_same_name_with_its_own_credential() -> None:
     _save()
-    other = _Host(beats=[_REVOKED])
+    other = _Host()
 
     connect(
         "box-1",
@@ -896,7 +1083,7 @@ def test_another_server_joins_the_same_name_with_its_own_credential() -> None:
     )
 
     # The second server is joined: the first one's credential would be refused there.
-    assert [call[0] for call in other.calls] == ["join", "beat"]
+    assert [call[0] for call in other.calls] == ["join", "beat", "beat"]
     machines = state_dir() / "rekursiv-ai" / "trax" / "machines"
     assert sorted(
         path.relative_to(machines).as_posix() for path in machines.rglob("*")
@@ -930,7 +1117,7 @@ def test_the_host_reports_the_installed_trackinizer_version_or_none(
         sleep=lambda _: None,
     )
 
-    assert [call[3] for call in host.calls] == [reported]
+    assert [call[3] for call in host.calls] == [reported, reported]
 
 
 def test_a_server_url_with_no_host_is_refused() -> None:

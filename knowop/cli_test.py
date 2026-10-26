@@ -90,6 +90,11 @@ class _Server:
         """Each machine's live runs, as its runs route lists them."""
         self.disconnected: list[str] = []
         """Each machine disconnected, in order."""
+        self.logged_out: list[str] = []
+        """Each machine logged out, in order."""
+        self.key_names_machine = False
+        """Whether the key names the machine, as one a login made since keys did: a
+        machine's logout then revokes it."""
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
@@ -159,6 +164,14 @@ class _Server:
             if route == ("POST", f"/api/machines/{name}/disconnect"):
                 self.disconnected.append(name)
                 return httpx2.Response(200, json={"runs": self.runs.pop(name, [])})
+            if route == ("POST", f"/api/machines/{name}/logout"):
+                self.logged_out.append(name)
+                self.revoked = self.key_names_machine
+                keys = int(self.key_names_machine)
+                return httpx2.Response(
+                    200,
+                    json={"runs": self.runs.pop(name, []), "keys": keys},
+                )
         if route == ("POST", ENROLL_PATH):
             return httpx2.Response(
                 201,
@@ -657,6 +670,57 @@ def test_logout_revokes_this_logins_key_then_removes_its_profile(
     assert not (config_dir() / "rekursiv-ai" / "knowop" / "profile").exists()
     assert "logged out" in capsys.readouterr().out
     assert _knowop("status") == 1
+
+
+def test_logout_logs_this_computers_machine_out_and_its_key_goes_with_it(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.key_names_machine = True
+    server.runs["ada-mac"] = [_run("chat-1a2b3c4d")]
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("logout") == 0
+
+    assert server.logged_out == ["ada-mac"]
+    # The machine's logout revoked the key a login made for it, so nothing is left to revoke.
+    assert not any(path.endswith("/revoke") for path in server.paths())
+    assert list_profiles() == []
+    assert capsys.readouterr().out.splitlines() == [
+        "logged out: machine ada-mac; runs stopped: chat-1a2b3c4d; keys revoked: 1",
+        "logged out: revoked its key; deleted profile acme.knowop.ai",
+    ]
+
+
+def test_logout_of_a_machine_the_server_does_not_know_as_ours_revokes_the_key_alone(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    server.refuse["/api/machines/ada-mac/logout"] = 404
+    capsys.readouterr()
+
+    assert _knowop("logout") == 0
+
+    assert server.logged_out == []
+    assert list_profiles() == []
+    assert capsys.readouterr().out.splitlines() == [
+        "logged out: revoked its key; deleted profile acme.knowop.ai",
+    ]
+
+
+def test_logout_keeps_the_profile_when_the_machine_logout_is_refused(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    server.refuse["/api/machines/ada-mac/logout"] = 409
+
+    assert _knowop("logout") == 1
+
+    assert [name for name, _ in list_profiles()] == ["acme.knowop.ai"]
+    assert "409" in capsys.readouterr().err
 
 
 def test_logout_keeps_the_profile_when_the_key_cannot_be_revoked(

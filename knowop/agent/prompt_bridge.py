@@ -59,8 +59,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from pathlib import Path
 
-    from trackinizer.lib.agent.types.sessions import SystemMessage
     from trackinizer.runs.asks import Resolver
+    from trackinizer.sagent.session.types import SystemMessage
 
 
 __all__ = ["PromptBridge", "ask"]

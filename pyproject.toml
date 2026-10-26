@@ -3,7 +3,7 @@
 
 [project]
 name = "knowop"
-version = "0.1.4"
+version = "0.1.5"
 description = "Log in to KnowOp, connect your computer, and run your agents and GPU jobs where Chat can reach them."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -29,9 +29,10 @@ dependencies = [
     # records the agent runner captures into. 0.1.11 adds `Client.machine_runs` and
     # `Client.disconnect_machine`, which `knowop status` and `knowop disconnect` call,
     # and the `Client` that ignores a field a newer server adds to an answer.
-    "trackinizer>=0.1.11",
-    # serialization
-    "treekle>=0.3.0",
+    # 0.1.12 ships `trackinizer.sagent`, where the session records now live.
+    "trackinizer>=0.1.12",
+    # serialization; 0.3.3 adds `to_plain(target=...)` and `json_dumps(target=...)`.
+    "treekle>=0.3.3",
     # data models: the exec and terminal hosts read the server's requests with them.
     # 2.12 adds `model_validate(..., extra=)`, with which trackinizer's `Client` ignores
     # a field a newer server added to an answer.
@@ -44,7 +45,7 @@ dependencies = [
     "wrapt",
     # shell parsing: the agent runner's session capture lifts a captured `cat` or
     # `echo >` into a typed file result through trackinizer's
-    # `lib/agent/sessions/shell_results.py`; without it every such command is left
+    # `sagent/session/shell_results.py`; without it every such command is left
     # unlifted, silently.
     "bashlex>=0.18",
     # filesystem watching: the agent runner follows the agent's session files through
