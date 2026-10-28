@@ -82,7 +82,7 @@ PROGRAM: Final = "knowop job"
 
 _SUBMIT: Final = (
     f"{PROGRAM} submit [--machine NAME [--memory SIZE]] [--gpus N] [--minutes M] "
-    "[--label TEXT] [--follow] [--include-untracked] -- CMD..."
+    "[--node NAME] [--label TEXT] [--follow] [--include-untracked] -- CMD..."
 )
 _UNTRACKED_SHOWN: Final = 10
 _MEMORY: Final = "32G"
@@ -154,6 +154,7 @@ class Job(Command):
                 "wall-clock limit, 1 to 360; to 1440 with --machine (default 10)",
             ),
             ("--label TEXT", "a short name for the job"),
+            ("--node NAME", "require a broker node; fail instead of falling back"),
             ("--follow", "with submit: stream the log until the job ends"),
             (
                 "--include-untracked",
@@ -217,6 +218,7 @@ class Job(Command):
             follow=False,
             include_untracked=False,
             machine="",
+            node=None,
             memory=None,
             job=None,
             to=None,
@@ -226,6 +228,7 @@ class Job(Command):
         verbs = parser.add_subparsers(dest="action", required=True, metavar="VERB")
         submit = verbs.add_parser("submit", add_help=False)
         submit.add_argument("--machine", default="")
+        submit.add_argument("--node", default=None)
         submit.add_argument("--memory", default=None)
         submit.add_argument("--gpus", type=int, default=1)
         submit.add_argument("--minutes", type=int, default=10)
@@ -284,6 +287,8 @@ class Job(Command):
         if flags.action == "submit" and not flags.command:
             raise ClientError(f"submit needs a command after --: {_SUBMIT}")
         job = flags.job
+        if flags.machine and flags.node is not None:
+            raise ClientError("choose --machine or --node, not both")
         match flags.action:
             case "submit" if flags.machine:
                 cls.run_machine_submit(
@@ -304,6 +309,7 @@ class Job(Command):
             case "submit":
                 cls.run_submit(
                     _rig(client_factory),
+                    node=flags.node,
                     command=flags.command,
                     gpus=flags.gpus,
                     minutes=flags.minutes,
@@ -427,6 +433,7 @@ class Job(Command):
         label: str,
         follow: bool,
         include_untracked: bool,
+        node: str | None = None,
     ) -> None:
         """Snapshot the repository, upload it to a node, and start the job.
 
@@ -441,6 +448,7 @@ class Job(Command):
           follow: Stream the log until the job ends.
           include_untracked: Send untracked files named like secrets, which the
             snapshot refuses otherwise.
+          node: Required broker node, or automatic placement.
 
         """
         with tempfile.TemporaryDirectory(prefix="job-") as scratch:
@@ -465,6 +473,7 @@ class Job(Command):
                     minutes=minutes,
                     label=label,
                     commit=snap.commit,
+                    node=node,
                 )
                 job = rig.client.job_submit(body)
                 echo(f"job {job.id}: requested, waiting for a node", err=True)
@@ -565,6 +574,7 @@ class _Flags(Protocol):
     action: str
     command: tuple[str, ...]
     machine: str
+    node: str | None
     memory: str | None
     gpus: int
     minutes: int
@@ -661,6 +671,7 @@ def _submit_body(
     minutes: int,
     label: str,
     commit: str,
+    node: str | None = None,
 ) -> wire_job.SubmitBody:
     """Build the submit request, or raise an error naming each bad field."""
     try:
@@ -672,6 +683,7 @@ def _submit_body(
                 "label": label,
                 "argv": list(command),
                 "commit": commit,
+                "node": node,
             },
         )
     except pydantic.ValidationError as err:

@@ -724,7 +724,17 @@ def test_a_credential_another_connect_saved_meanwhile_outlives_the_revoke() -> N
 def test_host_facts_fit_the_join_contract() -> None:
     facts = host_facts()
 
-    assert set(facts) == {"os", "arch", "cpus", "memory_mb", "user", "clis"}
+    assert set(facts) == {
+        "os",
+        "arch",
+        "cpus",
+        "memory_mb",
+        "user",
+        "clis",
+        "pid",
+        "started_at",
+        "knowop_version",
+    }
     cpus, memory_mb, clis = facts["cpus"], facts["memory_mb"], facts["clis"]
     assert isinstance(cpus, int)
     assert isinstance(memory_mb, int)
@@ -757,21 +767,79 @@ def test_host_facts_report_what_the_host_says_about_itself(
     monkeypatch.setattr(os, "sysconf", sysconf_of)
     monkeypatch.setattr(getpass, "getuser", lambda: "ada")
     monkeypatch.setattr(shutil, "which", which)
+    monkeypatch.setattr(os, "getpid", lambda: 4242)
+    installed = {"knowop": "0.1.6"}
+    monkeypatch.setattr(metadata, "version", partial(_version_of, installed=installed))
 
-    assert host_facts() == {
+    facts = host_facts()
+
+    assert facts == {
         "os": "linux",
         "arch": "aarch64",
         "cpus": 0,
         "memory_mb": 4096,
         "user": "ada",
         "clis": ["git", "uv"],
+        "pid": 4242,
+        "started_at": facts["started_at"],
+        "knowop_version": "0.1.6",
     }
     assert host_facts(terminal=True)["terminal"] is True
+    assert host_facts(terminal=True)["files"] is True
     assert host_facts(exec_commands=True)["exec"] is True
     assert set(host_facts(terminal=True, exec_commands=True)) - set(host_facts()) == {
         "terminal",
+        "files",
         "exec",
     }
+
+
+def test_every_report_of_one_host_names_the_same_start_in_utc() -> None:
+    started_at = host_facts()["started_at"]
+
+    assert isinstance(started_at, str)
+    started = datetime.fromisoformat(started_at)
+    assert (started.tzinfo, started.microsecond) == (UTC, 0)
+    assert started <= datetime.now(UTC)
+    assert host_facts(terminal=True)["started_at"] == started_at
+
+
+def test_a_join_only_connect_joins_saves_and_serves_nothing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    host = _Host(beats=[])
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        client_for=host,
+        read_token=lambda: _TOKEN,
+        sleep=_never_waits,
+        sandbox=True,
+        join_only=True,
+    )
+
+    assert [call[0] for call in host.calls] == ["join"]
+    assert _held() == _CREDENTIAL
+    # The connect that serves records the sandbox, so this one leaves it.
+    assert not is_sandbox()
+    assert capsys.readouterr().out == "joined: machine box-1\n"
+
+
+def test_a_join_only_connect_with_a_saved_credential_asks_nothing() -> None:
+    _save()
+    host = _Host(beats=[])
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        client_for=host,
+        read_token=_no_token,
+        sleep=_never_waits,
+        join_only=True,
+    )
+
+    assert (host.calls, host.keys) == ([], [])
 
 
 class _Terminals:
@@ -1133,6 +1201,10 @@ def test_a_server_url_with_no_host_is_refused() -> None:
 
 def _no_token() -> str:
     raise AssertionError("a saved credential must not read a token")
+
+
+def _never_waits(seconds: float) -> None:
+    raise AssertionError(f"a join-only connect must not wait {seconds} s")
 
 
 def _version_of(name: str, *, installed: dict[str, str]) -> str:

@@ -22,6 +22,7 @@ from trackinizer.lib.posix.host import Frame, decode_frame, encode_frame, encode
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.wire import wire_terminals
 from trackinizer.wire.wire_terminals import TerminalWait
+from treekle import from_plain, json_loads
 from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -30,6 +31,7 @@ from websockets.http11 import Response
 import pytest
 
 from knowop.shell import terminal_host
+from knowop.shell.files_channel import FilesChannel
 from knowop.shell.terminal_direct import DirectRouter
 from knowop.shell.terminal_host import (
     TerminalHost,
@@ -599,6 +601,92 @@ async def test_a_folder_that_is_missing_or_a_file_ends_the_terminal_and_runs_not
     ]
     assert len(closes) == 3
     assert all('"status":1' in line for line in closes)
+
+
+async def test_a_files_open_answers_requests_and_starts_no_shell(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a.txt").write_text("a")
+    marker = tmp_path / "shell-ran"
+    replies: list[bytes] = []
+
+    async def handler(ws: ServerConnection) -> None:
+        request = f'{{"id": 1, "op": "info", "path": "{tmp_path}"}}\n'
+        await ws.send(encode_frame(Frame.INPUT, request.encode()))
+        line = b""
+        while not line.endswith(b"\n"):
+            message = await ws.recv()
+            assert isinstance(message, bytes)
+            kind, payload = decode_frame(message)
+            if kind is Frame.OUTPUT:
+                line += payload
+        replies.append(line)
+        await ws.send(encode_frame(Frame.STOP))
+        replies.append(b"exit %d" % (await _until_exit(ws))[1])
+
+    server, url = await _listening(handler)
+    await _run(_host(url, "/bin/sh", "-c", f"touch {marker}"), _opened(kind="files"))
+    server.close()
+
+    reply = json_loads(replies[0], dict[str, object])
+    assert (reply["id"], reply["kind"]) == (1, "dir")
+    assert from_plain(reply["entries"], list[dict[str, object]])[0]["name"] == "a.txt"
+    assert replies[1:] == [b"exit 0"]
+    assert not marker.exists()
+    path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box.terminals.log"
+    assert '"kind":"files"' in path.read_text().splitlines()[0]
+
+
+async def _finish_files(
+    channel: FilesChannel,
+    send: Callable[[bytes], Awaitable[None]],
+) -> None:
+    del channel
+    await send(b"finished\n")
+
+
+async def test_a_completed_files_service_reports_a_successful_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(FilesChannel, "serve", _finish_files)
+    results: list[tuple[bytes, int]] = []
+
+    async def handler(ws: ServerConnection) -> None:
+        results.append(await _until_exit(ws))
+
+    server, url = await _listening(handler)
+    try:
+        await _run(_host(url), _opened(kind="files"))
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert results == [(b"finished\n", 0)]
+
+
+async def _fail_files(
+    channel: FilesChannel,
+    send: Callable[[bytes], Awaitable[None]],
+) -> None:
+    del channel, send
+    raise RuntimeError("file service failed")
+
+
+async def test_a_failed_files_service_propagates_its_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(FilesChannel, "serve", _fail_files)
+
+    async def handler(ws: ServerConnection) -> None:
+        await ws.wait_closed()
+
+    server, url = await _listening(handler)
+    try:
+        with pytest.raises(RuntimeError, match="file service failed"):
+            await _run(_host(url), _opened(kind="files"))
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 class _Leg:

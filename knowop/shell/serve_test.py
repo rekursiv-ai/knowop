@@ -444,6 +444,8 @@ def test_another_account_on_this_computer_is_never_served_the_first_ones_machine
         "`knowop connect --name NAME`, or ask an admin to free it with "
         "`knowop machine dev-box del`"
     )
+    # A refusal a restart cannot change: a service exits for good on it.
+    assert err.value.status_code == 403
     # Ada's credential, saved on this computer, never served bob.
     assert second.calls("/heartbeat") == []
     assert second.calls("/api/machines/join") == []
@@ -511,6 +513,36 @@ def test_an_enrollment_refused_for_another_reason_is_said_as_the_server_said_it(
     assert err.value.status_code == 409
     assert "another account" not in str(err.value)
     assert server.calls("/api/machines/join") == []
+
+
+def test_a_join_only_connect_enrolls_joins_and_returns_serving_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """What the service would refuse shows at the terminal; the service serves."""
+    server = _Server()
+    _on(server, monkeypatch)
+    _stdin(monkeypatch, "")
+    keyed = Client(_SERVER, api_key=_PROFILE_KEY)
+
+    serve.connect_machine(
+        "dev-box",
+        server=_SERVER,
+        signed_in=lambda: keyed,
+        sandbox=False,
+        exec_commands=True,
+        sleep=_Waits(lambda: False),
+        join_only=True,
+    )
+
+    assert [call[1] for call in server.requests] == [
+        "/api/me/profile",
+        wire_machine_host.ENROLL_PATH,
+        wire_machine_host.JOIN_PATH,
+    ]
+    machines = state_dir() / "rekursiv-ai" / "trax" / "machines" / server_dir(_SERVER)
+    assert (machines / "ada@example.com" / "dev-box.credential").is_file()
+    assert capsys.readouterr().out == "joined: machine dev-box as ada@example.com\n"
 
 
 def test_a_saved_profile_enrolls_the_machine_with_its_key_and_logs_nobody_in(
