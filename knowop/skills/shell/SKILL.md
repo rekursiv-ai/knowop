@@ -22,12 +22,20 @@ knowop connect --sandbox                      # this computer is disposable
 knowop connect --no-exec                      # terminals only
 knowop connect --jobs                         # also run your knowop job --machine jobs
 knowop connect --name box-7 < enrollment-token   # join with a token, no login
+knowop connect --foreground                   # serve here until Ctrl-C
+knowop logs -f                                # follow this computer's connect service
 ```
 
-- It runs in the foreground until the machine is revoked, a newer `knowop connect`
-  of the same machine takes over, or Ctrl-C. Ctrl-C, and the termination signal a
-  service manager sends, show the machine offline at once. Keep it in tmux or as a
-  user service.
+- At a terminal it joins, then serves from a user service (a launchd agent on
+  macOS, a `systemd --user` unit on Linux) that runs in the background and starts
+  again at login and after a crash, and returns once the machine is online. `knowop
+  logs -f` follows its log, `knowop status` lists it with its flags, and `knowop
+  disconnect` stops and removes it. Running `knowop connect` again restarts it only
+  when its flags, its environment, its knowop or the CLIs it finds changed.
+- Anywhere else (an agent's shell, a pipe, a box) and with `--foreground` it serves
+  in the foreground until the machine is revoked, a newer `knowop connect` of the
+  same machine takes over, or Ctrl-C. Ctrl-C, and the termination signal a service
+  manager sends, show the machine offline at once.
 - With no knowop login for the server it prints a link and a code. The person
   approves the code in a browser, and approving also allows the machine. The key
   it receives is saved as knowop's profile, and `knowop run` and `knowop job` use

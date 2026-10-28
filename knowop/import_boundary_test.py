@@ -2,9 +2,9 @@
 
 The client ships alone, as the public ``knowop`` package; the project around it stays
 private. A shipped module may import the standard library, the client itself, and
-what a ``trackinizer`` install provides: trackinizer, the ``lib`` modules it carries,
-and its dependencies. Any other import fails on a public install, or ships private
-code.
+what a ``trackinizer`` install provides (trackinizer, the ``lib`` modules it carries,
+and its dependencies), and the ``lib`` modules knowop's export vendors itself. Any
+other import fails on a public install, or ships private code.
 """
 
 from __future__ import annotations
@@ -37,6 +37,8 @@ _ALLOWED: Final = (
     "trackinizer.lib.agent",
     "trackinizer.lib.posix",
     "trackinizer.lib.userdirs",
+    # Vendored by knowop's own export (copy.barista.toml), beside the package.
+    "knowop.lib.files",
     "treekle",
     # Dependencies of trackinizer, so installed with it.
     "httpx2",
@@ -45,6 +47,11 @@ _ALLOWED: Final = (
     "wrapt",
     # Knowop's dependency for the direct terminal link.
     "aiortc",
+    # The vendored explorer search walks gitignore-aware trees.
+    "rignore",
+    # Knowop's macOS dependency for the menu bar (pyobjc-framework-Cocoa).
+    "AppKit",
+    "PyObjCTools",
     # Type checkers' own stubs, named under ``TYPE_CHECKING`` and never imported.
     "_typeshed",
 )

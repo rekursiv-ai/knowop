@@ -35,7 +35,8 @@ reads the record when it starts an agent.
 from __future__ import annotations
 
 from contextlib import ExitStack, closing, suppress
-from functools import partial
+from datetime import UTC, datetime
+from functools import cache, partial
 from importlib import metadata
 from typing import TYPE_CHECKING, Final, Literal, Protocol
 
@@ -51,6 +52,8 @@ from trackinizer.trax.connection import server_dir
 from trackinizer.trax.render import echo
 from trackinizer.wire.wire_machine_host import HEARTBEAT_SEC, JoinResponse
 from trackinizer.wire.wire_machine_job import JOBS_FACT
+
+from knowop.service import knowop_version
 
 
 if TYPE_CHECKING:
@@ -139,6 +142,7 @@ def connect(
     job_facts: Mapping[str, FactValue] | None = None,
     sandbox: bool = False,
     account: str | None = None,
+    join_only: bool = False,
 ) -> None:
     """Join ``name`` when no credential is saved, then heartbeat until it is revoked.
 
@@ -166,6 +170,8 @@ def connect(
       account: The signed-in account a personal machine belongs to, whose own
         credential alone it uses; ``None`` for a machine an admin's token enrolls,
         whose credential belongs to the machine.
+      join_only: Return once a credential is saved, joining only when none is,
+        and serve nothing: the connect that serves it records the sandbox.
 
     Raises:
       ClientError: The token was refused, which after a refused saved credential
@@ -210,6 +216,8 @@ def connect(
     if saved is None:
         saved = join()
         echo(f"joined: machine {name}{who}")
+    if join_only:
+        return
     set_sandbox(on=sandbox)
     if sandbox:
         echo("sandbox: on (agents on this computer act without asking)")
@@ -234,7 +242,8 @@ def host_facts(
     """Return what this host reports about itself.
 
     Args:
-      terminal: Whether this host serves terminals, which the facts then say.
+      terminal: Whether this host serves terminals, and with them a ``files``
+        terminal, which the facts then say.
       exec_commands: Whether this host runs commands the assistant sends, which the
         facts then say as ``exec``.
       jobs: What this host offers jobs, when it runs them; the facts then say
@@ -242,13 +251,14 @@ def host_facts(
 
     Returns:
       facts: Its OS and architecture, CPU count, memory in MB, the user it runs
-        as, which of :data:`HOST_CLIS` are on ``PATH``, ``terminal: true`` when
-        it serves terminals, ``exec: true`` when it runs commands, and ``jobs:
-        true`` with what it offers jobs when it runs them.
+        as, which of :data:`HOST_CLIS` are on ``PATH``, its process id, when it
+        started and its knowop version, ``terminal: true`` and ``files: true`` when
+        it serves terminals, ``exec: true`` when it runs commands, and ``jobs: true``
+        with what it offers jobs when it runs them.
 
     """
     return {
-        **({"terminal": True} if terminal else {}),
+        **({"terminal": True, "files": True} if terminal else {}),
         **({"exec": True} if exec_commands else {}),
         **({JOBS_FACT: True, **jobs} if jobs is not None else {}),
         "os": platform.system().lower(),
@@ -257,6 +267,9 @@ def host_facts(
         "memory_mb": os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 2**20,
         "user": getpass.getuser(),
         "clis": [cli for cli in HOST_CLIS if shutil.which(cli) is not None],
+        "pid": os.getpid(),
+        "started_at": _started_at(),
+        "knowop_version": knowop_version(),
     }
 
 
@@ -383,6 +396,8 @@ def _heartbeat(
         if claim == "take":
             serve()
         # Said once: the server repeats it on every heartbeat, four times a minute.
+        # Run at a terminal, the command also restarts a connect service, on the
+        # version it fetched.
         if beat.host_outdated and not told:
             echo(
                 f"knowop: this knowop is too old for {server}: "
@@ -480,6 +495,13 @@ def _host_version() -> str:
         return metadata.version("trackinizer")
     except metadata.PackageNotFoundError:
         return ""
+
+
+# Cached: a join and every heartbeat after it name the same start.
+@cache
+def _started_at() -> str:
+    """Return when this host first reported itself, in UTC, to the second."""
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 # An email is the account's whole identity; one that is not one, or that would leave

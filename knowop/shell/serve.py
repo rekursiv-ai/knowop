@@ -98,6 +98,7 @@ def connect_machine(
     token: str = "",
     jobs: bool = False,
     results_max: int = 256 * 2**20,
+    join_only: bool = False,
 ) -> None:
     """Join ``name`` on ``server`` and serve it until it is revoked or interrupted.
 
@@ -116,6 +117,9 @@ def connect_machine(
         login that enrolled the machine returns; used before any other.
       jobs: Whether the host runs the jobs its account submits to it.
       results_max: With ``jobs``, the most result bytes one job sends back.
+      join_only: Join once, unless a credential is saved, and serve nothing: what
+        a service would refuse (a jobs cap, another account's machine, a token)
+        shows here, and the service then serves from the saved credential.
 
     Raises:
       ClientError: The login was denied or expired, the token was refused, the
@@ -124,11 +128,13 @@ def connect_machine(
 
     """
     offer = _job_offer() if jobs else None
-    direct = _direct_link()
-    echo(
-        f"serving: machine {name} at {server} "
-        f"({_what_is_served(exec_commands, jobs=jobs)})",
-    )
+    direct = None
+    if not join_only:
+        direct = _direct_link()
+        echo(
+            f"serving: machine {name} at {server} "
+            f"({_what_is_served(exec_commands, jobs=jobs)})",
+        )
     account, read_token = _token_source(
         name,
         server=server,
@@ -170,6 +176,7 @@ def connect_machine(
         job_facts=None if offer is None else offer.facts,
         sandbox=sandbox,
         account=account,
+        join_only=join_only,
     )
 
 
@@ -387,9 +394,11 @@ def _enroll(client: Client, name: str, *, account: str) -> str:
         if err.status_code != 403:
             raise
         # The server names no owner: a personal machine is seen by its owner alone.
+        # The status stays, so a service exits for good rather than restart into it.
         raise ClientError(
             f"machine {name} on {client.base_url} belongs to another account, not to "
             f"{account}, who is signed in; connect under another name with "
             f"`knowop connect --name NAME`, or ask an admin to free it with "
             f"`knowop machine {name} del`",
+            status_code=403,
         ) from err

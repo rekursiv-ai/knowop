@@ -2,7 +2,8 @@
 
 A machine host (``knowop connect``) holds a request on the server for the next terminal to
 open. Each open runs one bridge: a login shell on a pty (or, when the open names a CLI,
-a detached ``knowop run`` of it, which outlives the pty), and a WebSocket the host dials
+a detached ``knowop run`` of it, which outlives the pty; or, for a ``files`` open, the
+answers to file requests of ``files_channel.py``), and a WebSocket the host dials
 out to the server, which relays it to the owner's browser. The host listens on nothing,
 except that a browser may offer it a direct link (``terminal_direct.py``) when a WebRTC
 library is installed.
@@ -36,6 +37,7 @@ from trackinizer.wire import wire_terminals
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
+from knowop.shell.files_channel import FilesChannel
 from knowop.shell.terminal_direct import DirectRouter
 from knowop.shell.trax_context import inherited_trax_context
 
@@ -340,6 +342,9 @@ class TerminalHost:
         status: int | None = None
         try:
             await socket.send(encode_frame(Frame.ACK))
+            if opened.kind == "files":
+                status = await self._serve_files(opened, socket, ended)
+                return
             folder = await asyncio.to_thread(_start_folder, opened.cwd)
             if folder is None:
                 await _end_with_line(
@@ -409,6 +414,39 @@ class TerminalHost:
             await router.exit(status)
         return status
 
+    async def _serve_files(
+        self,
+        opened: TerminalWait,
+        socket: ClientConnection,
+        ended: asyncio.Event,
+    ) -> int:
+        """Answer file requests until the server stops the terminal or the socket closes."""
+        files = FilesChannel()
+        router = DirectRouter(
+            relay=socket.send,
+            shell=files,
+            factory=self.direct,
+            ice_servers=tuple(opened.ice_servers),
+        )
+        serving = asyncio.create_task(files.serve(router.output))
+        reader = asyncio.create_task(_read(router, socket))
+        stopped = asyncio.create_task(ended.wait())
+        try:
+            await asyncio.wait(
+                {serving, reader, stopped},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if serving.done():
+                await serving
+        finally:
+            for task in (serving, reader, stopped):
+                task.cancel()
+            await asyncio.gather(serving, reader, stopped, return_exceptions=True)
+            await router.close()
+        with contextlib.suppress(ConnectionClosed):
+            await router.exit(0)
+        return 0
+
     def _argv(self, opened: TerminalWait) -> list[str]:
         """Return a detached ``knowop run`` of the CLI asked for, else a shell."""
         if opened.command is None:
@@ -473,13 +511,14 @@ class TerminalHost:
             terminal_id=opened.terminal_id,
             opener=opened.opener,
             requested_by=opened.requested_by,
+            kind=opened.kind,
             status=status,
         )
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as file:
             _ = file.write(line.model_dump_json() + "\n")
         if event == "open":
-            echo(f"terminal opened by {opened.opener}")
+            echo(f"{opened.kind or 'terminal'} opened by {opened.opener}")
 
 
 async def _pump(terminal: Terminal, router: DirectRouter) -> None:
@@ -555,4 +594,5 @@ class _LogLine(BaseModel):
     terminal_id: uuid.UUID
     opener: str
     requested_by: str | None = None
+    kind: str | None = None
     status: int | None = None

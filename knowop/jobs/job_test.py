@@ -365,6 +365,7 @@ def _submit(
     label: str = "",
     follow: bool = False,
     include_untracked: bool = False,
+    node: str | None = None,
 ) -> None:
     Job.run_submit(
         world.rig,
@@ -374,6 +375,7 @@ def _submit(
         label=label,
         follow=follow,
         include_untracked=include_untracked,
+        node=node,
     )
 
 
@@ -501,6 +503,15 @@ def test_submit_defaults_to_one_gpu_and_ten_minutes(
     assert [getattr(args, name) for name in names] == [1, 10, "", False, False]
 
 
+def test_node_and_machine_are_mutually_exclusive() -> None:
+    with pytest.raises(ClientError, match="choose --machine or --node"):
+        Job.dispatch(
+            JOB_WORD,
+            ["submit", "--machine", "mine", "--node", "gpu-node", "--", "true"],
+            _no_client,
+        )
+
+
 def test_submit_takes_include_untracked_as_a_flag_before_the_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -586,11 +597,13 @@ def test_a_verb_that_reaches_only_the_server_needs_no_ssh(
 # -- submit.
 
 
+@pytest.mark.parametrize("node", [None, "gpu-node"])
 def test_submit_uploads_the_bundle_starts_the_job_and_prints_only_its_id(
     world: _Rig,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    node: str | None,
 ) -> None:
     bundled = _fake_source(monkeypatch, tmp_path, base=_BASE)
     world.node.bases = [_BASE]
@@ -602,7 +615,7 @@ def test_submit_uploads_the_bundle_starts_the_job_and_prints_only_its_id(
     saved.mkdir(parents=True)
 
     with _caller_in(tmp_path):
-        _submit(world, command=("python", "x.py"), label="try", gpus=2)
+        _submit(world, command=("python", "x.py"), label="try", gpus=2, node=node)
 
     assert snapshotted == [tmp_path]
     captured = capsys.readouterr()
@@ -623,6 +636,7 @@ def test_submit_uploads_the_bundle_starts_the_job_and_prints_only_its_id(
     assert (submit.gpus, submit.minutes, submit.label) == (2, 10, "try")
     assert (submit.argv, submit.commit) == (["python", "x.py"], _COMMIT)
     assert submit.public_key == _PUBLIC
+    assert submit.node == node
     assert world.server.calls[1:3] == [("grant", (7, 25)), ("grant", (7, 25))]
     start = cast("tuple[int, StartBody]", world.server.calls[3][1])
     assert start[0] == 7

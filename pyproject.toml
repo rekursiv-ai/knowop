@@ -43,6 +43,9 @@ dependencies = [
     "aiortc>=1.15.0",
     # lazy imports
     "wrapt",
+    # gitignore-aware tree walks: the explorer's search where ripgrep is not
+    # installed, through the vendored `knowop.lib.files.grep`.
+    "rignore>=0.8.1",
     # shell parsing: the agent runner's session capture lifts a captured `cat` or
     # `echo >` into a typed file result through trackinizer's
     # `sagent/session/shell_results.py`; without it every such command is left
@@ -52,6 +55,8 @@ dependencies = [
     # trackinizer's `lib/posix/follow.py`, whose macOS backend lazy-imports watchdog's
     # fsevents.
     "watchdog>=6.0.0 ; sys_platform == 'darwin'",
+    # the macOS menu bar: `knowop menubar` shows its status item through AppKit.
+    "pyobjc-framework-Cocoa>=12 ; sys_platform == 'darwin'",
 ]
 
 [project.scripts]

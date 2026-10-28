@@ -5,6 +5,55 @@ All notable knowop changes are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `knowop connect` at a terminal keeps serving this computer in the background,
+  as a user service: a launchd agent on macOS, a `systemd --user` unit on Linux.
+  It joins in the foreground first, so a refusal shows at the terminal, installs
+  `ai.rekursiv.knowop.connect.NAME.TAG` (`knowop-connect-NAME-TAG.service`),
+  returns once the server shows the computer online, and starts again at login
+  and after a crash. Its definition names the knowop that installed it (`uvx
+  knowop@VERSION` when that one ran from uv's cache, which `uv cache clean`
+  deletes) and the flags given, and copies `PATH`, `LANG`, `LC_*` and the
+  variables the per-user folders are read from (`HOME`, `XDG_*_HOME`), so it finds
+  the login the shell would; it holds no secret, and it is never installed as
+  root. A refusal no restart can change ends it with exit
+  0, so the manager does not restart it. Running `knowop connect` again restarts
+  it only when its flags, its environment, its knowop or the CLIs it finds
+  changed; `--follow` then follows its log. A pipe, a box, a piped token and
+  `--foreground` serve in the foreground until Ctrl-C, as before, and so does a
+  Linux computer whose `systemctl --user` answers nothing.
+- `knowop logs [NAME] [-f] [-n N]` prints or follows the log a connect service
+  writes on this computer, kept under 5 MiB with one older copy.
+- `knowop status` shows each server knowop is logged in to, the one its commands
+  use first; the knowop version and process serving each online machine, a run
+  with no name by its short session, and this computer's connect services with
+  their flags and whether each is turned off; `--json` prints the same as one
+  object, one entry per login. A server that refuses its login's key is named,
+  after the others, and the command exits 1.
+- `knowop run stop RUN` stops a live run of yours on any of your machines, by its
+  name or session, through the server; a run live on this computer still stops
+  here. A RUN that names several runs lists them and stops none.
+- `knowop logout NAME` logs one machine out, as the Machines page does, and keeps
+  this computer's login; `knowop logout --all` logs every machine of yours out
+  first.
+- knowop keeps a login per server: connecting to a second server keeps the first
+  one's login, and its connect service still signs in with it. `knowop logout`
+  deletes one login and names the one knowop uses next.
+- The host reports `pid`, `started_at` and `knowop_version` in its facts.
+- `knowop connect` serves read-only file browsing: the web app's explorer
+  lists this computer's folders and reads its files, as the user who started
+  `knowop connect`, over the terminal link. Needs a trackinizer server that
+  knows the `files` terminal.
+
+### Changed
+
+- `knowop disconnect` and `knowop logout` remove this computer's connect services
+  of that machine (`logout`: of that server), and `disconnect` waits until the
+  server shows the machine offline.
+- Requires the trackinizer release that adds `Client.stop_machine_run` and
+  `userdirs.base_dir_variables`.
+
 ### Fixed
 
 - `knowop job submit` works from a shallow clone (`git clone --depth 1`). It
