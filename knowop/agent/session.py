@@ -2267,8 +2267,8 @@ def _env_argv(
 
 
 # The person's own ``-c`` overrides and feature toggles reach the app-server as they
-# reach a terminal run. Goals are turned on for the run as they are for a terminal one,
-# unless the person said otherwise.
+# reach a terminal run. Goals and reasoning summaries are turned on for the run as they
+# are for a terminal one, unless the person said otherwise.
 def _codex_argv(prefix: Sequence[str], *, cli_args: tuple[str, ...]) -> list[str]:
     """Return the command that starts codex's app-server."""
     return [
@@ -2276,6 +2276,11 @@ def _codex_argv(prefix: Sequence[str], *, cli_args: tuple[str, ...]) -> list[str
         "app-server",
         *_codex_overrides(cli_args),
         *([] if _sets_codex_goals(cli_args) else ["--enable", "goals"]),
+        *(
+            []
+            if _sets_codex_summary(cli_args)
+            else ["-c", 'model_reasoning_summary="auto"']
+        ),
     ]
 
 
@@ -2373,6 +2378,11 @@ def _cli_argv(
         argv[1:1] = [
             *(() if "--no-daemon" in config.cli_args else ("--no-daemon",)),
             *(() if _sets_codex_goals(config.cli_args) else ("--enable", "goals")),
+            *(
+                ()
+                if _sets_codex_summary(config.cli_args)
+                else ("-c", 'model_reasoning_summary="auto"')
+            ),
         ]
     approval = _approval_args(
         adapter.name,
@@ -2477,6 +2487,15 @@ def _sets_codex_goals(args: tuple[str, ...]) -> bool:
     return "goals" in toggled or any(
         value.startswith("features.goals") for value in _codex_config_values(args)
     )
+
+
+# A rollout keeps a reasoning summary only as ``model_reasoning_summary`` allows, and a
+# person's own config may say ``none``, so a run asks for one -- an override, as for
+# goals -- unless its own flags set the key. ``auto`` is the most detailed summary the
+# model offers.
+def _sets_codex_summary(args: tuple[str, ...]) -> bool:
+    """Whether ``args`` already set codex's ``model_reasoning_summary``."""
+    return "model_reasoning_summary" in _codex_config_pairs(args)
 
 
 # The server never places a chat's session, so a run attached to one would hear of no

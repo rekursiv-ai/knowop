@@ -252,11 +252,11 @@ class TestMain:
 
 def _command(text: str, event: str = "UserPromptSubmit") -> str:
     """Return the one command of ours the settings run on ``event``."""
-    settings = from_plain(
-        json_loads(text),
-        dict[str, dict[str, list[dict[str, list[dict[str, str | int]]]]]],
+    hooks = from_plain(
+        json_loads(text, dict[str, PlainTree])["hooks"],
+        dict[str, list[dict[str, list[dict[str, str | int]]]]],
     )
-    entry = settings["hooks"][event][-1]
+    entry = hooks[event][-1]
     [each] = entry["hooks"]
     assert each["type"] == "command"
     command = each["command"]
@@ -288,7 +288,10 @@ class TestSettings:
 
         command = _command(text, "SessionStart")
         assert command.endswith(f"--seen {tmp_path / 'seen'} --event session-start")
-        hooks = json_loads(text, dict[str, dict[str, object]])["hooks"]
+        hooks = from_plain(
+            json_loads(text, dict[str, PlainTree])["hooks"],
+            dict[str, object],
+        )
         assert "UserPromptSubmit" not in hooks
 
     def test_the_persons_own_settings_keep_their_hooks_and_gain_ours(
@@ -315,6 +318,24 @@ class TestSettings:
         assert hooks["SessionStart"][0] == {"hooks": [theirs]}
         assert len(hooks["SessionStart"]) == 2
         assert len(hooks["UserPromptSubmit"]) == 1
+
+    @pytest.mark.parametrize(
+        "user",
+        [None, {"showThinkingSummaries": False}],
+        ids=["none", "theirs-off"],
+    )
+    def test_thinking_summaries_are_always_asked_for(
+        self,
+        tmp_path: Path,
+        user: dict[str, PlainTree] | None,
+    ) -> None:
+        """Claude writes a summary into its transcript only when the setting is on."""
+        merged = json_loads(
+            hook.settings_json(seen=tmp_path / "seen", profile=None, user=user),
+            dict[str, PlainTree],
+        )
+
+        assert merged["showThinkingSummaries"] is True
 
     def test_a_run_gets_a_private_dir_with_the_file(self) -> None:
         prepared = hook.prepare(profile=None)
@@ -401,9 +422,9 @@ class TestBridge:
         )
 
         hooks = from_plain(
-            json_loads(text),
-            dict[str, dict[str, list[dict[str, list[dict[str, str | int]]]]]],
-        )["hooks"]
+            json_loads(text, dict[str, PlainTree])["hooks"],
+            dict[str, list[dict[str, list[dict[str, str | int]]]]],
+        )
         events = [
             "PreToolUse",
             "PermissionRequest",
@@ -440,19 +461,22 @@ class TestBridge:
         )
 
         hooks = from_plain(
-            json_loads(text),
-            dict[str, dict[str, list[dict[str, list[dict[str, str | int]]]]]],
-        )["hooks"]
+            json_loads(text, dict[str, PlainTree])["hooks"],
+            dict[str, list[dict[str, list[dict[str, str | int]]]]],
+        )
         commands = [entry["hooks"][0]["command"] for entry in hooks["UserPromptSubmit"]]
         assert len(commands) == 2
         assert str(commands[0]).endswith("--profile prod")
         assert str(commands[1]).endswith(f"--event bridge --socket {socket}")
 
     def test_a_run_without_a_bridge_hands_over_no_event(self, tmp_path: Path) -> None:
-        hooks = json_loads(
-            hook.settings_json(seen=tmp_path / "seen", profile=None),
-            dict[str, dict[str, object]],
-        )["hooks"]
+        hooks = from_plain(
+            json_loads(
+                hook.settings_json(seen=tmp_path / "seen", profile=None),
+                dict[str, PlainTree],
+            )["hooks"],
+            dict[str, object],
+        )
 
         assert set(hooks) == {"SessionStart", "UserPromptSubmit"}
 
