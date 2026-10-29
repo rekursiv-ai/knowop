@@ -25,6 +25,15 @@ All notable knowop changes are documented here. This project follows
   Linux computer whose `systemctl --user` answers nothing.
 - `knowop logs [NAME] [-f] [-n N]` prints or follows the log a connect service
   writes on this computer, kept under 5 MiB with one older copy.
+- On macOS, `knowop connect` shows the knowop mark in the menu bar (`knowop
+  menubar`, one more launchd agent): dimmed while a connect service here is not
+  online, with each login, its machines and runs. Where this knowop's Python cannot
+  import PyObjC, `knowop connect` says why on stderr and installs no menu bar;
+  `knowop status` says whether it runs, and why it fails. `knowop connect` starts a
+  menu bar quit since, also on a machine connected already.
+- macOS Login Items lists knowop's background items as "knowop" and "knowop menu
+  bar", with the knowop icon, not as two "python3" items: each launchd agent runs a
+  launcher of that name from knowop's data folder.
 - `knowop status` shows each server knowop is logged in to, the one its commands
   use first; the knowop version and process serving each online machine, a run
   with no name by its short session, and this computer's connect services with

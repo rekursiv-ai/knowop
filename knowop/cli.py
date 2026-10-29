@@ -580,6 +580,8 @@ class _Status:
     """Live detached runs here that name no machine of the accounts'."""
 
     services: list[service.Connect]
+    menubar: str | None
+    """How the menu bar agent here is; ``None`` where none is installed."""
 
 
 # A refused login is shown with the others, and then fails the command.
@@ -604,6 +606,7 @@ def _status(*, as_json: bool) -> None:
             and host.name not in listed
         ],
         services=[] if services is None else services.every(),
+        menubar=None if services is None else services.menu_bar(),
     )
     if as_json:
         echo(json_dumps(report, target=_Status, indent=2))
@@ -688,6 +691,8 @@ def _say_status(report: _Status, *, manager: str | None) -> None:
             else "; disabled: knowop connect enables it again"
         )
         echo(f"service: {each.name} {each.server}{flags}{off if each.disabled else ''}")
+    if report.menubar is not None:
+        echo(f"menubar: {report.menubar}")
 
 
 def _say_login(login: _Login) -> None:
@@ -915,6 +920,12 @@ def _connect_service(
     )
     echo(f"log:  knowop logs -f{_named(name)}")
     echo(f"stop: knowop disconnect{_named(name)}")
+    if (problem := services.show_menu_bar()) is not None:
+        echo(
+            f"knowop: no menu bar: {problem} in {sys.executable}; install PyObjC there "
+            "(in a checkout, uv sync), then run knowop connect again",
+            err=True,
+        )
     if services.linger_off():
         echo(
             "keep it running after you log out: sudo loginctl enable-linger "

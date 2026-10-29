@@ -92,6 +92,21 @@ loginctl enable-linger $USER` keeps it running after you log out; knowop says so
 Anywhere else, such as a pipe, a box or a service of your own, and with
 `--foreground`, `knowop connect` serves in the foreground until Ctrl-C.
 
+On macOS, `knowop connect` also shows the knowop mark in the menu bar: dimmed while
+a connect service here is not online, with a menu of each server you are logged in
+to, your machines and their runs. It runs as one more launchd agent,
+`ai.rekursiv.knowop.menubar`, and goes with the last connect service. Quit hides it
+until the next login or `knowop connect`. It needs PyObjC, which installs with
+knowop on macOS; where this knowop's Python cannot import it (a checkout not synced
+since), `knowop connect` says so and installs no menu bar. `knowop status` says
+whether it runs, and why it fails when it does.
+
+System Settings > General > Login Items & Extensions lists the two background items
+as "knowop" (a connect service) and "knowop menu bar", each with the knowop icon:
+each launchd agent runs a small launcher of that name, in knowop's folder of the
+user's data (`~/Library/Application Support/rekursiv-ai/knowop/launchers`), which
+runs this knowop. They go with the last connect service.
+
 Plain `knowop login` logs in to `https://alpha.knowop.ai`; `knowop login acme` to
 `https://acme.knowop.ai`, and `knowop login URL` to any server. Use it on a computer
 you will not connect, where only your agents work. A later `knowop connect` there
@@ -158,8 +173,9 @@ systemctl disable --now knowop-connect` stops it.
 |---|---|
 | `knowop login [ORG\|URL]` | Logs in with a code approved in a browser and saves the key. |
 | `knowop connect [ORG\|URL] [--name N] [--no-exec] [--sandbox] [--jobs [--job-results-max SIZE]] [--foreground] [--follow]` | Logs in first unless knowop is logged in to that server or a token is piped in, enrolling and confirming this computer in the same approval; then serves its terminal, and the assistant's commands unless `--no-exec`. At a terminal it serves from a user service that starts again at login, and `--follow` then follows its log; elsewhere, and with `--foreground`, until Ctrl-C. No server means knowop's own, else `https://alpha.knowop.ai`. `--sandbox` declares a disposable computer where agents act without asking. `--jobs` also runs your account's `knowop job submit --machine` jobs, each under a memory cap; it needs systemd's user manager. |
+| `knowop menubar` | Shows the knowop mark in the macOS menu bar until Quit; `knowop connect` starts it at login. |
 | `knowop logs [NAME] [-f] [-n N]` | Prints the log of NAME's connect service on this computer (default this computer's name), its last N lines, or follows it until Ctrl-C. A machine connected from another computer keeps its log there. |
-| `knowop status [--json]` | Prints, for each server knowop is logged in to (the one its commands use first), the profile, the server, your account and role, your computers with whether each is online, the knowop version and process serving each one online, and the runs live on each; the runs here that name no machine of yours; and this computer's connect services with their flags, and whether each is turned off (macOS Login Items). `--json` prints the same as one JSON object, one entry per login. Exits 1 when not logged in, or when a server refuses its login's key. |
+| `knowop status [--json]` | Prints, for each server knowop is logged in to (the one its commands use first), the profile, the server, your account and role, your computers with whether each is online, the knowop version and process serving each one online, and the runs live on each; the runs here that name no machine of yours; and this computer's connect services with their flags, and whether each is turned off (macOS Login Items). On macOS, the menu bar: running, stopped, or failing with its exit code and its last log line. `--json` prints the same as one JSON object, one entry per login. Exits 1 when not logged in, or when a server refuses its login's key. |
 | `knowop disconnect [NAME]` | Stops this computer's runs when NAME is this computer (the default), then disconnects NAME on the server: its connect is revoked and every run of yours that names it stops. Removes NAME's connect service on this computer, and waits until the server shows NAME offline. `knowop connect` joins it again with no login. |
 | `knowop logout [NAME\|--all]` | Logs this computer's machine out on the server (its connect revoked, its runs stopped, the keys its logins made revoked), revokes knowop's key if that left it, removes this computer's connect services of that server, and deletes the saved login; knowop then uses its login to another server, if it has one, and says which. `--all` logs every machine of yours out first. NAME logs that one machine out alone, as the Machines page does, and keeps this computer's login. |
 | `knowop run claude\|codex [ARGS]` | Runs Claude Code or Codex in this folder, recorded and reachable from Chat. Says to run `knowop connect` when this computer is not connected. |

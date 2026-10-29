@@ -45,11 +45,13 @@ from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import (
     base_dir_variables,
     config_dir,
+    data_dir,
     runtime_dir_variables,
     state_dir,
 )
 from treekle import from_plain
 
+from knowop import menubar
 from knowop.shell import job_limits
 
 
@@ -95,6 +97,10 @@ class Services:
       folder: Where that manager reads this user's service definitions.
       run: Runs ``launchctl``, ``systemctl`` and ``loginctl``.
       wait: Waits the given seconds between tries of a ``bootstrap``.
+      menubar_problem: Says why the menu bar cannot start in this knowop's Python;
+        ``None`` when it can. :func:`here` asks AppKit; others show no menu bar.
+      set_icon: Gives a file the knowop icon, which Login Items shows for an agent
+        that runs it; called only where the menu bar can start.
 
     """
 
@@ -102,12 +108,13 @@ class Services:
     folder: Path
     run: job_limits.Run
     wait: Callable[[float], None] = time.sleep
+    menubar_problem: Callable[[], str | None] = lambda: (
+        "AppKit not asked: here() asks it"
+    )
+    set_icon: Callable[[Path], None] = menubar.set_icon
 
     def start(self, connect: Connect) -> None:
         """Install ``connect``'s service and start it, or restart it when it runs.
-
-        On macOS the menu bar agent, ``knowop menubar``, is installed beside it and
-        started unless it runs; it goes with the last connect agent (:meth:`remove`).
 
         Args:
           connect: The machine, server and flags to serve.
@@ -126,18 +133,64 @@ class Services:
             self.run(["systemctl", "--user", "reset-failed", path.name])
             self._call("systemctl", "--user", "restart", path.name)
             return
-        self._load(path, unchanged=unchanged, again=("-k",))
-        # The menu bar shows every connect of this computer: one agent, beside them.
-        log = state_dir() / "rekursiv-ai" / "knowop" / "menubar.log"
+        fresh = self._launcher("knowop")
+        self._load(path, unchanged=unchanged and fresh, again=("-k",))
+
+    # An agent whose Python cannot import AppKit fails every 10 s, in a log no one
+    # reads: this one is never installed, and the caller says why.
+    def show_menu_bar(self) -> str | None:
+        """Start the menu bar agent, one beside every connect agent, unless it runs.
+
+        Returns:
+          problem: Why the menu bar cannot start in this knowop's Python, which then
+            removes any agent of it; ``None`` once it runs, and under systemd, which
+            has none.
+
+        Raises:
+          ClientError: A manager command failed.
+
+        """
         path = self.folder / f"{_MENUBAR}.plist"
-        agent = _agent(path.stem, [*self._program(), "menubar"], log)
+        if self.manager != "launchd":
+            return None
+        if (problem := self.menubar_problem()) is not None:
+            if path.is_file():
+                self._unload(path)
+            return problem
+        log = state_dir() / "rekursiv-ai" / "knowop" / "menubar.log"
+        launcher = (
+            data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop menu bar"
+        )
+        agent = _agent(path.stem, [str(launcher), "menubar"], log)
+        fresh = self._launcher(launcher.name)
         # Started again only when it ended: Quit, or a crash past its restarts.
-        self._load(path, unchanged=self._write(path, agent, log=log), again=())
+        unchanged = self._write(path, agent, log=log)
+        self._load(path, unchanged=unchanged and fresh, again=())
+        return None
+
+    def menu_bar(self) -> str | None:
+        """Return how the menu bar agent is, as ``knowop status`` shows it.
+
+        Returns:
+          state: ``running``; stopped, as Quit leaves it; or failing, with its exit
+            code and the last line of its log. ``None`` where none is installed.
+
+        """
+        if not (self.folder / f"{_MENUBAR}.plist").is_file():
+            return None
+        _, out = self.run(["launchctl", "print", f"gui/{os.getuid()}/{_MENUBAR}"])
+        if re.search(r"^\s*state = running$", out, re.MULTILINE):
+            return "running"
+        code = re.search(r"last exit code = (\d+)", out)
+        if code is None or code[1] == "0":
+            return "stopped; knowop connect starts it"
+        log = state_dir() / "rekursiv-ai" / "knowop" / "menubar.log"
+        return f"failing, exit {code[1]}: {_last_line(log)}"
 
     def remove(self, name: str, server: str) -> bool:
         """Stop the service of ``name`` on ``server`` and delete its definition.
 
-        The menu bar agent goes with the last connect agent of this computer.
+        The menu bar agent, and the launchers, go with the last connect agent here.
 
         Args:
           name: The machine's name.
@@ -159,9 +212,12 @@ class Services:
             self._call("systemctl", "--user", "daemon-reload")
             return True
         self._unload(path)
-        menubar = self.folder / f"{_MENUBAR}.plist"
-        if menubar.is_file() and not any(self.folder.glob(_CONNECT_PLISTS)):
-            self._unload(menubar)
+        if not any(self.folder.glob(_CONNECT_PLISTS)):
+            if (agent := self.folder / f"{_MENUBAR}.plist").is_file():
+                self._unload(agent)
+            for each in ("knowop", "knowop menu bar"):
+                launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / each
+                launcher.unlink(missing_ok=True)
         return True
 
     def every(self) -> list[Connect]:
@@ -201,9 +257,26 @@ class Services:
         return found
 
     def unchanged(self, connect: Connect) -> bool:
-        """Return whether ``connect``'s service is installed as :meth:`start` would."""
+        """Return whether ``connect``'s service is installed as :meth:`start` would.
+
+        Args:
+          connect: The machine, server and flags it serves.
+
+        Returns:
+          unchanged: Whether its definition, and under launchd its launcher, hold
+            what :meth:`start` would write.
+
+        """
         path = self._path(connect)
-        return path.is_file() and path.read_text() == self._definition(connect)
+        same = path.is_file() and path.read_text() == self._definition(connect)
+        if self.manager == "systemd":
+            return same
+        launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"
+        return (
+            same
+            and launcher.is_file()
+            and launcher.read_text() == _script(self._program())
+        )
 
     def linger_off(self) -> bool:
         """Return whether systemd stops this user's services when they log out.
@@ -249,8 +322,9 @@ class Services:
     def _definition(self, connect: Connect) -> str:
         """Return the definition file that serves ``connect``."""
         log = _log(connect)
+        launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"
         argv = [
-            *self._program(),
+            *([str(launcher)] if self.manager == "launchd" else self._program()),
             "connect",
             connect.server,
             *connect.flags,
@@ -290,23 +364,22 @@ class Services:
             ],
         )
 
-    # The definition replaces the one installed, by a temporary file renamed over it, so
-    # a symlink there is replaced, never followed. The log is made, readable by this
-    # user only, before the manager would make it.
+    # The log is made, readable by this user only, before the manager would make it.
     def _write(self, path: Path, definition: str, *, log: Path) -> bool:
         """Install ``definition`` at ``path`` and make its ``log``; say if it was so."""
-        unchanged = path.is_file() and path.read_text() == definition
         log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
-        self.folder.mkdir(parents=True, exist_ok=True)
-        staged = path.with_name(f".{path.name}.tmp")
-        staged.unlink(missing_ok=True)
-        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        # The umask would narrow it; nothing in it is secret.
-        os.fchmod(fd, 0o644)
-        with os.fdopen(fd, "w") as file:
-            file.write(definition)
-        staged.replace(path)
+        return _put(path, definition, mode=0o644)
+
+    # Login Items names a legacy agent by its program's file name, and shows that file's
+    # icon: each agent runs knowop through a script of its own, named for what it is.
+    def _launcher(self, name: str) -> bool:
+        """Install the launcher ``name``, which runs this knowop; say if it was so."""
+        path = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / name
+        unchanged = _put(path, _script(self._program()), mode=0o755)
+        # Set again at each write, which drops it: it is the file's extended attributes.
+        if self.menubar_problem() is None:
+            self.set_icon(path)
         return unchanged
 
     def _load(self, path: Path, *, unchanged: bool, again: tuple[str, ...]) -> None:
@@ -392,6 +465,8 @@ def here(
             manager="launchd",
             folder=Path.home() / "Library" / "LaunchAgents",  # noqa: TID251 -- vendor fixed path, not ours (AGENTS.md rule 3)  # house-ignore[xdg-literal] -- launchd reads a user's agents from this fixed folder (AGENTS.md rule 3).
             run=run,
+            menubar_problem=menubar.problem,
+            set_icon=menubar.set_icon,
         )
     # A login without PAM (sshd's ``UsePAM no``) sets no runtime folder, and
     # ``systemctl --user`` then finds no manager, though linger keeps one running.
@@ -452,6 +527,18 @@ _CONNECT_PLISTS: Final = "ai.rekursiv.knowop.connect.*.plist"
 """The connect agents' definitions, by file name."""
 
 
+# The end alone: a crash loop writes its traceback every 10 s.
+def _last_line(log: Path) -> str:
+    """Return the last line ``log`` holds; empty when it holds none."""
+    try:
+        with log.open("rb") as file:
+            file.seek(max(file.seek(0, os.SEEK_END) - 4096, 0))
+            lines = file.read().decode(errors="replace").strip().splitlines()
+    except FileNotFoundError:
+        return ""
+    return lines[-1] if lines else ""
+
+
 def _log(connect: Connect) -> Path:
     """Return the log ``connect``'s service writes."""
     tag = server_tag(connect.server)
@@ -471,6 +558,31 @@ def _environment() -> dict[str, str]:
         or (name.startswith("LC_") and not name.startswith("LC_TRAX"))
     }
     return dict(sorted({**shell, **base_dir_variables()}.items()))
+
+
+def _script(program: list[str]) -> str:
+    """Return a launcher: it runs ``program`` with the arguments it is given."""
+    return (
+        "#!/bin/sh\n"
+        "# knowop connect writes it: launchd runs knowop through it, under its name.\n"
+        f'exec {shlex.join(program)} "$@"\n'
+    )
+
+
+# By a temporary file renamed over it, so a symlink there is replaced, never followed.
+def _put(path: Path, text: str, *, mode: int) -> bool:
+    """Write ``text`` to ``path``, readable as ``mode`` says; say if it held it already."""
+    unchanged = path.is_file() and path.read_text() == text
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_name(f".{path.name}.tmp")
+    staged.unlink(missing_ok=True)
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    # The umask would narrow it; nothing in it is secret.
+    os.fchmod(fd, mode)
+    with os.fdopen(fd, "w") as file:
+        file.write(text)
+    staged.replace(path)
+    return unchanged
 
 
 def _agent(label: str, argv: list[str], log: Path) -> str:

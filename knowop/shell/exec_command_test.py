@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import partial
-from typing import TYPE_CHECKING, cast
+from typing import IO, TYPE_CHECKING
 
 import asyncio
 import base64
-import os
-import signal
 
+from trackinizer.lib.posix.child import Child
+from trackinizer.lib.posix.pids import gone_within, kill_and_reap, written_pid
 from trackinizer.wire.wire_exec import (
     MAX_STREAM_BYTES,
     TIMEOUT_EXIT_CODE,
@@ -21,16 +19,25 @@ from trackinizer.wire.wire_exec import (
 import pytest
 
 from knowop.shell.exec_command import (
-    _kill_group,
-    _Shell,
     _supervise,
     run_command,
+    run_until_ended,
 )
 from knowop.shell.exec_stream import Cut
 
 
 if TYPE_CHECKING:
+    from asyncio.subprocess import Process
+    from collections.abc import Collection, Iterator, Mapping
     from pathlib import Path
+
+
+@pytest.fixture
+def started() -> Iterator[list[int]]:
+    """Collect the pids a test starts; whatever still runs at teardown is killed."""
+    pids: list[int] = []
+    yield pids
+    kill_and_reap(pids)
 
 
 @pytest.fixture(autouse=True)
@@ -88,8 +95,11 @@ def test_a_home_folder_of_a_user_this_machine_lacks_runs_nothing(
 ) -> None:
     folder = "~no-such-user-of-knowop"
 
-    result = asyncio.run(run_command(_request(f"touch {tmp_path}/ran", cwd=folder)))
+    result, ending = asyncio.run(
+        run_until_ended(_request(f"touch {tmp_path}/ran", cwd=folder), ended=None),
+    )
 
+    assert ending == "exited"
     assert result.exit_code == 1
     assert _err(result) == f"{folder} is not a folder on this machine\n".encode()
     assert not (tmp_path / "ran").exists()
@@ -100,33 +110,82 @@ def test_a_command_started_without_its_pipes_is_refused(tmp_path: Path) -> None:
         asyncio.run(_supervise_without_pipes(tmp_path))
 
 
-@pytest.mark.parametrize("refusal", [ProcessLookupError, PermissionError])
-def test_a_group_already_gone_or_not_this_users_is_left_alone(
-    monkeypatch: pytest.MonkeyPatch,
-    refusal: type[OSError],
+@pytest.mark.asyncio
+async def test_a_cancelled_run_kills_the_command_and_what_it_started(
+    tmp_path: Path,
+    started: list[int],
 ) -> None:
-    killed: list[tuple[int, int]] = []
-    monkeypatch.setattr(os, "killpg", partial(_refuse_kill, refusal, killed))
+    running = asyncio.create_task(
+        run_command(
+            _request(f"sleep 60 & echo $! > {tmp_path}/job.pid; wait", cwd=tmp_path),
+        ),
+    )
+    started.append(await written_pid(tmp_path / "job.pid"))
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, timeout=5)
+    assert await gone_within(started)
 
-    _kill_group(cast("asyncio.subprocess.Process", _Running(pid=4242)))
 
-    assert killed == [(4242, signal.SIGKILL)]
+@pytest.mark.asyncio
+async def test_a_run_cancelled_while_its_shell_starts_kills_what_it_started(
+    tmp_path: Path,
+    started: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cancel lands before the runner holds the shell, so no one else can stop it."""
+    real = asyncio.create_subprocess_exec
+    handed = asyncio.Event()
+
+    async def slow(
+        *argv: str,
+        stdin: int | IO[bytes] | None,
+        stdout: int | IO[bytes] | None,
+        stderr: int | IO[bytes] | None,
+        cwd: str | Path | None,
+        env: Mapping[str, str] | None,
+        pass_fds: Collection[int],
+        limit: int,
+        start_new_session: bool,
+    ) -> Process:
+        process = await real(
+            *argv,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            cwd=cwd,
+            env=env,
+            pass_fds=pass_fds,
+            limit=limit,
+            start_new_session=start_new_session,
+        )
+        await handed.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", slow)
+    running = asyncio.create_task(
+        run_command(
+            _request(f"sleep 60 & echo $! > {tmp_path}/job.pid; wait", cwd=tmp_path),
+        ),
+    )
+    started.append(await written_pid(tmp_path / "job.pid"))
+    running.cancel()
+    handed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, timeout=5)
+    assert await gone_within(started)
 
 
 async def _supervise_without_pipes(cwd: Path) -> None:
     """Supervise a process started with none of the pipes the runner feeds and reads."""
-    process = await asyncio.create_subprocess_exec("true")
-    try:
+    async with await Child.start("true") as child:
         _ = await _supervise(
-            process,
+            child,
             _request("true", cwd=cwd),
-            shell=_Shell(loop=asyncio.get_running_loop()),
             ended=None,
             out=Cut(),
             err=Cut(),
         )
-    finally:
-        _ = await process.wait()
 
 
 async def _never(process: asyncio.subprocess.Process) -> int:
@@ -134,25 +193,6 @@ async def _never(process: asyncio.subprocess.Process) -> int:
     del process
     await asyncio.Event().wait()
     return 0
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _Running:
-    """A shell still running, as far as its parent knows."""
-
-    pid: int
-    returncode: int | None = None
-
-
-def _refuse_kill(
-    refusal: type[OSError],
-    killed: list[tuple[int, int]],
-    pgid: int,
-    signum: int,
-) -> None:
-    """Stand in for ``os.killpg`` on a group the kernel will not signal."""
-    killed.append((pgid, signum))
-    raise refusal
 
 
 def _request(command: str, *, cwd: Path | str, timeout_sec: float = 10) -> ExecRequest:

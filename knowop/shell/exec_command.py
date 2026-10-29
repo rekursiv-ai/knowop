@@ -11,14 +11,14 @@ from __future__ import annotations
 
 from contextlib import suppress
 from pathlib import Path
-from typing import Final, Literal, override
+from typing import Final, Literal
 
 import asyncio
 import base64
 import os
-import signal
 import time
 
+from trackinizer.lib.posix.child import Child
 from trackinizer.wire import wire_exec
 from trackinizer.wire.wire_exec import ExecRequest, ExecResult
 
@@ -96,7 +96,7 @@ async def run_until_ended(
         )
     report_read, report_write = os.pipe()
     try:
-        process, shell = await _spawn(request, folder, report_write=report_write)
+        child = await _spawn(request, folder, report_write=report_write)
     except OSError as failure:
         os.close(report_read)
         status = _NOT_FOUND if isinstance(failure, FileNotFoundError) else _CANNOT_RUN
@@ -111,9 +111,8 @@ async def run_until_ended(
     try:
         out, err = Cut(), Cut()
         ending, code = await _supervise(
-            process,
+            child,
             request,
-            shell=shell,
             ended=ended,
             out=out,
             err=err,
@@ -191,31 +190,23 @@ def _finished(
     )
 
 
-async def _spawn(
-    request: ExecRequest,
-    folder: Path,
-    *,
-    report_write: int,
-) -> tuple[asyncio.subprocess.Process, _Shell]:
+async def _spawn(request: ExecRequest, folder: Path, *, report_write: int) -> Child:
     """Start the login shell for the command, in a process group of its own."""
-    loop = asyncio.get_running_loop()
-    # ``create_subprocess_exec``'s own steps, with a protocol that also says when the
-    # shell exits.
-    transport, shell = await loop.subprocess_exec(
-        lambda: _Shell(loop=loop),
+    return await Child.start(
         "bash",
         "-lc",
         script(request.command, report_fd=report_write),
+        # Its own group, so a kill reaches what the command started.
+        group=True,
+        # Killed outright, whatever it does with a termination signal.
+        grace_sec=0.0,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=folder,
         env=_environment(request),
-        # Its own group, so a kill reaches what the command started.
-        start_new_session=True,
         pass_fds=(report_write,),
     )
-    return asyncio.subprocess.Process(transport, shell, loop), shell
 
 
 # The server's assistant reads every stream back, so a credential the host holds in its
@@ -230,15 +221,15 @@ def _environment(request: ExecRequest) -> dict[str, str]:
 
 
 async def _supervise(
-    process: asyncio.subprocess.Process,
+    child: Child,
     request: ExecRequest,
     *,
-    shell: _Shell,
     ended: asyncio.Event | None,
     out: Cut,
     err: Cut,
 ) -> tuple[Ending, int]:
     """Feed the command, collect its output, and kill it when it must end."""
+    process = child.process
     if process.stdin is None or process.stdout is None or process.stderr is None:
         raise ValueError("The command was started without its pipes.")
     streams = [
@@ -246,7 +237,7 @@ async def _supervise(
         asyncio.create_task(_collect(process.stdout, out)),
         asyncio.create_task(_collect(process.stderr, err)),
     ]
-    exited = asyncio.create_task(_exited(process, shell=shell))
+    exited = asyncio.create_task(child.exited())
     stop = asyncio.create_task((ended or asyncio.Event()).wait())
     try:
         done, _ = await asyncio.wait(
@@ -257,36 +248,19 @@ async def _supervise(
         ending: Ending = (
             "exited" if exited in done else "ended" if stop in done else "timeout"
         )
-        if ending != "exited":
-            _kill_group(process)
-        code = await exited
+        code = await exited if ending == "exited" else await child.stop()
         # What the shell left running keeps the pipes open, so the streams get a
         # moment to finish and no more.
         _ = await asyncio.wait(streams, timeout=_DRAIN_SEC)
+    except asyncio.CancelledError:
+        _ = await child.stop()
+        raise
     finally:
-        for task in (*streams, stop):
+        tasks = [*streams, stop, exited]
+        for task in tasks:
             _ = task.cancel()
-        _ = await asyncio.gather(*streams, stop, return_exceptions=True)
+        _ = await asyncio.wait(tasks)
     return ending, code
-
-
-# Not ``Process.wait``: before Python 3.13 it returns only once every pipe has closed,
-# so a job the shell left in the background held the result back until the job ended,
-# and past the timeout it was reported as one.
-async def _exited(process: asyncio.subprocess.Process, *, shell: _Shell) -> int:
-    """Return the shell's status once it exits, whatever still holds its pipes."""
-    while (code := process.returncode) is None:
-        await shell.exited.wait()
-    return code
-
-
-def _kill_group(process: asyncio.subprocess.Process) -> None:
-    """Kill the command's process group, whatever it does with a termination signal."""
-    # Unreaped, so the pid cannot name another process; the loop does not run between
-    # this check and the kill.
-    if process.returncode is None:
-        with suppress(ProcessLookupError, PermissionError):
-            os.killpg(process.pid, signal.SIGKILL)
 
 
 async def _feed(stdin: asyncio.StreamWriter, data: bytes) -> None:
@@ -343,17 +317,3 @@ def _refused(
         started=started,
     )
     return result, "exited"
-
-
-class _Shell(asyncio.subprocess.SubprocessStreamProtocol):
-    """The shell's pipes as streams, and an event set the moment the shell exits."""
-
-    def __init__(self, *, loop: asyncio.AbstractEventLoop) -> None:
-        # The limit ``create_subprocess_exec`` passes: asyncio's own stream default.
-        super().__init__(limit=2**16, loop=loop)
-        self.exited = asyncio.Event()
-
-    @override
-    def process_exited(self) -> None:
-        super().process_exited()
-        self.exited.set()
