@@ -390,6 +390,11 @@ class ClaudeStreamDriver:
             "--output-format",
             "stream-json",
             "--verbose",
+            # Measured on claude 2.1.312: stream-json writes empty thinking unless asked,
+            # and ``showThinkingSummaries`` applies to an interactive run only. The flag
+            # is not in ``--help``; it is what the Agent SDK passes for a display.
+            "--thinking-display",
+            "summarized",
             "--permission-prompt-tool",
             "stdio",
             *(

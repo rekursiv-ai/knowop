@@ -89,7 +89,7 @@ from trackinizer.wire.wire_sessions import (
     SessionStart,
     SessionStartResponse,
 )
-from treekle import from_plain, json_dumps, json_loads
+from treekle import PlainTree, from_plain, json_dumps, json_loads
 
 import pytest
 
@@ -164,7 +164,6 @@ if TYPE_CHECKING:
     from trackinizer.runs.asks import Driver
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.types.streams import TraxRecord
-    from treekle import PlainTree
 
 
 @pytest.fixture(autouse=True)
@@ -1791,6 +1790,8 @@ class TestAResumedTranscriptIsCaptured:
             "--no-daemon",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
             "resume",
             _ROLLOUT_ID,
         ]
@@ -3951,6 +3952,8 @@ class TestSessionOwnerAndArgv:
             "--no-daemon",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
             "exec",
             "hi",
         ]
@@ -3958,6 +3961,8 @@ class TestSessionOwnerAndArgv:
             "codex",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
             "--no-daemon",
         ]
 
@@ -3981,9 +3986,38 @@ class TestSessionOwnerAndArgv:
 
         assert _cli_argv(CodexAdapter(), config, None) == [
             "codex",
+            "-c",
+            'model_reasoning_summary="auto"',
             *given,
             "--no-daemon",
         ]
+
+    @pytest.mark.parametrize(
+        "given",
+        [
+            ("-c", "model_reasoning_summary=none"),
+            ("--config", 'model_reasoning_summary="detailed"'),
+            ("--config=model_reasoning_summary=concise",),
+        ],
+        ids=["c", "config", "config-equals"],
+    )
+    def test_codex_reasoning_summaries_are_left_as_the_person_set_them(
+        self,
+        given: tuple[str, ...],
+    ) -> None:
+        """Codex writes a reasoning summary into its rollout only when asked for one."""
+        config = RunConfig(cli_name="codex", cli_args=(*given, "--no-daemon"))
+
+        assert _cli_argv(CodexAdapter(), config, None) == [
+            "codex",
+            "--enable",
+            "goals",
+            *given,
+            "--no-daemon",
+        ]
+        app_server = session._codex_argv(["codex"], cli_args=given)
+        assert 'model_reasoning_summary="auto"' not in app_server
+        assert app_server[-2:] == ["--enable", "goals"]
 
     def test_another_feature_or_a_dangling_flag_still_gets_goals(self) -> None:
         config = RunConfig(
@@ -4048,6 +4082,8 @@ class TestChatRunApprovals:
                     "--no-daemon",
                     "--enable",
                     "goals",
+                    "-c",
+                    'model_reasoning_summary="auto"',
                     "exec",
                     "hi",
                 ],
@@ -4070,7 +4106,16 @@ class TestChatRunApprovals:
             (
                 "codex",
                 ("exec", "hi"),
-                ["codex", "--no-daemon", "--enable", "goals", "exec", "hi"],
+                [
+                    "codex",
+                    "--no-daemon",
+                    "--enable",
+                    "goals",
+                    "-c",
+                    'model_reasoning_summary="auto"',
+                    "exec",
+                    "hi",
+                ],
             ),
         ],
         ids=["claude", "codex"],
@@ -4157,6 +4202,8 @@ class TestChatRunApprovals:
             "--no-daemon",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
             *args,
             "exec",
             "hi",
@@ -4171,6 +4218,8 @@ class TestChatRunApprovals:
             "--no-daemon",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
             *args,
         ]
 
@@ -4282,6 +4331,8 @@ class TestChatRunApprovals:
             "--no-daemon",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
             "exec",
             "hi",
         ]
@@ -4300,6 +4351,8 @@ class TestChatRunApprovals:
             "--no-daemon",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
             *args,
         ]
 
@@ -4336,6 +4389,8 @@ class TestChatRunApprovals:
             "--no-daemon",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
             "exec",
             "hi",
         ]
@@ -6659,8 +6714,9 @@ class TestPromptBridge:
         assert files is not None
         assert files.socket is not None
         assert argv == ["claude", "--settings", str(files.settings)]
-        hooks = json_loads(files.settings.read_text(), dict[str, dict[str, object]])
-        assert {"PreToolUse", "PermissionRequest", "PostToolUse"} <= set(hooks["hooks"])
+        settings = json_loads(files.settings.read_text(), dict[str, PlainTree])
+        hooks = from_plain(settings["hooks"], dict[str, object])
+        assert {"PreToolUse", "PermissionRequest", "PostToolUse"} <= set(hooks)
         assert str(files.socket) in files.settings.read_text()
 
     def test_an_answer_goes_to_the_waiting_hook_and_is_never_typed(
@@ -6932,7 +6988,8 @@ class _PermissionHook:
 
     def ask(self, settings: Path, drained: Mapping[str, object]) -> None:
         """Start the hook the settings name; note whether the run saw it open."""
-        hooks = json_loads(settings.read_text(), dict[str, dict[str, object]])["hooks"]
+        stored = json_loads(settings.read_text(), dict[str, PlainTree])
+        hooks = from_plain(stored["hooks"], dict[str, object])
         entries = from_plain(
             hooks["PermissionRequest"],
             list[dict[str, list[dict[str, str | int]]]],
@@ -8105,12 +8162,26 @@ class TestWhatDrivesAChatRun:
     def test_codex_runs_its_app_server_with_goals_on(self) -> None:
         argv = session._codex_argv(["codex"], cli_args=())
 
-        assert argv == ["codex", "app-server", "--enable", "goals"]
+        assert argv == [
+            "codex",
+            "app-server",
+            "--enable",
+            "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
+        ]
 
     def test_codex_keeps_goals_as_the_person_set_them(self) -> None:
         argv = session._codex_argv(["codex"], cli_args=("--disable", "goals"))
 
-        assert argv == ["codex", "app-server", "--disable", "goals"]
+        assert argv == [
+            "codex",
+            "app-server",
+            "--disable",
+            "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
+        ]
 
     def test_codex_gets_the_persons_config_overrides(self) -> None:
         argv = session._codex_argv(
@@ -8133,6 +8204,8 @@ class TestWhatDrivesAChatRun:
             "a.b=1",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
         ]
 
     @pytest.mark.parametrize(
@@ -10002,11 +10075,13 @@ class TestATakeoverFromAHeadlessRun:
         )
 
         assert reply.ok
-        assert wiring.relays[0].argv[:6] == [
+        assert wiring.relays[0].argv[:8] == [
             "codex",
             "--no-daemon",
             "--enable",
             "goals",
+            "-c",
+            'model_reasoning_summary="auto"',
             "resume",
             _ROLLOUT_ID,
         ]

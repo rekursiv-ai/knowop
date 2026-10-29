@@ -973,6 +973,8 @@ def test_start_launches_claude_headless_over_stream_json(tmp_path: Path) -> None
         "--output-format",
         "stream-json",
         "--verbose",
+        "--thinking-display",
+        "summarized",
         "--permission-prompt-tool",
         "stdio",
         "--model",
@@ -996,7 +998,7 @@ def test_a_resumed_session_keeps_its_id(tmp_path: Path) -> None:
 
     run, session = asyncio.run(go())
     assert session == "abc"
-    assert from_plain(run.seen()[0]["argv"], list[str])[8:] == [
+    assert from_plain(run.seen()[0]["argv"], list[str])[10:] == [
         "--permission-mode",
         "default",
         "--resume",

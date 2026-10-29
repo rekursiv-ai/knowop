@@ -172,7 +172,7 @@ def settings_json(
     user: Mapping[str, PlainTree] | None = None,
     socket: Path | None = None,
 ) -> str:
-    """Return claude's settings holding the hooks that run :func:`main`.
+    """Return claude's settings holding the hooks that run :func:`main`, summaries on.
 
     Args:
       seen: Where the hook keeps the newest box it told this run; the readiness
@@ -216,6 +216,10 @@ def settings_json(
             event: [*theirs.get(event, []), *entries] for event, entries in ours.items()
         },
     }
+    # Measured on claude 2.1.312: an interactive run writes its thinking summary into
+    # the transcript only with this on; off, the block's text is empty. Ours wins over
+    # the person's, so every session keeps what the model returned.
+    kept["showThinkingSummaries"] = True
     return json.dumps(kept)
 
 
