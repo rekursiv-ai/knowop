@@ -479,7 +479,14 @@ def agents(
     tmp_path: Path,
 ) -> Services:
     """Stand in for launchctl and this user's agents folder: no real service runs."""
-    stand_in = Services(manager="launchd", folder=tmp_path / "agents", run=launchd)
+    # This Python can start the menu bar, wherever the tests run.
+    stand_in = Services(
+        manager="launchd",
+        folder=tmp_path / "agents",
+        run=launchd,
+        menubar_problem=lambda: None,
+        set_icon=lambda _path: None,
+    )
     monkeypatch.setattr(service, "here", lambda: stand_in)
     return stand_in
 
@@ -1716,6 +1723,58 @@ def test_connect_again_leaves_a_current_service_serving(
         "connected:",
         "connected already:",
     )
+    # A menu bar quit since starts again.
+    assert launchd.menubar[-1] == "kickstart"
+
+
+def test_connect_says_why_its_python_cannot_show_the_menu_bar_and_installs_none(
+    host: _Host,
+    launchd: _Launchd,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A checkout's environment synced before PyObjC was added, as in Dan's."""
+    del host
+    stand_in = Services(
+        manager="launchd",
+        folder=tmp_path / "agents",
+        run=launchd,
+        menubar_problem=lambda: "No module named 'AppKit'",
+    )
+    monkeypatch.setattr(service, "here", lambda: stand_in)
+    terminal = _at_terminal(monkeypatch)
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("connect") == 0
+
+    assert terminal.lines()[-3:] == [
+        _CONNECTED,
+        "log:  knowop logs -f",
+        "stop: knowop disconnect",
+    ]
+    assert capsys.readouterr().err == (
+        f"knowop: no menu bar: No module named 'AppKit' in {sys.executable}; install "
+        "PyObjC there (in a checkout, uv sync), then run knowop connect again\n"
+    )
+    assert launchd.menubar == []
+
+
+def test_status_says_how_the_menu_bar_is(
+    agents: Services,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    agents.start(Connect(name="ada-mac", server=_ACME))
+    agents.show_menu_bar()
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("status") == 0
+
+    # The stand-in launchd prints nothing of the agent: it has not run.
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        "menubar: stopped; knowop connect starts it"
+    )
 
 
 def test_connect_with_other_flags_reloads_its_service(
@@ -2328,13 +2387,9 @@ def test_status_json_holds_each_login_the_runs_here_and_the_services(
             {"run": "scratch", "cli": "claude", "cwd": "/work", "session_id": None},
         ],
         "services": [
-            {
-                "name": "ada-mac",
-                "server": _ACME,
-                "flags": ["--sandbox"],
-                "disabled": False,
-            },
+            {"name": "ada-mac", "server": _ACME, "flags": ["--sandbox"]},
         ],
+        "menubar": None,
     }
 
 

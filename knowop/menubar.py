@@ -14,8 +14,9 @@ next login or ``knowop connect``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Final, NotRequired, Protocol, TypedDict, cast
 
+import importlib
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ from wrapt import lazy_import
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
 
 # macOS alone has them: importing them eagerly would make this module, and so its pure
@@ -34,7 +36,7 @@ _appkit = lazy_import("AppKit")
 _helper = lazy_import("PyObjCTools.AppHelper")
 
 
-__all__ = ["Line", "Report", "run", "status", "view"]
+__all__ = ["Line", "Report", "problem", "run", "set_icon", "status", "view"]
 
 
 _MARK: Final = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
@@ -45,6 +47,16 @@ _MARK: Final = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
   </g>
 </svg>"""
 """The knowop mark, as the web app's favicon draws it, in black: a template image."""
+
+_ICON: Final = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#0b0c0e"/>
+  <g fill="none" stroke="#f7f8f8" stroke-width="6.5" stroke-linecap="square"
+     stroke-linejoin="round" transform="translate(12.8 12.8) scale(0.6)">
+    <path d="M9 10V54"/>
+    <path d="M29 12 9 32 29 52H35a20 20 0 0 0 0-40Z"/>
+  </g>
+</svg>"""
+"""The knowop icon, as the web app's draws it: the mark, light, on a dark square."""
 
 _ACCESSORY: Final = 1
 """``NSApplicationActivationPolicyAccessory``: a menu bar item, no Dock icon."""
@@ -68,7 +80,8 @@ class _Login(TypedDict):
 class _Service(TypedDict):
     name: str
     server: str
-    disabled: bool
+    disabled: NotRequired[bool]
+    """``service.Connect``'s, left out at its default, ``False``."""
 
 
 class Report(TypedDict):
@@ -113,7 +126,11 @@ def view(report: Report | None) -> tuple[bool, list[Line]]:
         for machine in login["machines"] or []
         if machine["status"] == "online"
     }
-    served = {(s["server"], s["name"]) for s in report["services"] if not s["disabled"]}
+    served = {
+        (s["server"], s["name"])
+        for s in report["services"]
+        if s.get("disabled") is not True
+    }
     connected = bool(served) and served <= online
     lines: list[Line] = [
         Line(title=f"knowop: {'connected' if connected else 'not connected'}"),
@@ -134,6 +151,32 @@ def view(report: Report | None) -> tuple[bool, list[Line]]:
             )
         lines.append(Line(title=f"Open {login['server']}", url=login["server"]))
     return connected, lines
+
+
+# Kept in the file's extended attributes, as Finder keeps a custom icon.
+def set_icon(path: Path) -> None:
+    """Give the file ``path`` the knowop icon, which Finder and Login Items show."""
+    kit = cast("_AppKit", _appkit)
+    icon = kit.NSImage.alloc().initWithData_(
+        kit.NSData.dataWithBytes_length_(_ICON, len(_ICON)),
+    )
+    kit.NSWorkspace.sharedWorkspace().setIcon_forFile_options_(icon, str(path), 0)
+
+
+# Imported, not looked up: a PyObjC install that is there but broken fails the same way.
+def problem() -> str | None:
+    """Return why the menu bar cannot start in this Python; ``None`` when it can.
+
+    Returns:
+      problem: What importing AppKit raised here, as in a checkout whose environment
+        predates PyObjC; ``None`` where it imports.
+
+    """
+    try:
+        importlib.import_module("AppKit")
+    except ImportError as error:
+        return str(error)
+    return None
 
 
 def status() -> Report | None:
@@ -334,6 +377,12 @@ class _URLs(Protocol):
 
 class _Workspace(Protocol):
     def openURL_(self, url: object) -> bool: ...
+    def setIcon_forFile_options_(
+        self,
+        image: _Image,
+        path: str,
+        options: int,
+    ) -> bool: ...
 
 
 class _Workspaces(Protocol):

@@ -9,16 +9,18 @@ from typing import TYPE_CHECKING, Final, Literal, override
 
 import os
 import plistlib
+import shlex
 import shutil
 import stat
+import subprocess
 import sys
 
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.userdirs import config_dir, state_dir
+from trackinizer.lib.userdirs import config_dir, data_dir, state_dir
 
 import pytest
 
-from knowop import service
+from knowop import menubar, service
 from knowop.service import Connect, Services
 
 
@@ -93,6 +95,14 @@ def _env(tmp_path: Path) -> dict[str, str]:
     }
 
 
+def _program_of(launcher: Path) -> list[str]:
+    """Return the program a launcher runs: its ``exec`` line, less ``"$@"``."""
+    (line,) = [
+        each for each in launcher.read_text().splitlines() if each.startswith("exec ")
+    ]
+    return shlex.split(line)[1:-1]
+
+
 def _argv(log: Path) -> list[str]:
     """Return what ``_ADA``'s service runs: this interpreter, its knowop package."""
     return [
@@ -118,7 +128,10 @@ def test_a_launchd_agent_runs_this_knowop_with_its_flags_and_the_shells_paths(
     log = state_dir() / "rekursiv-ai" / "knowop" / "connect" / f"ada-mac-{_TAG}.log"
     assert plistlib.loads(path.read_bytes()) == {
         "Label": _LABEL,
-        "ProgramArguments": _argv(log),
+        "ProgramArguments": [
+            str(data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"),
+            *_argv(log)[3:],
+        ],
         "EnvironmentVariables": _env(tmp_path),
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
@@ -126,6 +139,19 @@ def test_a_launchd_agent_runs_this_knowop_with_its_flags_and_the_shells_paths(
         "StandardOutPath": str(log),
         "StandardErrorPath": str(log),
     }
+    # Login Items shows the agent by its program's name: the launcher, which runs this.
+    assert (
+        _program_of(data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop")
+        == _argv(log)[:3]
+    )
+    assert (
+        stat.S_IMODE(
+            (data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop")
+            .stat()
+            .st_mode,
+        )
+        == 0o755
+    )
 
 
 def test_a_systemd_unit_restarts_on_failure_within_limits_and_appends_to_the_log(
@@ -201,12 +227,13 @@ def test_a_knowop_uvx_runs_from_its_cache_is_served_by_uvx_at_that_version(
     path = tmp_path / "agents" / f"{_LABEL}.plist"
     log = state_dir() / "rekursiv-ai" / "knowop" / "connect" / f"ada-mac-{_TAG}.log"
     assert plistlib.loads(path.read_bytes())["ProgramArguments"] == [
-        "/opt/homebrew/bin/uvx",
-        "knowop@0.1.6",
+        str(data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"),
         *_argv(log)[3:],
     ]
-    # Once for the connect agent, once for the menu bar's, which runs the same knowop.
-    assert run.uv == [["uv", "cache", "dir"]] * 2
+    assert _program_of(
+        data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop",
+    ) == ["/opt/homebrew/bin/uvx", "knowop@0.1.6"]
+    assert run.uv == [["uv", "cache", "dir"]]
 
 
 @pytest.mark.parametrize("manager", ["launchd", "systemd"])
@@ -224,7 +251,11 @@ def test_a_uvx_service_reads_back_as_the_same_connect(
     services.start(_ADA)
 
     assert services.every() == [_ADA]
-    path = _installed(tmp_path, manager)
+    path = (
+        (data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop")
+        if manager == "launchd"
+        else _installed(tmp_path, manager)
+    )
     assert "knowop@0.1.6" in path.read_text()
     assert sys.executable not in path.read_text()
 
@@ -245,9 +276,11 @@ def test_a_knowop_installed_outside_uvs_cache_is_served_by_its_own_interpreter(
 
     Services(manager="launchd", folder=tmp_path / "agents", run=run).start(_ADA)
 
-    path = tmp_path / "agents" / f"{_LABEL}.plist"
     log = state_dir() / "rekursiv-ai" / "knowop" / "connect" / f"ada-mac-{_TAG}.log"
-    assert plistlib.loads(path.read_bytes())["ProgramArguments"] == _argv(log)
+    assert (
+        _program_of(data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop")
+        == _argv(log)[:3]
+    )
 
 
 @pytest.mark.parametrize("manager", ["launchd", "systemd"])
@@ -495,21 +528,40 @@ def test_removing_what_is_not_installed_runs_nothing(
     assert run.calls == []
 
 
-def test_a_launchd_start_runs_the_menu_bar_beside_it_and_leaves_one_running(
+# Each file given the knowop icon is added to ``iconed``.
+def _menu_bar(
+    tmp_path: Path,
+    run: _Manager,
+    problem: str | None = None,
+    *,
+    iconed: list[Path] | None = None,
+) -> Services:
+    """Return launchd's services, whose Python can start the menu bar unless ``problem``."""
+    return Services(
+        manager="launchd",
+        folder=tmp_path / "agents",
+        run=run,
+        menubar_problem=lambda: problem,
+        set_icon=([] if iconed is None else iconed).append,
+    )
+
+
+def test_showing_the_menu_bar_installs_its_agent_and_starts_it_only_once_ended(
     tmp_path: Path,
 ) -> None:
     first = _Manager(print=(113, "Could not find service"))
     again = _Manager()
 
-    Services(manager="launchd", folder=tmp_path / "agents", run=first).start(_ADA)
-    Services(manager="launchd", folder=tmp_path / "agents", run=again).start(_ADA)
+    assert _menu_bar(tmp_path, first).show_menu_bar() is None
+    assert _menu_bar(tmp_path, again).show_menu_bar() is None
 
     path = tmp_path / "agents" / f"{_MENUBAR}.plist"
     log = state_dir() / "rekursiv-ai" / "knowop" / "menubar.log"
     package = service.__name__.rpartition(".")[0]
+    launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop menu bar"
     assert plistlib.loads(path.read_bytes()) == {
         "Label": _MENUBAR,
-        "ProgramArguments": [sys.executable, "-m", package, "menubar"],
+        "ProgramArguments": [str(launcher), "menubar"],
         "EnvironmentVariables": _env(tmp_path),
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
@@ -526,24 +578,33 @@ def test_a_launchd_start_runs_the_menu_bar_beside_it_and_leaves_one_running(
     # Started if it ended (Quit), never restarted while it runs.
     assert again.menubar[-1] == ["launchctl", "kickstart", target]
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
+    assert _program_of(launcher) == [sys.executable, "-m", package]
+
+
+def test_a_menu_bar_this_python_cannot_start_is_said_and_not_left_installed(
+    tmp_path: Path,
+) -> None:
+    _menu_bar(tmp_path, _Manager()).show_menu_bar()
+    run = _Manager()
+
+    said = _menu_bar(tmp_path, run, "No module named 'AppKit'").show_menu_bar()
+
+    assert said == "No module named 'AppKit'"
+    assert list((tmp_path / "agents").iterdir()) == []
+    assert [call[1] for call in run.menubar] == ["print", "bootout"]
 
 
 def test_the_menu_bar_goes_with_the_last_connect_agent(tmp_path: Path) -> None:
     gpu = Connect(name="gpu1", server="https://other.example")
-    services = Services(manager="launchd", folder=tmp_path / "agents", run=_Manager())
+    services = _menu_bar(tmp_path, _Manager())
     services.start(_ADA)
     services.start(gpu)
+    services.show_menu_bar()
     first, last = _Manager(), _Manager()
 
-    Services(manager="launchd", folder=tmp_path / "agents", run=first).remove(
-        "ada-mac",
-        _SERVER,
-    )
+    _menu_bar(tmp_path, first).remove("ada-mac", _SERVER)
     kept = sorted(path.name for path in (tmp_path / "agents").iterdir())
-    Services(manager="launchd", folder=tmp_path / "agents", run=last).remove(
-        "gpu1",
-        gpu.server,
-    )
+    _menu_bar(tmp_path, last).remove("gpu1", gpu.server)
 
     assert (first.menubar, kept[-1]) == ([], f"{_MENUBAR}.plist")
     target = f"gui/{os.getuid()}/{_MENUBAR}"
@@ -552,17 +613,138 @@ def test_the_menu_bar_goes_with_the_last_connect_agent(tmp_path: Path) -> None:
         ["launchctl", "bootout", target],
     ]
     assert list((tmp_path / "agents").iterdir()) == []
+    assert list((data_dir() / "rekursiv-ai" / "knowop" / "launchers").iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "problem",
+    [None, "No module named 'AppKit'"],
+    ids=["AppKit", "none"],
+)
+def test_each_agent_runs_through_a_launcher_named_for_it_with_knowops_icon(
+    tmp_path: Path,
+    problem: str | None,
+) -> None:
+    """Login Items shows an agent by its program's file name, with that file's icon."""
+    iconed: list[Path] = []
+    services = _menu_bar(tmp_path, _Manager(), problem, iconed=iconed)
+
+    services.start(_ADA)
+    services.show_menu_bar()
+
+    launchers = data_dir() / "rekursiv-ai" / "knowop" / "launchers"
+    shown = [launchers / "knowop", launchers / "knowop menu bar"]
+    agents = sorted((tmp_path / "agents").iterdir())
+    programs = [plistlib.loads(p.read_bytes())["ProgramArguments"][0] for p in agents]
+    # Where AppKit does not import, there is no icon, and no menu bar.
+    assert programs == [str(each) for each in shown][: 1 if problem is not None else 2]
+    assert iconed == ([] if problem is not None else shown)
+
+
+def test_a_launcher_runs_knowop_with_the_arguments_launchd_gives_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Stands in for this interpreter: prints each argument it is run with, one a line.
+    shown = tmp_path / "python"
+    shown.write_text('#!/bin/sh\nfor each; do echo "[$each]"; done\n')
+    shown.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(shown))
+    Services(manager="launchd", folder=tmp_path / "agents", run=_Manager()).start(_ADA)
+    launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"
+
+    done = subprocess.run(  # noqa: S603 -- the launcher just written, fixed words.
+        [launcher, "connect", "a b"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    package = service.__name__.rpartition(".")[0]
+    assert done.stdout.splitlines() == ["[-m]", f"[{package}]", "[connect]", "[a b]"]
+
+
+def test_a_launcher_changed_since_is_not_the_service_as_installed(
+    tmp_path: Path,
+) -> None:
+    services = _menu_bar(tmp_path, _Manager())
+    services.start(_ADA)
+    launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"
+    launcher.write_text('#!/bin/sh\nexec /old/python -m knowop "$@"\n')
+
+    changed = services.unchanged(_ADA)
+    services.start(_ADA)
+
+    assert (changed, services.unchanged(_ADA)) == (False, True)
 
 
 def test_systemd_has_no_menu_bar(tmp_path: Path) -> None:
     run = _Manager()
+    services = Services(manager="systemd", folder=tmp_path / "agents", run=run)
 
-    Services(manager="systemd", folder=tmp_path / "agents", run=run).start(_ADA)
+    services.start(_ADA)
 
-    assert ([p.name for p in (tmp_path / "agents").iterdir()], run.menubar) == (
-        [_UNIT],
+    assert (services.show_menu_bar(), services.menu_bar(), run.menubar) == (
+        None,
+        None,
         [],
     )
+    assert [p.name for p in (tmp_path / "agents").iterdir()] == [_UNIT]
+
+
+@pytest.mark.parametrize(
+    ("printed", "state"),
+    [
+        ("\tstate = running\n\tpid = 87559\n", "running"),
+        (
+            "\tstate = not running\n\tlast exit code = 0\n",
+            "stopped; knowop connect starts it",
+        ),
+        (
+            "\tstate = waiting\n\tlast exit code = (never exited)\n",
+            "stopped; knowop connect starts it",
+        ),
+        (
+            "\tstate = spawn scheduled\n\tlast exit code = 1\n",
+            "failing, exit 1: ModuleNotFoundError: No module named 'AppKit'",
+        ),
+    ],
+    ids=["running", "quit", "not yet started", "failing"],
+)
+def test_the_menu_bar_says_whether_it_runs_and_why_it_fails(
+    tmp_path: Path,
+    printed: str,
+    state: str,
+) -> None:
+    _menu_bar(tmp_path, _Manager()).show_menu_bar()
+    log = state_dir() / "rekursiv-ai" / "knowop" / "menubar.log"
+    log.write_text(
+        "Traceback (most recent call last):\n  ...\n" * 900
+        + "ModuleNotFoundError: No module named 'AppKit'\n",
+    )
+
+    assert _menu_bar(tmp_path, _Manager(print=(0, printed))).menu_bar() == state
+
+
+def test_no_menu_bar_installed_says_nothing(tmp_path: Path) -> None:
+    run = _Manager()
+
+    assert _menu_bar(tmp_path, run).menu_bar() is None
+    assert run.menubar == []
+
+
+@pytest.mark.parametrize("log_exists", [False, True], ids=["missing", "empty"])
+def test_a_failed_menu_bar_reports_its_exit_code_without_log_output(
+    tmp_path: Path,
+    log_exists: bool,
+) -> None:
+    _menu_bar(tmp_path, _Manager()).show_menu_bar()
+    log = state_dir() / "rekursiv-ai" / "knowop" / "menubar.log"
+    if not log_exists:
+        log.unlink()
+    run = _Manager(print=(0, "\tstate = spawn scheduled\n\tlast exit code = 1\n"))
+
+    assert _menu_bar(tmp_path, run).menu_bar() == "failing, exit 1: "
 
 
 def _installed(tmp_path: Path, manager: Literal["launchd", "systemd"]) -> Path:
@@ -583,10 +765,7 @@ def test_a_definition_that_does_not_stop_stays(tmp_path: Path) -> None:
             _SERVER,
         )
 
-    assert sorted(p.name for p in (tmp_path / "agents").iterdir()) == [
-        f"{_LABEL}.plist",
-        f"{_MENUBAR}.plist",
-    ]
+    assert [p.name for p in (tmp_path / "agents").iterdir()] == [f"{_LABEL}.plist"]
 
 
 def test_each_installed_agent_reads_back_with_whether_login_items_turned_it_off(
@@ -750,10 +929,13 @@ def test_a_mac_has_launchd_with_the_users_launch_agents(
     monkeypatch.setattr(sys, "platform", "darwin")
     run = _Manager()
 
+    # It alone asks AppKit whether the menu bar can start, and sets the icon.
     assert service.here(run) == Services(
         manager="launchd",
         folder=tmp_path / "home" / "Library" / "LaunchAgents",
         run=run,
+        menubar_problem=menubar.problem,
+        set_icon=menubar.set_icon,
     )
     assert run.calls == []
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Final, Protocol, cast
 
 import subprocess
@@ -18,6 +18,7 @@ from knowop.menubar import Line, Report, view
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from pathlib import Path
 
 
 _ALPHA: Final = "https://alpha.knowop.ai"
@@ -137,6 +138,23 @@ def test_status_reads_what_this_knowop_prints_whatever_it_exits_with(
     assert asked == [[sys.executable, "-m", package, "status", "--json"]]
 
 
+def test_status_reads_a_service_written_with_its_defaults_left_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``knowop status --json`` leaves out each field at its default: an enabled
+    # service's ``disabled``.
+    report = _report()
+    enabled = [{"name": s["name"], "server": s["server"]} for s in report["services"]]
+    out = json_dumps({**report, "services": enabled})
+
+    def answer(argv: Sequence[str], **_: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", answer)
+
+    assert view(menubar.status())[0]
+
+
 class _Item:
     def __init__(self, title: str, action: str | None = None, key: str = "") -> None:
         self.title, self.action, self.key = title, action, key
@@ -182,6 +200,7 @@ class _Kit:
         self.disabled: bool | None = None
         self.menu: list[_Item] = []
         self.opened: list[str] = []
+        self.iconed: list[tuple[object, str, int]] = []
 
     def namespace(self) -> SimpleNamespace:
         kit = self
@@ -243,6 +262,15 @@ class _Kit:
 
     def openURL_(self, url: str) -> bool:  # noqa: N802 -- Mirrors AppKit.
         self.opened.append(url)
+        return True
+
+    def setIcon_forFile_options_(  # noqa: N802 -- Mirrors AppKit.
+        self,
+        image: object,
+        path: str,
+        options: int,
+    ) -> bool:
+        self.iconed.append((image, path, options))
         return True
 
 
@@ -309,6 +337,38 @@ def test_the_status_item_shows_the_mark_the_menu_and_refreshes_it(
     assert delay == 7.0
     assert (kit.disabled, kit.tip) == (True, "knowop: not connected")
     assert [item.title for item in kit.menu].count("Quit") == 1
+
+
+@pytest.mark.parametrize("present", [True, False], ids=["AppKit", "none"])
+def test_this_python_says_why_it_cannot_start_the_menu_bar(
+    monkeypatch: pytest.MonkeyPatch,
+    present: bool,
+) -> None:
+    # None in sys.modules fails an import, as a missing module does.
+    monkeypatch.setitem(
+        sys.modules,
+        "AppKit",
+        ModuleType("AppKit") if present else None,
+    )
+
+    said = menubar.problem()
+
+    assert (said is None) is present
+    assert present or "AppKit" in (said or "")
+
+
+def test_a_file_gets_the_knowop_icon_on_a_dark_square(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    kit = _Kit()
+    monkeypatch.setattr(menubar, "_appkit", kit.namespace())
+
+    menubar.set_icon(tmp_path / "knowop")
+
+    assert kit.iconed == [(kit, str(tmp_path / "knowop"), 0)]
+    assert kit.data.startswith(b"<svg")
+    assert b"<rect" in kit.data
 
 
 if __name__ == "__main__":
