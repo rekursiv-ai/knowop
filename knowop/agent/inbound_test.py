@@ -14,12 +14,12 @@ from trackinizer.wire.wire_sessions import (
 import pytest
 
 from knowop.agent.inbound import (
-    CANVAS_COMMANDS,
     Box,
     Disclosure,
     render_box_lines,
     render_inbound,
     settings_from_payload,
+    using_knowop,
 )
 
 
@@ -111,7 +111,7 @@ class TestRenderInboundKinds:
 
         assert rendered == "[lab] What led here?"
 
-    def test_the_canvas_commands_follow_the_context_when_asked_for(self) -> None:
+    def test_the_skill_follows_the_context_when_asked_for(self) -> None:
         context = _context()
 
         rendered = render_inbound(
@@ -119,27 +119,38 @@ class TestRenderInboundKinds:
             None,
             None,
             context=context,
-            disclosure=Disclosure(canvas=True),
+            disclosure=Disclosure(skill=True),
         )
 
         assert rendered == (
             "Hi\n"
             f"Trackinizer context (verify with trax): {context.model_dump_json()}"
-            f"\n{CANVAS_COMMANDS}"
+            f"\n{using_knowop()}"
         )
 
+
+class TestUsingKnowop:
+    """The skill's body, as the run tells it: the words the agent acts on."""
+
+    def test_it_is_the_body_without_its_front_matter(self) -> None:
+        assert using_knowop().startswith(
+            "# Using KnowOp\n\nYou run under `knowop run`.",
+        )
+        assert "name: using-knowop" not in using_knowop()
+
     def test_the_canvas_commands_work_without_a_record_id_on_the_line(self) -> None:
-        assert "knowop canvas navigate '#/lookup/RECORD_UUID'" in CANVAS_COMMANDS
-        assert "page.record.id" in CANVAS_COMMANDS
-        assert "$TRAX_CANVAS" in CANVAS_COMMANDS
-        assert "\n" not in CANVAS_COMMANDS
-        assert '"' not in CANVAS_COMMANDS
-        assert "\\" not in CANVAS_COMMANDS
+        assert "knowop canvas navigate '#/lookup/RECORD_UUID'" in _said()
+        assert "page.record.id" in _said()
+        assert "$TRAX_CANVAS" in _said()
 
     def test_the_canvas_commands_need_knowop_alone(self) -> None:
         """A computer with only knowop installed has no ``trax`` to run them with."""
-        assert "trax canvas" not in CANVAS_COMMANDS
-        assert "`knowop canvas` acts on your canvas" in CANVAS_COMMANDS
+        assert "trax canvas" not in _said()
+        assert "`knowop canvas` acts on your canvas" in _said()
+        assert (
+            "Read it with `knowop canvas`; `knowop canvas --help` lists the rest"
+            in (_said())
+        )
 
     def test_a_terminal_asked_for_opens_in_the_canvas(self) -> None:
         assert (
@@ -147,7 +158,29 @@ class TestRenderInboundKinds:
             "canvas show trax.terminal --param machine=NAME --param start=true (NAME "
             "is this computer; `knowop status` lists it). Do not open a desktop "
             "terminal app."
-        ) in CANVAS_COMMANDS
+        ) in _said()
+
+    def test_the_agent_is_told_it_is_logged_and_how_to_file_results(self) -> None:
+        assert "already logged to trax as the chat's AgentSession" in _said()
+        assert "with `--as` set to $TRAX_ACTOR (`trax help` lists the grammar)" in (
+            _said()
+        )
+
+    def test_the_agent_knows_its_pull_request_tools_and_auto_fix(self) -> None:
+        assert "`watch_pull_request` with its `url`" in _said()
+        assert "`unwatch_pull_request` with its `url`" in _said()
+        assert "knowop canvas autofix to true (or false)" in _said()
+        assert "A line from `knowop-autofix` is this run's own report" in _said()
+        assert "Do not poll CI" in _said()
+
+
+def _said() -> str:
+    """Return the skill's body with each run of whitespace one space, as read."""
+    return " ".join(using_knowop().split())
+
+
+class TestRenderInboundBoxes:
+    """The boxes drawn since the agent's last line ride with that line."""
 
     def test_boxes_since_the_last_line_are_listed_with_id_page_and_covers(
         self,

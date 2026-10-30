@@ -42,13 +42,22 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Final, Literal, Protocol, cast
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    Final,
+    Literal,
+    Protocol,
+    cast,
+    runtime_checkable,
+)
 from uuid import UUID
 
 import argparse
 import asyncio
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import pwd
@@ -69,7 +78,7 @@ from trackinizer.lib.posix.relay import ThreadedRelay
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.runs.adapters.claude import ClaudeAdapter
 from trackinizer.runs.adapters.codex import CodexAdapter
-from trackinizer.runs.adapters.custom_types import Adapter, StreamAdapter
+from trackinizer.runs.adapters.custom_types import Adapter, StreamAdapter, Subagent
 from trackinizer.runs.adapters.gemini import GeminiAdapter
 from trackinizer.runs.adapters.iostream import IOStreamAdapter
 from trackinizer.runs.asks import answer_from_payload
@@ -127,10 +136,10 @@ from knowop.agent.headless import (
     TakenOverError,
 )
 from knowop.agent.inbound import (
-    CANVAS_COMMANDS,
     Disclosure,
     render_inbound,
     settings_from_payload,
+    using_knowop,
 )
 from knowop.agent.placement import (
     PlacementClient,
@@ -141,6 +150,9 @@ from knowop.agent.placement import (
 )
 from knowop.agent.program import PROGRAM
 from knowop.agent.prompt_bridge import PromptBridge
+from knowop.agent.pull_request_rows import PullRequestClient
+from knowop.agent.pull_request_watch import PullRequestWatch
+from knowop.agent.pull_requests import AUTOFIX_SOURCE
 from knowop.agent.sink import (
     FileSink,
     LockedSink,
@@ -154,6 +166,8 @@ from knowop.agent.slash import (
     SlashCommand,
     SlashCommandDetector,
 )
+from knowop.agent.subagents import SubagentSinks
+from knowop.agent.tool_server import BEARER_ENV, ToolServer
 from knowop.agent.trust import (
     TrustGate,
     TrustScreen,
@@ -273,24 +287,6 @@ _INSTALL: Final = {
 _HEADLESS_CLIS: Final = ("claude", "codex")
 
 
-# What a CLI placed on a canvas is told of it. Its own product may have a canvas too,
-# so "the canvas" is named as the canvas's. One line with no double quote or
-# backslash, so it is a TOML string as it stands, for codex's ``-c``.
-_CANVAS_NOTE: Final = (
-    "You run under knowop run, placed on a Trackinizer canvas: when the person says "
-    "the canvas, they mean that canvas's, which $TRAX_CANVAS names "
-    "(the workspace is $TRAX_WORKSPACE), not one of your own product's. "
-    "Read it with `knowop canvas`; change it with `knowop canvas show trax.subgraph "
-    "--record UUID` (or trax.timeline), `knowop canvas navigate ROUTE`, "
-    "`knowop canvas highlight UUID,UUID` and `knowop canvas hide ID`; "
-    "`knowop canvas --help` lists the rest. "
-    "This conversation is already logged to trax as the chat's AgentSession; "
-    "file each result to trax with the `trax` CLI as a row, with `--as` set to "
-    "$TRAX_ACTOR (`trax help` lists the grammar). "
-    f"{CANVAS_COMMANDS}"
-)
-
-
 # Adapter *factories*, not singletons: each run builds a fresh adapter so
 # per-run parse state (e.g. codex's last ``turn_context.model``) never leaks
 # into a second run in the same process (tests, a future supervisor).
@@ -364,6 +360,8 @@ class _SessionOwner:
 
     child_pid: int | None = None
     _output_tail: bytes = b""
+    subagents: set[str] = field(default_factory=set[str])
+    """The CLI's ids for the sub-agents this run's sessions spawned, at any depth."""
 
     def started(self, pid: int) -> None:
         """Record the wrapped child's PID for Codex rollout discovery."""
@@ -388,6 +386,10 @@ class _SessionOwner:
     def owns(self, adapter: Adapter, path: Path) -> bool:
         """Claim a Codex ID from its writer, then require it on every file.
 
+        A sub-agent's file is owned when the session that spawned it is: this run's,
+        or a sub-agent's it already owns. It is never claimed as the run's own, though
+        codex holds a spawned thread's rollout open as it does the run's.
+
         Args:
           adapter: CLI adapter extracting the ID from the file path.
           path: Candidate transcript file.
@@ -396,6 +398,13 @@ class _SessionOwner:
           owned: Whether this run owns the file.
 
         """
+        subagent = adapter.subagent_of(path)
+        if subagent is not None:
+            spawned = self.session_id is not None and subagent.parent == self.session_id
+            if not spawned and subagent.parent not in self.subagents:
+                return False
+            self.subagents.add(subagent.child)
+            return True
         candidate_id = adapter.session_id_from_path(path)
         if candidate_id is None:
             return False
@@ -505,6 +514,14 @@ class _Stats:
         return ", ".join(f"{k}={v}" for k, v in sorted(self.counts.items()))
 
 
+class _Wakes(Protocol):
+    """Lines the run makes itself for the inbound poll to type: Auto-fix's."""
+
+    def take(self) -> list[InboundDrainItem]:
+        """Return the lines due, each once."""
+        ...
+
+
 class _InboundClient(Protocol):
     """What the inbound poll needs of a client: ``Client``, or a narrower one."""
 
@@ -528,6 +545,7 @@ class RunClient(
     ResumeClient,
     PlacementClient,
     SessionLister,
+    PullRequestClient,
     _InboundClient,
     Protocol,
 ):
@@ -732,8 +750,8 @@ class InboundState:
     """Whether the CLI follows a goal, as the records it writes say."""
 
     noted: bool = True
-    """Whether the CLI's start note holds the canvas commands; if not, the first line
-    carries them."""
+    """Whether the CLI's start note holds the using-knowop skill; if not, the first
+    line carries it."""
 
     _ready: threading.Event = field(default_factory=threading.Event, init=False)
     _deadline: float = field(default=0.0, init=False)
@@ -823,7 +841,7 @@ class InboundState:
             context=(
                 told.stale or bool(context.marks) or told.context != _unmarked(context)
             ),
-            canvas=told.stale,
+            skill=told.stale,
         )
 
     def typed(
@@ -917,9 +935,10 @@ class InboundState:
         return replace(record, extra={**record.extra, "$inbound": sent})
 
 
-# The one sender that is no one's voice: the server speaking for itself. It is named on
-# every line and neither is nor makes anyone "the other person".
-_TRAX_SENDER: Final = "trackinizer"
+# The senders that are no one's voice: the server speaking for itself, and the run's own
+# Auto-fix. Each is named on every line and neither is nor makes anyone "the other
+# person", so a person's lines stay bare after one.
+_NO_ONES_VOICE: Final = frozenset({"trackinizer", AUTOFIX_SOURCE})
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -940,9 +959,19 @@ class _Told:
     """Whether the CLI may have lost the start note and the last context."""
 
     def names(self, source: str | None) -> bool:
-        """Whether a line from ``source`` must name its sender."""
+        """Say whether a line from ``source`` must name its sender.
+
+        Args:
+          source: The route-attested sender of the line.
+
+        Returns:
+          named: True for no sender, one that is no one's voice, or once someone
+            besides the owner has spoken.
+
+        """
         return (
-            source in (None, _TRAX_SENDER)
+            source is None
+            or source in _NO_ONES_VOICE
             or self.others
             or source != (self.owner or source)
         )
@@ -966,7 +995,7 @@ class _Told:
         if context is not None and context.relay is not None:
             return self
         owner, others = self.owner, self.others
-        if source not in (None, _TRAX_SENDER):
+        if source is not None and source not in _NO_ONES_VOICE:
             if owner is None and context is not None:
                 owner = source
             elif source != owner:
@@ -1509,7 +1538,7 @@ def _open_trackinizer_sink(
     """Build a fault-tolerant :class:`TrackinizerSink` for ``sync`` runs."""
     client = config.client or Client(base_url=LOCALHOST_FALLBACK_URL)
     sys.stderr.write(f"[{PROGRAM}] syncing events to {client.base_url}\n")
-    return ResilientSink(
+    root = ResilientSink(
         TrackinizerSink(
             client,
             adapter.name,
@@ -1523,6 +1552,38 @@ def _open_trackinizer_sink(
         fallback_path=_default_out_path(adapter.name),
         redactor=redactor,
     )
+
+    # A sub-agent joins no room. Its routing name is the run's and its own id, which no
+    # other live session holds: the server renames a taken one, and says so on the
+    # terminal the CLI is drawing on. Its own id opens its session, so a re-read or a
+    # resume lands on the same one.
+    def open_child(subagent: Subagent) -> Sink:
+        child = ResilientSink(
+            TrackinizerSink(
+                client,
+                adapter.name,
+                actor=f"{config.actor or adapter.name}/{subagent.child}",
+                private=config.private,
+                redactor=redactor,
+            ),
+            fallback_path=_default_out_path(f"{adapter.name}-agent-{subagent.child}"),
+            redactor=redactor,
+        )
+        child.set_cli_session_id(subagent.child)
+        return child
+
+    # A client that cannot write edges still records each sub-agent, unlinked.
+    def link(child: UUID, parent: UUID, note: str) -> None:
+        if isinstance(client, _EdgeClient):
+            client.add_edge(
+                child,
+                parent,
+                "produced_by",
+                actor=config.actor or adapter.name,
+                note=note,
+            )
+
+    return SubagentSinks(root, open_child=open_child, link=link)
 
 
 # One file per invocation; the name carries the adapter and start timestamp so recent
@@ -1614,6 +1675,8 @@ def _spawn_and_drain(
     # the cwd is in a git work tree; ``None`` otherwise, and the drain loop then
     # does nothing for it.
     worktree_diff = open_worktree_diff(Path.cwd()) if config.diff else None
+    pull_requests = _pull_request_watch(config, sink)
+    tools = _tool_server(pull_requests)
 
     # Slash-commands the human types (``/exit``) are handled inside the CLI and
     # never logged, so the drain thread can't see them. The relay tees the
@@ -1671,6 +1734,7 @@ def _spawn_and_drain(
         run_records=run_records,
         owner=owner,
         worktree_diff=worktree_diff,
+        pull_requests=pull_requests,
         inbound=inbound,
     )
 
@@ -1693,6 +1757,8 @@ def _spawn_and_drain(
         stop=stop,
         drain_thread=drain_thread,
     )
+    if pull_requests is not None:
+        pull_requests.start()
     # Placed before the fork, like the routing name, so the child's env holds its
     # workspace and canvas from the start. A failure leaves it unplaced.
     placed, hooked = _place(config, session_id=sink.session_id)
@@ -1718,7 +1784,12 @@ def _spawn_and_drain(
         emit=record,
         pending=inbound.prompt_pending,
     )
-    argv = _with_canvas_note(argv, adapter=adapter, placed=placed)
+    argv = _with_knowop(
+        argv,
+        adapter=adapter,
+        placed=placed,
+        tools="" if tools is None else tools.url,
+    )
     # Run the CLI on a PTY we own rather than letting it inherit the terminal:
     # owning the master fd is what lets the server splice messages into the
     # live session (the human still drives the native TUI). Byte-transparent,
@@ -1739,7 +1810,9 @@ def _spawn_and_drain(
     banner_reader = owner if adapter.name == "codex" else None
     relay = ThreadedRelay(
         argv,
-        env=_routing_env(config, granted_actor=granted_actor) | placed,
+        env=_routing_env(config, granted_actor=granted_actor)
+        | placed
+        | _tools_env(tools),
         drop_env=_dropped_env(adapter),
         host=config.host,
         on_input=detector.feed,
@@ -1775,6 +1848,7 @@ def _spawn_and_drain(
                 cli=adapter.name,
                 record=record,
                 gate=gate,
+                pull_requests=pull_requests,
                 instance=config.instance,
                 compact=(
                     f"the loaded conversation is past what {adapter.name} holds "
@@ -1812,7 +1886,15 @@ def _spawn_and_drain(
             # this emit serializes with the drain thread's.
             stream_capture.close()
 
-        _wind_down(config, stop, drain_thread, poll_thread, sink)
+        _wind_down(
+            config,
+            stop,
+            drain_thread,
+            poll_thread,
+            sink,
+            pull_requests=pull_requests,
+            tools=tools,
+        )
 
 
 # Set once the kernel watch is armed. ``Thread.start`` returns when the thread is
@@ -1833,6 +1915,7 @@ def _start_drain(
     run_records: deque[Event],
     owner: _SessionOwner | None,
     worktree_diff: WorktreeDiff | None,
+    pull_requests: PullRequestWatch | None,
     inbound: InboundState,
 ) -> threading.Thread:
     """Start the drain thread and wait until its watch is armed; return the thread."""
@@ -1853,6 +1936,7 @@ def _start_drain(
             armed=armed,
             owner=owner,
             worktree_diff=worktree_diff,
+            pull_requests=pull_requests,
             inbound=inbound,
         ),
         daemon=True,
@@ -1896,8 +1980,17 @@ def _wind_down(
     drain_thread: threading.Thread,
     poll_thread: threading.Thread | None,
     sink: Sink,
+    *,
+    pull_requests: PullRequestWatch | None = None,
+    tools: ToolServer | None = None,
 ) -> None:
     """Stop the workers once the CLI is gone, and close the sink under them."""
+    # Not joined: a pass may be inside a ``gh`` call, and the rows it writes are the
+    # server's, not the sink's, so one last write after the CLI is gone is harmless.
+    if pull_requests is not None:
+        pull_requests.close()
+    if tools is not None:
+        tools.close()
     # Let the drain thread finish pending reads before stopping it.
     time.sleep(config.quiesce_seconds)
     stop.set()
@@ -1933,6 +2026,41 @@ def _dropped_env(adapter: Adapter) -> frozenset[str]:
     }
 
 
+# In the folder the run started in, which is the agent's checkout: ``gh`` there reads
+# with the credential the agent pushes with. A local-file run keeps no rows to show.
+def _pull_request_watch(config: RunConfig, sink: Sink) -> PullRequestWatch | None:
+    """Return the run's watch of its session's pull requests, or ``None`` with no server."""
+    if not config.syncing or config.client is None:
+        return None
+    return PullRequestWatch(
+        client=config.client,
+        session=lambda: sink.session_id,
+        actor=config.actor or PROGRAM,
+        cwd=Path.cwd(),
+        resumed=(
+            config.attach is not None
+            or config.resume_path is not None
+            or config.cli_session_id is not None
+        ),
+    )
+
+
+# Claude and codex take a tool from outside themselves over MCP alone, so a run that
+# keeps a watch serves the watch's tools to the CLI it starts.
+def _tool_server(pull_requests: PullRequestWatch | None) -> ToolServer | None:
+    """Serve the run's tools, or return ``None`` for a run that has none."""
+    if pull_requests is None:
+        return None
+    server = ToolServer(pull_requests.tools())
+    server.start()
+    return server
+
+
+def _tools_env(tools: ToolServer | None) -> dict[str, str]:
+    """Return what the CLI's environment holds of the run's tools: their token."""
+    return {} if tools is None else {BEARER_ENV: tools.token}
+
+
 # A chat's run has no terminal. The CLI runs through its driver, which hears Chat's
 # lines and reports the asks Chat answers, and the same drain and poll threads capture
 # and feed it as for a terminal run. The pieces a terminal needs are gone: no trust
@@ -1959,6 +2087,8 @@ def _headless_and_drain(
     stop = threading.Event()
     inbound = InboundState(fallback_sec=0.0)
     worktree_diff = open_worktree_diff(Path.cwd()) if config.diff else None
+    pull_requests = _pull_request_watch(config, sink)
+    tools = _tool_server(pull_requests)
     run_records: deque[Event] = deque()
     record = partial(
         _queue_run_record,
@@ -1977,6 +2107,7 @@ def _headless_and_drain(
         run_records=run_records,
         owner=owner,
         worktree_diff=worktree_diff,
+        pull_requests=pull_requests,
         inbound=inbound,
     )
     granted_actor = _open_session(
@@ -1985,8 +2116,10 @@ def _headless_and_drain(
         stop=stop,
         drain_thread=drain_thread,
     )
+    if pull_requests is not None:
+        pull_requests.start()
     placed, hooked = _place(config, session_id=sink.session_id)
-    env = _routing_env(config, granted_actor=granted_actor) | placed
+    env = _routing_env(config, granted_actor=granted_actor) | placed | _tools_env(tools)
     argv, hook_files = _with_box_hook(
         [
             adapter.cli_binary,
@@ -2000,7 +2133,8 @@ def _headless_and_drain(
         placed=hooked,
         profile=config.profile,
     )
-    argv = _with_canvas_note(argv, adapter=adapter, placed=placed)
+    tools_url = "" if tools is None else tools.url
+    argv = _with_knowop(argv, adapter=adapter, placed=placed, tools=tools_url)
     model, effort = _model_and_effort(config.cli_args)
     host = config.host
     instance = config.instance
@@ -2023,7 +2157,7 @@ def _headless_and_drain(
             env=env,
             sandboxed=sandboxed,
         ),
-        make_tui=partial(_make_tui, config, adapter, env=env),
+        make_tui=partial(_make_tui, config, adapter, env=env, tools=tools_url),
         record=record,
         on_session=owner.adopt,
         on_listening=None if host is None else host.on_listening,
@@ -2046,6 +2180,7 @@ def _headless_and_drain(
                 cwd=_shown_cwd(Path.cwd()),
                 cli=adapter.name,
                 record=record,
+                pull_requests=pull_requests,
                 instance=instance,
                 compact=(
                     f"the loaded conversation is past what {adapter.name} holds "
@@ -2070,7 +2205,15 @@ def _headless_and_drain(
         # Before the sink closes the session, which a report to it would follow.
         if reporter is not None:
             reporter.close()
-        _wind_down(config, stop, drain_thread, poll_thread, sink)
+        _wind_down(
+            config,
+            stop,
+            drain_thread,
+            poll_thread,
+            sink,
+            pull_requests=pull_requests,
+            tools=tools,
+        )
 
 
 # The server shows it, and never trusts it: a report from any run but the one holding the
@@ -2113,16 +2256,17 @@ def _make_driver(
     dropped = _dropped_env(adapter)
     if adapter.name == "claude":
         return ClaudeStreamDriver(
-            argv=_env_argv(argv, env={}, drop=dropped - env.keys()),
+            argv=_env_argv(argv, drop=dropped - env.keys()),
             env=env,
             permission_mode=_claude_mode(config.cli_args, sandboxed=sandboxed),
         )
     approval_policy, sandbox = _codex_policy(config.cli_args, sandboxed=sandboxed)
     return CodexAppDriver(
         argv=_codex_argv(
-            _env_argv(argv, env=env, drop=dropped),
+            _env_argv(argv, drop=dropped - env.keys()),
             cli_args=config.cli_args,
         ),
+        env=env,
         approval_policy=approval_policy,
         sandbox=sandbox,
         reviewer=_codex_reviewer(config.cli_args),
@@ -2248,20 +2392,14 @@ _BYPASS_FLAGS: Final = frozenset(
 
 
 # A driver only adds to the environment the run inherited, so what names the launching
-# session is unset by ``env`` on the way in, as a terminal run drops it. ``env`` unsets
-# before it sets. The driver gives codex's app-server no environment of its own, so the
-# run's variables ride here too.
-def _env_argv(
-    prefix: Sequence[str],
-    *,
-    env: Mapping[str, str],
-    drop: AbstractSet[str],
-) -> list[str]:
-    """Return ``prefix`` started with ``drop`` unset and ``env`` set."""
+# session is unset by ``env`` on the way in, as a terminal run drops it. What the run
+# sets goes in the driver's own environment, never here: a command line is any user's to
+# read, and the run's tool token is among what it sets.
+def _env_argv(prefix: Sequence[str], *, drop: AbstractSet[str]) -> list[str]:
+    """Return ``prefix`` started with ``drop`` unset."""
     return [
         "env",
         *(arg for name in sorted(drop) for arg in ("-u", name)),
-        *(f"{name}={value}" for name, value in env.items()),
         *prefix,
     ]
 
@@ -2292,6 +2430,7 @@ def _make_tui(
     adapter: Adapter,
     *,
     env: Mapping[str, str],
+    tools: str,
     session_id: str,
     listening: Callable[[], None],
 ) -> ThreadedRelay:
@@ -2313,7 +2452,7 @@ def _make_tui(
         None,
     )
     return ThreadedRelay(
-        _with_canvas_note(argv, adapter=adapter, placed=env),
+        _with_knowop(argv, adapter=adapter, placed=env, tools=tools),
         env=env,
         drop_env=_dropped_env(adapter),
         host=replace(host, on_listening=listening),
@@ -2663,31 +2802,71 @@ def _without_flag(args: list[str], flag: str) -> list[str]:
     return kept
 
 
-# A placed agent has a canvas only its environment names, and one never told of it looks
-# for its own product's: asked for "the canvas", codex built a ChatGPT page. Each CLI
-# hears of it through its own instruction flag, and one the person passed wins: theirs
-# is deliberate, and a codex ``-c`` of the same key would replace it.
-def _with_canvas_note(
+# What the run gives the CLI: the using-knowop skill as standing instructions, and the
+# run's own tools.
+#
+# A run that syncs is told the skill (``inbound.using_knowop``). A placed agent has a
+# canvas only its environment names, and one never told of it looks for its own
+# product's: asked for "the canvas", codex built a ChatGPT page. Each CLI hears the skill
+# through its own instruction flag, and one the person passed wins: theirs is
+# deliberate, and a codex ``-c`` of the same key would replace it. codex reads a ``-c``
+# value as TOML, whose basic string takes JSON's escapes; non-ASCII is written as it is,
+# since TOML has no escape for half of a surrogate pair.
+#
+# The tools are an MCP server at ``tools`` (``tool_server.py``), named ``knowop``.
+# claude's ``--mcp-config`` and ``--allowedTools`` each take any number of values, so
+# each goes as one ``--flag=value`` word: a word after ``--mcp-config VALUE`` is read as
+# one more config, the person's prompt too (measured on claude 2.1.314). The server's
+# token is named, never written: claude expands ``${BEARER_ENV}`` in a header, and
+# codex reads the variable ``bearer_token_env_var`` names, from the environment the run
+# gives it (``_tools_env``).
+def _with_knowop(
     argv: list[str],
     *,
     adapter: Adapter,
     placed: Mapping[str, str],
+    tools: str,
 ) -> list[str]:
-    """Return ``argv`` telling the CLI of the canvas it was placed on, if any."""
-    if "TRAX_CANVAS" not in placed:
-        return argv
+    """Return ``argv`` handing a run's CLI the using-knowop skill and the run's tools."""
     given = tuple(argv[1:])
-    if adapter.name == "claude" and not any(
-        _cli_arg_value(given, flag=flag) is not None
-        for flag in ("--append-system-prompt", "--append-system-prompt-file")
-    ):
-        return [argv[0], "--append-system-prompt", _CANVAS_NOTE, *argv[1:]]
-    if adapter.name == "codex" and not any(
-        value.startswith("developer_instructions")
-        for value in _codex_config_values(given)
-    ):
-        return [argv[0], "-c", f'developer_instructions="{_CANVAS_NOTE}"', *argv[1:]]
-    return argv
+    told = bool(tools) or "TRAX_CANVAS" in placed
+    added: list[str] = []
+    if adapter.name == "claude":
+        if told and not any(
+            _cli_arg_value(given, flag=flag) is not None
+            for flag in ("--append-system-prompt", "--append-system-prompt-file")
+        ):
+            added += ["--append-system-prompt", using_knowop()]
+        if tools:
+            bearer = f"Bearer ${{{BEARER_ENV}}}"
+            server = {
+                "mcpServers": {
+                    "knowop": {
+                        "type": "http",
+                        "url": tools,
+                        "headers": {"Authorization": bearer},
+                    },
+                },
+            }
+            added += [
+                f"--mcp-config={json.dumps(server)}",
+                "--allowedTools=mcp__knowop",
+            ]
+    elif adapter.name == "codex":
+        if told and not any(
+            value.startswith("developer_instructions")
+            for value in _codex_config_values(given)
+        ):
+            skill = json.dumps(using_knowop(), ensure_ascii=False)
+            added += ["-c", f"developer_instructions={skill}"]
+        if tools:
+            added += [
+                "-c",
+                f'mcp_servers.knowop.url="{tools}"',
+                "-c",
+                f'mcp_servers.knowop.bearer_token_env_var="{BEARER_ENV}"',
+            ]
+    return [argv[0], *added, *argv[1:]]
 
 
 def _codex_config_values(args: tuple[str, ...]) -> list[str]:
@@ -2873,6 +3052,8 @@ class _Typist(Protocol):
 # A headless run takes its messages by kind from the run itself rather than typing them:
 # a line goes to its driver, an answer to the ask it names. It has no dialog to hold a
 # line back from, so it holds none.
+# The Auto-fix lines ``pull_requests`` queues are typed here too, held as a Chat line is
+# while a dialog would take them; one waits at most one drain's hold.
 def _inbound_poll_loop(
     client: _InboundClient,
     sink: _InboundSink,
@@ -2892,6 +3073,7 @@ def _inbound_poll_loop(
     gate: TrustGate | None = None,
     compact: str | None = None,
     instance: str | None = None,
+    pull_requests: _Wakes | None = None,
 ) -> None:
     """Wait on server-queued inbound messages and type them into the CLI."""
     warned = False
@@ -2946,6 +3128,8 @@ def _inbound_poll_loop(
                     reason=compact,
                 )
             compact = None
+        if pull_requests is not None:
+            held.extend(pull_requests.take())
         while held and not _holding(inbound):
             deliver(held.popleft())
         try:
@@ -3405,6 +3589,7 @@ def _drain_filesystem_loop(
     armed: threading.Event | None = None,
     owner: _SessionOwner | None = None,
     worktree_diff: WorktreeDiff | None = None,
+    pull_requests: PullRequestWatch | None = None,
     inbound: InboundState | None = None,
 ) -> None:
     """Watch the adapter's session dirs; emit records as lines are appended."""
@@ -3422,6 +3607,7 @@ def _drain_filesystem_loop(
             armed=armed,
             owner=owner,
             worktree_diff=worktree_diff,
+            pull_requests=pull_requests,
             inbound=inbound,
         ),
     )
@@ -3442,6 +3628,7 @@ async def _drain_until_stopped(
     armed: threading.Event | None = None,
     owner: _SessionOwner | None = None,
     worktree_diff: WorktreeDiff | None = None,
+    pull_requests: PullRequestWatch | None = None,
     inbound: InboundState | None = None,
 ) -> None:
     """Follow the session logs and drain the queues until ``stop``."""
@@ -3452,6 +3639,7 @@ async def _drain_until_stopped(
         stats,
         config,
         worktree_diff=worktree_diff,
+        pull_requests=pull_requests,
         prefix=(
             _Prefix(path=config.resume_path, size=config.prefix_bytes)
             if config.resume_path is not None and config.prefix_bytes
@@ -3771,6 +3959,7 @@ def _emit_line(
     captured: _Captured,
     *,
     worktree_diff: WorktreeDiff | None = None,
+    pull_requests: PullRequestWatch | None = None,
     prefix: _Prefix | None = None,
     inbound: InboundState | None = None,
 ) -> None:
@@ -3791,6 +3980,7 @@ def _emit_line(
         stats,
         config,
         worktree_diff=worktree_diff,
+        pull_requests=pull_requests,
         upload=upload,
         inbound=inbound,
     )
@@ -3933,6 +4123,7 @@ def _process_chunk(
     config: RunConfig,
     *,
     worktree_diff: WorktreeDiff | None = None,
+    pull_requests: PullRequestWatch | None = None,
     upload: bool = True,
     inbound: InboundState | None = None,
 ) -> None:
@@ -3943,7 +4134,7 @@ def _process_chunk(
             captured.path,
             captured.raw,
             restart=captured.restart,
-            on_record=None if worktree_diff is None else worktree_diff.note,
+            on_record=partial(_note_record, worktree_diff, pull_requests),
             upload=upload,
             annotate=None if inbound is None else inbound.stamp,
         )
@@ -3963,6 +4154,18 @@ def _process_chunk(
         stats.record(kind)
         if config.verbose:
             sys.stderr.write(f"[{PROGRAM}] {adapter.name}: {kind}\n")
+
+
+def _note_record(
+    worktree_diff: WorktreeDiff | None,
+    pull_requests: PullRequestWatch | None,
+    record: TraxRecord,
+) -> None:
+    """Show one emitted record to whichever of the diff and the pull request watch run."""
+    if worktree_diff is not None:
+        worktree_diff.note(record)
+    if pull_requests is not None:
+        pull_requests.note(record)
 
 
 # The same watch the live drain uses, with two differences that are the point of a dry
@@ -4017,3 +4220,20 @@ class _Flags(Protocol):
     detach: bool
     name: str | None
     attach: UUID | None
+
+
+@runtime_checkable
+class _EdgeClient(Protocol):
+    """A client that links a sub-agent's session to its parent's: ``Client``."""
+
+    def add_edge(
+        self,
+        from_id: UUID,
+        to_id: UUID,
+        edge_kind: str,
+        *,
+        actor: str,
+        note: str = "",
+    ) -> object:
+        """Add the edge ``from_id -> to_id``; a repeat is a no-op."""
+        ...

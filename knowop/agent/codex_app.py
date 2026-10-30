@@ -137,6 +137,8 @@ class CodexAppDriver:
     Args:
       argv: The command that starts the app-server on stdio. Settings that must not
         touch the person's codex config go here as ``-c key=value``.
+      env: Added to the app-server's environment: a secret goes here, never in
+        ``argv``, which any user of the computer may read.
       approval_policy: When codex asks before it runs something.
       sandbox: What a command may touch without asking.
       reviewer: Who decides an approval that is asked.
@@ -147,11 +149,13 @@ class CodexAppDriver:
         self,
         *,
         argv: Sequence[str] = ("codex", "app-server"),
+        env: Mapping[str, str] | None = None,
         approval_policy: ApprovalPolicy = "on-request",
         sandbox: SandboxMode = "workspace-write",
         reviewer: Reviewer = "user",
     ) -> None:
         self._argv = list(argv)
+        self._env = dict(env or {})
         self._policy: _Tree = {
             "approvalPolicy": approval_policy,
             "sandbox": sandbox,
@@ -186,7 +190,9 @@ class CodexAppDriver:
         """
         if self._run.reader is not None:
             raise RuntimeError("a CodexAppDriver starts once; build a new one")
-        piped = await self._stack.enter_async_context(Piped(self._argv, cwd=cwd))
+        piped = await self._stack.enter_async_context(
+            Piped(self._argv, cwd=cwd, env=self._env),
+        )
         self._piped = piped
         self._run.reader = asyncio.create_task(self._read(piped))
         params: _Tree = {"cwd": str(cwd), **self._policy}

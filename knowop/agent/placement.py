@@ -33,6 +33,8 @@ if TYPE_CHECKING:
 
     from treekle import PlainTree
 
+    from knowop.agent.worktree_diff import Runner
+
 
 class PlacementClient(Protocol):
     """What placing a run needs of a client: ``Client``, or a narrower one."""
@@ -55,11 +57,12 @@ class SessionLister(Protocol):
         ...
 
 
-def git_ref(cwd: Path) -> GitRef | None:
+def git_ref(cwd: Path, *, run: Runner = run_git) -> GitRef | None:
     """Return the checkout's origin URL and branch.
 
     Args:
       cwd: The run's working directory.
+      run: Runs each git command; the real subprocess runner by default.
 
     Returns:
       ref: ``None`` when ``cwd`` is not in a git work tree, has no ``origin`` or is on
@@ -67,8 +70,8 @@ def git_ref(cwd: Path) -> GitRef | None:
 
     """
     where = ["git", "-C", str(cwd)]
-    branch = run_git([*where, "symbolic-ref", "--short", "-q", "HEAD"], 4096)
-    origin = run_git([*where, "config", "--get", "remote.origin.url"], 4096)
+    branch = run([*where, "symbolic-ref", "--short", "-q", "HEAD"], 4096)
+    origin = run([*where, "config", "--get", "remote.origin.url"], 4096)
     if branch.returncode != 0 or origin.returncode != 0:
         return None
     name = branch.stdout.decode(errors="replace").strip()
