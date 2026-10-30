@@ -53,6 +53,7 @@ from trackinizer.lib.posix.host import HostSpec
 from trackinizer.lib.posix.relay import ThreadedRelay
 from trackinizer.runs.adapters.claude import ClaudeAdapter
 from trackinizer.runs.adapters.codex import CodexAdapter
+from trackinizer.runs.adapters.custom_types import Subagent
 from trackinizer.runs.adapters.gemini import GeminiAdapter
 from trackinizer.runs.adapters.iostream import IOStreamAdapter
 from trackinizer.runs.asks import Answer, Ask, Resolved, StateChanged
@@ -70,6 +71,7 @@ from trackinizer.sagent.session.types import (
 from trackinizer.trax.daemon.protocol import socket_address
 from trackinizer.trax.profile import LOCALHOST_FALLBACK_URL
 from trackinizer.types.session_records import SessionRecordRow
+from trackinizer.wire.audience import PRIVATE
 from trackinizer.wire.chat_commands import Command, classify
 from trackinizer.wire.wire_session_ir import (
     AppendRecordsResponse,
@@ -110,14 +112,12 @@ from knowop.agent.headless import (
     TakenOverError,
     Tui,
 )
-from knowop.agent.inbound import (
-    CANVAS_COMMANDS,
-    render_inbound,
-)
+from knowop.agent.inbound import render_inbound, using_knowop
 from knowop.agent.placement import place_run
 from knowop.agent.prompt_bridge import PromptBridge
+from knowop.agent.pull_request_watch import PullRequestWatch
+from knowop.agent.pull_requests import AUTOFIX_SOURCE
 from knowop.agent.session import (
-    _CANVAS_NOTE,
     InboundState,
     RunClient,
     RunConfig,
@@ -133,7 +133,7 @@ from knowop.agent.session import (
     _session_owner,
     _Stats,
     _with_box_hook,
-    _with_canvas_note,
+    _with_knowop,
     resume_argv,
     run,
 )
@@ -145,6 +145,7 @@ from knowop.agent.sink import (
     TrackinizerSink,
 )
 from knowop.agent.slash import SlashCommand
+from knowop.agent.tool_server import BEARER_ENV
 from knowop.agent.trust import TrustGate
 from knowop.agent.worktree_diff import (
     Output,
@@ -164,6 +165,7 @@ if TYPE_CHECKING:
     from trackinizer.runs.asks import Driver
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.types.streams import TraxRecord
+    from trackinizer.wire.filters import Filter
 
 
 @pytest.fixture(autouse=True)
@@ -324,6 +326,7 @@ class _FakeAdapter:
 
     def __init__(self, root: Path) -> None:
         self._root = root
+        self.subagents: dict[Path, Subagent] = {}
 
     def session_dirs(self) -> Iterable[Path]:
         return (self._root,)
@@ -341,6 +344,10 @@ class _FakeAdapter:
     def resumed_session(self, cli_args: tuple[str, ...]) -> str | None:
         del cli_args
         return None
+
+    def subagent_of(self, path: Path) -> Subagent | None:
+        """Return the sub-agent ``path`` names, as the run's CLI declares one."""
+        return self.subagents.get(path)
 
     def reader(self) -> Tail[TraxRecord]:
         return Tail(_line_records)
@@ -1511,6 +1518,90 @@ class TestARunSaysWhereItIs:
         monkeypatch.setattr(pwd, "getpwuid", _no_account)
 
         assert session._shown_cwd(Path("/home/ada/loop")) == "/home/ada/loop"
+
+
+class _Wakes:
+    """Hands the poll the Auto-fix lines a test queued, once."""
+
+    def __init__(self, *texts: str) -> None:
+        self._texts = list(texts)
+
+    def take(self) -> list[InboundDrainItem]:
+        taken, self._texts = self._texts, list[str]()
+        return [
+            InboundDrainItem(text=text, kind="line", source=AUTOFIX_SOURCE)
+            for text in taken
+        ]
+
+
+class TestAutofixLines:
+    """The poll types the lines the pull request watch queues, as Chat's lines are."""
+
+    def test_an_autofix_line_is_typed_under_its_sender(self) -> None:
+        stop = threading.Event()
+        relay = _RecordingRelay()
+
+        _inbound_poll_loop(
+            _WhereClient(stop),
+            _SessionSink(),
+            relay,
+            stop,
+            cli="claude",
+            pull_requests=_Wakes("<knowop-autofix>fix it</knowop-autofix>"),
+        )
+
+        assert relay.submitted == [
+            f"{AUTOFIX_SOURCE}: <knowop-autofix>fix it</knowop-autofix>",
+        ]
+
+    def test_an_autofix_line_waits_while_a_prompt_is_open(self) -> None:
+        stop = threading.Event()
+        relay = _RecordingRelay()
+        inbound = InboundState(fallback_sec=0.0)
+        inbound.prompt_pending.set()
+
+        _inbound_poll_loop(
+            _WhereClient(stop),
+            _SessionSink(),
+            relay,
+            stop,
+            cli="claude",
+            inbound=inbound,
+            pull_requests=_Wakes("<knowop-autofix>fix it</knowop-autofix>"),
+        )
+
+        assert relay.submitted == []
+
+    def test_a_syncing_run_hands_its_watch_to_the_drain_and_the_poll(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        wiring, _ = _wire(
+            monkeypatch,
+            tmp_path,
+            RunConfig(cli_name="claude", client=_NoServer()),
+            ClaudeAdapter(),
+        )
+
+        *_, options = wiring.inbound
+        watch = cast(dict[str, object], options)["pull_requests"]
+        assert isinstance(watch, PullRequestWatch)
+        assert wiring.drain["pull_requests"] is watch
+
+    def test_a_local_run_watches_no_pull_requests(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        wiring, _ = _wire(
+            monkeypatch,
+            tmp_path,
+            RunConfig(cli_name="claude", sync=False),
+            ClaudeAdapter(),
+        )
+
+        assert wiring.drain["pull_requests"] is None
 
 
 class _WhereClient:
@@ -3295,6 +3386,57 @@ class _NoServer:
         del ref
         raise AssertionError("get_inquiry reached the offline server.")
 
+    def list_kind(
+        self,
+        kind: Inquiry.InquiryKind,
+        *,
+        filters: Sequence[Filter] = (),
+    ) -> list[dict[str, PlainTree]]:
+        del kind, filters
+        raise AssertionError("list_kind reached the offline server.")
+
+    def submit(self, kind: Inquiry.InquiryKind, body: Mapping[str, object]) -> UUID:
+        del kind, body
+        raise AssertionError("submit reached the offline server.")
+
+    def add_edge(
+        self,
+        from_id: UUID,
+        to_id: UUID,
+        edge_kind: str,
+        *,
+        actor: str,
+        note: str = "",
+    ) -> object:
+        del from_id, to_id, edge_kind, actor, note
+        raise AssertionError("add_edge reached the offline server.")
+
+    def transition_app(
+        self,
+        target_id: UUID,
+        *,
+        expected_from: dict[str, object] | None,
+        to: dict[str, object] | None,
+        actor: str,
+    ) -> None:
+        del target_id, expected_from, to, actor
+        raise AssertionError("transition_app reached the offline server.")
+
+    def transition_status(
+        self,
+        target_id: UUID,
+        *,
+        expected_from: str,
+        to: str,
+        actor: str,
+    ) -> None:
+        del target_id, expected_from, to, actor
+        raise AssertionError("transition_status reached the offline server.")
+
+    def patch(self, path: str, *, body: object = None) -> PlainTree:
+        del path, body
+        raise AssertionError("patch reached the offline server.")
+
 
 class _BorrowedClient(_NoServer):
     """A shared client whose lifetime is owned outside one ``knowop run``."""
@@ -3852,47 +3994,61 @@ class TestSessionOwnerAndArgv:
             None,
         )
 
-    def test_a_placed_claude_or_codex_is_told_its_canvas_by_its_own_flag(self) -> None:
+    def test_a_placed_claude_or_codex_is_told_the_skill_by_its_own_flag(self) -> None:
         placed = {"TRAX_CANVAS": "w"}
         # A codex ``-c`` of another key, and one left dangling, are not the person's.
         codex_args = ["--no-daemon", "-c", 'model="o3"', "-c"]
 
-        claude = _with_canvas_note(
+        claude = _with_knowop(
             ["claude", "--model", "haiku"],
             adapter=ClaudeAdapter(),
             placed=placed,
+            tools="",
         )
-        codex = _with_canvas_note(
+        codex = _with_knowop(
             ["codex", *codex_args],
             adapter=CodexAdapter(),
             placed=placed,
+            tools="",
         )
 
         assert claude == [
             "claude",
             "--append-system-prompt",
-            _CANVAS_NOTE,
+            using_knowop(),
             "--model",
             "haiku",
         ]
         assert codex[:2] == ["codex", "-c"]
         assert codex[3:] == codex_args
-        assert tomllib.loads(codex[2]) == {"developer_instructions": _CANVAS_NOTE}
-        assert "$TRAX_CANVAS" in _CANVAS_NOTE
+        assert tomllib.loads(codex[2]) == {"developer_instructions": using_knowop()}
 
-    def test_a_placed_cli_is_told_it_is_logged_and_how_to_log_results(self) -> None:
-        """The note is a TOML string as it stands, so it holds no quote or backslash."""
-        assert "already logged to trax as the chat's AgentSession" in _CANVAS_NOTE
-        assert "`--as` set to $TRAX_ACTOR" in _CANVAS_NOTE
-        assert "`trax help` lists the grammar" in _CANVAS_NOTE
-        assert '"' not in _CANVAS_NOTE
-        assert "\\" not in _CANVAS_NOTE
+    def test_codex_reads_any_text_of_the_skill_as_the_text(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Quotes, backslashes, lines and text past the BMP survive codex's TOML read."""
+        said = f'say "hi"\\n\n{chr(0x1F600)} {chr(0xE9)}\t.'
+        monkeypatch.setattr(session, "using_knowop", lambda: said)
 
-    def test_a_placed_cli_drives_its_canvas_with_knowop_alone(self) -> None:
-        """A computer with only knowop installed has no ``trax`` to run them with."""
-        assert "Read it with `knowop canvas`" in _CANVAS_NOTE
-        assert "`knowop canvas --help` lists the rest" in _CANVAS_NOTE
-        assert "trax canvas" not in _CANVAS_NOTE
+        codex = _with_knowop(
+            ["codex"],
+            adapter=CodexAdapter(),
+            placed={"TRAX_CANVAS": "w"},
+            tools="",
+        )
+
+        assert tomllib.loads(codex[2]) == {"developer_instructions": said}
+
+    def test_a_run_with_tools_and_no_canvas_is_told_the_skill_too(self) -> None:
+        claude = _with_knowop(
+            ["claude"],
+            adapter=ClaudeAdapter(),
+            placed={},
+            tools="http://127.0.0.1:5/t",
+        )
+
+        assert claude[1:3] == ["--append-system-prompt", using_knowop()]
 
     @pytest.mark.parametrize(
         ("adapter", "placed", "args"),
@@ -3931,7 +4087,47 @@ class TestSessionOwnerAndArgv:
     ) -> None:
         argv = [adapter.cli_binary, *args]
 
-        assert _with_canvas_note(argv, adapter=adapter, placed=placed) == argv
+        assert _with_knowop(argv, adapter=adapter, placed=placed, tools="") == argv
+
+    def test_claude_and_codex_reach_the_runs_tools_and_keep_the_prompt(self) -> None:
+        """Claude's MCP flags take any number of values, so each goes as one word."""
+        url = "http://127.0.0.1:5/t"
+
+        claude = _with_knowop(
+            ["claude", "fix it"],
+            adapter=ClaudeAdapter(),
+            placed={},
+            tools=url,
+        )
+        codex = _with_knowop(
+            ["codex", "fix it"],
+            adapter=CodexAdapter(),
+            placed={},
+            tools=url,
+        )
+        gemini = _with_knowop(["gemini"], adapter=GeminiAdapter(), placed={}, tools=url)
+
+        flag, config = claude[3].split("=", 1)
+        assert flag == "--mcp-config"
+        # The token is named for each CLI to read from its environment, never written.
+        assert json.loads(config) == {
+            "mcpServers": {
+                "knowop": {
+                    "type": "http",
+                    "url": url,
+                    "headers": {"Authorization": "Bearer ${KNOWOP_TOOLS_TOKEN}"},
+                },
+            },
+        }
+        assert claude[4:] == ["--allowedTools=mcp__knowop", "fix it"]
+        assert codex[3] == codex[5] == "-c"
+        assert tomllib.loads(f"{codex[4]}\n{codex[6]}") == {
+            "mcp_servers": {
+                "knowop": {"url": url, "bearer_token_env_var": "KNOWOP_TOOLS_TOKEN"},
+            },
+        }
+        assert codex[7:] == ["fix it"]
+        assert gemini == ["gemini"]
 
     def test_codex_claims_only_a_resumed_id(self) -> None:
         fresh = _session_owner(CodexAdapter(), RunConfig(cli_name="codex"))
@@ -4781,7 +4977,7 @@ class TestSpawnWiring:
             str(UUID(int=7)),
             str(UUID(int=8)),
         )
-        assert wiring.argv[1:3] == ["--append-system-prompt", _CANVAS_NOTE]
+        assert wiring.argv[1:3] == ["--append-system-prompt", using_knowop()]
         assert client.asked == [
             (
                 f"/api/sessions/{_SESSION}/place",
@@ -4847,7 +5043,7 @@ class TestSpawnWiring:
         )
         env = cast(dict[str, str], wiring.relay["env"])
         assert (env["TRAX_WORKSPACE"], env["TRAX_CANVAS"]) == (_WORKSPACE, _CANVAS)
-        assert wiring.argv[1:3] == ["--append-system-prompt", _CANVAS_NOTE]
+        assert wiring.argv[1:3] == ["--append-system-prompt", using_knowop()]
         assert server.posted == [f"/api/sessions/{_SESSION}/place"]
         assert server.listed == [{"days": 1}]
 
@@ -5118,6 +5314,8 @@ class TestSpawnWiring:
         inbound = named.pop("inbound")
         bridge = named.pop("bridge")
         assert callable(named.pop("record"))
+        # A synced run watches the pull requests its session opens.
+        assert isinstance(named.pop("pull_requests"), PullRequestWatch)
         # A run in this terminal names its machine and folder, and no host; a trusted
         # CLI opens no trust card, and one that loaded nothing compacts nothing.
         assert named == {
@@ -8142,7 +8340,6 @@ class TestWhatDrivesAChatRun:
     ) -> None:
         argv = session._env_argv(
             ["codex", "-c", 'developer_instructions="note"'],
-            env={"TRAX_ACTOR": "scout#2", "TRAX_CANVAS": "w1"},
             drop={"TRAX_ROOMS", "TRAX_ACTOR"},
         )
 
@@ -8152,8 +8349,6 @@ class TestWhatDrivesAChatRun:
             "TRAX_ACTOR",
             "-u",
             "TRAX_ROOMS",
-            "TRAX_ACTOR=scout#2",
-            "TRAX_CANVAS=w1",
             "codex",
             "-c",
             'developer_instructions="note"',
@@ -8268,7 +8463,10 @@ _CODEX_ENV_WRAPPER: Final = """
 import os, runpy, sys
 
 with open(sys.argv[1] + ".env", "w") as seen:
-    seen.write(os.environ.get("TRAX_ACTOR", "") + "|" + os.environ.get("TRAX_ROOMS", ""))
+    seen.write("|".join(
+        os.environ.get(name, "")
+        for name in ("TRAX_ACTOR", "TRAX_ROOMS", "KNOWOP_TOOLS_TOKEN")
+    ))
 plan, fake = sys.argv[1], sys.argv[2]
 sys.argv = [fake, plan]
 runpy.run_path(fake, run_name="__main__")
@@ -8411,7 +8609,7 @@ class TestTheDriversAreBuiltAsTheRunIsConfigured:
             RunConfig(cli_name="codex", cli_args=cli_args),
             CodexAdapter(),
             argv=[sys.executable, "-I", "-S", str(wrapper), str(plan), str(fake)],
-            env={"TRAX_ACTOR": "scout"},
+            env={"TRAX_ACTOR": "scout", "KNOWOP_TOOLS_TOKEN": "t0k"},
             sandboxed=sandboxed,
         )
 
@@ -8429,8 +8627,9 @@ class TestTheDriversAreBuiltAsTheRunIsConfigured:
         params = from_plain(started["params"], dict[str, object])
         assert (params["approvalPolicy"], params["sandbox"]) == (policy, sandbox)
         assert params["approvalsReviewer"] == reviewer
-        # The run's environment reaches the app-server, which has no way to be given it.
-        assert Path(f"{plan}.env").read_text() == "scout|"
+        # The run's environment reaches the app-server through the driver's own, which
+        # no other user of the computer may read; the command line holds none of it.
+        assert Path(f"{plan}.env").read_text() == "scout||t0k"
 
 
 class _FakeRun:
@@ -9467,7 +9666,7 @@ class TestAHeadlessRunsWiring:
         )
 
         [made] = wiring.made
-        assert made["env"] == {"TRAX_ACTOR": "scout", "TRAX_ROOMS": "lab"}
+        assert _past_token(made) == {"TRAX_ACTOR": "scout", "TRAX_ROOMS": "lab"}
 
     def test_the_session_the_driver_reports_is_the_one_the_run_captures(
         self,
@@ -9512,6 +9711,24 @@ class TestAHeadlessRunsWiring:
         inbound = found["inbound"]
         assert isinstance(inbound, InboundState)
         assert inbound.ready()
+
+    def test_the_drain_and_the_poll_share_one_pull_request_watch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        wiring, _ = _wire_headless(
+            monkeypatch,
+            tmp_path,
+            _headless_config(),
+            ClaudeAdapter(),
+            [_ScriptedDriver()],
+        )
+
+        *_, options = wiring.poll
+        watch = cast(dict[str, object], options)["pull_requests"]
+        assert isinstance(watch, PullRequestWatch)
+        assert wiring.drain["pull_requests"] is watch
 
     def test_the_poll_names_itself_by_the_id_the_state_is_reported_under(
         self,
@@ -9628,7 +9845,7 @@ class TestAHeadlessRunsWiring:
         ]
         assert placed == [(client, _CHAT, Path.cwd())]
         [made] = wiring.made
-        assert made["env"] == {
+        assert _past_token(made) == {
             "TRAX_ACTOR": "scout#2",
             "TRAX_ROOMS": "lab",
             "TRAX_WORKSPACE": _WORKSPACE,
@@ -9637,7 +9854,7 @@ class TestAHeadlessRunsWiring:
         assert isinstance(made["adapter"], ClaudeAdapter)
         assert cast(RunConfig, made["config"]).profile == "b2profile"
         argv = cast(list[str], made["argv"])
-        assert argv[argv.index("--append-system-prompt") + 1] == _CANVAS_NOTE
+        assert argv[argv.index("--append-system-prompt") + 1] == using_knowop()
         assert "b2profile" in cast(str, made["settings"])
         # The drain gets the files that were there, the sink, the stats and the diff.
         drained = cast(tuple[object, ...], wiring.drain["args"])
@@ -9692,13 +9909,13 @@ class TestAHeadlessRunsWiring:
         )
 
         [made] = wiring.made
-        assert made["env"] == {
+        assert _past_token(made) == {
             "TRAX_ACTOR": "scout#2",
             "TRAX_WORKSPACE": _WORKSPACE,
             "TRAX_CANVAS": _CANVAS,
         }
         argv = cast(list[str], made["argv"])
-        assert argv[argv.index("--append-system-prompt") + 1] == _CANVAS_NOTE
+        assert argv[argv.index("--append-system-prompt") + 1] == using_knowop()
         # Chat's lines carry the canvas's boxes, so no box hook tells them again.
         assert "UserPromptSubmit" not in cast(str, made["settings"])
         assert server.listed == [{"days": 1}]
@@ -9962,6 +10179,33 @@ class TestAHeadlessRunsWiring:
         assert driver.started is None
 
 
+# The token is there, and in no word of its ``argv``, which any user may read.
+def _past_token(made: Mapping[str, object]) -> dict[str, str]:
+    """Return the ``env`` a CLI was started with, less the run's tool token."""
+    env = dict(cast(Mapping[str, str], made["env"]))
+    token = env.pop(BEARER_ENV)
+    assert len(token) == 32
+    assert not any(token in arg for arg in cast(list[str], made["argv"]))
+    return env
+
+
+def _past_tools(argv: Sequence[str]) -> list[str]:
+    """Return a CLI's ``argv`` past the skill and the run's tools, which lead it."""
+    if argv[0] == "claude":
+        assert argv[1:3] == ["--append-system-prompt", using_knowop()]
+        flag, config = argv[3].split("=", 1)
+        assert flag == "--mcp-config"
+        assert set(json.loads(config)["mcpServers"]) == {"knowop"}
+        assert argv[4] == "--allowedTools=mcp__knowop"
+        return [argv[0], *argv[5:]]
+    assert argv[1:3] == ["-c", argv[2]]
+    assert tomllib.loads(argv[2]) == {"developer_instructions": using_knowop()}
+    assert argv[3] == argv[5] == "-c"
+    assert argv[4].startswith('mcp_servers.knowop.url="http://127.0.0.1:')
+    assert argv[6].startswith("mcp_servers.knowop.bearer_token_env_var=")
+    return [argv[0], *argv[7:]]
+
+
 class TestATakeoverFromAHeadlessRun:
     """``knowop run attach`` hands the CLI's own terminal the session the driver was on."""
 
@@ -10014,8 +10258,10 @@ class TestATakeoverFromAHeadlessRun:
 
         assert reply.ok
         [relay] = wiring.relays
-        assert relay.argv[:3] == ["claude", "--resume", "s1"]
-        assert relay.kwargs["env"] == {"TRAX_ACTOR": "scout"}
+        assert _past_tools(relay.argv)[:3] == ["claude", "--resume", "s1"]
+        assert _past_token({"env": relay.kwargs["env"], "argv": relay.argv}) == {
+            "TRAX_ACTOR": "scout",
+        }
         assert relay.over, "the end of the run took the terminal down"
         assert wiring.drivers[0].stopped
 
@@ -10045,7 +10291,13 @@ class TestATakeoverFromAHeadlessRun:
         )
 
         assert replies[0].ok
-        assert wiring.relays[0].argv == ["claude", "--resume", "s1", "--model", "haiku"]
+        assert _past_tools(wiring.relays[0].argv) == [
+            "claude",
+            "--resume",
+            "s1",
+            "--model",
+            "haiku",
+        ]
 
     def test_claude_with_no_turn_yet_starts_the_session_by_its_id(
         self,
@@ -10060,7 +10312,11 @@ class TestATakeoverFromAHeadlessRun:
         )
 
         assert reply.ok
-        assert wiring.relays[0].argv[:3] == ["claude", "--session-id", "s1"]
+        assert _past_tools(wiring.relays[0].argv)[:3] == [
+            "claude",
+            "--session-id",
+            "s1",
+        ]
 
     def test_codex_resumes_its_thread_with_goals_on(
         self,
@@ -10075,7 +10331,7 @@ class TestATakeoverFromAHeadlessRun:
         )
 
         assert reply.ok
-        assert wiring.relays[0].argv[:8] == [
+        assert _past_tools(wiring.relays[0].argv)[:8] == [
             "codex",
             "--no-daemon",
             "--enable",
@@ -10137,12 +10393,13 @@ class TestATakeoverFromAHeadlessRun:
             replace(RunConfig(cli_name="claude"), host=_spec(tmp_path)),
             ClaudeAdapter(),
             env={"TRAX_CANVAS": _CANVAS},
+            tools="",
             session_id="s1",
             listening=lambda: None,
         )
 
         argv = wiring.relays[0].argv
-        assert argv[argv.index("--append-system-prompt") + 1] == _CANVAS_NOTE
+        assert argv[argv.index("--append-system-prompt") + 1] == using_knowop()
 
     def test_a_run_with_no_host_has_no_terminal_to_give(
         self,
@@ -10155,6 +10412,7 @@ class TestATakeoverFromAHeadlessRun:
                 RunConfig(cli_name="claude"),
                 ClaudeAdapter(),
                 env={},
+                tools="",
                 session_id="s1",
                 listening=lambda: None,
             )
@@ -10312,6 +10570,23 @@ class TestChatLinesReadLikeTheCli:
         assert _told(run)[0] == "ann@x: note"
         assert _told(run)[1].startswith("ann@x: hi")
 
+    def test_an_autofix_line_is_named_and_leaves_the_owner_unnamed(self) -> None:
+        run = _FakeRun()
+        inbound = InboundState(fallback_sec=0.0)
+
+        for text, who in (("a", "ann@x"), ("fix", AUTOFIX_SOURCE), ("b", "ann@x")):
+            _deliver(
+                InboundDrainItem(text=text, source=who, context=_on("#/graph")),
+                run,
+                inbound=inbound,
+            )
+
+        assert [t.split(_TRAILER)[0] for t in _told(run)] == [
+            "a",
+            f"{AUTOFIX_SOURCE}: fix",
+            "b",
+        ]
+
     def test_the_first_line_after_a_compaction_repeats_the_context_and_canvas(
         self,
     ) -> None:
@@ -10334,7 +10609,7 @@ class TestChatLinesReadLikeTheCli:
             )
 
         told = _told(run)
-        assert told[2] == (f"c{_TRAILER}{context.model_dump_json()}\n{CANVAS_COMMANDS}")
+        assert told[2] == (f"c{_TRAILER}{context.model_dump_json()}\n{using_knowop()}")
         assert told[3] == "d"
 
     def test_a_cli_with_no_start_note_is_given_the_canvas_commands_once(self) -> None:
@@ -10349,7 +10624,7 @@ class TestChatLinesReadLikeTheCli:
             )
 
         told = _told(run)
-        assert told[0].endswith(f"\n{CANVAS_COMMANDS}")
+        assert told[0].endswith(f"\n{using_knowop()}")
         assert told[1] == "b"
 
     def test_a_line_that_never_reached_the_cli_does_not_count_as_told(self) -> None:
@@ -10413,9 +10688,6 @@ class TestChatLinesReadLikeTheCli:
         ]
 
         assert stamps == [{"source": "ann@x", "room": "lab", "kind": "line"}] * 2
-
-    def test_the_start_note_holds_the_canvas_commands(self) -> None:
-        assert CANVAS_COMMANDS in _CANVAS_NOTE
 
 
 class TestWhoHoldsARollout:
@@ -10714,6 +10986,132 @@ def _mine_nothing(path: Path) -> bool:
     """Claim no file the watch sees."""
     del path
     return False
+
+
+def _held_open(pid: int, path: Path) -> bool:
+    """Say the run's CLI holds every file open."""
+    del pid, path
+    return True
+
+
+class _NamingAdapter(_FakeAdapter):
+    """Names each file's session by its stem, as claude does."""
+
+    @override
+    def session_id_from_path(self, path: Path) -> str | None:
+        return path.stem
+
+
+class _EdgesClient(_UploadsClient):
+    """A server that opens every session and keeps each start and edge it was sent."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.starts: dict[UUID, SessionStart] = {}
+        self.edges: list[tuple[UUID, UUID, str, str, str]] = []
+
+    @override
+    def session_start(self, body: SessionStart) -> SessionStartResponse:
+        opened = SessionStartResponse(
+            id=uuid.uuid4(),
+            seq=0,
+            actor=body.actor,
+            audience=PRIVATE if body.private else None,
+        )
+        self.starts[opened.id] = body
+        return opened
+
+    @override
+    def add_edge(
+        self,
+        from_id: UUID,
+        to_id: UUID,
+        edge_kind: str,
+        *,
+        actor: str,
+        note: str = "",
+    ) -> None:
+        self.edges.append((from_id, to_id, edge_kind, actor, note))
+
+
+class TestSubagentSessions:
+    """Each sub-agent of the run is recorded in a session of its own, under its parent."""
+
+    _RUN: Final = Path("/s/s1.jsonl")
+    _KID: Final = Path("/s/s1/subagents/agent-a1.jsonl")
+    _GRANDKID: Final = Path("/s/s1/subagents/agent-a2.jsonl")
+
+    def _adapter(self, *, parent: str = "s1") -> _NamingAdapter:
+        adapter = _NamingAdapter(Path("/s"))
+        adapter.subagents = {
+            self._KID: Subagent(child="agent-a1", parent=parent, note="Explore: read"),
+            self._GRANDKID: Subagent(child="agent-a2", parent="agent-a1"),
+        }
+        return adapter
+
+    def test_the_runs_subagents_are_owned_at_every_depth(self) -> None:
+        owner = session._SessionOwner(session_id="s1")
+        adapter = self._adapter()
+
+        assert not owner.owns(adapter, self._GRANDKID)
+        assert owner.owns(adapter, self._KID)
+        assert owner.owns(adapter, self._GRANDKID)
+        assert owner.owns(adapter, self._RUN)
+        assert owner.subagents == {"agent-a1", "agent-a2"}
+
+    def test_another_sessions_subagent_is_not_owned(self) -> None:
+        owner = session._SessionOwner(session_id="s1")
+
+        assert not owner.owns(self._adapter(parent="s9"), self._KID)
+
+    def test_a_spawned_rollout_the_cli_holds_is_never_claimed_as_the_runs_own(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Codex holds a thread it spawned open as it does the run's own rollout."""
+        monkeypatch.setattr(session, "_path_held_by_child", _held_open)
+        owner = session._SessionOwner(child_pid=os.getpid())
+
+        assert not owner.owns(self._adapter(), self._KID)
+        assert owner.session_id is None
+        assert owner.owns(self._adapter(), self._RUN)
+        assert owner.session_id == "s1"
+
+    def test_a_synced_subagent_opens_its_own_session_linked_to_the_runs(self) -> None:
+        client = _EdgesClient()
+        config = RunConfig(cli_name="fake", client=client, actor="lead", private=True)
+        adapter = self._adapter()
+        sink = _open_sink(config, adapter)
+        sink.set_cli_session_id("s1")
+        _ = sink.open()
+
+        _ = sink.feed(adapter, self._RUN, b"go\n")
+        _ = sink.feed(adapter, self._KID, b"look\n")
+        sink.close()
+
+        run, kid = client.starts
+        assert client.starts[run].cli_session_id == "s1"
+        assert client.starts[run].actor == "lead"
+        child = client.starts[kid]
+        assert (child.cli_session_id, child.actor, child.private) == (
+            "agent-a1",
+            "lead/agent-a1",
+            True,
+        )
+        assert client.edges == [(kid, run, "produced_by", "lead", "Explore: read")]
+        assert len(client.ends) == 2
+
+    def test_a_client_that_writes_no_edges_still_records_each_subagent(self) -> None:
+        client = _UploadsClient()
+        adapter = self._adapter()
+        sink = _open_sink(RunConfig(cli_name="fake", client=client), adapter)
+        sink.set_cli_session_id("s1")
+        _ = sink.open()
+
+        _ = sink.feed(adapter, self._KID, b"look\n")
+        sink.close()
+
+        assert len(client.ends) == 2
 
 
 if __name__ == "__main__":

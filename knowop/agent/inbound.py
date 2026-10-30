@@ -8,12 +8,16 @@ does not import it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, overload
 
 import json
 
 from treekle import from_plain, json_loads
 
+
+_CWD: Final = Path(__file__).resolve().parent
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -25,43 +29,27 @@ if TYPE_CHECKING:
     )
 
 
-# What the run's start note tells the CLI about moving the canvas, once. One line with
-# no double quote or backslash, so it is a TOML string as it stands, for codex's ``-c``.
-# The line after a compaction carries it again: the CLI may have lost the note.
-#
-# ``knowop canvas``, never ``trax canvas``: a computer may have knowop alone. Asked for
-# a terminal, claude on such a Mac opened the Terminal app, which the person in Chat
-# cannot see.
-CANVAS_COMMANDS: Final = (
-    "Canvas: run these commands; describing them does nothing. "
-    "`knowop canvas` acts on your canvas, $TRAX_CANVAS (a line's Trackinizer "
-    "context names it as canvas_id). RECORD_UUID is the record on screen "
-    "(page.record.id in that context) or any record's uuid. "
-    "Show a record: knowop canvas navigate '#/lookup/RECORD_UUID'. "
-    "Show its graph: knowop canvas show trax.subgraph --record RECORD_UUID "
-    "--placement side. "
-    "Show its timeline: knowop canvas show trax.timeline --record RECORD_UUID. "
-    "Show an artifact: knowop canvas show trax.artifact --record RECORD_UUID "
-    "--placement main. "
-    "Show its files and diffs: knowop canvas show trax.files --record RECORD_UUID "
-    "(narrow: --param path=DIR/ or a glob, --param changed=true, --param file=NAME). "
-    "When the person asks for a terminal, open one in their canvas: knowop canvas "
-    "show trax.terminal --param machine=NAME --param start=true (NAME is this "
-    "computer; `knowop status` lists it). Do not open a desktop terminal app. "
-    "Point at records: knowop canvas highlight UUID[,UUID...] (highlight '' clears). "
-    "Go to a view: knowop canvas navigate '#/list/Issue' (or '#/graph', "
-    "'#/activity', '#/console', '#/search/TEXT' with TEXT percent-encoded). "
-    "Hide your Chat window so they look at the page: knowop canvas hide chat "
-    "(show chat brings it back). "
-    "Hide a visual: knowop canvas hide INSTANCE_UUID (never the page)."
-)
+# What an agent inside knowop can do is one text, the ``using-knowop`` skill
+# (``skills/using-knowop/SKILL.md``): the run's start note gives it to claude and codex
+# through their own instruction flag, and the line after a compaction, or a CLI's first
+# line when it has no such flag, carries it again, since the CLI may have lost it.
+# Its commands are ``knowop canvas``, never ``trax canvas``: a computer may have knowop
+# alone. Asked for a terminal, claude on such a Mac opened the Terminal app, which the
+# person in Chat cannot see.
+@cache
+def using_knowop() -> str:
+    """Return what an agent inside knowop is told it can do: the skill's body."""
+    skill = _CWD.parent / "skills" / "using-knowop" / "SKILL.md"
+    # The front matter ends at the first line that is only ---.
+    _, _, body = skill.read_text().partition("\n---\n")
+    return body.strip()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Disclosure:
     """What a person's line says beyond their words.
 
-    The default says everything but the canvas commands, which the run's start note
+    The default says everything but :func:`using_knowop`, which the run's start note
     holds. A line reads as it would typed at the CLI: the run says more only when the
     CLI could not know it (see ``InboundState.disclosure``).
     """
@@ -72,8 +60,8 @@ class Disclosure:
     context: bool = True
     """Whether the line carries the Trackinizer context: it is the first, or changed."""
 
-    canvas: bool = False
-    """Whether the line repeats :data:`CANVAS_COMMANDS`: the CLI may have lost them."""
+    skill: bool = False
+    """Whether the line repeats :func:`using_knowop`: the CLI may have lost it."""
 
 
 # A single PTY interleaves every room's messages into one input stream, so the agent
@@ -95,10 +83,10 @@ class Disclosure:
 # typed bare: with ``sender: `` before it, ``/compact`` reaches the model as a prompt
 # and never runs as a command.
 #
-# A Chat line reads as one typed at the CLI (see :class:`Disclosure`): the canvas commands
-# are in the run's start note, the context goes only when it changed, and the sender is
-# named only when it tells speakers apart. Marks ride with their line every time, after
-# the context, which readers of a transcript cut them off by.
+# A Chat line reads as one typed at the CLI (see :class:`Disclosure`): the using-knowop
+# skill is in the run's start note, the context goes only when it changed, and the
+# sender is named only when it tells speakers apart. Marks ride with their line every
+# time, after the context, which readers of a transcript cut them off by.
 @overload
 def render_inbound(
     text: str,
@@ -145,7 +133,7 @@ def render_inbound(
       stream: Whether the receiver is an IO-stream child rather than a model CLI.
       kind: What the message is; see
         :data:`~trackinizer.wire.wire_sessions.InboundKind`.
-      disclosure: What of the context, the canvas commands and the sender the line
+      disclosure: What of the context, the using-knowop skill and the sender the line
         carries; see :class:`Disclosure`.
 
     Returns:
@@ -188,8 +176,8 @@ def render_inbound(
             )
         if context.marks:
             rendered += _render_marks(context.marks)
-        if shown.canvas:
-            rendered += f"\n{CANVAS_COMMANDS}"
+        if shown.skill:
+            rendered += f"\n{using_knowop()}"
     return rendered
 
 
