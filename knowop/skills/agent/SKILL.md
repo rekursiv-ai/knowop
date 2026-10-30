@@ -88,6 +88,11 @@ moved out of trax.
   cards, and Chat's answers come back.
 - Messages sent to the session (`trax send @NAME ...`, or Chat) are typed into
   the CLI once it is ready for them.
+- A shell command the agent wrote that the chat's starter clicks Run on in Chat
+  runs on the run's computer, in its folder, with the CLI's environment, in the
+  background. Its start and end are `run` records Chat draws under the block, and
+  a line from `knowop-run` tells the CLI how it ended. The whole output stays in
+  the user state directory under `rekursiv-ai/knowop/runs/`.
 - A run placed on a canvas gets `$TRAX_CANVAS`, `$TRAX_WORKSPACE` and
   `$TRAX_ACTOR`, and is told its canvas is the canvas's; a run attached to a
   chat (`--attach SESSION`) gets those of the canvas its chat sits on.

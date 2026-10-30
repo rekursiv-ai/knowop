@@ -139,13 +139,13 @@ def render_inbound(
     Returns:
       rendered: Text to type and submit with Enter; raw keys to send as they are
         (an interrupt is Escape); ``None`` for a kind that is not typed at all (a
-        settings change).
+        settings change, or a command clicked Run on, which the run runs itself).
 
     """
     match kind:
         case "command" | "answer":
             return text
-        case "settings":
+        case "settings" | "run":
             return None
         case "interrupt":
             return b"\x1b"

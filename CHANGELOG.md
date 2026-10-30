@@ -54,6 +54,11 @@ All notable knowop changes are documented here. This project follows
   lists this computer's folders and reads its files, as the user who started
   `knowop connect`, over the terminal link. Needs a trackinizer server that
   knows the `files` terminal.
+- `knowop run` runs a command its chat's starter clicks Run on in Chat: in the
+  run's folder, with the CLI's environment, at most four at once. It shows Chat
+  the output as it grows and, once the command ends, types the agent a
+  `knowop-run` line with how it ended and the end of what it printed; the whole
+  output stays under the state folder. Needs a server that takes Run.
 
 ### Changed
 

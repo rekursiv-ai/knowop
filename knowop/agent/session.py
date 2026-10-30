@@ -96,7 +96,9 @@ from trackinizer.wire.wire_sessions import (
     RUN_ENDING_REFUSALS,
     CanvasMessageContext,
     InboundDrainItem,
+    SessionRunOutput,
     SessionRunState,
+    session_run_output_path,
     session_run_state_path,
 )
 from treekle import PlainTree, from_plain, json_dumps, json_loads
@@ -106,6 +108,7 @@ from knowop.agent.claude_stream import (
     REMOTE_CONTROL,
     ClaudeStreamDriver,
 )
+from knowop.agent.clicked_runs import RUN_SOURCE, ClickedRuns
 from knowop.agent.codex_app import (
     ApprovalPolicy,
     CodexAppDriver,
@@ -253,6 +256,10 @@ _QUEUE_DRAIN_SEC: Final = 0.05
 # whenever the message is enqueued, nor exit latency, since ending the session
 # ends the request.
 _INBOUND_WAIT_SEC: Final = 25.0
+
+# How long an inbound request holds while a command clicked in Chat runs: the line that
+# says how it ended waits for the next drain, and a whole hold would make it 25 s late.
+_RUN_WAIT_SEC: Final = 2.0
 
 # Total time the worker threads get to stop at teardown. Shared across every
 # join rather than granted per thread: two sequential 30s budgets plus the
@@ -535,6 +542,7 @@ class _InboundClient(Protocol):
         cwd: str | None = None,
         cli: str | None = None,
         instance: str | None = None,
+        runs: bool = False,
     ) -> list[InboundDrainItem]:
         """Drain the session's pending inbound messages, oldest first."""
         ...
@@ -936,9 +944,9 @@ class InboundState:
 
 
 # The senders that are no one's voice: the server speaking for itself, and the run's own
-# Auto-fix. Each is named on every line and neither is nor makes anyone "the other
-# person", so a person's lines stay bare after one.
-_NO_ONES_VOICE: Final = frozenset({"trackinizer", AUTOFIX_SOURCE})
+# Auto-fix and Run reports. Each is named on every line and none is or makes anyone
+# "the other person", so a person's lines stay bare after one.
+_NO_ONES_VOICE: Final = frozenset({"trackinizer", AUTOFIX_SOURCE, RUN_SOURCE})
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1773,6 +1781,15 @@ def _spawn_and_drain(
         # Set before the poller starts, which is the only reader of it.
         inbound.marker = hook_files.ready
     machine = _machine_name()
+    env = _routing_env(config, granted_actor=granted_actor) | placed | _tools_env(tools)
+    runs = _clicked_runs(
+        config,
+        adapter=adapter,
+        env=env,
+        record=record,
+        machine=machine,
+        sink=sink,
+    )
     trust = (
         _trust_gate(adapter, record=record, inbound=inbound, machine=machine)
         if config.syncing
@@ -1810,9 +1827,7 @@ def _spawn_and_drain(
     banner_reader = owner if adapter.name == "codex" else None
     relay = ThreadedRelay(
         argv,
-        env=_routing_env(config, granted_actor=granted_actor)
-        | placed
-        | _tools_env(tools),
+        env=env,
         drop_env=_dropped_env(adapter),
         host=config.host,
         on_input=detector.feed,
@@ -1849,6 +1864,7 @@ def _spawn_and_drain(
                 record=record,
                 gate=gate,
                 pull_requests=pull_requests,
+                runs=runs,
                 instance=config.instance,
                 compact=(
                     f"the loaded conversation is past what {adapter.name} holds "
@@ -1894,6 +1910,7 @@ def _spawn_and_drain(
             sink,
             pull_requests=pull_requests,
             tools=tools,
+            runs=runs,
         )
 
 
@@ -1983,6 +2000,7 @@ def _wind_down(
     *,
     pull_requests: PullRequestWatch | None = None,
     tools: ToolServer | None = None,
+    runs: ClickedRuns | None = None,
 ) -> None:
     """Stop the workers once the CLI is gone, and close the sink under them."""
     # Not joined: a pass may be inside a ``gh`` call, and the rows it writes are the
@@ -1991,6 +2009,9 @@ def _wind_down(
         pull_requests.close()
     if tools is not None:
         tools.close()
+    # Before the quiesce, so the records of the commands it stops are drained.
+    if runs is not None:
+        runs.close()
     # Let the drain thread finish pending reads before stopping it.
     time.sleep(config.quiesce_seconds)
     stop.set()
@@ -2059,6 +2080,33 @@ def _tool_server(pull_requests: PullRequestWatch | None) -> ToolServer | None:
 def _tools_env(tools: ToolServer | None) -> dict[str, str]:
     """Return what the CLI's environment holds of the run's tools: their token."""
     return {} if tools is None else {BEARER_ENV: tools.token}
+
+
+# A command clicked in Chat runs as the agent's own shell call would: in the run's
+# folder, with the environment the CLI is given. A local-file run takes no clicks.
+def _clicked_runs(
+    config: RunConfig,
+    *,
+    adapter: Adapter,
+    env: Mapping[str, str],
+    record: Callable[[SystemMessage], None],
+    machine: str | None,
+    sink: Sink,
+) -> ClickedRuns | None:
+    """Return what runs the commands clicked in Chat, or ``None`` with no server."""
+    if not config.syncing or config.client is None:
+        return None
+    dropped = _dropped_env(adapter)
+    given = {k: v for k, v in os.environ.items() if k not in dropped} | dict(env)
+    return ClickedRuns(
+        record=record,
+        cwd=Path.cwd(),
+        env=given,
+        shell_path=given.get("SHELL") or "/bin/sh",
+        machine=machine,
+        shown_cwd=_shown_cwd(Path.cwd()),
+        publish=partial(_put_run_output, config.client, sink, config.instance),
+    )
 
 
 # A chat's run has no terminal. The CLI runs through its driver, which hears Chat's
@@ -2138,6 +2186,15 @@ def _headless_and_drain(
     model, effort = _model_and_effort(config.cli_args)
     host = config.host
     instance = config.instance
+    machine = _machine_name()
+    runs = _clicked_runs(
+        config,
+        adapter=adapter,
+        env=env,
+        record=record,
+        machine=machine,
+        sink=sink,
+    )
     reporter = (
         None
         if config.client is None
@@ -2176,11 +2233,12 @@ def _headless_and_drain(
                 stop,
                 inbound=inbound,
                 run_name=config.run_name,
-                machine=_machine_name(),
+                machine=machine,
                 cwd=_shown_cwd(Path.cwd()),
                 cli=adapter.name,
                 record=record,
                 pull_requests=pull_requests,
+                runs=runs,
                 instance=instance,
                 compact=(
                     f"the loaded conversation is past what {adapter.name} holds "
@@ -2213,6 +2271,7 @@ def _headless_and_drain(
             sink,
             pull_requests=pull_requests,
             tools=tools,
+            runs=runs,
         )
 
 
@@ -2231,6 +2290,23 @@ def _report_state(
         return
     body = SessionRunState(state=state, instance=instance)
     _ = client.post(session_run_state_path(session_id), body=body.model_dump())
+
+
+# Shown, like the run's state, and never trusted: the server keeps it only from the run
+# holding the session's lease.
+def _put_run_output(
+    client: RunClient,
+    sink: Sink,
+    instance: str,
+    run_id: str,
+    text: str,
+) -> None:
+    """Show Chat what a clicked command has printed so far."""
+    session_id = sink.session_id
+    if session_id is None:
+        return
+    body = SessionRunOutput(instance=instance, text=text)
+    _ = client.post(session_run_output_path(session_id, run_id), body=body.model_dump())
 
 
 # Claude and codex each have a flag for the model; only claude has one for the effort.
@@ -3054,6 +3130,11 @@ class _Typist(Protocol):
 # line back from, so it holds none.
 # The Auto-fix lines ``pull_requests`` queues are typed here too, held as a Chat line is
 # while a dialog would take them; one waits at most one drain's hold.
+#
+# A ``run`` message is a command Chat's Run button clicked, never typed: ``runs`` runs
+# it, and the line that says how it ended is typed as Auto-fix's is. While one runs, a
+# drain holds no longer than ``_RUN_WAIT_SEC``, so that line is not a whole hold late.
+# Only a run with ``runs`` tells the server it takes them.
 def _inbound_poll_loop(
     client: _InboundClient,
     sink: _InboundSink,
@@ -3074,6 +3155,7 @@ def _inbound_poll_loop(
     compact: str | None = None,
     instance: str | None = None,
     pull_requests: _Wakes | None = None,
+    runs: ClickedRuns | None = None,
 ) -> None:
     """Wait on server-queued inbound messages and type them into the CLI."""
     warned = False
@@ -3130,24 +3212,32 @@ def _inbound_poll_loop(
             compact = None
         if pull_requests is not None:
             held.extend(pull_requests.take())
+        if runs is not None:
+            held.extend(runs.take())
         while held and not _holding(inbound):
             deliver(held.popleft())
+        hold = poll_interval if held or _trusting(inbound) else wait_sec
+        if runs is not None and runs.running():
+            hold = min(hold, _RUN_WAIT_SEC)
         try:
             batch = client.drain_inbound(
                 session_id,
-                wait_sec=poll_interval if held or _trusting(inbound) else wait_sec,
+                wait_sec=hold,
                 run=run_name,
                 machine=machine,
                 cwd=cwd,
                 cli=cli or None,
                 instance=instance,
+                runs=runs is not None,
             )
             # Each submission is guarded on its own. ``drain_inbound`` CONSUMES
             # server-side, so the batch is already gone from the queue: one
             # message that cannot be typed must not take its siblings with it,
             # since no later drain will ever return them again.
             for item in batch:
-                if item.kind in {"line", "command"} and (held or _holding(inbound)):
+                if item.kind == "run" and runs is not None:
+                    _start_clicked(runs, item, record=record)
+                elif item.kind in {"line", "command"} and (held or _holding(inbound)):
                     held.append(item)
                 else:
                     deliver(item)
@@ -3186,6 +3276,20 @@ def _inbound_poll_loop(
         # outage is not a hot retry loop.
         if stop.wait(poll_interval):
             break
+
+
+def _start_clicked(
+    runs: ClickedRuns,
+    item: InboundDrainItem,
+    *,
+    record: Callable[[SystemMessage], None] | None,
+) -> None:
+    """Hand a ``run`` message to ``runs``; a failure is recorded, and the rest go on."""
+    try:
+        runs.handle(item)
+    except Exception as error:
+        _record_delivery_failure(item, error, record=record)
+        _logger.warning("knowop run: could not run a clicked command", exc_info=True)
 
 
 def _holding(inbound: InboundState | None) -> bool:
@@ -3371,6 +3475,14 @@ def _deliver_headless(
                 _deliver_headless_command(run, item, inbound=inbound, record=record)
             case "line":
                 _deliver_headless_line(run, item, inbound=inbound)
+            case "run":
+                # The poll loop hands a run to its ``ClickedRuns``; a run with none
+                # does not say it takes runs, so the server sends it none.
+                _record_delivery_failure(
+                    item,
+                    ValueError("this run runs no clicked commands"),
+                    record=record,
+                )
     except (TakenOverError, RunEndedError) as error:
         _record_delivery_failure(item, error, record=record, refused=True)
         _logger.info("knowop run: a %s message was not taken: %s", item.kind, error)

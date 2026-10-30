@@ -102,6 +102,7 @@ from knowop.agent import (
     session,
 )
 from knowop.agent.claude_stream import ClaudeStreamDriver
+from knowop.agent.clicked_runs import ClickedRuns
 from knowop.agent.codex_app import CodexAppDriver
 from knowop.agent.commands import command_record
 from knowop.agent.custom_types import Event, RunRequest
@@ -1258,8 +1259,10 @@ class TestARunSaysWhereItIs:
             "machine": "gx10",
             "cwd": "~/work",
             "cli": "claude",
+            "runs": False,
         }
-        assert re.fullmatch(r"[0-9a-f]{32}", instance or "")
+        assert isinstance(instance, str)
+        assert re.fullmatch(r"[0-9a-f]{32}", instance)
 
     def test_a_run_names_its_cli_and_the_same_instance_on_every_drain(self) -> None:
         stop = threading.Event()
@@ -1278,7 +1281,7 @@ class TestARunSaysWhereItIs:
         assert len({said["instance"] for said in client.said}) == 1
 
     def test_two_runs_do_not_share_an_instance(self) -> None:
-        instances: list[str | None] = []
+        instances: list[str | bool | None] = []
         for _ in range(2):
             stop = threading.Event()
             client = _WhereClient(stop)
@@ -1610,14 +1613,14 @@ class _WhereClient:
     def __init__(self, stop: threading.Event, *, drains: int = 1) -> None:
         self._stop = stop
         self._drains = drains
-        self.said: list[dict[str, str | None]] = []
+        self.said: list[dict[str, str | bool | None]] = []
 
     def drain_inbound(
         self,
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del session_id, wait_sec
         self.said.append(where)
@@ -1646,7 +1649,7 @@ class _RefusingClient:
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del session_id, wait_sec, where
         self.drains += 1
@@ -3360,7 +3363,7 @@ class _NoServer:
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del session_id, wait_sec, where
         raise AssertionError("drain_inbound reached the offline server.")
@@ -5316,6 +5319,8 @@ class TestSpawnWiring:
         assert callable(named.pop("record"))
         # A synced run watches the pull requests its session opens.
         assert isinstance(named.pop("pull_requests"), PullRequestWatch)
+        # And runs the commands Chat's Run button clicks.
+        assert isinstance(named.pop("runs"), ClickedRuns)
         # A run in this terminal names its machine and folder, and no host; a trusted
         # CLI opens no trust card, and one that loaded nothing compacts nothing.
         assert named == {
@@ -5667,7 +5672,7 @@ class _HoldingServer(_NoServer):
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del where
         del session_id
@@ -5742,7 +5747,7 @@ class _RefusingServer(_HoldingServer):
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del session_id, wait_sec, where
         self.drains += 1
@@ -5878,6 +5883,76 @@ class TestInboundIsWaitDriven:
             f"retried {client.attempts} times with {len(stop.timeouts)} backoffs"
         )
         assert set(stop.timeouts) == {0.05}, f"backed off by {stop.timeouts}"
+
+
+class TestAClickedCommandInTheInboundLoop:
+    """A command clicked Run on is run here, never typed, and its end is typed."""
+
+    def test_it_runs_and_the_line_that_says_how_it_ended_is_typed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        stop = threading.Event()
+        relay = _RecordingRelay()
+        client = _ClickClient(
+            stop,
+            relay,
+            InboundDrainItem(
+                text="sleep 0.01; printf hi",
+                kind="run",
+                payload={"run_id": "a" * 32, "block": "k@0"},
+                source="dan@x",
+            ),
+        )
+        runs = ClickedRuns(
+            record=lambda _: None,
+            cwd=tmp_path,
+            env={"PATH": "/usr/bin:/bin"},
+            shell_path="/bin/sh",
+        )
+
+        _inbound_poll_loop(client, _SessionSink(), relay, stop, runs=runs)
+
+        [typed] = relay.submitted
+        assert typed.startswith("knowop-run: <knowop-run ")
+        assert "<stdout>hi</stdout>" in typed
+        assert all(said["runs"] is True for said in client.said)
+        # A whole hold before the click and after its line; a short one while it ran.
+        assert (client.waits[0], client.waits[-1]) == (25.0, 25.0)
+        assert set(client.waits[1:-1]) == {2.0}
+
+
+class _ClickClient:
+    """Hands out one ``run`` message, then nothing, until a line is typed."""
+
+    def __init__(
+        self,
+        stop: threading.Event,
+        relay: _RecordingRelay,
+        item: InboundDrainItem,
+    ) -> None:
+        self._stop = stop
+        self._relay = relay
+        self._items: list[InboundDrainItem] = [item]
+        self.said: list[dict[str, str | bool | None]] = []
+        self.waits: list[float] = []
+
+    def drain_inbound(
+        self,
+        session_id: UUID,
+        *,
+        wait_sec: float = 0.0,
+        **where: str | bool | None,
+    ) -> list[InboundDrainItem]:
+        del session_id
+        self.said.append(where)
+        self.waits.append(wait_sec)
+        if self._relay.submitted or len(self.waits) > 2_000:
+            self._stop.set()
+        time.sleep(0.001)
+        items = self._items
+        self._items = []
+        return items
 
 
 class TestInboundBatchSurvivesOneBadMessage:
@@ -6117,7 +6192,7 @@ class _BatchClient:
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del where
         del session_id, wait_sec
@@ -6161,7 +6236,7 @@ class _UploadOutageClient(_BatchClient):
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del where
         self.drained_for.add(session_id)
@@ -6282,7 +6357,7 @@ class _WaitingClient:
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del where
         del session_id
@@ -6305,7 +6380,7 @@ class _FailingClient:
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del where
         del session_id, wait_sec
@@ -6888,7 +6963,7 @@ class _MarkerCheckingClient:
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del where
         del session_id, wait_sec
@@ -7239,7 +7314,7 @@ class _ScriptedClient:
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del where
         del session_id
@@ -9208,7 +9283,7 @@ class _OneBatchServer:
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del session_id, wait_sec, where
         if self._refuse is not None:
@@ -10767,7 +10842,7 @@ class _UndrainedClient:
         session_id: UUID,
         *,
         wait_sec: float = 0.0,
-        **where: str | None,
+        **where: str | bool | None,
     ) -> list[InboundDrainItem]:
         del session_id, wait_sec, where
         raise AssertionError("The stopped loop drained the server.")
