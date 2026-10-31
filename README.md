@@ -12,25 +12,10 @@ jobs where Chat can reach them.
 ## Quick Start
 
 ```bash
-# Mac:
-#   # Required for quick install.
-#   brew install uv
-
-# Ubuntu/Debian:
-#   # Required for quick install.
-#   sudo apt-get install -y curl
-#   curl -LsSf https://astral.sh/uv/install.sh | sh
-
-uvx knowop connect
+uvx knowop@latest connect
 ```
 
-`uvx knowop connect` runs knowop without installing it. To keep the command for
-every day, install it:
-
-```bash
-uv tool install knowop
-# Alternatively: python -m pip install knowop
-```
+See [Install](#install) for additional details.
 
 ## Use
 
@@ -113,6 +98,32 @@ you will not connect, where only your agents work. A later `knowop connect` ther
 enrolls the computer with that login's key, and it waits until you confirm it in the
 web app. A first `knowop run` logs in too.
 
+## Install
+
+`uvx knowop@latest connect` runs the latest knowop without installing it. To keep
+the command for every day, install it:
+
+```bash
+uv tool install knowop && knowop connect
+# Later: uv tool upgrade knowop
+```
+
+If you're missing `uvx`/`uv`,
+- Mac
+  ```bash
+  brew install uv
+  ```
+- Linux
+  ```bash
+  sudo apt install -y curl
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+
+Or with pip,
+```bash
+python -m pip install knowop
+```
+
 ## In Docker
 
 A container has no service manager: `knowop connect --foreground` serves it, and
@@ -122,7 +133,7 @@ and uv's cache, so a new container joins again with no login:
 ```bash
 docker run -d --name knowop --restart unless-stopped -v knowop:/root \
   ghcr.io/astral-sh/uv:python3.12-bookworm-slim \
-  uvx knowop connect --foreground --name my-box
+  uvx knowop@latest connect --foreground --name my-box
 docker logs -f knowop   # approve the code it prints, then Ctrl-C
 ```
 
