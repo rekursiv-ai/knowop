@@ -80,7 +80,7 @@ class TerminalHost:
       name: The machine's name, which names the log.
       server_url: The server's URL; the sockets use its host over ``ws``/``wss``.
       credential: The machine credential, sent as a bearer on each socket.
-      client_for: Returns a client that sends the given credential.
+      credential_client: Returns a client that sends the given credential.
       trax_env: The trax context every shell starts with, which names no secret.
       shell: The command a terminal runs; the user's login shell when empty.
       drain_sec: How long output may keep flowing after the shell exits, which a job
@@ -96,7 +96,7 @@ class TerminalHost:
         name: str,
         server_url: str,
         credential: str,
-        client_for: Callable[[str], TerminalClient],
+        credential_client: Callable[[str], TerminalClient],
         trax_env: dict[str, str],
         shell: Sequence[str] = (),
         drain_sec: float = 0.5,
@@ -107,7 +107,7 @@ class TerminalHost:
         self._name = name
         self._url = server_url.replace("http", "ws", 1).rstrip("/")
         self._credential = credential
-        self._client_for = client_for
+        self._client_for = credential_client
         self.trax_env = trax_env
         """The trax context every shell starts with."""
         self._shell = list(shell)

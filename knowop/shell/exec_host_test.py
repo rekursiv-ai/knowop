@@ -409,7 +409,7 @@ def _host(server: _Server) -> ExecHost:
     return ExecHost(
         name="box-1",
         credential=_CREDENTIAL,
-        client_for=server,
+        credential_client=server,
         retry_sec=0,
     )
 

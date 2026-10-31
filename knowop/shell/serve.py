@@ -160,10 +160,10 @@ def connect_machine(
     machine_host.connect(
         name,
         server=server,
-        client_for=lambda key: Client(server, api_key=key),
+        credential_client=lambda key: Client(server, api_key=key),
         read_token=read_token,
         sleep=sleep,
-        terminals_for=lambda joined: _terminal_host(
+        joined_terminals=lambda joined: _terminal_host(
             name,
             server,
             joined,
@@ -229,7 +229,7 @@ def _terminal_host(
         name=name,
         server_url=url,
         credential=joined.credential,
-        client_for=lambda key: Client(url, api_key=key),
+        credential_client=lambda key: Client(url, api_key=key),
         trax_env=trax_env,
         direct=direct,
     )
@@ -240,7 +240,7 @@ def _exec_host(name: str, url: str, joined: JoinResponse) -> exec_host.ExecHost:
     return exec_host.ExecHost(
         name=name,
         credential=joined.credential,
-        client_for=lambda key: Client(url, api_key=key),
+        credential_client=lambda key: Client(url, api_key=key),
     )
 
 
@@ -330,7 +330,7 @@ def _job_host(
         name=name,
         server_url=url,
         credential=joined.credential,
-        client_for=lambda key: Client(url, api_key=key),
+        credential_client=lambda key: Client(url, api_key=key),
         account=account,
         root=jobs / server_dir(url),
         repos=job_repo.Repos(jobs / "repos"),
@@ -353,7 +353,7 @@ def _token_source(
     """Return the account ``name`` is served for, and how to get the token joining it."""
     if token:
         # The caller's own login returned it, so it belongs to the account signed in.
-        return (None if signed_in is None else _account_of(signed_in())), lambda: token
+        return (None if signed_in is None else _key_account(signed_in())), lambda: token
     if piped := piped_token():
         return None, lambda: piped
     return _signed_in_as(name, server=server, signed_in=signed_in, sleep=sleep)
@@ -373,14 +373,14 @@ def _signed_in_as(
     """Return the signed-in account, logging in when no key is saved, and its token."""
     if signed_in is not None:
         client = signed_in()
-        account = _account_of(client)
+        account = _key_account(client)
         return account, functools.partial(_enroll, client, name, account=account)
     result = login.login(server, machine=name, client="knowop", sleep=sleep)
     with Client(server, api_key=read_profile(result.profile).api_key) as client:
-        return _account_of(client), lambda: result.machine_token
+        return _key_account(client), lambda: result.machine_token
 
 
-def _account_of(client: Client) -> str:
+def _key_account(client: Client) -> str:
     """Return the email of the account ``client``'s key signs in as."""
     profile = from_plain(client.get(_PROFILE_PATH), dict[str, object])
     return from_plain(profile.get("email"), str)

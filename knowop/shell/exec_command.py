@@ -26,7 +26,7 @@ from knowop.shell.exec_stream import Cut, read_report, script
 from knowop.shell.trax_context import inherited_trax_context
 
 
-__all__ = ["Ending", "result_of", "run_command", "run_until_ended"]
+__all__ = ["Ending", "exec_result", "run_command", "run_until_ended"]
 
 _DRAIN_SEC: Final = 0.5
 """How long output may keep flowing after the shell exits. A job it left running in the
@@ -131,7 +131,7 @@ async def run_until_ended(
     return result, ending
 
 
-def result_of(
+def exec_result(
     exit_code: int,
     *,
     stdout: bytes = b"",
@@ -180,7 +180,7 @@ def _finished(
         err.feed(f"timed out after {request.timeout_sec:g} s\n".encode())
     stderr, stderr_cut = err.value()
     stdout, stdout_cut = out.value()
-    return result_of(
+    return exec_result(
         wire_exec.TIMEOUT_EXIT_CODE if ending == "timeout" else _exit_code(code),
         stdout=stdout,
         stderr=stderr,
@@ -233,7 +233,7 @@ async def _supervise(
     if process.stdin is None or process.stdout is None or process.stderr is None:
         raise ValueError("The command was started without its pipes.")
     streams = [
-        asyncio.create_task(_feed(process.stdin, _stdin_of(request))),
+        asyncio.create_task(_feed(process.stdin, _request_stdin(request))),
         asyncio.create_task(_collect(process.stdout, out)),
         asyncio.create_task(_collect(process.stderr, err)),
     ]
@@ -283,7 +283,7 @@ async def _collect(stream: asyncio.StreamReader, sink: Cut) -> None:
         sink.feed(chunk)
 
 
-def _stdin_of(request: ExecRequest) -> bytes:
+def _request_stdin(request: ExecRequest) -> bytes:
     """Return the bytes the request gives the command on standard input."""
     return b"" if request.stdin_b64 is None else base64.b64decode(request.stdin_b64)
 
@@ -310,7 +310,7 @@ def _refused(
     started: float,
 ) -> tuple[ExecResult, Ending]:
     """Return the result of a command that never ran, with its reason on stderr."""
-    result = result_of(
+    result = exec_result(
         exit_code,
         stderr=f"{reason}\n".encode(),
         cwd=request.cwd,

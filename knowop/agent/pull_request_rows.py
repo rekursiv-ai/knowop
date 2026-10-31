@@ -199,7 +199,7 @@ class PullRequestRows:
         for peer in view["backlinks"].get("produced_by", ()):
             if LABEL not in peer.get("labels", ()):
                 continue
-            url = self._link_of(peer)
+            url = self._row_link(peer)
             if url is None:
                 continue
             self._linked[url] = UUID(peer["id"])
@@ -390,7 +390,7 @@ class PullRequestRows:
             body={"op": "add" if on else "sub", "value": label, "actor": self._actor},
         )
 
-    def _link_of(self, peer: _Peer) -> str | None:
+    def _row_link(self, peer: _Peer) -> str | None:
         """Return the link of a pull request's row, read once; ``None`` for no row."""
         row = UUID(peer["id"])
         if row not in self._links:

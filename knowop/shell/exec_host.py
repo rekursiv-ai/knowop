@@ -29,7 +29,7 @@ from trackinizer.trax.render import echo
 from trackinizer.wire import wire_exec
 
 from knowop.shell.exec_command import (
-    result_of,
+    exec_result,
     run_until_ended,
 )
 
@@ -79,7 +79,7 @@ class ExecHost:
     Args:
       name: The machine's name, which names the log.
       credential: The machine credential, which the client sends.
-      client_for: Returns a client that sends the given credential.
+      credential_client: Returns a client that sends the given credential.
       retry_sec: How long to wait before asking again after a failed wait, or before
         sending a result again.
 
@@ -90,12 +90,12 @@ class ExecHost:
         *,
         name: str,
         credential: str,
-        client_for: Callable[[str], ExecClient],
+        credential_client: Callable[[str], ExecClient],
         retry_sec: float = 5.0,
     ) -> None:
         self._name = name
         self._credential = credential
-        self._client_for = client_for
+        self._client_for = credential_client
         self._retry_sec = retry_sec
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -165,7 +165,7 @@ class ExecHost:
             self._post(
                 machine_id,
                 command.exec_id,
-                result_of(
+                exec_result(
                     1,
                     stderr=b"knowop connect stopped before the command started\n",
                     cwd=command.cwd,

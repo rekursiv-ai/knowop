@@ -301,7 +301,7 @@ class JobHost:
       name: The machine's name, for the log lines and refusals.
       server_url: The server's URL, which the scopes' names are told apart by.
       credential: The machine credential, which the client sends.
-      client_for: Returns a client that sends the given credential.
+      credential_client: Returns a client that sends the given credential.
       account: The account whose jobs this machine runs.
       root: The folder that holds a folder per job.
       repos: Fetches a job's commit into its worktree, and deletes it.
@@ -323,7 +323,7 @@ class JobHost:
         name: str,
         server_url: str,
         credential: str,
-        client_for: Callable[[str], JobClient],
+        credential_client: Callable[[str], JobClient],
         account: str,
         root: Path,
         repos: Worktrees,
@@ -341,7 +341,7 @@ class JobHost:
         self._server_url = server_url
         self._tag = hashlib.sha256(server_url.encode()).hexdigest()[:8]
         self._credential = credential
-        self._client_for = client_for
+        self._client_for = credential_client
         self._account = account.lower()
         self._root = root
         self._repos = repos

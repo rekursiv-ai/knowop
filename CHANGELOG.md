@@ -5,6 +5,10 @@ All notable knowop changes are documented here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- `knowop.shell.exec_command.result_of` is `exec_result`.
+
 ### Added
 
 - `knowop connect` at a terminal keeps serving this computer in the background,

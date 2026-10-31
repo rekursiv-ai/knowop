@@ -156,7 +156,7 @@ class _Agents:
     def session_id_from_path(self, path: Path) -> str | None:
         return path.stem
 
-    def subagent_of(self, path: Path) -> Subagent | None:
+    def subagent(self, path: Path) -> Subagent | None:
         self.asked.append(path)
         return self.subagents.get(path)
 

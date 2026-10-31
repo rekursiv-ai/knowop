@@ -340,7 +340,7 @@ def _host(
     found_repos = repos or _Repos()
     clock = _Clock()
 
-    def client_for(credential: str) -> _Server:
+    def credential_client(credential: str) -> _Server:
         assert credential == "trax_machine_x"
         return found_server
 
@@ -348,7 +348,7 @@ def _host(
         name="gx10",
         server_url=server_url,
         credential="trax_machine_x",
-        client_for=client_for,
+        credential_client=credential_client,
         account=account,
         root=tmp_path / "jobs",
         repos=found_repos,
@@ -1421,7 +1421,7 @@ def test_default_schedule_and_retry_cadence(tmp_path: Path) -> None:
         name="gx10",
         server_url=_URL,
         credential="key",
-        client_for=lambda _: server,
+        credential_client=lambda _: server,
         account=_JAN,
         root=tmp_path,
         repos=_Repos(),

@@ -306,7 +306,10 @@ async def _ask(events: AsyncIterator[_Event]) -> Ask:
             return event
 
 
-def _of[T: Ask | Resolved | StateChanged](seen: list[_Event], kind: type[T]) -> list[T]:
+def _seen_kind[T: Ask | Resolved | StateChanged](
+    seen: list[_Event],
+    kind: type[T],
+) -> list[T]:
     return [each for each in seen if isinstance(each, kind)]
 
 
@@ -810,7 +813,7 @@ def test_an_answer_sends_the_decision_its_option_stands_for(
     rig = _Rig(tmp_path, after={"turn/start": [_command()]})
     ask, after = rig.run(_asked(rig, option=option))
     assert rig.response(0) == {"decision": decision}
-    resolved = _of(after, Resolved)[0]
+    resolved = _seen_kind(after, Resolved)[0]
     assert resolved.ask_id == ask.id
     assert (resolved.by, resolved.who, resolved.decision) == ("chat", "jp", ended)
 
@@ -835,7 +838,7 @@ def test_an_answer_naming_no_option_is_refused_and_the_ask_stays_open(
         return await _collect(events)
 
     after = rig.run(scenario())
-    assert [each.by for each in _of(after, Resolved)] == ["chat"]
+    assert [each.by for each in _seen_kind(after, Resolved)] == ["chat"]
     assert rig.response(0) == {"decision": "accept"}
 
 
@@ -859,7 +862,7 @@ def test_a_second_answer_to_one_ask_is_a_no_op(tmp_path: Path) -> None:
     after = rig.run(scenario())
     answers = [each for each in rig.frames() if "method" not in each]
     assert answers == [{"id": 0, "result": {"decision": "accept"}}]
-    assert len(_of(after, Resolved)) == 1
+    assert len(_seen_kind(after, Resolved)) == 1
 
 
 def test_a_decline_is_offered_when_the_agent_lists_none(tmp_path: Path) -> None:
@@ -1092,7 +1095,7 @@ def test_a_question_is_answered_by_header_or_id(
         options=(Option(id="answer", label="Send answers", kind="allow_once"),),
     )
     assert rig.response(3) == {"answers": sent}
-    resolved = _of(after, Resolved)[0]
+    resolved = _seen_kind(after, Resolved)[0]
     assert (resolved.option, resolved.decision) == ("answer", "answered")
 
 
@@ -1232,7 +1235,7 @@ def test_a_request_the_interrupt_cleared_was_ended_by_the_run(tmp_path: Path) ->
         # The fake sends both ends after the interrupt's reply. A stop before they
         # are read can kill it first, and the stop then releases ask 0 itself.
         seen: list[_Event] = []
-        while len(_of(seen, Resolved)) < 2:
+        while len(_seen_kind(seen, Resolved)) < 2:
             seen.append(await _next(events))
         await rig.driver.stop()
         return seen + await _collect(events)
@@ -1240,7 +1243,7 @@ def test_a_request_the_interrupt_cleared_was_ended_by_the_run(tmp_path: Path) ->
     seen = rig.run(scenario())
     ended = {
         each.ask_id.split("-")[1]: (each.by, each.decision)
-        for each in _of(seen, Resolved)
+        for each in _seen_kind(seen, Resolved)
     }
     assert ended == {"5": ("terminal", "answered"), "0": ("run", "released")}
 
@@ -1329,14 +1332,14 @@ def test_when_the_app_server_exits_open_asks_are_released(tmp_path: Path) -> Non
         return await _collect(events)
 
     seen = rig.run(scenario())
-    asks = _of(seen, Ask)
-    released = _of(seen, Resolved)
+    asks = _seen_kind(seen, Ask)
+    released = _seen_kind(seen, Resolved)
     assert [each.ask_id for each in released] == [each.id for each in asks]
     assert all(
         (each.by, each.decision) == ("released", "released") for each in released
     )
     assert seen[-1] == StateChanged(state="idle")
-    assert _of(seen, StateChanged) == [
+    assert _seen_kind(seen, StateChanged) == [
         StateChanged(state="requires_action"),
         StateChanged(state="idle"),
     ]

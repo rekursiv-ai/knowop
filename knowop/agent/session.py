@@ -405,7 +405,7 @@ class _SessionOwner:
           owned: Whether this run owns the file.
 
         """
-        subagent = adapter.subagent_of(path)
+        subagent = adapter.subagent(path)
         if subagent is not None:
             spawned = self.session_id is not None and subagent.parent == self.session_id
             if not spawned and subagent.parent not in self.subagents:
@@ -2906,13 +2906,14 @@ def _with_knowop(
     """Return ``argv`` handing a run's CLI the using-knowop skill and the run's tools."""
     given = tuple(argv[1:])
     told = bool(tools) or "TRAX_CANVAS" in placed
-    added: list[str] = []
+    skill: list[str] = []
+    served: list[str] = []
     if adapter.name == "claude":
         if told and not any(
             _cli_arg_value(given, flag=flag) is not None
             for flag in ("--append-system-prompt", "--append-system-prompt-file")
         ):
-            added += ["--append-system-prompt", using_knowop()]
+            skill = ["--append-system-prompt", using_knowop()]
         if tools:
             bearer = f"Bearer ${{{BEARER_ENV}}}"
             server = {
@@ -2924,7 +2925,7 @@ def _with_knowop(
                     },
                 },
             }
-            added += [
+            served = [
                 f"--mcp-config={json.dumps(server)}",
                 "--allowedTools=mcp__knowop",
             ]
@@ -2933,16 +2934,19 @@ def _with_knowop(
             value.startswith("developer_instructions")
             for value in _codex_config_values(given)
         ):
-            skill = json.dumps(using_knowop(), ensure_ascii=False)
-            added += ["-c", f"developer_instructions={skill}"]
+            text = json.dumps(
+                using_knowop(),
+                ensure_ascii=False,
+            )  # pragma: no mutate -- None is as falsy as False.
+            skill = ["-c", f"developer_instructions={text}"]
         if tools:
-            added += [
+            served = [
                 "-c",
                 f'mcp_servers.knowop.url="{tools}"',
                 "-c",
                 f'mcp_servers.knowop.bearer_token_env_var="{BEARER_ENV}"',
             ]
-    return [argv[0], *added, *argv[1:]]
+    return [argv[0], *skill, *served, *argv[1:]]
 
 
 def _codex_config_values(args: tuple[str, ...]) -> list[str]:

@@ -346,7 +346,7 @@ class _FakeAdapter:
         del cli_args
         return None
 
-    def subagent_of(self, path: Path) -> Subagent | None:
+    def subagent(self, path: Path) -> Subagent | None:
         """Return the sub-agent ``path`` names, as the run's CLI declares one."""
         return self.subagents.get(path)
 
@@ -1170,14 +1170,14 @@ class TestMainDispatch:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        def cli_of(argv: list[str], default_cli: str) -> str:
+        def cli_name(argv: list[str], default_cli: str) -> str:
             config = _keep_main(monkeypatch, argv, default_cli=default_cli)
             return config.cli_name
 
-        assert cli_of(["--no-sync"], "claude") == "claude"
-        assert cli_of(["--no-sync"], "codex") == "codex"
-        assert cli_of(["--no-sync", "codex"], "claude") == "codex"
-        assert cli_of(["claude", "--no-sync"], "codex") == "claude"
+        assert cli_name(["--no-sync"], "claude") == "claude"
+        assert cli_name(["--no-sync"], "codex") == "codex"
+        assert cli_name(["--no-sync", "codex"], "claude") == "codex"
+        assert cli_name(["claude", "--no-sync"], "codex") == "claude"
 
     @pytest.mark.parametrize(
         "argv",
@@ -1729,8 +1729,8 @@ class TestAResumedTranscriptIsCaptured:
         argv = list(seen)
         if argv[0] == "claude":
             # Every claude run is handed its hooks; the rest is what is asserted.
-            assert argv[1] == "--settings"
-            del argv[1:3]
+            at = argv.index("--settings")
+            del argv[at : at + 2]
         return sink, argv
 
     def test_a_claude_resume_captures_the_file_it_appends_to(
@@ -10209,7 +10209,8 @@ class TestAHeadlessRunsWiring:
             [_ScriptedDriver()],
         )
 
-        settings = Path(cast(list[str], wiring.made[0]["argv"])[2])
+        argv = cast(list[str], wiring.made[0]["argv"])
+        settings = Path(argv[argv.index("--settings") + 1])
         assert not settings.exists()
         stop = cast(tuple[object, ...], wiring.drain["args"])[4]
         assert isinstance(stop, threading.Event)
