@@ -133,10 +133,10 @@ def connect(
     name: str,
     *,
     server: str,
-    client_for: Callable[[str], HostClient],
+    credential_client: Callable[[str], HostClient],
     read_token: Callable[[], str],
     sleep: Callable[[float], None],
-    terminals_for: Callable[[JoinResponse], Serving] | None = None,
+    joined_terminals: Callable[[JoinResponse], Serving] | None = None,
     exec_for: Callable[[JoinResponse], Serving] | None = None,
     jobs_for: Callable[[JoinResponse], Serving] | None = None,
     job_facts: Mapping[str, FactValue] | None = None,
@@ -153,10 +153,10 @@ def connect(
     Args:
       name: The machine's name, already checked against the name rules.
       server: The server's URL, which keeps its own credential for ``name``.
-      client_for: Returns a client that sends the given key; ``""`` sends none.
+      credential_client: Returns a client that sends the given key; ``""`` sends none.
       read_token: Returns the enrollment token; called only to join.
       sleep: Waits the given seconds between heartbeats.
-      terminals_for: Makes the terminal server for the joined machine's credential;
+      joined_terminals: Makes the terminal server for the joined machine's credential;
         ``None`` serves none, whatever the server asks.
       exec_for: Makes the command server the same way; ``None`` serves none, and the
         facts do not say ``exec``.
@@ -184,7 +184,7 @@ def connect(
     instance = uuid.uuid4()
     version = _host_version()
     facts = host_facts(
-        terminal=terminals_for is not None,
+        terminal=joined_terminals is not None,
         exec_commands=exec_for is not None,
         jobs=None if jobs_for is None else {} if job_facts is None else job_facts,
     )
@@ -192,7 +192,7 @@ def connect(
         _join,
         name,
         path=path,
-        client_for=client_for,
+        credential_client=credential_client,
         read_token=read_token,
         instance=instance,
         version=version,
@@ -202,11 +202,11 @@ def connect(
         _host,
         name=name,
         server=server,
-        client_for=client_for,
+        credential_client=credential_client,
         instance=instance,
         version=version,
         sleep=sleep,
-        makers=(terminals_for, exec_for, jobs_for),
+        makers=(joined_terminals, exec_for, jobs_for),
     )
     who = "" if account is None else f" as {account.lower()}"
     saved = _saved_credential(path)
@@ -306,7 +306,7 @@ def _host(
     *,
     name: str,
     server: str,
-    client_for: Callable[[str], HostClient],
+    credential_client: Callable[[str], HostClient],
     instance: uuid.UUID,
     version: str,
     facts: Facts | None,
@@ -315,7 +315,10 @@ def _host(
     rejoin: bool,
 ) -> _Ending:
     """Serve with ``joined``'s credential until it ends; Ctrl-C releases the machine."""
-    with ExitStack() as serving, closing(client_for(joined.credential)) as client:
+    with (
+        ExitStack() as serving,
+        closing(credential_client(joined.credential)) as client,
+    ):
         try:
             return _heartbeat(
                 client,
@@ -441,7 +444,7 @@ def _join(
     name: str,
     *,
     path: Path,
-    client_for: Callable[[str], HostClient],
+    credential_client: Callable[[str], HostClient],
     read_token: Callable[[], str],
     instance: uuid.UUID,
     version: str,
@@ -451,7 +454,7 @@ def _join(
     token = read_token().strip()
     if not token:
         raise ClientError("connect reads the enrollment token from stdin; none came")
-    with closing(client_for("")) as joining:
+    with closing(credential_client("")) as joining:
         joined = joining.join_machine(
             name,
             token=token,

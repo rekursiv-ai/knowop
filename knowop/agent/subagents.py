@@ -1,7 +1,7 @@
 """Each sub-agent of a run in an AgentSession of its own, linked to its parent.
 
 A CLI writes a sub-agent's transcript beside the run's own: Claude Code under
-``<session>/subagents/``, Codex as a rollout of its own (:meth:`Adapter.subagent_of`).
+``<session>/subagents/``, Codex as a rollout of its own (:meth:`Adapter.subagent`).
 :class:`SubagentSinks` is the run's sink, and sends each sub-agent's lines to a sink of
 its own instead, opened under the sub-agent's own id, so a re-read or a resume lands on
 the same session. Once both sessions are open, it links the sub-agent's to the one that
@@ -88,15 +88,15 @@ class SubagentSinks(Sink):
 
     @override
     def emit(self, adapter_name: str, event: Event) -> None:
-        self._sink_of(event.path).emit(adapter_name, event)
+        self._path_sink(event.path).emit(adapter_name, event)
 
     @override
     def restart(self, path: Path) -> None:
-        self._sink_of(path).restart(path)
+        self._path_sink(path).restart(path)
 
     @override
     def pass_over(self, path: Path) -> None:
-        self._sink_of(path).pass_over(path)
+        self._path_sink(path).pass_over(path)
 
     @override
     def emit_slash_command(self, command: SlashCommand, at: datetime) -> None:
@@ -125,7 +125,7 @@ class SubagentSinks(Sink):
         annotate: Callable[[TraxRecord], TraxRecord] | None = None,
     ) -> list[str]:
         if path not in self._subagents:
-            self._subagents[path] = adapter.subagent_of(path)
+            self._subagents[path] = adapter.subagent(path)
         subagent = self._subagents[path]
         if subagent is None:
             return self._root.feed(
@@ -181,7 +181,7 @@ class SubagentSinks(Sink):
         self._root.close()
         self._link_open(last=True)
 
-    def _sink_of(self, path: Path) -> Sink:
+    def _path_sink(self, path: Path) -> Sink:
         """Return the sink ``path``'s records go to: a sub-agent's, else the run's."""
         subagent = self._subagents.get(path)
         return self._root if subagent is None else self._children[subagent.child]

@@ -95,7 +95,7 @@ def _env(tmp_path: Path) -> dict[str, str]:
     }
 
 
-def _program_of(launcher: Path) -> list[str]:
+def _launcher_program(launcher: Path) -> list[str]:
     """Return the program a launcher runs: its ``exec`` line, less ``"$@"``."""
     (line,) = [
         each for each in launcher.read_text().splitlines() if each.startswith("exec ")
@@ -141,7 +141,9 @@ def test_a_launchd_agent_runs_this_knowop_with_its_flags_and_the_shells_paths(
     }
     # Login Items shows the agent by its program's name: the launcher, which runs this.
     assert (
-        _program_of(data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop")
+        _launcher_program(
+            data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop",
+        )
         == _argv(log)[:3]
     )
     assert (
@@ -211,7 +213,11 @@ def _uvx_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Manager:
     monkeypatch.setattr(sys, "prefix", str(cache / "archive-v0" / "Xk3q"))
     monkeypatch.setattr(shutil, "which", _on_homebrews_path)
     installed = {"knowop": "0.1.6"}
-    monkeypatch.setattr(metadata, "version", partial(_version_of, installed=installed))
+    monkeypatch.setattr(
+        metadata,
+        "version",
+        partial(_installed_version, installed=installed),
+    )
     return _Manager(cache=(0, f"{cache}\n"))
 
 
@@ -230,7 +236,7 @@ def test_a_knowop_uvx_runs_from_its_cache_is_served_by_uvx_at_that_version(
         str(data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"),
         *_argv(log)[3:],
     ]
-    assert _program_of(
+    assert _launcher_program(
         data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop",
     ) == ["/opt/homebrew/bin/uvx", "knowop@0.1.6"]
     assert run.uv == [["uv", "cache", "dir"]]
@@ -278,7 +284,9 @@ def test_a_knowop_installed_outside_uvs_cache_is_served_by_its_own_interpreter(
 
     log = state_dir() / "rekursiv-ai" / "knowop" / "connect" / f"ada-mac-{_TAG}.log"
     assert (
-        _program_of(data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop")
+        _launcher_program(
+            data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop",
+        )
         == _argv(log)[:3]
     )
 
@@ -578,7 +586,7 @@ def test_showing_the_menu_bar_installs_its_agent_and_starts_it_only_once_ended(
     # Started if it ended (Quit), never restarted while it runs.
     assert again.menubar[-1] == ["launchctl", "kickstart", target]
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
-    assert _program_of(launcher) == [sys.executable, "-m", package]
+    assert _launcher_program(launcher) == [sys.executable, "-m", package]
 
 
 def test_a_menu_bar_this_python_cannot_start_is_said_and_not_left_installed(
@@ -1057,7 +1065,11 @@ def test_the_version_is_the_installed_knowops_or_unknown(
     installed: dict[str, str],
     version: str,
 ) -> None:
-    monkeypatch.setattr(metadata, "version", partial(_version_of, installed=installed))
+    monkeypatch.setattr(
+        metadata,
+        "version",
+        partial(_installed_version, installed=installed),
+    )
 
     assert service.knowop_version() == version
 
@@ -1107,7 +1119,7 @@ def _on_homebrews_path(name: str) -> str:
     return f"/opt/homebrew/bin/{name}"
 
 
-def _version_of(name: str, *, installed: dict[str, str]) -> str:
+def _installed_version(name: str, *, installed: dict[str, str]) -> str:
     """Answer as ``importlib.metadata.version`` would with only ``installed`` present."""
     if name not in installed:
         raise metadata.PackageNotFoundError(name)

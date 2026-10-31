@@ -140,7 +140,7 @@ class _Server:
             "clis": host_facts()["clis"],
         }
 
-    def status_of(self, name: str) -> str:
+    def server_status(self, name: str) -> str:
         """Return the status the server lists ``name`` with."""
         return next(str(m["status"]) for m in self.machines if m["name"] == name)
 
@@ -445,7 +445,7 @@ class _Runners:
 def server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Server:
     """Answer every request from the scripted server, on a computer named Ada_Mac."""
     scripted = _Server()
-    monkeypatch.setattr(httpx2, "HTTPTransport", _transport_of(scripted))
+    monkeypatch.setattr(httpx2, "HTTPTransport", _server_transport(scripted))
     for name in (
         "TRACKINIZER_PROFILE",
         "TRACKINIZER_URL",
@@ -1195,7 +1195,7 @@ def test_connect_leaves_no_client_open_for_a_later_command(
     assert _knowop("login", "acme") == 0
     assert _knowop("connect") == 0
     later = _Server()
-    monkeypatch.setattr(httpx2, "HTTPTransport", _transport_of(later))
+    monkeypatch.setattr(httpx2, "HTTPTransport", _server_transport(later))
 
     assert _knowop("connect") == 0
 
@@ -1566,7 +1566,11 @@ def test_version_names_the_command_and_unknown_from_a_checkout(
     installed: dict[str, str],
     printed: str,
 ) -> None:
-    monkeypatch.setattr(metadata, "version", partial(_version_of, installed=installed))
+    monkeypatch.setattr(
+        metadata,
+        "version",
+        partial(_installed_version, installed=installed),
+    )
 
     with pytest.raises(SystemExit) as exited:
         _knowop("--version")
@@ -2193,7 +2197,7 @@ def _saved_logins() -> list[str]:
     return (config_dir() / "rekursiv-ai" / "knowop" / "profile").read_text().split()
 
 
-def _log_of(name: str) -> Path:
+def _connect_log(name: str) -> Path:
     """Write the log a connect service of ``name`` on acme keeps here, and return it."""
     folder = state_dir() / "rekursiv-ai" / "knowop" / "connect"
     folder.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2215,8 +2219,8 @@ def test_logs_prints_a_machines_log_here_or_its_last_lines(
     argv: list[str],
     printed: str,
 ) -> None:
-    _log_of("ada-mac")
-    _log_of("gpu1")
+    _connect_log("ada-mac")
+    _connect_log("gpu1")
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
@@ -2228,7 +2232,7 @@ def test_logs_prints_a_machines_log_here_or_its_last_lines(
 def test_logs_follow_reads_on_from_the_start_of_a_rotated_log(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    log = _log_of("ada-mac")
+    log = _connect_log("ada-mac")
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
     waits: list[float] = []
@@ -2558,7 +2562,7 @@ def test_disconnect_removes_this_computers_service_once_the_server_lets_go(
 
     assert agents.every() == []
     assert launchd.calls[-1][1] == "bootout"
-    assert server.status_of("ada-mac") == "revoked"
+    assert server.server_status("ada-mac") == "revoked"
     assert capsys.readouterr().out.splitlines()[0] == (
         "removed: the connect service of machine ada-mac on this computer"
     )
@@ -2647,7 +2651,7 @@ def _host(name: str) -> HostRecord:
     )
 
 
-def _transport_of(server: _Server) -> Callable[..., httpx2.MockTransport]:
+def _server_transport(server: _Server) -> Callable[..., httpx2.MockTransport]:
     """Return what stands in for ``httpx2.HTTPTransport``: it answers from ``server``."""
 
     def make(**options: object) -> httpx2.MockTransport:
@@ -2657,7 +2661,7 @@ def _transport_of(server: _Server) -> Callable[..., httpx2.MockTransport]:
     return make
 
 
-def _version_of(name: str, *, installed: dict[str, str]) -> str:
+def _installed_version(name: str, *, installed: dict[str, str]) -> str:
     """Answer as ``importlib.metadata.version`` would with only ``installed`` present."""
     if name not in installed:
         raise metadata.PackageNotFoundError(name)

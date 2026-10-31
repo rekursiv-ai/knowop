@@ -916,7 +916,7 @@ class TrackinizerSink(Sink):
             name=path.name,
             manifest=ManifestBody(
                 name=path.name,
-                metadata=self._metadata_for(path),
+                metadata=self._spelled_metadata(path),
                 ir_id=self._ir_ids.setdefault(path, uuid4()),
                 format="" if path in self._run_parts else self._cli,
                 records=self._next_idx.get(path, 0),
@@ -944,7 +944,7 @@ class TrackinizerSink(Sink):
     #
     # A path with no reader yet -- a body replayed into a degraded sink, which carries
     # positions but no reader -- declares nothing, which the empty default already says.
-    def _metadata_for(self, path: Path) -> Mapping[str, PlainTree]:
+    def _spelled_metadata(self, path: Path) -> Mapping[str, PlainTree]:
         r"""How the file SPELLS its bytes, as its own reader has read it so far."""
         reader = self.readers.get(path)
         if reader is None:

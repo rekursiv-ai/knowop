@@ -116,7 +116,7 @@ def _host(
         name="box",
         server_url=url,
         credential=_CREDENTIAL,
-        client_for=lambda _key: client or _Client([]),
+        credential_client=lambda _key: client or _Client([]),
         trax_env=trax_env or {},
         shell=shell,
         drain_sec=drain_sec,

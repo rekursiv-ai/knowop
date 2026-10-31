@@ -37,5 +37,5 @@ class Canvas(verbs.Canvas):
     # ``trax canvas`` example is one an agent cannot run.
     @classmethod
     @override
-    def help_text_for(cls, verb: str) -> str:
-        return super().help_text_for(verb).replace("trax canvas", PROGRAM)
+    def verb_help_text(cls, verb: str) -> str:
+        return super().verb_help_text(verb).replace("trax canvas", PROGRAM)

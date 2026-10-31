@@ -859,11 +859,13 @@ def _terminals_started(
         sandbox=False,
         exec_commands=True,
     )
-    terminals_for = cast(
+    joined_terminals = cast(
         "Callable[[JoinResponse], TerminalHost]",
-        seen["terminals_for"],
+        seen["joined_terminals"],
     )
-    return terminals_for(JoinResponse(machine_id=_MACHINE_ID, credential=_CREDENTIAL))
+    return joined_terminals(
+        JoinResponse(machine_id=_MACHINE_ID, credential=_CREDENTIAL),
+    )
 
 
 def test_the_host_offers_a_direct_link_when_the_library_is_installed_and_says_so(

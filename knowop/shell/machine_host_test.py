@@ -137,7 +137,7 @@ def _connect(host: _Host, *, stdin: str = f"{_TOKEN}\n") -> list[float]:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=lambda: stdin,
         sleep=slept.append,
     )
@@ -150,7 +150,7 @@ def _connect_as(name: str, host: _Host, *, sandbox: bool = False) -> list[float]
     connect(
         name,
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=lambda: f"{_TOKEN}\n",
         sleep=slept.append,
         sandbox=sandbox,
@@ -287,7 +287,7 @@ def test_a_saved_credential_skips_the_join_and_sends_facts_once() -> None:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
     )
@@ -303,7 +303,7 @@ def test_a_personal_credential_is_kept_under_its_account(
     connect(
         "box-1",
         server=_SERVER,
-        client_for=_Host(),
+        credential_client=_Host(),
         read_token=lambda: _TOKEN,
         sleep=lambda _: None,
         account="Ada@X.y",
@@ -321,7 +321,7 @@ def test_an_accounts_own_saved_credential_skips_the_join() -> None:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=_Host(),
+        credential_client=_Host(),
         read_token=lambda: _TOKEN,
         sleep=lambda _: None,
         account="ada@x.y",
@@ -331,7 +331,7 @@ def test_an_accounts_own_saved_credential_skips_the_join() -> None:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
         account="ada@x.y",
@@ -346,7 +346,7 @@ def test_a_credential_saved_by_anyone_else_is_never_used(saved_by: str | None) -
     connect(
         "box-1",
         server=_SERVER,
-        client_for=_Host(),
+        credential_client=_Host(),
         read_token=lambda: _TOKEN,
         sleep=lambda _: None,
         account=saved_by,
@@ -356,7 +356,7 @@ def test_a_credential_saved_by_anyone_else_is_never_used(saved_by: str | None) -
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=lambda: _TOKEN,
         sleep=lambda _: None,
         account="bob@x.y",
@@ -379,7 +379,7 @@ def test_an_account_that_is_no_email_or_would_leave_its_directory_is_refused(
         connect(
             "box-1",
             server=_SERVER,
-            client_for=host,
+            credential_client=host,
             read_token=_no_token,
             sleep=lambda _: None,
             account=account,
@@ -397,7 +397,7 @@ def test_each_process_heartbeats_as_its_own_instance() -> None:
         connect(
             "box-1",
             server=_SERVER,
-            client_for=host,
+            credential_client=host,
             read_token=_no_token,
             sleep=lambda _: None,
         )
@@ -418,7 +418,7 @@ def test_lost_contact_is_retried_sooner_at_first_and_never_ends_the_host(
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=delays.append,
     )
@@ -462,7 +462,7 @@ def test_hours_offline_never_overflow_the_backoff() -> None:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=delays.append,
     )
@@ -482,7 +482,7 @@ def test_an_answer_a_retry_cannot_change_ends_the_host(status: int) -> None:
         connect(
             "box-1",
             server=_SERVER,
-            client_for=host,
+            credential_client=host,
             read_token=_no_token,
             sleep=lambda _: None,
         )
@@ -541,7 +541,7 @@ def test_a_corrupt_credential_file_is_named_without_quoting_it() -> None:
         connect(
             "box-1",
             server=_SERVER,
-            client_for=_Host(),
+            credential_client=_Host(),
             read_token=_no_token,
             sleep=lambda _: None,
         )
@@ -573,7 +573,7 @@ def test_a_saved_credential_refused_before_it_served_is_replaced_by_a_join(
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=lambda: _TOKEN,
         sleep=lambda _: None,
         account=account or None,
@@ -636,7 +636,7 @@ def test_a_refused_rejoin_says_what_to_run_and_leaves_no_credential(
         connect(
             "box-1",
             server=_SERVER,
-            client_for=host,
+            credential_client=host,
             read_token=read_token,
             sleep=lambda _: None,
             account=account or None,
@@ -693,7 +693,7 @@ def test_a_machine_revoked_while_it_serves_ends_the_host_and_forgets_the_credent
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
     )
@@ -713,7 +713,7 @@ def test_a_credential_another_connect_saved_meanwhile_outlives_the_revoke() -> N
     connect(
         "box-1",
         server=_SERVER,
-        client_for=_Host(beats=[None, _REVOKED]),
+        credential_client=_Host(beats=[None, _REVOKED]),
         read_token=_no_token,
         sleep=another_connect_joins,
     )
@@ -755,7 +755,7 @@ def test_host_facts_report_what_the_host_says_about_itself(
 ) -> None:
     sysconf = {"SC_PAGE_SIZE": 4096, "SC_PHYS_PAGES": 2**20}
 
-    def sysconf_of(name: str) -> int:
+    def fake_sysconf(name: str) -> int:
         return sysconf[name]
 
     def which(cli: str) -> str | None:
@@ -764,12 +764,16 @@ def test_host_facts_report_what_the_host_says_about_itself(
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(platform, "machine", lambda: "aarch64")
     monkeypatch.setattr(os, "cpu_count", lambda: None)
-    monkeypatch.setattr(os, "sysconf", sysconf_of)
+    monkeypatch.setattr(os, "sysconf", fake_sysconf)
     monkeypatch.setattr(getpass, "getuser", lambda: "ada")
     monkeypatch.setattr(shutil, "which", which)
     monkeypatch.setattr(os, "getpid", lambda: 4242)
     installed = {"knowop": "0.1.6"}
-    monkeypatch.setattr(metadata, "version", partial(_version_of, installed=installed))
+    monkeypatch.setattr(
+        metadata,
+        "version",
+        partial(_installed_version, installed=installed),
+    )
 
     facts = host_facts()
 
@@ -812,7 +816,7 @@ def test_a_join_only_connect_joins_saves_and_serves_nothing(
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=lambda: _TOKEN,
         sleep=_never_waits,
         sandbox=True,
@@ -833,7 +837,7 @@ def test_a_join_only_connect_with_a_saved_credential_asks_nothing() -> None:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=_never_waits,
         join_only=True,
@@ -872,17 +876,17 @@ def test_a_host_that_opted_in_reports_terminals_and_stops_them_before_it_returns
     host = _Host(beats=[None, _REVOKED])
     served: list[JoinResponse] = []
 
-    def terminals_for(joined: JoinResponse) -> _Terminals:
+    def joined_terminals(joined: JoinResponse) -> _Terminals:
         served.append(joined)
         return _Terminals(host.calls)
 
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
-        terminals_for=terminals_for,
+        joined_terminals=joined_terminals,
     )
 
     kinds = [call[0] for call in host.calls]
@@ -902,10 +906,10 @@ def test_no_server_starts_before_a_heartbeat_has_taken_the_machine() -> None:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
-        terminals_for=lambda _joined: _Terminals(host.calls),
+        joined_terminals=lambda _joined: _Terminals(host.calls),
         exec_for=lambda _joined: _Terminals(host.calls, "exec"),
         jobs_for=lambda _joined: _Terminals(host.calls, "jobs"),
     )
@@ -935,10 +939,10 @@ def test_a_host_that_serves_exec_reports_it_and_stops_it_before_the_terminals() 
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
-        terminals_for=lambda _joined: _Terminals(host.calls),
+        joined_terminals=lambda _joined: _Terminals(host.calls),
         exec_for=lambda _joined: _Terminals(host.calls, "exec"),
     )
 
@@ -962,7 +966,7 @@ def test_a_host_that_serves_exec_alone_reports_exec_and_no_terminal() -> None:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
         exec_for=lambda _joined: _Terminals(host.calls, "exec"),
@@ -980,7 +984,7 @@ def test_a_host_that_runs_jobs_says_what_it_offers_and_stops_them_first() -> Non
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
         exec_for=lambda _joined: _Terminals(host.calls, "exec"),
@@ -1011,7 +1015,7 @@ def test_a_host_that_runs_no_jobs_says_nothing_of_them() -> None:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
         job_facts={"gpus": 1},
@@ -1033,10 +1037,10 @@ def test_an_exec_server_that_will_not_start_stops_the_terminals_already_running(
         connect(
             "box-1",
             server=_SERVER,
-            client_for=host,
+            credential_client=host,
             read_token=_no_token,
             sleep=lambda _: None,
-            terminals_for=lambda _joined: _Terminals(host.calls),
+            joined_terminals=lambda _joined: _Terminals(host.calls),
             exec_for=lambda _joined: _Terminals(
                 host.calls,
                 "exec",
@@ -1060,10 +1064,10 @@ def test_terminals_stop_when_the_host_ends_on_an_error_too() -> None:
         connect(
             "box-1",
             server=_SERVER,
-            client_for=host,
+            credential_client=host,
             read_token=_no_token,
             sleep=lambda _: None,
-            terminals_for=lambda _joined: _Terminals(host.calls),
+            joined_terminals=lambda _joined: _Terminals(host.calls),
         )
 
     assert host.calls[-1] == ("terminals-stop",)
@@ -1076,7 +1080,7 @@ def test_a_host_that_did_not_opt_in_serves_no_terminals_and_says_so() -> None:
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
     )
@@ -1096,10 +1100,10 @@ def test_a_host_a_newer_connect_took_over_stops_its_terminals_and_returns(
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=slept.append,
-        terminals_for=lambda _joined: _Terminals(host.calls),
+        joined_terminals=lambda _joined: _Terminals(host.calls),
     )
 
     kinds = [call[0] for call in host.calls]
@@ -1125,10 +1129,10 @@ def test_ctrl_c_releases_the_machine_once_then_stops_terminals_and_goes_on(
         connect(
             "box-1",
             server=_SERVER,
-            client_for=host,
+            credential_client=host,
             read_token=_no_token,
             sleep=interrupt,
-            terminals_for=lambda _joined: _Terminals(host.calls),
+            joined_terminals=lambda _joined: _Terminals(host.calls),
         )
 
     beat, _, release, stop = host.calls
@@ -1145,7 +1149,7 @@ def test_another_server_joins_the_same_name_with_its_own_credential() -> None:
     connect(
         "box-1",
         server="https://Other.example:8443",
-        client_for=other,
+        credential_client=other,
         read_token=lambda: _TOKEN,
         sleep=lambda _: None,
     )
@@ -1173,14 +1177,18 @@ def test_the_host_reports_the_installed_trackinizer_version_or_none(
     installed: dict[str, str],
     reported: str,
 ) -> None:
-    monkeypatch.setattr(metadata, "version", partial(_version_of, installed=installed))
+    monkeypatch.setattr(
+        metadata,
+        "version",
+        partial(_installed_version, installed=installed),
+    )
     _save()
     host = _Host()
 
     connect(
         "box-1",
         server=_SERVER,
-        client_for=host,
+        credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
     )
@@ -1193,7 +1201,7 @@ def test_a_server_url_with_no_host_is_refused() -> None:
         connect(
             "box-1",
             server="not a url",
-            client_for=_Host(),
+            credential_client=_Host(),
             read_token=_no_token,
             sleep=lambda _: None,
         )
@@ -1207,7 +1215,7 @@ def _never_waits(seconds: float) -> None:
     raise AssertionError(f"a join-only connect must not wait {seconds} s")
 
 
-def _version_of(name: str, *, installed: dict[str, str]) -> str:
+def _installed_version(name: str, *, installed: dict[str, str]) -> str:
     """Answer as ``importlib.metadata.version`` would with only ``installed`` present."""
     if name not in installed:
         raise metadata.PackageNotFoundError(name)
