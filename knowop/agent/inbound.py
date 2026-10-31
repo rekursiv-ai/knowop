@@ -45,6 +45,13 @@ def using_knowop() -> str:
     return body.strip()
 
 
+# The key that stops a CLI's turn. claude and codex stop at Escape. sagent reads Escape
+# as a prefix key (Escape then Enter is a newline) and halts at Ctrl-C, which never
+# exits it (``tui/prompt.py``, ``_interrupt``).
+_ESCAPE: Final = b"\x1b"
+_INTERRUPT_KEYS: Final = {"sagent": b"\x03"}
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Disclosure:
     """What a person's line says beyond their words.
@@ -97,6 +104,7 @@ def render_inbound(
     stream: bool = False,
     kind: Literal["line"] = "line",
     disclosure: Disclosure | None = None,
+    cli: str = "",
 ) -> str: ...
 
 
@@ -110,6 +118,7 @@ def render_inbound(
     stream: bool = False,
     kind: InboundKind,
     disclosure: Disclosure | None = None,
+    cli: str = "",
 ) -> str | bytes | None: ...
 
 
@@ -122,6 +131,7 @@ def render_inbound(
     stream: bool = False,
     kind: InboundKind = "line",
     disclosure: Disclosure | None = None,
+    cli: str = "",
 ) -> str | bytes | None:
     """Decorate an inbound message with its routing context for injection.
 
@@ -135,11 +145,13 @@ def render_inbound(
         :data:`~trackinizer.wire.wire_sessions.InboundKind`.
       disclosure: What of the context, the using-knowop skill and the sender the line
         carries; see :class:`Disclosure`.
+      cli: The CLI that receives it, which names the key an interrupt is.
 
     Returns:
       rendered: Text to type and submit with Enter; raw keys to send as they are
-        (an interrupt is Escape); ``None`` for a kind that is not typed at all (a
-        settings change, or a command clicked Run on, which the run runs itself).
+        (an interrupt is the CLI's halt key, :data:`_INTERRUPT_KEYS`); ``None`` for a
+        kind that is not typed at all (a settings change, or a command clicked Run on,
+        which the run runs itself).
 
     """
     match kind:
@@ -148,7 +160,7 @@ def render_inbound(
         case "settings" | "run":
             return None
         case "interrupt":
-            return b"\x1b"
+            return _INTERRUPT_KEYS.get(cli, _ESCAPE)
         case "line":
             pass
     if context is None and source == "trackinizer" and not stream:

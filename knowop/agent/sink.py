@@ -84,6 +84,16 @@ if TYPE_CHECKING:
 _DIFF_PATH = Path(WORKTREE_DIFF_PART)
 
 
+# The server keeps one part per file NAME in a session (``upsert_session_manifest``),
+# and claude's and codex's files are named for their session. sagent names every journal
+# ``session.jsonl``, in a folder named for its session, so two sagent runs written into
+# one chat would share one part and overwrite each other's records: a journal's part
+# takes its folder's name instead.
+def _part_name(path: Path) -> str:
+    """Return the name the server keeps ``path``'s records under."""
+    return f"{path.parent.name}.jsonl" if path.name == "session.jsonl" else path.name
+
+
 class Sink(Protocol):
     """Where captured records go.
 
@@ -491,7 +501,7 @@ class FileSink(Sink):
                 # The BASENAME, matching how the server resolves a part: the
                 # absolute path differs across machines, so a capture replayed
                 # elsewhere must still name the same file.
-                "part_name": path.name,
+                "part_name": _part_name(path),
                 **body.model_dump(mode="json"),
             },
         )
@@ -898,7 +908,8 @@ class TrackinizerSink(Sink):
                 ):
                     sys.stderr.write(
                         f"[{PROGRAM}] the server refused record {refused.idx} of "
-                        f"{path.name} ({refused.kind}); a stand-in holds its place\n",
+                        f"{_part_name(path)} ({refused.kind}); a stand-in holds its "
+                        "place\n",
                     )
             self._restarted.discard(path)
             # Sent with the first part only; the rest carry records alone.
@@ -913,9 +924,9 @@ class TrackinizerSink(Sink):
         """Append one batch of ``path``'s records, with the commands typed since."""
         self._client.append_records(
             session_id,
-            name=path.name,
+            name=_part_name(path),
             manifest=ManifestBody(
-                name=path.name,
+                name=_part_name(path),
                 metadata=self._spelled_metadata(path),
                 ir_id=self._ir_ids.setdefault(path, uuid4()),
                 format="" if path in self._run_parts else self._cli,

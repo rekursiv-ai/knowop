@@ -23,6 +23,7 @@ from trackinizer.sagent.session.types import (
     AgentToAgentMessage,
     AssistantMessage,
     ContextClear,
+    FileReadResult,
     IncompleteRecord,
     ShellCommandResult,
     Thinking,
@@ -250,6 +251,37 @@ class TestWhichTargetsResume:
 
         assert written.path.exists()
 
+    def test_a_claude_capture_resumes_as_sagent_with_nothing_lost(self) -> None:
+        """Sagent journals the IR itself, so a crossing into it drops no act.
+
+        Measured by sagent's own writer: rewritten by another format's, the gate
+        named losses the journal does not have and asked for ``--lossy``.
+        """
+        client = _PartsClient(
+            {
+                0: (
+                    "claude",
+                    [
+                        UserMessage(content="what is in a.py?"),
+                        ToolCall(call_id="c1", name="Read", arguments={"path": "a.py"}),
+                        FileReadResult(call_id="c1", content="x = 1"),
+                        AssistantMessage(content="it sets x"),
+                    ],
+                ),
+            },
+        )
+
+        written = prepare_resume(client, uuid4(), "sagent")
+
+        assert written.path.name == "session.jsonl"
+        assert written.path.parent.name == written.cli_session_id
+        with written.path.open(encoding="utf-8") as handle:
+            journal = list(sagent.normalize(handle))
+        # Stamped on the way: a record crossing formats gets the time it lacked.
+        assert [r.content for r in journal if isinstance(r, FileReadResult)] == [
+            "x = 1",
+        ]
+
     def test_a_session_with_no_native_part_is_refused(self) -> None:
         """An ``sh`` scrape is searchable and has no format to hand back."""
         client = _FakeClient("claude_sidechain.jsonl", session_format="")
@@ -284,7 +316,7 @@ class TestTheChatKeepsItsSession:
 
         written = prepare_resume(client, uuid4(), "claude")
 
-        assert written.path.stem == str(written.cli_session_id)
+        assert written.path.stem == written.cli_session_id
 
 
 class TestAMixedSessionResumes:

@@ -11,7 +11,8 @@ disconnect`` stops it.
 Examples:
   knowop connect          log in if needed, then connect this computer
   knowop login acme       log in to https://acme.knowop.ai, without connecting
-  knowop run claude       Claude Code in this folder, recorded, reachable from Chat
+  knowop run              sagent in this folder, recorded, reachable from Chat
+  knowop run claude       Claude Code, the same way
   knowop run stop NAME    stop a run of yours, here or on another machine
   knowop job submit -- python train.py
                           run a job on a GPU node from this repository
@@ -302,16 +303,17 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     verbs.add_parser(
         "run",
-        help="run an agent here, recorded: claude, codex, attach NAME",
+        help="run an agent here, recorded: sagent, claude, codex, attach NAME",
         description=(
-            "Run Claude Code or Codex in this folder as knowop's account, recorded "
-            "and reachable from Chat; its arguments pass to the runner unchanged. "
-            "Logs in first when knowop is not logged in."
+            "Run sagent (when no agent is named), Claude Code or Codex in this "
+            "folder as knowop's account, recorded and reachable from Chat; its "
+            "arguments pass to the runner unchanged. Logs in first when knowop is "
+            "not logged in."
         ),
     ).add_argument(
         "args",
         nargs=argparse.REMAINDER,
-        metavar="claude|codex|attach|ls|log|send|stop|resume ...",
+        metavar="sagent|claude|codex|attach|ls|log|send|stop|resume ...",
     )
     verbs.add_parser(
         "job",
@@ -736,7 +738,7 @@ def _next_step() -> None:
             for m in http.list_machines()
         )
     if connected:
-        echo(f"Connected as {here} to {profile.url}. Next:  knowop run claude")
+        echo(f"Connected as {here} to {profile.url}. Next:  knowop run")
     else:
         echo("Not connected. Run:  knowop connect")
 
@@ -1132,9 +1134,11 @@ def _hand_off(
             return agent_cli.codex_main([*leading, *args[1:]])
         case ["claude"]:
             return agent_cli.main([*leading, *args[1:]])
-    # ``attach``, ``ls``, ``log``, ``send``, ``stop``, ``resume`` and the runner's own
-    # flags are the claude runner's words.
-    return agent_cli.main([*leading, *args])
+        case ["sagent"]:
+            return agent_cli.sagent_main([*leading, *args[1:]])
+    # A bare ``knowop run`` runs sagent, and ``attach``, ``ls``, ``log``, ``send``,
+    # ``stop``, ``resume`` and the runner's own flags are the sagent runner's words.
+    return agent_cli.sagent_main([*leading, *args])
 
 
 def _starts_an_agent(args: Sequence[str]) -> bool:

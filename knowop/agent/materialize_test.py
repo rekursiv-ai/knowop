@@ -12,11 +12,13 @@ from uuid import uuid4
 import re
 import subprocess
 
-from trackinizer.lib.agent.sessions import claude, codex
+from trackinizer.lib.agent.sessions import claude, codex, sagent
 from trackinizer.lib.agent.sessions.convert import detect_format
 from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.runs.adapters.claude import ClaudeAdapter
 from trackinizer.runs.adapters.codex import CodexAdapter
+from trackinizer.runs.adapters.sagent import SagentAdapter
+from trackinizer.sagent.session.projects import find_sessions, project_dir
 from trackinizer.sagent.session.types import (
     AssistantMessage,
     IncompleteRecord,
@@ -154,7 +156,7 @@ class TestTheFileIsThisMachinesOwn:
             encoding=_encoding(),
         )
 
-        assert written.path.stem == str(written.cli_session_id)
+        assert written.path.stem == written.cli_session_id
         assert written.path.suffix == ".jsonl"
 
     def test_a_claude_with_no_project_folder_for_here_is_refused(self) -> None:
@@ -187,7 +189,7 @@ class TestTheFileIsThisMachinesOwn:
             json_loads(line, dict[str, object])["sessionId"]
             for line in written.path.read_text(encoding="utf-8").splitlines()
         }
-        assert declared == {str(written.cli_session_id)}
+        assert declared == {written.cli_session_id}
 
     def test_a_record_stating_no_id_is_still_named_by_the_file(self) -> None:
         """``_renamed`` rewrites an id a record HAS; the writer fills one it lacks.
@@ -216,7 +218,7 @@ class TestTheFileIsThisMachinesOwn:
             json_loads(line, dict[str, object]).get("sessionId")
             for line in written.path.read_text(encoding="utf-8").splitlines()
         }
-        assert declared == {str(written.cli_session_id)}
+        assert declared == {written.cli_session_id}
 
     def test_the_path_derives_from_the_local_cwd(self, tmp_path: Path) -> None:
         """Claude encodes the working directory in its project directory name.
@@ -324,7 +326,7 @@ class TestTheRewriteIsReadableBack:
                 for record in claude.normalize(handle)
             }
 
-        assert declared - {None} == {str(written.cli_session_id)}
+        assert declared - {None} == {written.cli_session_id}
 
 
 class TestCiphertext:
@@ -458,7 +460,7 @@ class TestMaterializingCodex:
         )
 
         assert written.path.name.startswith("rollout-")
-        assert str(written.cli_session_id) in written.path.name
+        assert written.cli_session_id in written.path.name
         assert CodexAdapter().matches_session_file(written.path)
 
     def test_the_rollout_reads_back_as_codex(self) -> None:
@@ -491,7 +493,7 @@ class TestMaterializingCodex:
             dict[str, object],
         )
         payload = from_plain(declared["payload"], dict[str, object])
-        assert payload["id"] == str(written.cli_session_id)
+        assert payload["id"] == written.cli_session_id
 
     def test_the_launch_payload_is_one_codex_will_load(self) -> None:
         """A rollout declaring only its id is refused by the CLI.
@@ -731,7 +733,7 @@ class TestMaterializingCodex:
             dict[str, object],
         )
         assert payload["cwd"] == "/elsewhere"
-        assert payload["id"] == str(written.cli_session_id)
+        assert payload["id"] == written.cli_session_id
 
     def test_the_session_is_added_to_the_index_codex_resumes_from(self) -> None:
         """``codex resume <id>`` looks the session up in an INDEX.
@@ -753,7 +755,7 @@ class TestMaterializingCodex:
             json_loads(line, dict[str, object])
             for line in index.read_text(encoding="utf-8").splitlines()
         ]
-        assert [entry["id"] for entry in entries] == [str(written.cli_session_id)]
+        assert [entry["id"] for entry in entries] == [written.cli_session_id]
 
     def test_the_index_is_appended_never_rewritten(self) -> None:
         """The operator's other sessions must survive a materialization."""
@@ -775,7 +777,7 @@ class TestMaterializingCodex:
             json_loads(line, dict[str, object])["id"]
             for line in index.read_text(encoding="utf-8").splitlines()
         ]
-        assert ids == ["kept", str(written.cli_session_id)]
+        assert ids == ["kept", written.cli_session_id]
 
     def test_an_unknown_target_is_refused(self) -> None:
         """Naming a target with no writer is a caller error, not an empty file."""
@@ -925,6 +927,65 @@ class TestACrossingIsStampedAndLinked:
         assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", first.timestamp)
         stamped = datetime.fromisoformat(first.timestamp)
         assert abs(stamped - before).total_seconds() < 5
+
+
+class TestMaterializingSagent:
+    """A stored session written back as a journal ``sagent --resume`` re-enters."""
+
+    def test_the_journal_sits_in_the_folder_its_id_names(self) -> None:
+        """Sagent names a session by its journal's folder, and resumes by that name."""
+        written = materialize(
+            attach=uuid4(),
+            target="sagent",
+            records=[UserMessage(content="hi")],
+            encoding=immutable({}),
+        )
+
+        assert written.path.name == "session.jsonl"
+        assert written.path.parent.parent == project_dir(Path.cwd())
+        assert written.path.parent.name == written.cli_session_id
+        assert SagentAdapter().session_id_from_path(written.path) == (
+            written.cli_session_id
+        )
+
+    def test_sagent_finds_the_journal_by_the_id_it_resumes(self) -> None:
+        written = materialize(
+            attach=uuid4(),
+            target="sagent",
+            records=[UserMessage(content="hi")],
+            encoding=immutable({}),
+        )
+
+        assert [each.path for each in find_sessions(written.cli_session_id)] == [
+            written.path,
+        ]
+
+    def test_the_journal_reads_back_as_the_records_it_was_given(self) -> None:
+        """A crossing from claude keeps every turn: sagent journals the IR itself."""
+        records = [
+            UserMessage(content="what is 2+2?"),
+            AssistantMessage(content="4"),
+        ]
+
+        written = materialize(
+            attach=uuid4(),
+            target="sagent",
+            records=records,
+            encoding=immutable({}),
+            source="claude",
+        )
+
+        with written.path.open(encoding="utf-8") as handle:
+            read = [
+                record
+                for record in sagent.normalize(handle)
+                if not isinstance(record, TurnContext)
+            ]
+        assert [type(r) for r in read] == [UserMessage, AssistantMessage]
+        assert [
+            r.content for r in read if isinstance(r, UserMessage | AssistantMessage)
+        ] == ["what is 2+2?", "4"]
+        assert written.prefix_bytes == written.path.stat().st_size
 
 
 if __name__ == "__main__":

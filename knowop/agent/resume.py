@@ -33,6 +33,7 @@ from trackinizer.client.conversation import (
 from trackinizer.lib.agent.sessions import (
     claude,
     codex,
+    sagent,
 )
 from trackinizer.sagent.session.types import (
     ContextClear,
@@ -330,7 +331,8 @@ def _undroppable(
             source=source,
             session_id=uuid4(),
         )
-    writer = claude if target == "claude" else codex
+    # The target's own writer: another format's names losses the file never has.
+    writer = {"claude": claude, "codex": codex, "sagent": sagent}[target]
     out = StringIO()
     writer.denormalize(ready, out)
     rebuilt = writer.normalize(StringIO(out.getvalue()))

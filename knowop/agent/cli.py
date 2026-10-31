@@ -1,17 +1,18 @@
-"""The agent runner ``knowop run`` hands to: Claude Code or Codex here, recorded.
+"""The agent runner ``knowop run`` hands to: sagent, Claude Code or Codex here, recorded.
 
-``knowop run claude [ARGS]`` calls :func:`main`, which runs Claude Code in the current
-folder, and ``knowop run codex [ARGS]`` calls :func:`codex_main`, which runs Codex.
-Each run is recorded as an AgentSession on the server of the profile it is given, and
-a message sent to it from Chat reaches it. ``--detach`` hosts the run in the
+``knowop run [ARGS]`` and ``knowop run sagent [ARGS]`` call :func:`sagent_main`, which
+runs sagent in the current folder; ``knowop run claude [ARGS]`` calls :func:`main`,
+which runs Claude Code, and ``knowop run codex [ARGS]`` calls :func:`codex_main`, which
+runs Codex. Each run is recorded as an AgentSession on the server of the profile it is
+given, and a message sent to it from Chat reaches it. ``--detach`` hosts the run in the
 background, and the host is reached by name:
 
-    knowop run claude --detach --name fix-tests
+    knowop run --detach --name fix-tests
     knowop run ls | attach NAME | log NAME [-f] | send NAME TEXT | stop NAME
 
-``knowop run claude resume SESSION`` re-enters a stored session as claude, and
-``knowop run codex resume SESSION`` as codex. Everything after ``--`` goes to the CLI
-itself. The connection flags ``--profile``, ``--host`` and ``--port`` come first, as
+``knowop run resume SESSION`` re-enters a stored session as sagent, ``knowop run
+claude resume SESSION`` as claude, and ``knowop run codex resume SESSION`` as codex.
+Everything after ``--`` goes to the CLI itself. The connection flags ``--profile``, ``--host`` and ``--port`` come first, as
 they do for ``trax``: knowop puts its own profile there. Unattended plumbing that
 keeps trax's connection instead (``run_agent.sh``) runs this package's
 ``__main__.py``, or ``codex.py`` for Codex.
@@ -59,10 +60,24 @@ else:
     )
 
 
-__all__ = ["codex_main", "main"]
+__all__ = ["codex_main", "main", "sagent_main"]
 
 # The connection flags that take a value, as ``trax`` peels them before its verb.
 _VALUE_FLAGS: Final = frozenset({"--profile", "--host", "--port"})
+
+
+def sagent_main(argv: Sequence[str] | None = None) -> int:
+    """Run sagent, recorded (``knowop run``); return the exit code.
+
+    Args:
+      argv: Command-line arguments; ``None`` for ``sys.argv[1:]``.
+
+    Returns:
+      exit_code: The wrapped CLI's status; for ``--detach``, whether the host came
+        up; 2 when a command is refused.
+
+    """
+    return _run("sagent", sys.argv[1:] if argv is None else argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -170,7 +185,7 @@ def _resume(cli: str, argv: Sequence[str], connection: argparse.Namespace) -> in
         client_factory=functools.partial(connect, connection),
         connection=from_plain(vars(connection), dict[str, FlagValue]),
         resume_path=written.path,
-        cli_session_id=str(written.cli_session_id),
+        cli_session_id=written.cli_session_id,
         profile=cast(_Connection, connection).profile,
         attach=written.attach,
         prefix_bytes=written.prefix_bytes,

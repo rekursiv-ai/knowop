@@ -81,8 +81,10 @@ from trackinizer.runs.adapters.codex import CodexAdapter
 from trackinizer.runs.adapters.custom_types import Adapter, StreamAdapter, Subagent
 from trackinizer.runs.adapters.gemini import GeminiAdapter
 from trackinizer.runs.adapters.iostream import IOStreamAdapter
+from trackinizer.runs.adapters.sagent import SagentAdapter
 from trackinizer.runs.asks import answer_from_payload
 from trackinizer.runs.redact import Redactor, redactor_from_environ
+from trackinizer.sagent.session.projects import new_session_path, project_dir
 from trackinizer.sagent.session.types import (
     ContextCompaction,
     ContextState,
@@ -286,6 +288,7 @@ _TYPED_REMEMBERED: Final = 32
 _INSTALL: Final = {
     "claude": "npm install -g @anthropic-ai/claude-code",
     "codex": "npm install -g @openai/codex",
+    "sagent": "uv tool install sagent",
 }
 
 
@@ -298,6 +301,7 @@ _HEADLESS_CLIS: Final = ("claude", "codex")
 # per-run parse state (e.g. codex's last ``turn_context.model``) never leaks
 # into a second run in the same process (tests, a future supervisor).
 _ADAPTERS: dict[str, Callable[[], Adapter]] = {
+    SagentAdapter.name: SagentAdapter,
     ClaudeAdapter.name: ClaudeAdapter,
     GeminiAdapter.name: GeminiAdapter,
     CodexAdapter.name: CodexAdapter,
@@ -364,6 +368,10 @@ class _SessionOwner:
     session_id: str | None = None
     minted: bool = False
     """Whether this run made ``session_id`` up, so must hand it to the CLI."""
+
+    journal: Path | None = None
+    """The journal this run made for a sagent it starts afresh: sagent writes the path
+    it is handed. It exists, empty, before sagent starts."""
 
     child_pid: int | None = None
     _output_tail: bytes = b""
@@ -570,7 +578,7 @@ class RunConfig:
     """Settings for one ``knowop run`` invocation."""
 
     cli_name: str
-    """``claude`` / ``gemini`` / ``codex``; selects the adapter."""
+    """``sagent`` / ``claude`` / ``gemini`` / ``codex``; selects the adapter."""
 
     cli_args: tuple[str, ...] = ()
     """Passed verbatim to the wrapped CLI binary."""
@@ -1068,12 +1076,13 @@ def run(config: RunConfig) -> int:
     return rc
 
 
-def build_parser(default_cli: str = "claude") -> argparse.ArgumentParser:
-    """Argument parser for ``knowop run claude`` and ``knowop run codex``.
+def build_parser(default_cli: str = "sagent") -> argparse.ArgumentParser:
+    """Argument parser for ``knowop run``, ``knowop run claude`` and the rest.
 
     Args:
       default_cli: The CLI wrapped when none is named, which names the program:
-        ``knowop run claude`` wraps claude and ``knowop run codex`` wraps codex.
+        ``knowop run`` wraps sagent, ``knowop run claude`` claude and ``knowop run
+        codex`` codex.
 
     Returns:
       parser: Configured ArgumentParser with all subcommands.
@@ -1191,11 +1200,11 @@ def build_parser(default_cli: str = "claude") -> argparse.ArgumentParser:
 def resume_argv(cli_name: str, cli_session_id: str | None) -> tuple[str, ...]:
     """Return the tokens that tell ``cli_name`` to continue ``cli_session_id``.
 
-    Per-CLI because the spelling is: claude takes a FLAG (``--resume <uuid>``)
-    and codex a SUBCOMMAND (``codex resume <SESSION_ID>``), both verified
-    against the installed binaries' help. Handing codex claude's spelling
-    makes it reject the argument, so a resume that materialized a perfectly
-    good rollout never starts.
+    Per-CLI because the spelling is: claude and sagent take a FLAG (``--resume
+    <id>``) and codex a SUBCOMMAND (``codex resume <SESSION_ID>``), each verified
+    against the installed binary's help. Handing codex claude's spelling makes
+    it reject the argument, so a resume that materialized a perfectly good
+    rollout never starts.
 
     Args:
       cli_name: Which CLI is being spawned.
@@ -1216,7 +1225,7 @@ def resume_argv(cli_name: str, cli_session_id: str | None) -> tuple[str, ...]:
 def main(
     argv: Sequence[str],
     *,
-    default_cli: str = "claude",
+    default_cli: str = "sagent",
     client_factory: Callable[[], RunClient] | None = None,
     connection: dict[str, FlagValue] | None = None,
     resume_path: Path | None = None,
@@ -1226,12 +1235,12 @@ def main(
     prefix_bytes: int = 0,
     compact_after_load: bool = False,
 ) -> int:
-    """Run ``knowop run claude`` or ``knowop run codex``, called from :mod:`.cli`.
+    """Run ``knowop run``, ``knowop run claude`` or the rest, called from :mod:`.cli`.
 
     Args:
       argv: The program's arguments; everything after ``--`` goes to the CLI.
-      default_cli: The CLI to wrap when ``argv`` names none: claude for
-        ``knowop run claude``, codex for ``knowop run codex``.
+      default_cli: The CLI to wrap when ``argv`` names none: sagent for ``knowop
+        run``, claude for ``knowop run claude``, codex for ``knowop run codex``.
       client_factory: Builds the Trackinizer client from the active profile.
         Invoked only when the run actually syncs, so a ``--no-sync`` or
         ``--out`` capture never resolves a profile or opens a socket.
@@ -1384,7 +1393,7 @@ def _load_window(
     )
     return (
         written.path,
-        str(written.cli_session_id),
+        written.cli_session_id,
         written.prefix_bytes,
         written.compact_after_load,
     )
@@ -1426,13 +1435,16 @@ def _continued_transcript(
 # Searched for by its id rather than built from the cwd: claude resumes a session filed
 # under ANOTHER project directory -- a worktree resuming its main checkout's session --
 # and keeps appending to that file, so a path derived from this cwd names nothing.
+# sagent names a session by its journal's folder, so a folder the id matches is looked
+# into as well.
 def _session_file(adapter: Adapter, session_id: str) -> Path | None:
     """Return the transcript ``adapter`` keeps for ``session_id``, if there is one."""
     return next(
         (
             path
             for root in adapter.session_dirs()
-            for path in root.rglob(f"*{session_id}*")
+            for found in root.rglob(f"*{session_id}*")
+            for path in (found, *(found.iterdir() if found.is_dir() else ()))
             if adapter.matches_session_file(path)
             and adapter.session_id_from_path(path) == session_id
         ),
@@ -1673,7 +1685,7 @@ def _spawn_and_drain(
             + ("" if install is None else f"; install it with: {install}"),
         )
     _prepare_session_dirs(adapter)
-    baseline = _existing_session_files(adapter, config)
+    baseline = _existing_session_files(adapter, config, owner=owner)
     stop = threading.Event()
     # Shared by the drain, which sees the CLI's records, and the inbound poller,
     # which waits on them; built before either starts.
@@ -1781,7 +1793,12 @@ def _spawn_and_drain(
         # Set before the poller starts, which is the only reader of it.
         inbound.marker = hook_files.ready
     machine = _machine_name()
-    env = _routing_env(config, granted_actor=granted_actor) | placed | _tools_env(tools)
+    env = (
+        _routing_env(config, granted_actor=granted_actor)
+        | placed
+        | _tools_env(tools)
+        | _cli_env(adapter, hosted=config.host is not None)
+    )
     runs = _clicked_runs(
         config,
         adapter=adapter,
@@ -2045,6 +2062,17 @@ def _dropped_env(adapter: Adapter) -> frozenset[str]:
         "TRAX_WORKSPACE",
         "TRAX_CANVAS",
     }
+
+
+# A hosted sagent's terminal may have no viewer to answer prompt_toolkit's
+# cursor-position request, and prompt_toolkit then prints a warning over the screen;
+# ``PROMPT_TOOLKIT_NO_CPR`` stops it asking (``prompt_toolkit/output/vt100.py``). A
+# person's own terminal answers, so it still asks.
+def _cli_env(adapter: Adapter, *, hosted: bool) -> dict[str, str]:
+    """Return what ``adapter``'s CLI is told of the run beside its routing."""
+    if adapter.name != "sagent" or not hosted:
+        return {}
+    return {"PROMPT_TOOLKIT_NO_CPR": "1"}
 
 
 # In the folder the run started in, which is the agent's checkout: ``gh`` there reads
@@ -2543,6 +2571,12 @@ def _make_tui(
 # claude refuses ``--session-id`` beside an unforked resume, and the file it continues
 # is in ``baseline``, so this run captures none of it (``main`` warned).
 # Codex mints its own, so only a resumed codex run knows it in advance.
+#
+# sagent names a session by its journal's folder and writes the journal it is handed
+# (``--session PATH``), so a new one is minted the same way: its journal made here, in
+# the folder sagent would pick, and handed over. A journal the person names is claimed
+# as theirs; one sagent picks itself (``--continue``, the picker) is not known, and an
+# ``--ephemeral`` session keeps none.
 def _session_owner(adapter: Adapter, config: RunConfig) -> _SessionOwner | None:
     """Return the CLI session this run captures, or None when it cannot say."""
     if adapter.name == "claude":
@@ -2552,13 +2586,33 @@ def _session_owner(adapter: Adapter, config: RunConfig) -> _SessionOwner | None:
         return _SessionOwner(session_id=named)
     if adapter.name == "codex":
         return _SessionOwner(session_id=config.cli_session_id)
+    if adapter.name == "sagent":
+        given = _cli_arg_value(config.cli_args, "--session")
+        if given is not None:
+            journal = Path(given).expanduser().absolute()
+            return _SessionOwner(session_id=adapter.session_id_from_path(journal))
+        if (
+            config.cli_session_id is None
+            and adapter.resumed_session(config.cli_args) is None
+            and "--ephemeral" not in config.cli_args
+        ):
+            journal = new_session_path(project_dir(Path.cwd()))
+            return _SessionOwner(
+                session_id=adapter.session_id_from_path(journal),
+                minted=True,
+                journal=journal,
+            )
+        return _SessionOwner(session_id=config.cli_session_id)
     return None
 
 
 # Claude says it is ready through its ``SessionStart`` hook, whose marker is set once
 # the hook files exist; its records do not count, since it writes none before the trust
 # dialog is answered. A stream child reads lines with no dialog in the way, so it is
-# ready from the start.
+# ready from the start. sagent writes its first records as its prompt comes up
+# (measured: 1.0 to 1.3 s after spawn), and a line typed before then can be lost.
+# codex and sagent hear the using-knowop skill through their own instruction flag
+# (``_with_knowop``); gemini has none, so its first line carries it.
 def _inbound_state(adapter: Adapter) -> InboundState:
     """Return when ``adapter``'s CLI is ready for inbound, before it is spawned."""
     if isinstance(adapter, StreamAdapter):
@@ -2568,7 +2622,7 @@ def _inbound_state(adapter: Adapter) -> InboundState:
     return InboundState(
         by_record=True,
         fallback_sec=_RECORD_READY_SEC,
-        noted=adapter.name == "codex",
+        noted=adapter.name in {"codex", "sagent"},
     )
 
 
@@ -2589,6 +2643,8 @@ def _cli_argv(
     if adapter.name == "claude" and owner is not None and owner.minted:
         assert isinstance(owner.session_id, str)
         argv[1:1] = ["--session-id", owner.session_id]
+    elif adapter.name == "sagent" and owner is not None and owner.journal is not None:
+        argv[1:1] = ["--session", str(owner.journal)]
     elif adapter.name == "codex":
         argv[1:1] = [
             *(() if "--no-daemon" in config.cli_args else ("--no-daemon",)),
@@ -2893,9 +2949,10 @@ def _without_flag(args: list[str], flag: str) -> list[str]:
 # claude's ``--mcp-config`` and ``--allowedTools`` each take any number of values, so
 # each goes as one ``--flag=value`` word: a word after ``--mcp-config VALUE`` is read as
 # one more config, the person's prompt too (measured on claude 2.1.314). The server's
-# token is named, never written: claude expands ``${BEARER_ENV}`` in a header, and
-# codex reads the variable ``bearer_token_env_var`` names, from the environment the run
-# gives it (``_tools_env``).
+# token is named, never written: claude and sagent expand ``${BEARER_ENV}`` in a
+# header, and codex reads the variable ``bearer_token_env_var`` names, from the
+# environment the run gives it (``_tools_env``). sagent takes claude's two flags and
+# asks before no tool, so it is allowed none by name.
 def _with_knowop(
     argv: list[str],
     *,
@@ -2908,7 +2965,7 @@ def _with_knowop(
     told = bool(tools) or "TRAX_CANVAS" in placed
     skill: list[str] = []
     served: list[str] = []
-    if adapter.name == "claude":
+    if adapter.name in {"claude", "sagent"}:
         if told and not any(
             _cli_arg_value(given, flag=flag) is not None
             for flag in ("--append-system-prompt", "--append-system-prompt-file")
@@ -2925,10 +2982,9 @@ def _with_knowop(
                     },
                 },
             }
-            served = [
-                f"--mcp-config={json.dumps(server)}",
-                "--allowedTools=mcp__knowop",
-            ]
+            served = [f"--mcp-config={json.dumps(server)}"]
+            if adapter.name == "claude":
+                served.append("--allowedTools=mcp__knowop")
     elif adapter.name == "codex":
         if told and not any(
             value.startswith("developer_instructions")
@@ -3346,6 +3402,7 @@ def _deliver_one(
         stream=stream,
         kind=item.kind,
         disclosure=_disclosure(item, inbound=inbound),
+        cli=cli,
     )
     if rendered is None:
         _logger.info(
@@ -3660,8 +3717,14 @@ def _prepare_session_dirs(adapter: Adapter) -> None:
 # unless this run is resuming one (``RunConfig.resume_path``).
 #
 # A ``resume_path`` is EXEMPT: this run is about to continue it, so excluding it would
-# drop the very transcript being resumed.
-def _existing_session_files(adapter: Adapter, config: RunConfig) -> frozenset[Path]:
+# drop the very transcript being resumed. So is the journal the run made for sagent to
+# write (``_SessionOwner.journal``), which exists before sagent does.
+def _existing_session_files(
+    adapter: Adapter,
+    config: RunConfig,
+    *,
+    owner: _SessionOwner | None = None,
+) -> frozenset[Path]:
     """Snapshot the matching session files present before the run starts."""
     found: set[Path] = set()
     for session_dir in adapter.session_dirs():
@@ -3670,7 +3733,9 @@ def _existing_session_files(adapter: Adapter, config: RunConfig) -> frozenset[Pa
         for path in session_dir.rglob("*"):
             if path.is_file() and adapter.matches_session_file(path):
                 found.add(path)
-    return frozenset(found - {config.resume_path})
+    return frozenset(
+        found - {config.resume_path, None if owner is None else owner.journal},
+    )
 
 
 # Wake-driven, not polled. The cost of polling was never the tick -- it was the

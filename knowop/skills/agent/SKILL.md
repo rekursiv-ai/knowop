@@ -1,26 +1,29 @@
 ---
 name: knowop-run
-description: ALWAYS invoke this skill before running Claude Code or Codex recorded with knowop run, detaching a run, attaching to one, sending it a message, stopping it, or resuming a stored session. Do not start or reach an agent run, or tell a person which command reaches it, from memory -- invoke this skill first.
+description: ALWAYS invoke this skill before running sagent, Claude Code or Codex recorded with knowop run, detaching a run, attaching to one, sending it a message, stopping it, or resuming a stored session. Do not start or reach an agent run, or tell a person which command reaches it, from memory -- invoke this skill first.
 ---
 
 # knowop run -- recorded agent runs
 
-`knowop run claude` runs Claude Code in the current folder and `knowop run codex`
-runs Codex. Each run is recorded as an AgentSession on the server knowop is logged
-in to, and a message sent to it from Chat reaches it. A first run logs in when
-knowop has no login. `trax run` moved out of trax.
+`knowop run` runs sagent in the current folder, `knowop run claude` runs Claude
+Code and `knowop run codex` runs Codex. Each run is recorded as an AgentSession on
+the server knowop is logged in to, and a message sent to it from Chat reaches it. A
+first run logs in when knowop has no login. `trax run` moved out of trax.
 
-`knowop run claude --help` is the source of truth for the flags; if this skill
+`knowop run sagent --help` is the source of truth for the flags; if this skill
 disagrees, trust the help.
 
 ## Run
 
 ```bash
+knowop run                                     # sagent here, recorded
 knowop run claude                              # Claude Code here, recorded
 knowop run codex                               # Codex here, recorded
 knowop run claude --as scientist --room lab -- --model opus
-knowop run claude -- "fix the failing test"    # after -- everything goes to the CLI
+knowop run -- --resume 3f2a                    # after -- everything goes to the CLI
 ```
+
+- Chat's Stop halts sagent with Ctrl-C, and claude and codex with Escape.
 
 - `--as NAME` names the session. Other agents and the web app address it as
   `@NAME`. It defaults to `$AGENTNAME`, else `Agent`, and the server makes it
@@ -37,13 +40,13 @@ knowop run claude -- "fix the failing test"    # after -- everything goes to the
 - A run that starts an agent says so when this computer is not connected, so
   Chat cannot open its terminal: run `knowop connect` in another terminal.
 
-A missing `claude` or `codex` binary stops the run and prints the install
-command.
+A missing `sagent`, `claude` or `codex` binary stops the run and prints the
+install command.
 
 ## Detach, then reach it by name
 
 ```bash
-knowop run claude --detach --name lead --as lead
+knowop run --detach --name lead --as lead
 knowop run ls                    # live hosts; --all adds exited and lost ones
 knowop run attach lead           # drive it here; Ctrl-\ detaches
 knowop run log lead --follow     # scrollback, then live output
@@ -57,7 +60,7 @@ knowop run stop lead             # stop it; waits until it has exited
 - `--name` defaults to the `--as` name, else the CLI. A name belongs to one
   live host at a time.
 - A host can be attached only on the computer it runs on. `ls`, `attach`,
-  `log`, `send` and `stop` reach claude and codex hosts alike, and need no login.
+  `log`, `send` and `stop` reach every CLI's host alike, and need no login.
 - A Chat run has no terminal until someone attaches. Attaching takes it over;
   Chat gets it back with Reattach in the chat.
 - To tell a person how to reach a Chat run, give `knowop run attach NAME` with
@@ -67,12 +70,13 @@ knowop run stop lead             # stop it; waits until it has exited
 
 ```bash
 trax agentsession 42                            # its id, among the row's fields
+knowop run resume SESSION_UUID                  # re-enter it as sagent
 knowop run claude resume SESSION_UUID           # re-enter it as claude
 knowop run codex resume SESSION_UUID --lossy    # resume as codex
 ```
 
 The target CLI is chosen here, not by whatever captured the session, so a
-codex-captured session resumes as claude. The run writes into the session it
+codex-captured session resumes as claude or sagent. The run writes into the session it
 resumes as a new part. `--lossy` accepts a conversion that drops records the CLI
 cannot express; without it such a resume is refused. `trax agentsession N run`
 moved out of trax.
@@ -104,7 +108,8 @@ moved out of trax.
 
 ## Rules
 
-- Run an agent under `knowop run claude` or `knowop run codex`, not bare `claude`
-  or `codex`, when the work should be recorded or reachable from Chat.
+- Run an agent under `knowop run`, `knowop run claude` or `knowop run codex`, not
+  bare `claude` or `codex`, when the work should be recorded or reachable from
+  Chat.
 - Do not put a secret on the command line; the CLI's own arguments are recorded
   in the host list.

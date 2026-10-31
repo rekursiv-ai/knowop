@@ -22,7 +22,8 @@ See [Install](#install) for additional details.
 ```bash
 knowop connect          # this computer: log in, enroll, serve it in the background
 knowop logs -f          # follow this computer's connect
-knowop run claude       # Claude Code in this folder, recorded, reachable from Chat
+knowop run              # sagent in this folder, recorded, reachable from Chat
+knowop run claude       # the same for Claude Code
 knowop run codex        # the same for Codex
 knowop run stop NAME    # stop a run of yours, here or on another of your machines
 knowop job submit -- python train.py   # a job on a GPU node, from this repository
@@ -189,16 +190,16 @@ systemctl disable --now knowop-connect` stops it.
 | `knowop status [--json]` | Prints, for each server knowop is logged in to (the one its commands use first), the profile, the server, your account and role, your computers with whether each is online, the knowop version and process serving each one online, and the runs live on each; the runs here that name no machine of yours; and this computer's connect services with their flags, and whether each is turned off (macOS Login Items). On macOS, the menu bar: running, stopped, or failing with its exit code and its last log line. `--json` prints the same as one JSON object, one entry per login. Exits 1 when not logged in, or when a server refuses its login's key. |
 | `knowop disconnect [NAME]` | Stops this computer's runs when NAME is this computer (the default), then disconnects NAME on the server: its connect is revoked and every run of yours that names it stops. Removes NAME's connect service on this computer, and waits until the server shows NAME offline. `knowop connect` joins it again with no login. |
 | `knowop logout [NAME\|--all]` | Logs this computer's machine out on the server (its connect revoked, its runs stopped, the keys its logins made revoked), revokes knowop's key if that left it, removes this computer's connect services of that server, and deletes the saved login; knowop then uses its login to another server, if it has one, and says which. `--all` logs every machine of yours out first. NAME logs that one machine out alone, as the Machines page does, and keeps this computer's login. |
-| `knowop run claude\|codex [ARGS]` | Runs Claude Code or Codex in this folder, recorded and reachable from Chat. Says to run `knowop connect` when this computer is not connected. |
+| `knowop run [sagent\|claude\|codex] [ARGS]` | Runs sagent (when no agent is named), Claude Code or Codex in this folder, recorded and reachable from Chat. Says to run `knowop connect` when this computer is not connected. |
 | `knowop run attach\|ls\|log\|send\|stop NAME` | Reaches a run started with `--detach`. `knowop run stop --all` stops every one on this computer. `knowop run stop RUN` stops any live run of yours another machine runs, by its name or session (its first 8 characters will do); a RUN that names several lists them. |
-| `knowop run claude\|codex resume SESSION` | Re-enters a stored session. |
+| `knowop run [sagent\|claude\|codex] resume SESSION` | Re-enters a stored session. |
 | `knowop job submit\|logs\|results ...` | Runs a job on a GPU node from this repository, or with `--machine NAME` on a computer of yours, and reads its log and results. |
 | `knowop job status [JOB]\|cancel JOB\|secrets\|secret NAME set\|del` | Lists your jobs or shows one, stops one, and keeps the secrets a job may use. |
 | `knowop machine [NAME ...]` | Lists, shows, sets, labels and deletes the machines campaigns may run on. |
 | `knowop canvas [CANVAS_UUID] [show TYPE\|navigate ROUTE\|highlight UUID,...\|hide ID\|KEY to VALUE ...]` | Reads and changes a canvas with the grammar of `trax canvas`. In a run that `knowop run` placed on a canvas, `$TRAX_CANVAS` names it, so an agent drives the person's canvas with knowop alone. |
 | `knowop --version` | Prints the version; `unknown` from a checkout. |
 
-Every command takes `--help`; `knowop run claude --help` and `knowop job submit
+Every command takes `--help`; `knowop run sagent --help` and `knowop job submit
 --help` show the runner's own.
 
 knowop keeps a login per server it logs in or connects to, and every command uses
