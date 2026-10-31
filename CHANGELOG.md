@@ -63,14 +63,23 @@ All notable knowop changes are documented here. This project follows
   the output as it grows and, once the command ends, types the agent a
   `knowop-run` line with how it ended and the end of what it printed; the whole
   output stays under the state folder. Needs a server that takes Run.
+- `knowop run sagent` runs sagent as `knowop run claude` runs Claude Code: on a
+  terminal the run owns, its journal recorded, Chat's lines typed in once its
+  prompt is up, Stop sent as Ctrl-C. The run names the journal
+  (`sagent --session PATH`), so each agent the session spawns is recorded in a
+  session of its own under it. `--detach`, `attach`, `send` and `resume SESSION`
+  work as for claude.
 
 ### Changed
 
+- A bare `knowop run`, and its `attach`, `ls`, `log`, `send`, `stop` and `resume`,
+  are sagent's runner: `knowop run` runs sagent. `knowop run claude` and `knowop
+  run codex` are unchanged.
 - `knowop disconnect` and `knowop logout` remove this computer's connect services
   of that machine (`logout`: of that server), and `disconnect` waits until the
   server shows the machine offline.
-- Requires the trackinizer release that adds `Client.stop_machine_run` and
-  `userdirs.base_dir_variables`.
+- Requires the trackinizer release that adds `Client.stop_machine_run`,
+  `userdirs.base_dir_variables`, and sagent's journal reader and capture adapter.
 
 ### Fixed
 

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Final, Literal, override
 import getpass
 import io
 import os
+import select
 import signal
 import socket
 import sys
@@ -426,8 +427,9 @@ class _Runner:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Runners:
-    """The three runners ``run`` and ``job`` hand off to."""
+    """The four runners ``run`` and ``job`` hand off to."""
 
+    sagent: _Runner
     claude: _Runner
     codex: _Runner
     job: _Runner
@@ -435,6 +437,7 @@ class _Runners:
     def calls(self) -> list[tuple[str, list[str]]]:
         """Return every hand-off, each with the runner that took it."""
         return [
+            *(("sagent", argv) for argv in self.sagent.calls),
             *(("claude", argv) for argv in self.claude.calls),
             *(("codex", argv) for argv in self.codex.calls),
             *(("job", argv) for argv in self.job.calls),
@@ -461,6 +464,7 @@ def server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Server:
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     # The real host serves until Ctrl-C, and the real runners start an agent or a job.
     monkeypatch.setattr(serve, "connect_machine", _never_runs("connect_machine"))
+    monkeypatch.setattr(agent_cli, "sagent_main", _never_runs("the sagent runner"))
     monkeypatch.setattr(agent_cli, "main", _never_runs("the claude runner"))
     monkeypatch.setattr(agent_cli, "codex_main", _never_runs("the codex runner"))
     monkeypatch.setattr(jobs_cli, "main", _never_runs("the job runner"))
@@ -500,7 +504,13 @@ def host(monkeypatch: pytest.MonkeyPatch) -> _Host:
 
 @pytest.fixture
 def runners(monkeypatch: pytest.MonkeyPatch) -> _Runners:
-    stand_ins = _Runners(claude=_Runner(), codex=_Runner(), job=_Runner())
+    stand_ins = _Runners(
+        sagent=_Runner(),
+        claude=_Runner(),
+        codex=_Runner(),
+        job=_Runner(),
+    )
+    monkeypatch.setattr(agent_cli, "sagent_main", stand_ins.sagent)
     monkeypatch.setattr(agent_cli, "main", stand_ins.claude)
     monkeypatch.setattr(agent_cli, "codex_main", stand_ins.codex)
     monkeypatch.setattr(jobs_cli, "main", stand_ins.job)
@@ -1209,9 +1219,11 @@ def test_connect_leaves_no_client_open_for_a_later_command(
     [
         (["claude", "--as", "ada", "--", "--model", "opus"], "claude", 1),
         (["codex", "--private"], "codex", 1),
-        (["attach", "claude"], "claude", 0),
-        (["resume", "00000000-0000-0000-0000-000000000009"], "claude", 0),
-        (["--detach", "--name", "nightly"], "claude", 0),
+        (["sagent", "resume", "00000000-0000-0000-0000-000000000009"], "sagent", 1),
+        ([], "sagent", 0),
+        (["attach", "claude"], "sagent", 0),
+        (["resume", "00000000-0000-0000-0000-000000000009"], "sagent", 0),
+        (["--detach", "--name", "nightly"], "sagent", 0),
     ],
 )
 def test_run_hands_the_agent_runner_knowops_profile_and_the_rest(
@@ -1472,7 +1484,9 @@ def test_help_and_a_host_command_need_no_login_and_ask_the_server_nothing(
     assert _knowop("run", *argv) == 0
 
     assert server.requests == []
-    assert runners.calls() == [("claude", argv[1:] if argv[0] == "claude" else argv)]
+    assert runners.calls() == [
+        ("claude", argv[1:]) if argv[0] == "claude" else ("sagent", argv),
+    ]
 
 
 def test_a_host_command_still_names_knowops_profile_once_logged_in(
@@ -1488,7 +1502,7 @@ def test_a_host_command_still_names_knowops_profile_once_logged_in(
 
     assert len(server.requests) == asked
     assert runners.calls() == [
-        ("claude", ["--profile", "acme.knowop.ai", "stop", "nightly"]),
+        ("sagent", ["--profile", "acme.knowop.ai", "stop", "nightly"]),
     ]
 
 
@@ -1598,7 +1612,7 @@ def test_bare_knowop_names_this_connected_computer_and_the_next_step(
     assert _knowop() == 0
 
     assert capsys.readouterr() == (
-        "Connected as ada-mac to https://acme.knowop.ai. Next:  knowop run claude\n",
+        "Connected as ada-mac to https://acme.knowop.ai. Next:  knowop run\n",
         "",
     )
 
@@ -1656,6 +1670,23 @@ _CONNECTED: Final = (
 )
 
 
+# One read of a terminal returns only the bytes that have crossed it so far: each line
+# knowop prints is a write of its own, and on a loaded Linux runner a read can come back
+# holding the first line alone.
+def _screen_lines(fd: int, *, count: int) -> list[str]:
+    """Return the lines printed on the terminal ``fd`` reads, once ``count`` show."""
+    printed = b""
+    deadline = time.monotonic() + 5.0
+    while printed.count(b"\n") < count:
+        left = deadline - time.monotonic()
+        nothing: list[int] = []
+        ready, _, _ = select.select([fd], nothing, nothing, max(left, 0))
+        if not ready:
+            raise AssertionError(f"{count} lines did not show: {printed!r}")
+        printed += os.read(fd, 4096)
+    return printed.decode().replace("\r\n", "\n").splitlines()
+
+
 def test_connect_at_a_terminal_returns_once_its_service_serves_the_machine(
     host: _Host,
     launchd: _Launchd,
@@ -1673,8 +1704,8 @@ def test_connect_at_a_terminal_returns_once_its_service_serves_the_machine(
 
         assert _knowop("connect", "--sandbox") == 0
 
-        printed = screen.read(4096).decode().replace("\r\n", "\n")
-    assert printed.splitlines() == [
+        printed = _screen_lines(screen.fileno(), count=3)
+    assert printed == [
         _CONNECTED,
         "log:  knowop logs -f",
         "stop: knowop disconnect",

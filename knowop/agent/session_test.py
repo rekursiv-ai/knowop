@@ -51,12 +51,16 @@ from trackinizer.lib.posix import follow
 from trackinizer.lib.posix.follow import follow_tree
 from trackinizer.lib.posix.host import HostSpec
 from trackinizer.lib.posix.relay import ThreadedRelay
+from trackinizer.lib.userdirs import data_dir
 from trackinizer.runs.adapters.claude import ClaudeAdapter
 from trackinizer.runs.adapters.codex import CodexAdapter
 from trackinizer.runs.adapters.custom_types import Subagent
 from trackinizer.runs.adapters.gemini import GeminiAdapter
 from trackinizer.runs.adapters.iostream import IOStreamAdapter
+from trackinizer.runs.adapters.sagent import SagentAdapter
 from trackinizer.runs.asks import Answer, Ask, Resolved, StateChanged
+from trackinizer.sagent.session.jsonl import record_line
+from trackinizer.sagent.session.projects import project_dir
 from trackinizer.sagent.session.types import (
     AssistantMessage,
     ContextCompaction,
@@ -486,6 +490,7 @@ def _drain_once(
     baseline: frozenset[Path] = frozenset(),
     expected: int = 1,
     sink: _RecordingSink | None = None,
+    owner: session._SessionOwner | None = None,
 ) -> tuple[_Stats, _RecordingSink]:
     """Run the real drain, perform ``write``, and collect what it captured."""
     sink = sink or _RecordingSink()
@@ -503,6 +508,7 @@ def _drain_once(
             baseline=baseline,
             slash_queue=deque(),
             armed=armed,
+            owner=owner,
         )
 
     worker = threading.Thread(target=_run, daemon=True)
@@ -4230,6 +4236,230 @@ class TestSessionOwnerAndArgv:
         config = RunConfig(cli_name="gemini", cli_args=("-p", "x"))
         assert _session_owner(GeminiAdapter(), config) is None
         assert _cli_argv(GeminiAdapter(), config, None) == ["gemini", "-p", "x"]
+
+
+class TestASagentRun:
+    """sagent on a terminal: its journal named up front, its agents owned, Ctrl-C."""
+
+    def test_a_fresh_run_mints_its_journal_and_hands_it_to_sagent(self) -> None:
+        config = RunConfig(cli_name="sagent", cli_args=("--model", "m"))
+        owner = _session_owner(SagentAdapter(), config)
+
+        assert owner is not None
+        assert owner.journal is not None
+        assert owner.journal.is_file()
+        assert owner.journal.relative_to(project_dir(Path.cwd())).parts == (
+            owner.session_id,
+            "session.jsonl",
+        )
+        assert _cli_argv(SagentAdapter(), config, owner) == [
+            "sagent",
+            "--session",
+            str(owner.journal),
+            "--model",
+            "m",
+        ]
+
+    @pytest.mark.parametrize("args", [("--session", "{}"), ("--session={}",)])
+    def test_a_journal_named_on_the_command_line_is_claimed_not_minted(
+        self,
+        args: tuple[str, ...],
+    ) -> None:
+        journal = project_dir(Path.cwd()) / "0123456789ab" / "session.jsonl"
+        given = tuple(arg.format(journal) for arg in args)
+        config = RunConfig(cli_name="sagent", cli_args=given)
+        owner = _session_owner(SagentAdapter(), config)
+
+        assert owner is not None
+        assert (owner.session_id, owner.journal) == ("0123456789ab", None)
+        assert _cli_argv(SagentAdapter(), config, owner) == ["sagent", *given]
+        assert not (data_dir() / "rekursiv-ai" / "sagent" / "projects").exists()
+
+    def test_a_resume_claims_its_id_and_mints_nothing(self) -> None:
+        config = RunConfig(
+            cli_name="sagent",
+            cli_args=("--resume", "r1"),
+            cli_session_id="r1",
+        )
+        owner = _session_owner(SagentAdapter(), config)
+
+        assert owner is not None
+        assert (owner.session_id, owner.journal) == ("r1", None)
+        assert _cli_argv(SagentAdapter(), config, owner) == ["sagent", "--resume", "r1"]
+        assert not (data_dir() / "rekursiv-ai" / "sagent" / "projects").exists()
+
+    @pytest.mark.parametrize(
+        "args",
+        [("--continue",), ("--resume",), ("--resume-all",), ("--ephemeral",)],
+    )
+    def test_a_session_sagent_picks_itself_is_unnamed_and_nothing_is_minted(
+        self,
+        args: tuple[str, ...],
+    ) -> None:
+        """Sagent refuses ``--session`` beside each, and an ephemeral one keeps none."""
+        config = RunConfig(cli_name="sagent", cli_args=args)
+        owner = _session_owner(SagentAdapter(), config)
+
+        assert owner is not None
+        assert (owner.session_id, owner.journal) == (None, None)
+        assert _cli_argv(SagentAdapter(), config, owner) == ["sagent", *args]
+        assert not (data_dir() / "rekursiv-ai" / "sagent" / "projects").exists()
+
+    def test_the_minted_journal_is_not_taken_for_an_earlier_sessions(self) -> None:
+        adapter = SagentAdapter()
+        earlier = project_dir(Path.cwd()) / "aaaaaaaaaaaa" / "session.jsonl"
+        earlier.parent.mkdir(parents=True)
+        _ = earlier.write_bytes(record_line(UserMessage(content="before")))
+        config = RunConfig(cli_name="sagent")
+        owner = _session_owner(adapter, config)
+
+        assert _existing_session_files(adapter, config, owner=owner) == {earlier}
+
+    def test_only_the_runs_journal_and_its_agents_are_captured(self) -> None:
+        """Another session's journal, and its agent's, appear after the watch too."""
+        adapter = SagentAdapter()
+        config = RunConfig(cli_name="sagent")
+        owner = _session_owner(adapter, config)
+        assert owner is not None
+        assert owner.journal is not None
+        journal = owner.journal
+        other = project_dir(Path.cwd()) / "bbbbbbbbbbbb" / "session.jsonl"
+        baseline = _existing_session_files(adapter, config, owner=owner)
+
+        def write(path: Path, text: str) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("ab") as handle:
+                _ = handle.write(record_line(UserMessage(content=text)))
+
+        def turns() -> None:
+            write(other, "theirs")
+            write(other.parent / "explore" / "session.jsonl", "their agent")
+            write(journal.parent / "explore" / "session.jsonl", "my agent")
+            write(journal, "mine")
+
+        _stats, sink = _drain_once(
+            adapter,
+            turns,
+            baseline=baseline,
+            expected=2,
+            owner=owner,
+        )
+
+        assert sorted(_texts(sink)) == ["mine", "my agent"]
+
+    def test_a_resume_typed_after_the_dashes_follows_the_journal_it_names(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        journal = project_dir(Path.cwd()) / "0123456789ab" / "session.jsonl"
+        journal.parent.mkdir(parents=True)
+        _ = journal.write_bytes(record_line(UserMessage(content="before")))
+
+        config = _keep_main(
+            monkeypatch,
+            ["--no-sync", "--", "--resume", "0123"],
+            default_cli="sagent",
+        )
+
+        assert (config.resume_path, config.cli_session_id) == (journal, "0123456789ab")
+
+    def test_sagent_is_ready_on_its_first_record_and_told_the_skill_at_start(
+        self,
+    ) -> None:
+        state = session._inbound_state(SagentAdapter())
+
+        assert (state.by_record, state.noted) == (True, True)
+
+    def test_a_placed_run_is_told_the_skill_and_reaches_the_runs_tools(self) -> None:
+        url = "http://127.0.0.1:5/t"
+
+        argv = _with_knowop(
+            ["sagent", "fix it"],
+            adapter=SagentAdapter(),
+            placed={"TRAX_CANVAS": "w"},
+            tools=url,
+        )
+
+        assert argv[:3] == ["sagent", "--append-system-prompt", using_knowop()]
+        flag, config = argv[3].split("=", 1)
+        assert flag == "--mcp-config"
+        # Sagent reads the token from the run's environment, as claude does.
+        assert json.loads(config) == {
+            "mcpServers": {
+                "knowop": {
+                    "type": "http",
+                    "url": url,
+                    "headers": {"Authorization": "Bearer ${KNOWOP_TOOLS_TOKEN}"},
+                },
+            },
+        }
+        # Sagent asks before no tool, so none is allowed by name.
+        assert argv[4:] == ["fix it"]
+
+    def test_the_persons_own_instructions_win_over_the_skill(self) -> None:
+        argv = ["sagent", "--append-system-prompt", "x"]
+
+        assert (
+            _with_knowop(
+                argv,
+                adapter=SagentAdapter(),
+                placed={"TRAX_CANVAS": "w"},
+                tools="",
+            )
+            == argv
+        )
+
+    @pytest.mark.parametrize(
+        ("cli", "key"),
+        [("sagent", b"\x03"), ("claude", b"\x1b"), ("codex", b"\x1b")],
+    )
+    def test_an_interrupt_is_the_key_that_halts_the_cli(
+        self,
+        cli: str,
+        key: bytes,
+    ) -> None:
+        """Sagent reads Escape as a prefix key, and Ctrl-C halts it without exiting."""
+        relay = _RecordingRelay()
+
+        session._deliver_one(
+            relay,
+            InboundDrainItem(text="interrupt", kind="interrupt"),
+            stream=False,
+            cli=cli,
+        )
+
+        assert relay.written == [key]
+
+    @pytest.mark.parametrize("hosted", [False, True], ids=["terminal", "hosted"])
+    def test_only_a_hosted_child_asks_no_cursor_position(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        *,
+        hosted: bool,
+    ) -> None:
+        host = HostSpec(address=tmp_path / "s", scrollback=tmp_path / "scrollback")
+
+        wiring, _ = _wire(
+            monkeypatch,
+            tmp_path,
+            RunConfig(cli_name="sagent", sync=False, host=host if hosted else None),
+            SagentAdapter(),
+        )
+
+        env = cast(dict[str, str], wiring.relay["env"])
+        assert ("PROMPT_TOOLKIT_NO_CPR" in env) is hosted
+
+    def test_a_run_naming_no_cli_runs_sagent(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ran: list[RunConfig] = []
+        monkeypatch.setattr(session, "run", partial(_keep_run, ran))
+
+        assert session.main(["--no-sync"]) == 0
+
+        assert [config.cli_name for config in ran] == ["sagent"]
 
 
 _CHAT_RUN: Final = UUID("44444444-4444-4444-8444-444444444444")

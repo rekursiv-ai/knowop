@@ -389,6 +389,30 @@ class TestTrackinizerSink:
         for _, name, bodies, _ in client.appended:
             assert [b.idx for b in bodies] == [0], name
 
+    def test_each_sagent_journal_is_a_part_named_for_its_session(self) -> None:
+        """Every journal is ``session.jsonl``; two runs of one chat keep their own."""
+        client = _FakeClient()
+        sink = TrackinizerSink(client, "sagent", batch_size=50)
+        sink.emit("sagent", _event("first run", path=Path("/p/aaa/session.jsonl")))
+        sink.emit("sagent", _event("next run", path=Path("/p/bbb/session.jsonl")))
+        sink.close()
+
+        assert sorted(name for _, name, _, _ in client.appended) == [
+            "aaa.jsonl",
+            "bbb.jsonl",
+        ]
+        assert sorted(manifest.name for manifest in client.manifests) == [
+            "aaa.jsonl",
+            "bbb.jsonl",
+        ]
+
+    def test_a_file_sink_names_a_sagent_journal_for_its_session_too(self) -> None:
+        buf = io.StringIO()
+
+        FileSink(buf).emit("sagent", _event("x", path=Path("/p/aaa/session.jsonl")))
+
+        assert json_loads(buf.getvalue(), dict[str, object])["part_name"] == "aaa.jsonl"
+
     def test_restart_rides_the_batch_for_that_file_only(self) -> None:
         """``restart`` is batch-level and describes ONE part's production.
 

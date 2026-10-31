@@ -406,7 +406,7 @@ class _Resumed:
         self.entered: list[tuple[list[str], dict[str, object]]] = []
         self.written = Materialized(
             path=tmp_path / "session.jsonl",
-            cli_session_id=uuid.uuid4(),
+            cli_session_id=str(uuid.uuid4()),
             attach=uuid.uuid4(),
             prefix_bytes=prefix_bytes,
         )
@@ -471,7 +471,7 @@ def test_a_resume_asks_for_its_own_cli_and_hands_the_runner_the_loaded_file(
     assert kwargs["attach"] == resumed.written.attach
     assert kwargs["prefix_bytes"] == 4_096
     assert kwargs["resume_path"] == resumed.written.path
-    assert kwargs["cli_session_id"] == str(resumed.written.cli_session_id)
+    assert kwargs["cli_session_id"] == resumed.written.cli_session_id
     assert kwargs["default_cli"] == "codex"
 
 

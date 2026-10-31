@@ -40,9 +40,11 @@ import subprocess
 from trackinizer.lib.agent.sessions import (
     claude,
     codex,
+    sagent,
 )
 from trackinizer.runs.adapters.claude import ClaudeAdapter
 from trackinizer.runs.adapters.codex import CodexAdapter
+from trackinizer.sagent.session.projects import project_dir
 from trackinizer.sagent.session.types import (
     IncompleteRecord,
     SessionRecord,
@@ -71,14 +73,15 @@ __all__ = [
 ]
 
 
-RESUMABLE_TARGETS: frozenset[str] = frozenset({"claude", "codex"})
+RESUMABLE_TARGETS: frozenset[str] = frozenset({"claude", "codex", "sagent"})
 """The CLIs a stored session can be handed back to.
 
 A target qualifies when it NAMES a session by an id its CLI accepts on the
-command line, and both of these do: ``claude --resume <uuid>`` finds a
-transcript by file stem, and ``codex resume <SESSION_ID>`` finds a rollout by
-the uuid its own filename ends with (verified against the installed CLI and a
-captured rollout, whose launch line repeats that uuid as ``payload.id``).
+command line, and these do: ``claude --resume <uuid>`` finds a transcript by
+file stem, ``codex resume <SESSION_ID>`` finds a rollout by the uuid its own
+filename ends with (verified against the installed CLI and a captured rollout,
+whose launch line repeats that uuid as ``payload.id``), and ``sagent --resume
+<id>`` finds a journal by the folder it sits in.
 
 Gemini and ``sh`` do not. Gemini rewrites one document in place and offers no
 resume-by-id; a scrape has no native log at all. Both stay DOWNLOADABLE in
@@ -97,9 +100,9 @@ class Materialized:
     path: Path
     """Where the file was written, in the layout its own CLI reads."""
 
-    cli_session_id: UUID
-    """The freshly minted id: the file's name, the id stated INSIDE it, and
-    the argument the CLI's resume flag takes are all this value."""
+    cli_session_id: str
+    """The freshly minted id, as the CLI's resume flag takes it: the file's name (its
+    folder's, for sagent) and the id stated INSIDE it, where the format states one."""
 
     attach: UUID
     """The AgentSession the run re-enters. The chat keeps its own id, so the run
@@ -169,9 +172,9 @@ def materialize(
     # The adapter names the directory, rather than this module re-deriving each
     # CLI's layout: two spellings of one rule drift, and the one that drifts
     # writes a file into a directory the CLI never reads.
-    scope = spec.scope()
-    scope.mkdir(parents=True, exist_ok=True)
-    path = scope / spec.filename(minted)
+    path = spec.scope() / spec.filename(minted)
+    # Private, as a CLI keeps its own sessions: what was said is its owner's alone.
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with path.open("w", encoding="utf-8") as handle:
         spec.write(spliced, handle, minted)
     # AFTER the write: an index entry naming a file that does not exist offers
@@ -179,7 +182,7 @@ def materialize(
     spec.announce(path, minted)
     return Materialized(
         path=path,
-        cli_session_id=minted,
+        cli_session_id=spec.named(minted),
         attach=attach,
         prefix_bytes=path.stat().st_size,
     )
@@ -285,6 +288,9 @@ class _Target:
     disk does not exist to it. Claude finds a transcript by scanning its
     project directory and needs nothing.
     """
+
+    named: Callable[[UUID], str] = str
+    """The minted id as the CLI's resume flag takes it."""
 
 
 def _claude_scope() -> Path:
@@ -536,6 +542,22 @@ _TARGETS: Mapping[str, _Target] = MappingProxyType(
                 stream,
             ),
             announce=_codex_indexed,
+        ),
+        "sagent": _Target(
+            scope=lambda: project_dir(Path.cwd()),
+            # `sagent` names a session by its journal's folder; a whole uuid's hex is a
+            # name it takes for one (``session/projects.py``, ``is_session``).
+            filename=lambda session_id: f"{session_id.hex}/session.jsonl",
+            # A journal states no id: its folder is the session's name.
+            identify=lambda records, _session_id: list(records),
+            write=lambda records, stream, _session_id: sagent.denormalize(
+                records,
+                stream,
+            ),
+            # `sagent` finds a session by globbing for its folder, so the journal is
+            # the announcement.
+            announce=lambda _path, _session_id: None,
+            named=lambda session_id: session_id.hex,
         ),
     },
 )
