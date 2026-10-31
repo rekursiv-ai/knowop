@@ -37,13 +37,13 @@ dependencies = [
     # data models: the exec and terminal hosts read the server's requests with them.
     # 2.12 adds `model_validate(..., extra=)`, with which trackinizer's `Client` ignores
     # a field a newer server added to an answer.
-    "pydantic>=2.12",
+    "pydantic>=2.14.2",
     # the terminal host's relay to the server
-    "websockets>=15",
+    "websockets>=17.4",
     # Include the direct terminal link by default (~25 MB of wheels on macOS).
     "aiortc>=1.15.0",
     # lazy imports
-    "wrapt",
+    "wrapt>=2.5.2",
     # gitignore-aware tree walks: the explorer's search where ripgrep is not
     # installed, through the vendored `knowop.lib.files.grep`.
     "rignore>=0.8.1",
@@ -55,9 +55,9 @@ dependencies = [
     # filesystem watching: the agent runner follows the agent's session files through
     # trackinizer's `lib/posix/follow.py`, whose macOS backend lazy-imports watchdog's
     # fsevents.
-    "watchdog>=6.0.0 ; sys_platform == 'darwin'",
+    "watchdog>=7.0.0 ; sys_platform == 'darwin'",
     # the macOS menu bar: `knowop menubar` shows its status item through AppKit.
-    "pyobjc-framework-Cocoa>=12 ; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=13.0 ; sys_platform == 'darwin'",
 ]
 
 [project.scripts]
@@ -67,34 +67,34 @@ knowop = "knowop.cli:main"
 # NEVER ADD MORE DEPENDENCIES!
 
 debug = [
-    "ipython",
-    "tqdm",
+    "ipython>=9.18.0",
+    "tqdm>=4.70.1",
 ]
 lint = [
-    "codespell>=2.2.4",
-    "ruff",
+    "codespell>=2.4.3",
+    "ruff>=0.17.3",
 ]
 test = [
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.8.0",
-    "pytest>=7.0",
-    "hypothesis>=6.155.1",
+    "pytest>=9.2.0",
+    "hypothesis>=6.170.14",
     # Without it the pytest and coverage hooks skip measuring, so fail_under is
     # never enforced.
-    "pytest-cov",
-    "nodejs-wheel-binaries>=24.16.0",
-    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.1.0",
+    "nodejs-wheel-binaries>=24.19.0",
+    "pytest-asyncio>=1.4.1",
 ]
 typecheck = [
-    "basedpyright>=1.40.1",
+    "basedpyright>=1.40.2",
     "pyrefly>=1.4.0",
-    "ty>=0.0.84",
+    "ty>=0.0.95",
     # Extra.
     "basedtyping>=0.1.10",
     "rekursiv-ai-typings>=0.1.11",
 ]
 "pre-commit" = [
-    "pre-commit>=4.6",
+    "pre-commit>=4.7.0",
     {include-group = "lint"},
     {include-group = "test"},
     {include-group = "typecheck"},
