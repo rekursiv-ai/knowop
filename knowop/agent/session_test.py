@@ -76,7 +76,7 @@ from trackinizer.trax.daemon.protocol import socket_address
 from trackinizer.trax.profile import LOCALHOST_FALLBACK_URL
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.audience import PRIVATE
-from trackinizer.wire.chat_commands import Command, classify
+from trackinizer.wire.private.chat_commands import Command, classify
 from trackinizer.wire.wire_session_ir import (
     AppendRecordsResponse,
     ManifestBody,

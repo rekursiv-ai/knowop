@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from trackinizer.trax import verbs
+from trackinizer.trax.private import canvas
 
 import pytest
 
@@ -30,7 +30,7 @@ def test_the_grammar_is_traxs_own() -> None:
 
     ours = Canvas.make_parser().parse_args(argv)
 
-    assert ours == verbs.Canvas.make_parser().parse_args(argv)
+    assert ours == canvas.Canvas.make_parser().parse_args(argv)
 
 
 def test_a_malformed_command_names_knowop_canvas_in_its_usage(
