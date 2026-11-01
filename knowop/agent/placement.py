@@ -14,7 +14,7 @@ from uuid import UUID
 import sys
 
 from trackinizer.client.errors import ClientError
-from trackinizer.trax.context import canvas_from_env
+from trackinizer.trax.private.canvas import canvas_from_env
 from trackinizer.wire.wire_sessions import (
     GitRef,
     PlaceSession,
