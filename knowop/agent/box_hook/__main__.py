@@ -2,7 +2,7 @@
 # ruff: noqa: EXE003, D300, D205 -- Polyglot shell/Python script.
 # fmt: off
 '''' 2>/dev/null #
-exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" "$@"
+exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 -P "$0" "$@"
 Mark a claude that ``knowop run`` runs ready, bridge its prompts to Chat, and tell it of boxes.
 
 Executable entry point: dispatches to the sibling ``entry`` module's ``main``.
