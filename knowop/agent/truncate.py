@@ -39,14 +39,17 @@ import json
 import re
 
 from trackinizer.sagent.session.types import (
-    CONCRETE_TYPES,
     IncompleteRecord,
     ToolResult,
     UncategorizedRecord,
 )
-from trackinizer.types.session_records import SessionRecordRow
+from trackinizer.types.session_records import (
+    SessionRecordRow,
+    payload_record,
+    stored_payload,
+)
 from trackinizer.types.streams import Stderr, Stdin, Stdout
-from treekle import from_plain, immutable, mutable, to_plain
+from treekle import immutable, mutable
 
 
 if TYPE_CHECKING:
@@ -187,22 +190,16 @@ def without_note[R: TraxRecord](record: R) -> R:
 def _cut(body: RecordBody, record: TraxRecord, *, cap: int) -> RecordBody:
     """Return ``body`` holding ``record`` with every string over ``cap`` bytes cut."""
     omitted: list[int] = []
-    tree = to_plain(
-        record,
-        sort=False,
-        default_concrete_types=CONCRETE_TYPES,
-    )
-    cut = from_plain(
-        _cut_tree(tree, cap=cap, omitted=omitted),
-        type(record),
-        default_concrete_types=CONCRETE_TYPES,
+    cut = payload_record(
+        _cut_tree(mutable(stored_payload(record)), cap=cap, omitted=omitted),
+        type(record),  # pragma: no mutate -- the payload's tag names the class too.
     )
     if not omitted:
         return body
     row = SessionRecordRow.of(
-        session_id=UUID(int=0),
-        part=0,
-        idx=body.idx,
+        session_id=UUID(int=0),  # pragma: no mutate -- only payload and text are read.
+        part=0,  # pragma: no mutate -- only payload and text are read.
+        idx=body.idx,  # pragma: no mutate -- only payload and text are read.
         record=_with_note(cut, immutable({"omitted_bytes": sum(omitted)})),
     )
     # Through the row, so the search text is derived from what was kept. The rest
