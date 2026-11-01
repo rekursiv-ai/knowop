@@ -149,6 +149,7 @@ from knowop.agent.sink import (
     Sink,
     TrackinizerSink,
 )
+from knowop.agent.sink_test import _Server
 from knowop.agent.slash import SlashCommand
 from knowop.agent.tool_server import BEARER_ENV
 from knowop.agent.trust import TrustGate
@@ -2761,6 +2762,46 @@ class TestDrainLoopSurvivesTransientError:
         )
 
 
+def test_the_drain_streams_a_line_to_the_server_before_close(tmp_path: Path) -> None:
+    server = _Server()
+    stop, armed = threading.Event(), threading.Event()
+    with server.client() as client:
+        sink = TrackinizerSink(client, "fake", flush_interval_sec=0.0)
+        worker = threading.Thread(
+            target=partial(
+                _drain_filesystem_loop,
+                _FakeAdapter(tmp_path),
+                sink,
+                _Stats(),
+                RunConfig(cli_name="fake", quiesce_seconds=0.0),
+                stop,
+                baseline=frozenset(),
+                slash_queue=deque(),
+                armed=armed,
+            ),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            assert armed.wait(5.0), "session-log watch did not arm"
+            (tmp_path / "session.jsonl").write_bytes(b"streamed before close\n")
+            assert server.uploaded.wait(5.0), "the drain never uploaded the line"
+            assert worker.is_alive()
+            assert [
+                record.content
+                for record in server.read_back()
+                if isinstance(record, UserMessage)
+            ] == ["streamed before close"]
+            assert sink.session_id == server.session_id
+            assert not server.ended
+        finally:
+            stop.set()
+            worker.join(timeout=5.0)
+            sink.close()
+        assert not worker.is_alive()
+        assert server.ended
+
+
 class TestDrainIsWakeDriven:
     """The drain must wake on a write, not on a timer.
 
@@ -5363,6 +5404,35 @@ class TestSpawnWiring:
         )
         assert wiring.relay["host"] is host
 
+    def test_a_detached_run_opens_its_session_before_its_host_listens(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _UploadsClient()
+        sink = TrackinizerSink(client, "claude")
+        observed: list[UUID | None] = []
+
+        class _SessionAtListen(_WiringRelay):
+            @override
+            def run(self) -> int:
+                observed.append(sink.session_id)
+                return super().run()
+
+        host = HostSpec(address=tmp_path / "s", scrollback=tmp_path / "scrollback")
+        wiring, status = _wire(
+            monkeypatch,
+            tmp_path,
+            RunConfig(cli_name="claude", sync=False, host=host),
+            ClaudeAdapter(),
+            sink=sink,
+            relay=_SessionAtListen,
+        )
+        assert wiring.relay["host"] is host
+        assert status == 0
+        assert observed == [sink.session_id]
+        assert observed[0] is not None
+
     def test_a_watch_that_never_arms_is_reported_and_the_cli_still_starts(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -5377,7 +5447,7 @@ class TestSpawnWiring:
             "ThreadedRelay",
             partial(_WiringRelay, wiring=wiring, rc=0, output=b""),
         )
-        monkeypatch.setattr(session, "_drain_filesystem_loop", _late_arming_drain)
+        monkeypatch.setattr(session, "_drain_filesystem_loop", _never_arming_drain)
         monkeypatch.setattr(shutil, "which", _always_found)
         status = session._spawn_and_drain(
             RunConfig(cli_name="claude", sync=False, quiesce_seconds=0.0),
@@ -5757,11 +5827,16 @@ def _never_found(
     del cmd, mode, path
 
 
-def _late_arming_drain(*args: object, armed: threading.Event, **kwargs: object) -> None:
-    """Arm only after the spawn has stopped waiting for it."""
-    del args, kwargs
-    time.sleep(0.2)
-    armed.set()
+def _never_arming_drain(
+    *args: object,
+    armed: threading.Event,
+    **kwargs: object,
+) -> None:
+    """Stay unarmed until teardown stops the drain."""
+    del armed, kwargs
+    stop = args[4]
+    assert isinstance(stop, threading.Event)
+    _ = stop.wait()
 
 
 def _held_drain(
@@ -5790,6 +5865,35 @@ class TestTeardownRunsEvenWhenTheRelayRaises:
     ``stop.set()`` and both joins, so the daemon drain is still emitting into
     a sink being torn down -- the race the joins and ``LockedSink`` exist for.
     """
+
+    def test_a_host_stopped_by_sigterm_still_ends_its_session(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        server = _HoldingServer()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        monkeypatch.setattr(
+            session,
+            "ThreadedRelay",
+            partial(_ExitsOnceParked, server, rc=143),
+        )
+        monkeypatch.setattr(session, "_drain_filesystem_loop", _drain_until_stop)
+        monkeypatch.setattr(session, "_HOOK_READY_SEC", 0.0)
+        monkeypatch.setattr(shutil, "which", _always_found)
+        status = session._spawn_and_drain(
+            RunConfig(
+                cli_name="claude",
+                client=server,
+                quiesce_seconds=0.0,
+                host=HostSpec(address=tmp_path / "s", scrollback=tmp_path / "log"),
+            ),
+            ClaudeAdapter(),
+            LockedSink(TrackinizerSink(server, "claude")),
+            _Stats(),
+        )
+        assert status == 143
+        assert server.holds == ["ended"]
 
     def test_a_raising_relay_still_stops_the_drain(
         self,
@@ -5914,13 +6018,21 @@ class _HoldingServer(_NoServer):
 class _ExitsOnceParked:
     """A CLI that exits once inbound delivery is parked in its held request."""
 
-    def __init__(self, server: _HoldingServer, argv: object, **kwargs: object) -> None:
+    def __init__(
+        self,
+        server: _HoldingServer,
+        argv: object,
+        *,
+        rc: int = 0,
+        **kwargs: object,
+    ) -> None:
         del argv, kwargs
         self._server = server
+        self._rc = rc
 
     def run(self) -> int:
         assert self._server.parked.wait(5.0), "inbound delivery never parked"
-        return 0
+        return self._rc
 
 
 def _drain_until_stop(*args: object, armed: threading.Event, **kwargs: object) -> None:
@@ -6321,6 +6433,7 @@ class TestInboundBatchSurvivesOneBadMessage:
             stop.set()
             worker.join(timeout=5.0)
 
+        assert not worker.is_alive()
         assert relay.submitted[:2] == ["first", "third"], (
             f"a bad message took the rest of its batch with it: {relay.submitted}"
         )

@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 # tree shallower.
 _ROOT: Final = _CWD.parents[__name__.count(".") - 1]
 
-_PROBE: Final = """\
+_PROBE: Final = """\\
 import sys
 sys.path.insert(0, sys.argv[1])
 import knowop.jobs.cli
@@ -90,7 +90,7 @@ def seen(monkeypatch: pytest.MonkeyPatch) -> _Seen:
 
 @pytest.mark.cli_python_subprocess
 def test_importing_the_endpoint_loads_no_trax_verb() -> None:
-    """``trax.cli`` and the verbs behind it move out in M1 and M2; this must not care."""
+    """``trax.cli`` and the verbs behind it move out; this endpoint must stay light."""
     done = subprocess.run(  # noqa: S603 -- fixed interpreter and probe.
         [sys.executable, "-c", _PROBE, str(_ROOT)],
         capture_output=True,
@@ -98,8 +98,10 @@ def test_importing_the_endpoint_loads_no_trax_verb() -> None:
         check=True,
         cwd=_ROOT,
     )
+    trax = set(done.stdout.split())
 
-    assert set(done.stdout.split()) <= _ALLOWED
+    assert "connection" in trax
+    assert trax <= _ALLOWED, sorted(trax - _ALLOWED)
 
 
 def test_the_verb_and_its_arguments_reach_the_command(seen: _Seen) -> None:

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Final
 
 import os
-import subprocess
+import runpy
 import sys
 
 import pytest
@@ -50,23 +50,25 @@ def test_the_library_module_carries_no_run_guard() -> None:
     assert not text.startswith("#!")
 
 
-@pytest.mark.cli_python_subprocess
-def test_the_module_prints_the_usage() -> None:
-    """The whole chain -- module, imports, argparse -- works."""
-    # The checkout under test, not whichever one the shared venv installed. Counted
-    # from the module's dotted name: the export republishes this tree shallower.
-    root = _CWD.parents[__name__.count(".") - 1]
-    completed = subprocess.run(
-        [sys.executable, "-m", "knowop.jobs", "--help"],
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=root,
-        env={**os.environ, "PYTHONPATH": str(root)},
-    )
+def test_the_module_prints_the_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The whole chain -- module, imports, argparse -- works, run as ``-m`` runs it."""
+    monkeypatch.setattr(sys, "argv", ["knowop.jobs", "--help"])
+    monkeypatch.delitem(sys.modules, "knowop.jobs.__main__", raising=False)
 
-    assert completed.stdout.startswith("Usage: knowop job submit")
-    assert not completed.stderr
+    with pytest.raises(SystemExit) as exited:
+        _ = runpy.run_module(
+            "knowop.jobs",
+            run_name="__main__",
+            alter_sys=True,
+        )
+
+    assert exited.value.code == 0
+    out, err = capsys.readouterr()
+    assert out.startswith("Usage: knowop job submit")
+    assert not err
 
 
 if __name__ == "__main__":

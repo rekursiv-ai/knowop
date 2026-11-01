@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING
 
 import os
+import runpy
 import subprocess
 import sys
 import time
@@ -16,13 +17,13 @@ import pytest
 
 from knowop.shell import job_runner
 from knowop.shell.job_folder import Ended, JobFolder
+from knowop.shell.job_limits import run
 from knowop.shell.job_runner import run_job
 
 
-# The export shortens the namespace, so the child needs its matching import root.
-_REPO: Final = (
-    Path(job_runner.__file__).resolve().parents[len(job_runner.__name__.split(".")) - 1]
-)
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from subprocess import Popen
 
 
 def _folder(tmp_path: Path, *argv: str, minutes: int = 5) -> JobFolder:
@@ -132,10 +133,35 @@ def test_a_job_past_its_limit_is_stopped_with_its_whole_group(tmp_path: Path) ->
     assert _gone(int(pid.read_text()))
 
 
+def _expire_when_ready(
+    child: Popen[bytes],
+    timeout: float | None,
+    *,
+    ready: Path,
+    wait: Callable[[Popen[bytes], float | None], int],
+) -> int:
+    if timeout is None:
+        return wait(child, None)
+    deadline = time.monotonic() + 5
+    while not (ready.exists() and ready.stat().st_size):
+        assert time.monotonic() < deadline, "the child never reached its wait"
+        time.sleep(0.001)
+    raise subprocess.TimeoutExpired(child.args, timeout)
+
+
 def test_a_job_that_ignores_sigterm_is_killed_and_reaped_once_the_grace_is_up(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pid, shell = tmp_path / "pid", tmp_path / "shell"
+    original_wait = subprocess.Popen.wait
+    waits: list[float | None] = []
+
+    def wait(child: Popen[bytes], timeout: float | None = None) -> int:
+        waits.append(timeout)
+        return _expire_when_ready(child, timeout, ready=pid, wait=original_wait)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", wait)
     folder = _folder(
         tmp_path,
         "sh",
@@ -150,6 +176,7 @@ def test_a_job_that_ignores_sigterm_is_killed_and_reaped_once_the_grace_is_up(
     assert time.monotonic() - started < 5
     assert _gone(int(pid.read_text()))
     assert _gone(int(shell.read_text()))
+    assert waits == [0.05, 0.05, None]
 
 
 def test_a_process_the_kernel_killed_at_the_cap_names_the_cap(tmp_path: Path) -> None:
@@ -217,21 +244,42 @@ def test_main_runs_the_folders_job_niced_under_its_own_scope_and_records_its_end
 
 
 @pytest.mark.cli_python_subprocess
-def test_the_runner_records_the_jobs_end_as_a_module(tmp_path: Path) -> None:
-    folder = _folder(tmp_path, *_python("import os; print(os.nice(0))"), minutes=1)
+def test_the_runner_records_the_jobs_end_as_a_module(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folder = _folder(tmp_path, *_python("print('module-job')"), minutes=1)
+    niced: list[int] = []
 
-    done = subprocess.run(  # noqa: S603 -- the runner, by module, as the host starts it.
-        [sys.executable, "-m", job_runner.__name__, str(folder.path)],
-        cwd=folder.path,
-        env={**os.environ, "PYTHONPATH": str(_REPO)},
-        capture_output=True,
-        text=True,
-        check=False,
+    def nice(increment: int) -> int:
+        niced.append(increment)
+        return increment
+
+    monkeypatch.setattr(os, "nice", nice)
+    monkeypatch.setattr(sys, "argv", [job_runner.__name__, str(folder.path)])
+    monkeypatch.delitem(sys.modules, job_runner.__name__)
+    monkeypatch.chdir(folder.path)
+    with pytest.raises(SystemExit) as exited:
+        runpy.run_module(job_runner.__name__, run_name="__main__", alter_sys=True)
+
+    assert exited.value.code == 0
+    assert folder.ended() == Ended(state="completed", exit_code=0, reason="")
+    assert folder.log.read_text() == "module-job\n"
+    assert niced == [10]
+
+
+@pytest.mark.cli_python_subprocess
+def test_a_job_process_inherits_the_runners_niceness() -> None:
+    code, output = run(
+        _python(
+            "import os, subprocess, sys; os.nice(10); "
+            "raise SystemExit(subprocess.run([sys.executable, '-c', "
+            "'import os; print(os.nice(0))']).returncode)",
+        ),
     )
 
-    assert done.returncode == 0, done.stderr
-    assert folder.ended() == Ended(state="completed", exit_code=0, reason="")
-    assert int(folder.log.read_text()) >= 10
+    assert code == 0
+    assert int(output) >= 10
 
 
 if __name__ == "__main__":
