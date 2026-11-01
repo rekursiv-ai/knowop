@@ -2,31 +2,260 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from functools import partial
 from http import server
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, Self, cast, override
 
+import hashlib
 import os
+import selectors
 import shlex
+import shutil
 import ssl
 import subprocess
-import sys
 import threading
 import time
 
 import pytest
 
 from knowop.shell import job_repo
-from knowop.shell.job_limits import run, scope_argv
+from knowop.shell.job_limits import run
 from knowop.shell.job_repo import FetchError, Repos
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Sequence
+    from selectors import SelectorKey
 
 
 _FILE = frozenset({"file"})
+
+
+@dataclass(kw_only=True, slots=True)
+class _Remote:
+    url: str
+    refs: dict[str, str] = field(default_factory=dict)
+    commits: dict[str, tuple[str, str | None]] = field(default_factory=dict)
+    trees: dict[str, dict[str, bytes]] = field(default_factory=dict)
+
+    def commit(self, files: dict[str, bytes], *, ref: str = "refs/heads/main") -> str:
+        tree = hashlib.sha1(
+            repr(sorted(files.items())).encode(),
+            usedforsecurity=False,
+        ).hexdigest()
+        parent = self.refs.get(ref)
+        commit = hashlib.sha1(
+            f"{tree} {parent} {len(self.commits)}".encode(),
+            usedforsecurity=False,
+        ).hexdigest()
+        self.trees[tree] = dict(files)
+        self.commits[commit] = (tree, parent)
+        self.refs[ref] = commit
+        return commit
+
+    def history(self, commit: str) -> list[str]:
+        found: list[str] = []
+        while commit:
+            found.append(commit)
+            parent = self.commits[commit][1]
+            if parent is None:
+                break
+            commit = parent
+        return found
+
+
+class _FakeGit:
+    def __init__(self, remote: _Remote) -> None:
+        self.remote = remote
+        self.calls: list[tuple[str, ...]] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def run(
+            repos: Repos,
+            mirror: Path | None,
+            *args: str,
+        ) -> subprocess.CompletedProcess[str]:
+            return self.run(repos, mirror, *args)
+
+        monkeypatch.setattr(Repos, "_run", run)
+
+    def run(
+        self,
+        repos: Repos,
+        mirror: Path | None,
+        *args: str,
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(args)
+        match args:
+            case ["init", "--bare", "--quiet", path] if mirror is None:
+                root = Path(path)
+                (root / "objects").mkdir(parents=True)
+                _ = (root / "HEAD").write_text("ref: refs/heads/main\n")
+                return _completed(args, repos=repos)
+            case ["fetch", "--no-tags", "--quiet", "--", url, want] if mirror:
+                if url != self.remote.url:
+                    return _completed(
+                        args,
+                        repos=repos,
+                        stderr="fatal: not our ref\n",
+                        returncode=128,
+                    )
+                if want.startswith("+"):
+                    ref = want[1:]
+                    commit = self.remote.refs.get(ref)
+                    if commit is None:
+                        return _completed(
+                            args,
+                            repos=repos,
+                            stderr=f"fatal: couldn't find remote ref {ref}\n",
+                            returncode=128,
+                        )
+                    commits = self.remote.history(commit)
+                elif want in self.remote.trees:
+                    _store(
+                        mirror,
+                        want,
+                        "tree",
+                        b"".join(self.remote.trees[want].values()),
+                    )
+                    return _completed(args, repos=repos)
+                elif want in self.remote.commits:
+                    commits = self.remote.history(want)
+                else:
+                    return _completed(
+                        args,
+                        repos=repos,
+                        stderr="fatal: not our ref\n",
+                        returncode=128,
+                    )
+                for commit in commits:
+                    tree, _parent = self.remote.commits[commit]
+                    files = self.remote.trees[tree]
+                    _store(mirror, commit, "commit", tree.encode())
+                    _store(mirror, tree, "tree", b"".join(files.values()))
+                return _completed(args, repos=repos)
+            case ["cat-file", "-e", spec] if mirror and spec.endswith("^{commit}"):
+                object_id = spec.removesuffix("^{commit}")
+                is_commit = _stored(mirror, object_id) == "commit"
+                return _completed(args, repos=repos, returncode=0 if is_commit else 128)
+            case ["worktree", "add", "--detach", "--quiet", dest, commit] if mirror:
+                if _stored(mirror, commit) != "commit":
+                    return _completed(
+                        args,
+                        repos=repos,
+                        stderr="fatal: invalid reference\n",
+                        returncode=128,
+                    )
+                tree, _parent = self.remote.commits[commit]
+                worktree = Path(dest)
+                worktree.mkdir(parents=True)
+                for name, content in self.remote.trees[tree].items():
+                    _ = (worktree / name).write_bytes(content)
+                record = mirror / "worktrees" / worktree.name
+                record.mkdir(parents=True)
+                _ = (record / "gitdir").write_text(f"{worktree / '.git'}\n")
+                _ = (record / "HEAD").write_text(f"{commit}\n")
+                _ = (worktree / ".git").write_text(f"gitdir: {record}\n")
+                return _completed(args, repos=repos)
+            case ["worktree", "prune"] if mirror:
+                for record in (mirror / "worktrees").glob("*"):
+                    if not Path((record / "gitdir").read_text().strip()).exists():
+                        for child in record.iterdir():
+                            child.unlink()
+                        record.rmdir()
+                return _completed(args, repos=repos)
+            case _:
+                raise AssertionError(f"git {args} is not modeled")
+
+    def head(self, worktree: Path) -> str:
+        gitdir = Path((worktree / ".git").read_text().removeprefix("gitdir: ").strip())
+        return (gitdir / "HEAD").read_text().strip()
+
+    def worktrees(self, mirror: Path) -> list[Path]:
+        return sorted(
+            Path((record / "gitdir").read_text().strip()).parent
+            for record in (mirror / "worktrees").glob("*")
+        )
+
+
+def _store(git_dir: Path, object_id: str, kind: str, body: bytes) -> None:
+    path = git_dir / "objects" / object_id[:2] / object_id[2:]
+    path.parent.mkdir(exist_ok=True)
+    _ = path.write_bytes(kind.encode() + b"\0" + body)
+
+
+def _stored(git_dir: Path, object_id: str) -> str | None:
+    path = git_dir / "objects" / object_id[:2] / object_id[2:]
+    return path.read_bytes().split(b"\0")[0].decode() if path.is_file() else None
+
+
+def _completed(
+    args: list[str] | tuple[str, ...],
+    *,
+    repos: Repos | None = None,
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    if repos is not None:
+        repos._check_storage()
+    return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+
+class _Exited:
+    def __init__(self, argv: list[str]) -> None:
+        self.args = argv
+        self.pid = 1
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        del exc
+
+    def poll(self) -> int:
+        return 0
+
+
+def _capture_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    remote_config: str | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    spawned: list[tuple[list[str], dict[str, object]]] = []
+
+    def popen(argv: list[str], **kwargs: object) -> _Exited:
+        spawned.append((argv, kwargs))
+        return _Exited(argv)
+
+    def require_tool(name: str) -> str:
+        assert name == "git"
+        return "/usr/bin/git"
+
+    def collect(
+        self: Repos,
+        child: subprocess.Popen[bytes],
+    ) -> subprocess.CompletedProcess[str]:
+        del self
+        return _completed(cast("list[str]", child.args))
+
+    def kill_scope(argv: Sequence[str]) -> tuple[int, str]:
+        assert argv[0] == "systemctl"
+        return 0, ""
+
+    monkeypatch.setattr(job_repo, "require_tool", require_tool)
+    monkeypatch.setattr(job_repo, "scope_argv", _unscoped)
+    monkeypatch.setattr(job_repo.subprocess, "Popen", popen)
+    monkeypatch.setattr(Repos, "_collect", collect)
+    monkeypatch.setattr(job_repo, "run", kill_scope)
+    if remote_config is not None:
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", remote_config)
+    Repos(tmp_path / "repos")._run(None, "version")
+    argv, kwargs = spawned[0]
+    return argv, cast("dict[str, str]", kwargs["env"])
 
 
 def _unscoped(
@@ -42,54 +271,37 @@ def _unscoped(
     return list(argv)
 
 
-def _git(repo: Path, *args: str) -> str:
-    done = subprocess.run(  # noqa: S603 -- fixed git argv on a tmp_path repo.
-        ["git", "-C", str(repo), *args],  # noqa: S607 -- git is the tool under test.
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return done.stdout.strip()
-
-
 @pytest.fixture(autouse=True)
-def _git_identity(tmp_path: Path) -> Iterator[None]:
-    config = tmp_path / "gitconfig"
-    _ = config.write_text("[user]\n\tname = t\n\temail = t@example.com\n")
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setenv("GIT_CONFIG_GLOBAL", str(config))
-        patch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-        patch.delenv("GIT_DIR", raising=False)
-        patch.setattr(job_repo, "scope_argv", _unscoped)
-        yield
+def unscoped_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(job_repo, "scope_argv", _unscoped)
 
 
 @pytest.fixture
-def remote(tmp_path: Path) -> Path:
-    """Return a bare repository whose ``main`` is two commits deep, as pushed."""
-    work = tmp_path / "work"
-    work.mkdir()
-    _ = _git(work, "init", "--quiet", "--initial-branch=main")
-    _ = (work / "train.py").write_text("print(1)\n")
-    _ = _git(work, "add", "-A")
-    _ = _git(work, "commit", "--quiet", "-m", "one")
-    _ = (work / "train.py").write_text("print(2)\n")
-    _ = _git(work, "commit", "--quiet", "-am", "two")
-    bare = tmp_path / "remote.git"
-    _ = _git(tmp_path, "clone", "--quiet", "--bare", str(work), str(bare))
-    return bare
+def remote() -> _Remote:
+    remote = _Remote(url="file:///srv/remote.git")
+    _ = remote.commit({"train.py": b"print(1)\n"})
+    _ = remote.commit({"train.py": b"print(2)\n"})
+    return remote
 
 
-def _url(remote: Path) -> str:
-    return f"file://{remote}"
+@pytest.fixture
+def fake_git(remote: _Remote, monkeypatch: pytest.MonkeyPatch) -> _FakeGit:
+    fake = _FakeGit(remote)
+    fake.install(monkeypatch)
+    return fake
+
+
+def _url(remote: _Remote) -> str:
+    return remote.url
 
 
 def test_a_job_gets_a_detached_worktree_of_its_commit(
     tmp_path: Path,
-    remote: Path,
+    remote: _Remote,
+    fake_git: _FakeGit,
 ) -> None:
     repos = Repos(tmp_path / "repos", protocols=_FILE)
-    first = _git(remote, "rev-parse", "main~1")
+    first = remote.history(remote.refs["refs/heads/main"])[1]
 
     repos.checkout(
         remote=_url(remote),
@@ -100,17 +312,17 @@ def test_a_job_gets_a_detached_worktree_of_its_commit(
 
     src = tmp_path / "jobs" / "7" / "src"
     assert (src / "train.py").read_text() == "print(1)\n"
-    assert _git(src, "rev-parse", "HEAD") == first
-    assert _git(src, "branch", "--show-current") == ""
+    assert fake_git.head(src) == first
     assert [p.suffix for p in (tmp_path / "repos").iterdir()] == [".git"]
 
 
 def test_a_second_job_from_the_same_remote_shares_its_mirror(
     tmp_path: Path,
-    remote: Path,
+    remote: _Remote,
+    fake_git: _FakeGit,
 ) -> None:
     repos = Repos(tmp_path / "repos", protocols=_FILE)
-    tip = _git(remote, "rev-parse", "main")
+    tip = remote.refs["refs/heads/main"]
 
     for name in ("7", "8"):
         repos.checkout(
@@ -122,30 +334,39 @@ def test_a_second_job_from_the_same_remote_shares_its_mirror(
 
     assert len(list((tmp_path / "repos").iterdir())) == 1
     assert (tmp_path / "8" / "train.py").read_text() == "print(2)\n"
+    assert (
+        fake_git.calls.count(
+            ("worktree", "add", "--detach", "--quiet", str(tmp_path / "7"), tip),
+        )
+        == 1
+    )
 
 
 def test_failed_preparation_preserves_active_worktrees_and_later_promotes_new_objects(
     tmp_path: Path,
-    remote: Path,
+    remote: _Remote,
+    fake_git: _FakeGit,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "repos"
     repos = Repos(root, protocols=_FILE)
-    first = _git(remote, "rev-parse", "main")
+    first = remote.refs["refs/heads/main"]
     repos.checkout(
         remote=_url(remote),
         ref="refs/heads/main",
         commit=first,
         dest=tmp_path / "first",
     )
-    work = tmp_path / "work"
-    (work / "payload").write_bytes(os.urandom(512 * 1024))
-    _git(work, "add", "payload")
-    _git(work, "commit", "--quiet", "-m", "payload")
-    _git(work, "push", "--quiet", str(remote), "main")
-    new = _git(remote, "rev-parse", "main")
+    payload = os.urandom(32 * 1024)
+    payload_file = tmp_path / "payload"
+    _ = payload_file.write_bytes(payload)
+    new = remote.commit({"train.py": b"print(2)\n", "payload": payload})
+    retained_bytes = sum(
+        path.stat().st_size for path in root.rglob("*") if path.is_file()
+    )
+    byte_budget = retained_bytes + 16 * 1024
     with monkeypatch.context() as patch:
-        patch.setattr(job_repo, "MIRRORS_MAX_BYTES", 128 * 1024)
+        patch.setattr(job_repo, "MIRRORS_MAX_BYTES", byte_budget)
         with pytest.raises(FetchError, match="mirror storage"):
             repos.checkout(
                 remote=_url(remote),
@@ -154,23 +375,24 @@ def test_failed_preparation_preserves_active_worktrees_and_later_promotes_new_ob
                 dest=tmp_path / "second",
             )
     assert not (root / ".prepare").exists()
-    assert sum(p.stat().st_size for p in root.rglob("*") if p.is_file()) < 128 * 1024
-    assert _git(tmp_path / "first", "rev-parse", "HEAD") == first
+    assert sum(path.stat().st_size for path in root.rglob("*") if path.is_file()) == (
+        retained_bytes
+    )
+    assert fake_git.head(tmp_path / "first") == first
     repos.checkout(
         remote=_url(remote),
         ref="refs/heads/main",
         commit=new,
         dest=tmp_path / "second",
     )
-    assert (tmp_path / "second" / "payload").read_bytes() == (
-        work / "payload"
-    ).read_bytes()
-    assert _git(tmp_path / "first", "rev-parse", "HEAD") == first
+    assert (tmp_path / "second" / "payload").read_bytes() == payload_file.read_bytes()
+    assert fake_git.head(tmp_path / "first") == first
 
 
 def test_a_commit_that_is_not_on_the_remote_is_refused(
     tmp_path: Path,
-    remote: Path,
+    remote: _Remote,
+    fake_git: _FakeGit,
 ) -> None:
     repos = Repos(tmp_path / "repos", protocols=_FILE)
 
@@ -182,11 +404,13 @@ def test_a_commit_that_is_not_on_the_remote_is_refused(
             dest=tmp_path / "src",
         )
     assert not (tmp_path / "src").exists()
+    assert fake_git.calls[-1][0] == "fetch"
 
 
 def test_a_branch_that_is_not_on_the_remote_says_what_git_said(
     tmp_path: Path,
-    remote: Path,
+    remote: _Remote,
+    fake_git: _FakeGit,
 ) -> None:
     repos = Repos(tmp_path / "repos", protocols=_FILE)
 
@@ -194,9 +418,10 @@ def test_a_branch_that_is_not_on_the_remote_says_what_git_said(
         repos.checkout(
             remote=_url(remote),
             ref="refs/heads/gone",
-            commit=_git(remote, "rev-parse", "main"),
+            commit=remote.refs["refs/heads/main"],
             dest=tmp_path / "src",
         )
+    assert fake_git.calls[-1][0] == "fetch"
 
 
 @pytest.mark.parametrize(
@@ -236,103 +461,51 @@ def test_the_default_host_fetches_over_https_and_ssh_only(tmp_path: Path) -> Non
         )
 
 
-def test_git_itself_refuses_every_protocol_the_host_does_not_allow(
+def test_git_is_configured_to_refuse_every_non_host_protocol(
     tmp_path: Path,
-    remote: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Allowed by the parser, then refused by git: the parser and git agree on ``file``.
-    repos = Repos(tmp_path / "repos", protocols=_FILE)
-    tip = _git(remote, "rev-parse", "main")
-    repos.checkout(
-        remote=_url(remote),
-        ref="refs/heads/main",
-        commit=tip,
-        dest=tmp_path / "a",
-    )
-    mirror = next((tmp_path / "repos").iterdir())
+    argv, _kwargs = _capture_run(monkeypatch, tmp_path)
 
-    refused = subprocess.run(  # noqa: S603 -- the host's own argv, replayed.
-        [  # noqa: S607 -- git is the tool under test.
-            "git",
-            "-c",
-            "protocol.allow=never",
-            "-c",
-            "protocol.https.allow=always",
-            "--git-dir",
-            str(mirror),
-            "fetch",
-            "--",
-            _url(remote),
-            "+refs/heads/main",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert refused.returncode != 0
-    assert "transport 'file' not allowed" in refused.stderr
+    assert argv[argv.index("-c") + 1] == "protocol.allow=never"
+    assert "protocol.file.allow=always" not in argv
 
 
-def test_no_hook_of_the_mirror_runs_on_checkout(tmp_path: Path, remote: Path) -> None:
-    repos = Repos(tmp_path / "repos", protocols=_FILE)
-    tip = _git(remote, "rev-parse", "main")
-    repos.checkout(
-        remote=_url(remote),
-        ref="refs/heads/main",
-        commit=tip,
-        dest=tmp_path / "a",
-    )
-    mirror = next((tmp_path / "repos").iterdir())
-    hook = mirror / "hooks" / "post-checkout"
-    _ = hook.write_text(f"#!/bin/sh\ntouch {tmp_path / 'hooked'}\n")
-    hook.chmod(0o755)
+def test_git_runs_no_mirror_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    argv, _kwargs = _capture_run(monkeypatch, tmp_path)
 
-    repos.checkout(
-        remote=_url(remote),
-        ref="refs/heads/main",
-        commit=tip,
-        dest=tmp_path / "b",
-    )
-
-    assert (tmp_path / "b" / "train.py").exists()
-    assert not (tmp_path / "hooked").exists()
+    assert argv[argv.index("-c") + 1] == "protocol.allow=never"
+    assert "core.hooksPath=/dev/null" in argv
 
 
 @pytest.mark.parametrize("protocol", ["file", "ext"])
-def test_hostile_global_transport_rewrites_cannot_fetch_local_code(
+def test_hostile_transport_configuration_cannot_expand_git_protocols(
     tmp_path: Path,
-    remote: Path,
     monkeypatch: pytest.MonkeyPatch,
     protocol: str,
 ) -> None:
-    tip = _git(remote, "rev-parse", "main")
-    target = _url(remote) if protocol == "file" else f"ext::git upload-pack {remote}"
     config = tmp_path / "hostile.gitconfig"
-    config.write_text(
-        f'[protocol "{protocol}"]\nallow = always\n'
-        f'[url "{target}"]\ninsteadOf = https://127.0.0.1:1/repo\n',
-    )
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-    repos = Repos(tmp_path / "repos", timeout_sec=5)
+    config.write_text(f'[protocol "{protocol}"]\nallow = always\n')
+    monkeypatch.setenv("GIT_DIR", "/elsewhere/.git")
+    argv, env = _capture_run(monkeypatch, tmp_path, remote_config=str(config))
 
-    with pytest.raises(FetchError):
-        repos.checkout(
-            remote="https://127.0.0.1:1/repo",
-            ref="refs/heads/main",
-            commit=tip,
-            dest=tmp_path / "src",
-        )
-
-    assert not (tmp_path / "src").exists()
+    assert "protocol.allow=never" in argv
+    assert f"protocol.{protocol}.allow=always" not in argv
+    assert env["GIT_ALLOW_PROTOCOL"] == "https:ssh"
+    assert env["GIT_CONFIG_GLOBAL"] == str(config)
+    assert "GIT_DIR" not in env
 
 
 def test_removing_a_worktree_deletes_it_and_the_mirrors_record(
     tmp_path: Path,
-    remote: Path,
+    remote: _Remote,
+    fake_git: _FakeGit,
 ) -> None:
     repos = Repos(tmp_path / "repos", protocols=_FILE)
-    tip = _git(remote, "rev-parse", "main")
+    tip = remote.refs["refs/heads/main"]
     repos.checkout(
         remote=_url(remote),
         ref="refs/heads/main",
@@ -345,38 +518,79 @@ def test_removing_a_worktree_deletes_it_and_the_mirrors_record(
     repos.remove(remote="https://github.com/never/fetched.git", dest=tmp_path / "x")
 
     assert not (tmp_path / "a").exists()
-    listed = _git(tmp_path, "--git-dir", str(mirror), "worktree", "list", "--porcelain")
-    assert str(tmp_path / "a") not in listed
+    assert fake_git.worktrees(mirror) == []
 
 
-@pytest.mark.parametrize("code", ["print('x' * 131072)", "x = bytearray(512 * 2**20)"])
-def test_preparation_output_and_memory_are_bounded_before_launch(
+def test_git_uses_the_memory_and_time_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    code: str,
 ) -> None:
-    git = tmp_path / "git"
-    git.write_text(
-        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(code)}\n",
-    )
-    git.chmod(0o700)
+    argv, _env = _capture_run(monkeypatch, tmp_path)
 
-    def tool(name: str) -> str:
-        assert name == "git"
-        return str(git)
+    assert argv == [
+        "/usr/bin/git",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.ssh.allow=always",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "version",
+    ]
 
-    monkeypatch.setattr(job_repo, "require_tool", tool)
-    if "bytearray" in code:
-        monkeypatch.setattr(job_repo, "scope_argv", scope_argv)
-    repos = Repos(tmp_path / "repos")
 
-    with pytest.raises(FetchError):
-        repos._git(None, "version")
+class _PipedChild:
+    args = ("git", "version")
+
+    def __init__(self, stdout: int, stderr: int) -> None:
+        self.stdout = os.fdopen(stdout, "rb", buffering=0)
+        self.stderr = os.fdopen(stderr, "rb", buffering=0)
+
+    def poll(self) -> int:
+        return 0
+
+    def wait(self) -> int:
+        return 0
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        del exc
+        self.stdout.close()
+        self.stderr.close()
+
+
+def test_preparation_output_is_bounded_before_launch() -> None:
+    stdout, writer = os.pipe()
+    stderr, stderr_writer = os.pipe()
+    os.close(stderr_writer)
+    child = _PipedChild(stdout, stderr)
+    payload = b"x" * (job_repo.PREPARATION_OUTPUT_BYTES + 1)
+
+    def write_output() -> None:
+        try:
+            view = memoryview(payload)
+            while view:
+                view = view[os.write(writer, view) :]
+        except BrokenPipeError:
+            pass
+        finally:
+            os.close(writer)
+
+    writer_thread = threading.Thread(target=write_output)
+    writer_thread.start()
+    with child, pytest.raises(FetchError, match="output exceeds its byte budget"):
+        Repos(Path("unused"))._collect(cast("subprocess.Popen[bytes]", child))
+    writer_thread.join()
 
 
 def test_preparation_refuses_a_full_mirror_budget(
     tmp_path: Path,
-    remote: Path,
+    remote: _Remote,
+    fake_git: _FakeGit,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "repos"
@@ -389,14 +603,16 @@ def test_preparation_refuses_a_full_mirror_budget(
         repos.checkout(
             remote=_url(remote),
             ref="refs/heads/main",
-            commit=_git(remote, "rev-parse", "main"),
+            commit=remote.refs["refs/heads/main"],
             dest=tmp_path / "src",
         )
+    assert not fake_git.calls
 
 
 def test_storage_scan_tolerates_a_git_file_renamed_between_checks(
     tmp_path: Path,
-    remote: Path,
+    remote: _Remote,
+    fake_git: _FakeGit,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "repos"
@@ -417,92 +633,24 @@ def test_storage_scan_tolerates_a_git_file_renamed_between_checks(
     Repos(root, protocols=_FILE).checkout(
         remote=_url(remote),
         ref="refs/heads/main",
-        commit=_git(remote, "rev-parse", "main"),
+        commit=remote.refs["refs/heads/main"],
         dest=tmp_path / "src",
     )
+    assert len(calls) == 2
+    assert fake_git.calls
     assert (tmp_path / "src" / "train.py").read_text() == "print(2)\n"
 
 
-class _AuthenticatedRepo(server.SimpleHTTPRequestHandler):
-    """Serve a dumb Git repository only after the test helper supplies credentials."""
-
-    @override
-    def do_GET(self) -> None:
-        if self.headers.get("Authorization") != "Basic dGVzdDp0b2tlbg==":
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="test"')
-            self.end_headers()
-            return
-        super().do_GET()
-
-    @override
-    def log_message(self, format: str, *args: object) -> None:
-        del format, args
-
-
-@pytest.mark.network_localhost
-def test_https_preparation_uses_the_users_configured_credential_helper(
+def test_git_uses_the_users_configured_credential_helper(
     tmp_path: Path,
-    remote: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    certificate, key = tmp_path / "cert.pem", tmp_path / "key.pem"
-    code, _ = run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            str(key),
-            "-out",
-            str(certificate),
-            "-days",
-            "1",
-            "-subj",
-            "/CN=127.0.0.1",
-            "-addext",
-            "subjectAltName=IP:127.0.0.1",
-        ],
-    )
-    assert code == 0
-    monkeypatch.setenv("GIT_SSL_CAINFO", str(certificate))
-    _git(remote, "update-server-info")
-    tip = _git(remote, "rev-parse", "main")
-    helper = tmp_path / "helper"
-    helper.write_text(
-        "#!/bin/sh\n"
-        f"printf '%s\\n' \"$1\" >> {shlex.quote(str(tmp_path / 'helper-called'))}\n"
-        "if [ \"$1\" = get ]; then printf 'username=test\\npassword=token\\n'; fi\n",
-    )
-    helper.chmod(0o700)
-    with (tmp_path / "gitconfig").open("a") as config:
-        config.write(
-            f"[credential]\nhelper = {helper}\n[http]\nsslCAInfo = {certificate}\n",
-        )
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(certificate, key)
-    with server.ThreadingHTTPServer(
-        ("127.0.0.1", 0),
-        partial(_AuthenticatedRepo, directory=str(tmp_path)),
-    ) as httpd:
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
-        worker = threading.Thread(target=httpd.serve_forever)
-        worker.start()
-        try:
-            Repos(tmp_path / "repos").checkout(
-                remote=f"https://127.0.0.1:{httpd.server_port}/remote.git",
-                ref="refs/heads/main",
-                commit=tip,
-                dest=tmp_path / "src",
-            )
-        finally:
-            httpd.shutdown()
-            worker.join(timeout=5)
-    assert "get" in (tmp_path / "helper-called").read_text().splitlines()
-    assert (tmp_path / "src" / "train.py").read_text() == "print(2)\n"
+    config = tmp_path / "gitconfig"
+    _ = config.write_text("[credential]\nhelper = /tmp/credential-helper\n")
+    _argv, env = _capture_run(monkeypatch, tmp_path, remote_config=str(config))
+
+    assert env["GIT_CONFIG_GLOBAL"] == str(config)
+    assert env["GIT_ALLOW_PROTOCOL"] == "https:ssh"
 
 
 def test_git_that_runs_out_of_time_is_said_plainly(
@@ -557,10 +705,11 @@ def test_git_still_running_at_its_deadline_is_killed_and_said_plainly(
 
 def test_an_object_the_fetches_bring_that_is_not_a_commit_is_refused(
     tmp_path: Path,
-    remote: Path,
+    remote: _Remote,
+    fake_git: _FakeGit,
 ) -> None:
     repos = Repos(tmp_path / "repos", protocols=_FILE)
-    tree = _git(remote, "rev-parse", "main^{tree}")
+    tree, _parent = remote.commits[remote.refs["refs/heads/main"]]
 
     with pytest.raises(FetchError, match=f"{tree[:12]} is not on refs/heads/main"):
         repos.checkout(
@@ -570,6 +719,7 @@ def test_an_object_the_fetches_bring_that_is_not_a_commit_is_refused(
             dest=tmp_path / "src",
         )
     assert not (tmp_path / "src").exists()
+    assert fake_git.calls[-1] == ("cat-file", "-e", f"{tree}^{{commit}}")
 
 
 def test_a_preparation_cancelled_before_it_holds_the_mirrors_runs_no_git(
@@ -635,6 +785,243 @@ def test_a_git_child_without_output_pipes_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="preparation output pipes"):
         _ = repos._collect(cast("subprocess.Popen[bytes]", _Pipeless()))
+
+
+def _real_git(root: Path, *args: str) -> str:
+    code, stdout = run(["git", "-C", str(root), *args])
+    assert code == 0, (args, stdout)
+    return stdout.strip()
+
+
+@pytest.fixture(scope="module")
+def real_remote_seed(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str, str]:
+    root = tmp_path_factory.mktemp("git-remote-seed")
+    work = root / "work"
+    bare = root / "remote.git"
+    work.mkdir()
+    _real_git(work, "init", "--quiet", "--initial-branch=main")
+    _real_git(work, "config", "user.name", "Test")
+    _real_git(work, "config", "user.email", "test@example.com")
+    _ = (work / "train.py").write_text("print(2)\n")
+    _real_git(work, "add", "train.py")
+    _real_git(work, "commit", "--quiet", "-m", "initial")
+    commit = _real_git(work, "rev-parse", "HEAD")
+    _real_git(root, "clone", "--quiet", "--bare", str(work), str(bare))
+    return bare, commit, _real_git(work, "rev-parse", "HEAD^{tree}")
+
+
+@pytest.fixture
+def real_remote(
+    real_remote_seed: tuple[Path, str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, str, str]:
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(templates))
+    seed, commit, tree = real_remote_seed
+    bare = tmp_path / "remote.git"
+    shutil.copytree(seed, bare)
+    return bare, commit, tree
+
+
+def _ignore_scope_kill(argv: Sequence[str]) -> tuple[int, str]:
+    assert argv[:2] == ["systemctl", "--user"]
+    return 0, ""
+
+
+class _PromptSelector(selectors.DefaultSelector):
+    """Keep real pipe readiness while shortening the supervision polling interval."""
+
+    @override
+    def select(self, timeout: float | None = None) -> list[tuple[SelectorKey, int]]:
+        return super().select(None if timeout is None else min(timeout, 0.001))
+
+
+def _real_repos(monkeypatch: pytest.MonkeyPatch, root: Path) -> Repos:
+    monkeypatch.setattr(job_repo, "scope_argv", _unscoped)
+    monkeypatch.setattr(job_repo.selectors, "DefaultSelector", _PromptSelector)
+    monkeypatch.setattr(job_repo, "run", _ignore_scope_kill)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    config = root / "global.gitconfig"
+    config.write_text("[user]\nname = Test\nemail = test@example.com\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    return Repos(root / "repos", protocols=_FILE)
+
+
+@pytest.mark.cli_git
+def test_real_git_fetches_the_requested_commit_into_a_bare_mirror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_remote: tuple[Path, str, str],
+) -> None:
+    bare, commit, _tree = real_remote
+    repos = _real_repos(monkeypatch, tmp_path)
+    stage = tmp_path / "stage.git"
+
+    repos._prepare(stage, remote=f"file://{bare}", ref="refs/heads/main", commit=commit)
+
+    assert _real_git(stage, "rev-parse", "--is-bare-repository") == "true"
+    assert _real_git(stage, "cat-file", "-t", commit) == "commit"
+
+
+@pytest.mark.cli_git
+def test_real_git_adds_a_detached_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_remote: tuple[Path, str, str],
+) -> None:
+    bare, commit, _tree = real_remote
+    dest = tmp_path / "job" / "src"
+
+    _real_repos(monkeypatch, tmp_path).checkout(
+        remote=f"file://{bare}",
+        ref="refs/heads/main",
+        commit=commit,
+        dest=dest,
+    )
+
+    assert (dest / "train.py").read_text() == "print(2)\n"
+    assert _real_git(dest, "rev-parse", "HEAD") == commit
+    assert _real_git(dest, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
+    assert len(list((tmp_path / "repos").glob("*.git"))) == 1
+
+
+@pytest.mark.cli_git
+def test_real_git_rejects_a_tree_as_the_requested_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_remote: tuple[Path, str, str],
+) -> None:
+    bare, _commit, tree = real_remote
+
+    with pytest.raises(FetchError, match=f"{tree[:12]} is not on refs/heads/main"):
+        _real_repos(monkeypatch, tmp_path).checkout(
+            remote=f"file://{bare}",
+            ref="refs/heads/main",
+            commit=tree,
+            dest=tmp_path / "src",
+        )
+    assert not (tmp_path / "src").exists()
+
+
+@pytest.mark.cli_git
+def test_real_git_prunes_a_removed_worktree_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_remote: tuple[Path, str, str],
+) -> None:
+    bare, commit, _tree = real_remote
+    repos = _real_repos(monkeypatch, tmp_path)
+    dest = tmp_path / "src"
+    repos.checkout(
+        remote=f"file://{bare}",
+        ref="refs/heads/main",
+        commit=commit,
+        dest=dest,
+    )
+    mirror = next((tmp_path / "repos").glob("*.git"))
+    assert _real_git(mirror, "worktree", "list", "--porcelain").count("worktree ") == 2
+
+    repos.remove(remote=f"file://{bare}", dest=dest)
+
+    assert not dest.exists()
+    assert _real_git(mirror, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+class _AuthenticatedRepo(server.SimpleHTTPRequestHandler):
+    @override
+    def do_GET(self) -> None:
+        if self.headers.get("Authorization") != "Basic dGVzdDp0b2tlbg==":
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="test"')
+            self.end_headers()
+            return
+        super().do_GET()
+
+    @override
+    def log_message(self, format: str, *args: object) -> None:
+        del format, args
+
+
+@pytest.mark.cli_git
+@pytest.mark.network_localhost
+def test_real_git_uses_the_credential_helper_over_local_https(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    real_remote: tuple[Path, str, str],
+) -> None:
+    bare, commit, _tree = real_remote
+    _real_git(bare, "update-server-info")
+    certificate, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    code, output = run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-keyout",
+            str(key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-subj",
+            "/CN=127.0.0.1",
+            "-addext",
+            "subjectAltName=IP:127.0.0.1",
+        ],
+    )
+    assert code == 0, output
+    helper = tmp_path / "credential-helper"
+    helper_called = tmp_path / "helper-called"
+    helper.write_text(
+        "#!/bin/sh\n"
+        f'echo "$1" >> {shlex.quote(str(helper_called))}\n'
+        'if [ "$1" = get ]; then echo username=test; echo password=token; fi\n',
+    )
+    helper.chmod(0o700)
+    ca_directory = tmp_path / "ca"
+    ca_directory.mkdir()
+    config = tmp_path / "global.gitconfig"
+    config.write_text(
+        "[user]\nname = Test\nemail = test@example.com\n"
+        f"[credential]\nhelper = {helper}\n"
+        f"[http]\nsslCAInfo = {certificate}\nsslCAPath = {ca_directory}\n",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setattr(job_repo, "run", _ignore_scope_kill)
+    monkeypatch.setattr(job_repo.selectors, "DefaultSelector", _PromptSelector)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate, key)
+    with server.ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        partial(_AuthenticatedRepo, directory=str(bare.parent)),
+    ) as httpd:
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        worker = threading.Thread(
+            target=partial(httpd.serve_forever, poll_interval=0.005),
+        )
+        worker.start()
+        try:
+            dest = tmp_path / "src"
+            Repos(tmp_path / "repos").checkout(
+                remote=f"https://127.0.0.1:{httpd.server_port}/{bare.name}",
+                ref="refs/heads/main",
+                commit=commit,
+                dest=dest,
+            )
+        finally:
+            httpd.shutdown()
+            worker.join(timeout=5)
+
+    assert "get" in helper_called.read_text().splitlines()
+    assert (tmp_path / "src" / "train.py").read_text() == "print(2)\n"
 
 
 if __name__ == "__main__":

@@ -965,8 +965,8 @@ class _ScriptedPeer:
         self.ice_servers = ice_servers
         loop = asyncio.get_running_loop()
         route = wire_terminals.encode_route(wire_terminals.ROUTE_DIRECT, 0)
-        loop.call_later(0.05, on_message, encode_frame(Frame.ROUTE, route))
-        loop.call_later(0.1, on_message, encode_frame(Frame.INPUT, b"go\n"))
+        loop.call_soon(on_message, encode_frame(Frame.ROUTE, route))
+        loop.call_soon(on_message, encode_frame(Frame.INPUT, b"go\n"))
         return "answer-sdp"
 
     def send(self, data: bytes) -> None:

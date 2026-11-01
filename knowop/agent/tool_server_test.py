@@ -6,10 +6,12 @@ Each test serves on ``127.0.0.1`` and posts JSON-RPC as claude and codex do.
 from __future__ import annotations
 
 from http.client import HTTPConnection
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 from urllib.parse import urlsplit
 
 import json
+import socket
+import time
 
 from treekle import json_loads
 
@@ -24,7 +26,7 @@ from knowop.agent.tool_server import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Buffer, Iterator, Mapping
 
 
 def _echo(arguments: Mapping[str, object]) -> str:
@@ -185,12 +187,71 @@ def test_an_unknown_tool_or_method_is_a_json_rpc_error(
 
 def test_ping_and_bad_json(server: ToolServer) -> None:
     assert _rpc(server, "ping")["result"] == {}
-    status, answer = _post(server, b"{not json")
+    assert _post(server, b"{not json") == (
+        400,
+        {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": -32_700,
+                "message": "Expecting property name enclosed in double quotes: "
+                "line 1 column 2 (char 1)",
+            },
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"[]",
+        b"null",
+        b"1",
+        b'"ping"',
+        b'{"id": [], "method": "ping"}',
+        b'{"id": 1, "method": 7}',
+        b'{"id": 1, "method": "ping", "params": []}',
+    ],
+)
+def test_a_message_with_the_wrong_shape_is_a_parse_error(
+    server: ToolServer,
+    body: bytes,
+) -> None:
+    status, answer = _post(server, body)
     assert status == 400
     assert answer is not None
     error = answer["error"]
     assert isinstance(error, dict)
-    assert error["code"] == -32_700
+    message = error["message"]
+    assert isinstance(message, str)
+    assert message not in ("", "None")
+    assert answer == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32_700, "message": message},
+    }
+
+
+def test_a_request_without_content_length_reads_no_body(server: ToolServer) -> None:
+    parts = urlsplit(server.url)
+    connection = HTTPConnection(parts.hostname or "", parts.port, timeout=1.0)
+    try:
+        connection.putrequest("POST", "/mcp")
+        connection.putheader("Authorization", f"Bearer {server.token}")
+        connection.endheaders()
+        connection.send(b" ")
+        response = connection.getresponse()
+        assert response.status == 400
+        assert json_loads(response.read(), dict[str, object]) == {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": -32_700,
+                "message": "Expecting value: line 1 column 1 (char 0)",
+            },
+        }
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(
@@ -231,6 +292,27 @@ def test_a_stream_is_refused(server: ToolServer) -> None:
     assert _send(server, "GET") == (405, b"", "POST")
 
 
+class _GoneAfterTheHeaders(socket.socket):
+    """A client that closes after response headers, as for an empty body."""
+
+    sent: bytes = b""
+
+    @override
+    def sendall(self, data: Buffer, flags: int = 0, /) -> None:
+        del flags
+        if b"\r\n\r\n" in self.sent:
+            raise BrokenPipeError(32, "Broken pipe")
+        self.sent += bytes(data)
+
+
+def test_an_empty_answer_ends_with_its_headers(server: ToolServer) -> None:
+    ours, theirs = socket.socketpair()
+    with ours, _GoneAfterTheHeaders(fileno=theirs.detach()) as client:
+        ours.sendall(b"GET /mcp HTTP/1.1\r\nHost: x\r\n\r\n")
+        server._http.finish_request(client, ("127.0.0.1", 1))
+    assert client.sent.startswith(b"HTTP/1.0 401 Unauthorized\r\n")
+
+
 def test_a_request_writes_nothing_to_the_persons_terminal(
     server: ToolServer,
     capsys: pytest.CaptureFixture[str],
@@ -242,6 +324,44 @@ def test_a_request_writes_nothing_to_the_persons_terminal(
 
 def test_a_server_never_started_closes() -> None:
     ToolServer([]).close()
+
+
+def test_close_returns_before_the_next_server_poll() -> None:
+    server = ToolServer([])
+    server.start()
+    parts = urlsplit(server.url)
+    connection = HTTPConnection(parts.hostname or "", parts.port, timeout=1.0)
+    try:
+        connection.request("GET", "/mcp")
+        response = connection.getresponse()
+        assert response.status == 401
+        _ = response.read()
+    finally:
+        connection.close()
+
+    time.sleep(0.02)
+    started = time.monotonic()
+    server.close()
+    elapsed = time.monotonic() - started
+
+    thread = server._serving
+    assert thread is not None
+    thread.join(timeout=1.0)
+    assert elapsed < 0.1, f"close waited {elapsed:.3f}s for serve_forever"
+    assert not thread.is_alive()
+
+
+def test_close_stops_the_server_thread() -> None:
+    server = ToolServer([])
+    server.start()
+    thread = server._serving
+    assert thread is not None
+
+    server.close()
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert server._http.socket.fileno() == -1
 
 
 if __name__ == "__main__":

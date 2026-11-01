@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast, override
 from uuid import UUID, uuid4
 
+import functools
 import json
 
-from trackinizer.client.conversation import read_part
+from trackinizer.client.conversation import Segment, read_part
 from trackinizer.lib.agent.sessions import (
     claude,
     codex,
@@ -62,6 +63,7 @@ from knowop.agent.truncate import (
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from trackinizer.client.conversation import PartReader
     from trackinizer.sagent.session.types import SessionRecord
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.types.streams import TraxRecord
@@ -77,13 +79,20 @@ _TESTDATA: Final = Path(__file__).resolve().parent / "testdata" / "sessions"
 # the runner never takes.
 def _records(name: str) -> tuple[list[TraxRecord], Mapping[str, PlainTree]]:
     """Return a corpus fixture's records and how its file spells its bytes."""
+    records, encoding = _read(name)
+    return list(records), encoding
+
+
+@functools.cache
+def _read(name: str) -> tuple[tuple[TraxRecord, ...], Mapping[str, PlainTree]]:
+    """Read a corpus fixture as capture does; see :func:`_records`."""
     reader = Tail((codex if name.startswith("codex") else claude).normalize)
     out: list[TraxRecord] = []
     with (_TESTDATA / name).open(encoding="utf-8") as handle:
         for line in handle:
             out.extend(reader.feed(line))
     out.extend(reader.close())
-    return out, immutable(reader.encoding)
+    return tuple(out), immutable(reader.encoding)
 
 
 class _FakeClient:
@@ -188,6 +197,15 @@ class _PartsClient:
         return "AgentSession", ref.uuid, {"self": {"seq": 7}}
 
 
+def _direct_segments(
+    segments: list[Segment],
+    client: PartReader,
+    session_id: UUID,
+) -> list[Segment]:
+    del client, session_id
+    return segments
+
+
 @pytest.fixture(autouse=True)
 def local_session_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Materialize into temp roots, never the operator's own.
@@ -228,7 +246,6 @@ class TestWhichTargetsResume:
 
         assert written.path.exists()
 
-    @pytest.mark.compute_large_fixture
     def test_codex_resumes(self) -> None:
         """``codex resume <uuid>`` re-enters a rollout, so codex is a target."""
         client = _FakeClient("codex_main.jsonl", session_format="codex")
@@ -535,23 +552,37 @@ class TestAMixedSessionResumes:
 
     def test_a_real_capture_with_a_result_it_never_calls_resumes_as_claude(
         self,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The captured claude transcript carries a result with no call in it.
 
         Behind a bot part it resumed as a refused conversion, which dropped the result.
         """
         records, _ = _records("claude_main.jsonl")
+        full_capture = cast("Sequence[SessionRecord]", records)
+        bot_records: list[SessionRecord] = [
+            AgentToAgentMessage(sender="ada@example.com", content="q1"),
+            AssistantMessage(content="bot says"),
+        ]
+        segments = [
+            Segment(part=0, name="0.jsonl", format="assistant", records=bot_records),
+            Segment(
+                part=1,
+                name="1.jsonl",
+                format="claude",
+                records=list(full_capture),
+            ),
+        ]
         client = _PartsClient(
             {
-                0: (
-                    "assistant",
-                    [
-                        AgentToAgentMessage(sender="ada@example.com", content="q1"),
-                        AssistantMessage(content="bot says"),
-                    ],
-                ),
-                1: ("claude", cast("Sequence[SessionRecord]", records)),
+                0: ("assistant", bot_records),
+                1: ("claude", full_capture),
             },
+        )
+
+        monkeypatch.setattr(
+            "knowop.agent.resume.read_segments",
+            functools.partial(_direct_segments, segments),
         )
 
         written = prepare_resume(client, uuid4(), "claude")
@@ -604,7 +635,6 @@ class TestLossyConversion:
 
         assert prepare_resume(client, uuid4(), "claude").path.exists()
 
-    @pytest.mark.compute_large_fixture
     def test_a_codex_session_resumes_as_claude_without_the_flag(self) -> None:
         """A rollout's own events are not conversation, so they cross without a flag.
 
@@ -619,7 +649,6 @@ class TestLossyConversion:
 
         assert written.path.exists()
 
-    @pytest.mark.compute_large_fixture
     def test_the_flag_accepts_the_loss(self) -> None:
         client = _FakeClient("codex_main.jsonl", session_format="codex")
 

@@ -466,7 +466,7 @@ class TestRunGit:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.setattr(worktree_diff, "GIT_SEC", 0.3)
+        monkeypatch.setattr(worktree_diff, "GIT_SEC", 0.02)
 
         done = run_git(["sh", "-c", "printf partial; exec sleep 30"], 4)
 

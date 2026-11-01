@@ -45,6 +45,9 @@ PROTOCOL: Final = "2025-06-18"
 BEARER_ENV: Final = "KNOWOP_TOOLS_TOKEN"
 """The environment variable that hands the CLI the server's bearer token."""
 
+_SHUTDOWN_POLL_SEC: Final = 0.01
+"""Maximum interval between ``serve_forever`` checks for shutdown."""
+
 _BAD_PARAMS: Final = -32_602
 
 
@@ -100,6 +103,7 @@ class ToolServer:
         self._serving = threading.Thread(
             name="agent tools",
             target=self._http.serve_forever,
+            kwargs={"poll_interval": _SHUTDOWN_POLL_SEC},
             daemon=True,
         )
         self._serving.start()
@@ -131,7 +135,9 @@ class _Handler(BaseHTTPRequestHandler):
         http = self._admitted()
         if http is None:
             return
-        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        # HTTPMessage ignores header-name case, so casing mutants are equivalent.
+        raw = self.headers.get("Content-Length")  # pragma: no mutate
+        body = self.rfile.read(int(raw or 0))
         try:
             message = json_loads(body, _Message)
         except ValueError as error:
@@ -184,7 +190,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        _ = self.wfile.write(data)
+        if data:
+            _ = self.wfile.write(data)
 
 
 class _Message(TypedDict):

@@ -67,6 +67,7 @@ from treekle import from_plain, immutable, json_loads
 import httpx2
 import pytest
 
+from knowop.agent import truncate
 from knowop.agent.custom_types import Event
 from knowop.agent.sink import (
     FileSink,
@@ -97,6 +98,9 @@ _AT = datetime(2026, 6, 1, tzinfo=UTC)
 _PROXY_LIMIT: Final = 8_000_000
 """The live proxy's request-body cap: Caddy's ``8MB`` counts decimal megabytes."""
 
+_SMALL_PROXY_LIMIT: Final = 32_000
+"""A scaled proxy bound for fast tests of oversized-record truncation."""
+
 _WORKER_LOG: Final = (
     '\x1b[2K\r\x1b[36m[w3]\x1b[0m \x1b[2m22:45:01\x1b[0m\t{"step":120,"loss":0.25}'
     " \x1b[32m━━━━\x1b[0m\x1b[1A" + "\x00" * 28 + "\n"
@@ -105,9 +109,8 @@ _WORKER_LOG: Final = (
 NUL padding of a preallocated log. Each control character takes six bytes on the
 wire, which is how ~1 MB of output became an 11.39 MB record."""
 
-_OVER_THE_LIMIT: Final = '\x00\x1b[0m"' * 500_000
-"""Text one copy of which is over 8 MB on the wire: each control character
-encodes as six bytes."""
+_OVER_THE_LIMIT: Final = '\x00\x1b[0m"' * 5_000
+"""Text oversized against the scaled proxy bound used in truncation tests."""
 
 _OVERSIZED: Final[dict[str, Callable[[str], TraxRecord]]] = {
     "AgentStatusResult": lambda text: AgentStatusResult(call_id="c", content=text),
@@ -1025,6 +1028,52 @@ class TestWorktreeDiffSink:
 
 class TestCatchUp:
     """A run that loses the server keeps capturing, and catches it up on return."""
+
+    def test_an_edge_502_is_an_outage_the_sink_catches_up_from(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr("trackinizer.client.client.time.sleep", sleeps.append)
+        server, now = _Server(), [0.0]
+        fallback = tmp_path / "fallback.jsonl"
+        with server.client() as client:
+            sink = ResilientSink(
+                TrackinizerSink(client, "claude", flush_interval_sec=0.0),
+                fallback_path=fallback,
+                clock=lambda: now[0],
+            )
+            try:
+                sink.emit("claude", _event("before"))
+                sink.flush()
+                server.down = True
+                sink.emit("claude", _event("during"))
+                sink.flush()
+                assert [
+                    json_loads(line, dict[str, object])["text"]
+                    for line in fallback.read_text().splitlines()
+                ] == ["during"]
+                server.down = False
+                now[0] = 30.0
+                sink.flush()
+                sink.emit("claude", _event("after"))
+                sink.flush()
+            finally:
+                server.down = False
+                sink.close()
+
+        assert [
+            [body.idx for body in AppendRecordsRequest.model_validate_json(raw).records]
+            for raw in server.uploads
+        ] == [[0], [1], [2]]
+        assert [
+            record.content
+            for record in server.read_back()
+            if isinstance(record, UserMessage)
+        ] == ["before", "during", "after"]
+        assert server.ended
+        assert sleeps == [0.1, 0.1 * 3.0]
 
     def test_the_server_gets_everything_once_it_answers_again(
         self,
@@ -2676,29 +2725,29 @@ class TestRedaction:
 
 
 class TestOneRecordOverTheProxyLimit:
-    """One captured record larger than the proxy accepts must still upload.
+    """An oversized record is bounded before the proxy receives it."""
 
-    Uploaded through the real :class:`Client` to a transport that refuses what
-    the live proxy refuses, so the bytes measured are the bytes sent.
-    """
+    @pytest.fixture(autouse=True)
+    def _small_record_limits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(truncate, "MAX_TOOL_RESULT_BYTES", 2_000)
+        monkeypatch.setattr(truncate, "MAX_RECORD_BYTES", 4_000)
 
-    @pytest.mark.compute_large_fixture
-    def test_the_record_that_hit_413_uploads_with_its_marker(self) -> None:
-        """~1 MB of shell output, stated three times by codex and once for search."""
-        line = _codex_shell_line((_WORKER_LOG * 10_000)[:1_050_000])
+    def test_an_oversized_codex_result_uploads_with_its_marker(self) -> None:
+        """Codex repeats its output; every copy is bounded before upload."""
+        line = _codex_shell_line((_WORKER_LOG * 200)[:8_000])
         reader = CodexAdapter().reader()
         (failing,) = [
             r for r in reader.feed(line.decode()) if isinstance(r, ShellCommandResult)
         ]
-        assert encoded_size(_uncut(failing)) > _PROXY_LIMIT
-        server = _Server()
+        server = _Server(proxy_limit=_SMALL_PROXY_LIMIT)
+        assert encoded_size(_uncut(failing)) > server.proxy_limit
         sink = TrackinizerSink(server.client(), "codex")
 
         _ = sink.feed(CodexAdapter(), _PART, line)
         sink.close()
 
         assert server.uploads
-        assert max(len(upload) for upload in server.uploads) <= _PROXY_LIMIT
+        assert max(len(upload) for upload in server.uploads) <= server.proxy_limit
         (shell,) = [r for r in server.read_back() if isinstance(r, ShellCommandResult)]
         assert was_truncated(shell)
         item = from_plain(shell.extra["item"], dict[str, object])
@@ -2708,19 +2757,18 @@ class TestOneRecordOverTheProxyLimit:
                 "[Trackinizer capture truncated: kept beginning/end; omitted " in kept
             )
 
-    @pytest.mark.compute_large_fixture
     @pytest.mark.parametrize("kind", sorted(_OVERSIZED))
     def test_a_record_of_every_kind_uploads(self, kind: str) -> None:
-        """Tool results are the usual culprit, but any kind can hold 8 MB."""
+        """Tool results are usual; every stored kind must also be bounded."""
         record = _OVERSIZED[kind](_OVER_THE_LIMIT)
-        assert encoded_size(_uncut(record)) > _PROXY_LIMIT
-        server = _Server()
+        server = _Server(proxy_limit=_SMALL_PROXY_LIMIT)
+        assert encoded_size(_uncut(record)) > server.proxy_limit
         sink = TrackinizerSink(server.client(), "claude")
 
         sink.emit("claude", Event(record=record, path=_PART))
         sink.close()
 
-        assert max(len(upload) for upload in server.uploads) <= _PROXY_LIMIT
+        assert max(len(upload) for upload in server.uploads) <= server.proxy_limit
         (stored,) = server.read_back()
         assert type(stored) is type(record)
         assert was_truncated(stored)
@@ -2795,11 +2843,15 @@ def _stored_by(client: _FakeClient) -> str:
 
 
 class _Server:
-    """Answers as Trackinizer does, behind a proxy that refuses a body over 8 MB."""
+    """Answers as Trackinizer does, behind a proxy with a byte limit."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, proxy_limit: int = _PROXY_LIMIT) -> None:
         self.session_id = uuid4()
+        self.proxy_limit = proxy_limit
         self.uploads: list[bytes] = []
+        self.down = False
+        self.ended = False
+        self.uploaded = threading.Event()
 
     def client(self) -> Client:
         """Return a real client whose requests reach this server and nothing else."""
@@ -2824,14 +2876,19 @@ class _Server:
         return [body.row(self.session_id, 0).record() for body in self.records()]
 
     def _answer(self, request: httpx2.Request) -> httpx2.Response:
-        if len(request.content) > _PROXY_LIMIT:
+        if self.down:
+            return httpx2.Response(502, text="Bad Gateway")
+        if len(request.content) > self.proxy_limit:
             return httpx2.Response(413, text="Request Entity Too Large")
         path = request.url.path
         if path.endswith("/records"):
             self.uploads.append(request.content)
+            self.uploaded.set()
             return httpx2.Response(200, json={"written": 0, "skipped": 0})
         if path.endswith("/start"):
             return httpx2.Response(200, json={"id": str(self.session_id), "seq": 0})
+        if path.endswith("/end"):
+            self.ended = True
         return httpx2.Response(200, json={"id": str(self.session_id)})
 
 

@@ -194,6 +194,7 @@ class _Rig:
     no_tui: Exception | None = None
     resume: str = ""
     control: Path | None = None
+    notify_takeover: bool = True
     records: list[SystemMessage] = field(default_factory=list[SystemMessage])
     sessions: list[str] = field(default_factory=list[str])
     states: list[HostState] = field(default_factory=list[HostState])
@@ -220,7 +221,7 @@ class _Rig:
             on_session=self.sessions.append,
             on_listening=self.listening.set,
             on_state=self.states.append,
-            on_takeover=self.taken.append,
+            on_takeover=self.taken.append if self.notify_takeover else None,
             control=self.control,
         )
         self._thread = threading.Thread(
@@ -436,12 +437,18 @@ class TestWhatThePersonSends:
 class TestTakeover:
     """A terminal takes the chat's CLI over, and the chat can have it back."""
 
+    @pytest.mark.parametrize(
+        "notify_takeover",
+        [True, False],
+        ids=["callback", "no-callback"],
+    )
     def test_the_driver_stops_and_the_session_is_handed_to_the_terminal(
         self,
         tmp_path: Path,
+        notify_takeover: bool,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _Rig(control=control, notify_takeover=notify_takeover) as rig:
             rig.wait_started()
             reply = request(control, "takeover")
             assert reply.ok
@@ -450,7 +457,7 @@ class TestTakeover:
             assert rig.tui_for == ["s1"]
             assert rig.states == ["taken_over"]
             assert rig.run.state == "taken_over"
-            assert rig.taken == ["s1"]
+            assert rig.taken == (["s1"] if notify_takeover else [])
 
     def test_a_line_is_refused_while_it_is_taken_over(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")

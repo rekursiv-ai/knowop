@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TypedDict, Unpack
 
 import asyncio
 import base64
@@ -30,13 +30,14 @@ from trackinizer.wire.wire_exec import (
 
 import pytest
 
-from knowop.shell import exec_host
+from knowop.shell import exec_command, exec_host
 from knowop.shell.exec_command import run_command
 from knowop.shell.exec_host import ExecHost
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from asyncio import Future
+    from collections.abc import Callable, Iterable
 
 
 _MACHINE: Final = uuid.UUID(int=1)
@@ -110,6 +111,35 @@ def _wait_until(done: Callable[[], bool]) -> None:
 def _wait_for(path: Path) -> None:
     """Wait until ``path`` holds output; the shell creates it before it writes."""
     _wait_until(lambda: path.exists() and path.stat().st_size > 0)
+
+
+class _WaitOptions(TypedDict, total=False):
+    timeout: float | None
+    return_when: str
+
+
+class _ReadyDeadline:
+    """Expire supervision once the real shell has reached the exercised state."""
+
+    def __init__(self, ready: Path, *, timeout_sec: float) -> None:
+        self.ready = ready
+        self.timeout_sec = timeout_sec
+        self.wait = asyncio.wait
+
+    async def __call__(
+        self,
+        futures: Iterable[Future[object]],
+        **options: Unpack[_WaitOptions],
+    ) -> tuple[set[Future[object]], set[Future[object]]]:
+        if options.get("return_when") == asyncio.FIRST_COMPLETED:
+            assert options["timeout"] == self.timeout_sec
+            await asyncio.to_thread(_wait_for, self.ready)
+            options["timeout"] = 0
+        return await self.wait(
+            futures,
+            timeout=options.get("timeout"),
+            return_when=options.get("return_when", asyncio.ALL_COMPLETED),
+        )
 
 
 def test_the_commands_exit_code_and_both_streams_are_reported(tmp_path: Path) -> None:
@@ -220,8 +250,10 @@ def test_the_request_adds_variables_to_the_hosts_environment(tmp_path: Path) -> 
 
 def test_a_command_past_its_timeout_is_killed_with_its_children(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pids = tmp_path / "pid"
+    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(pids, timeout_sec=0.3))
 
     result = _run(
         _request(f"sleep 30 & echo $! > {pids}; wait", cwd=tmp_path, timeout_sec=0.3),
@@ -234,8 +266,10 @@ def test_a_command_past_its_timeout_is_killed_with_its_children(
 
 def test_a_child_that_ignores_termination_is_killed_at_the_timeout_too(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pids = tmp_path / "pid"
+    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(pids, timeout_sec=0.3))
 
     result = _run(
         _request(
@@ -249,8 +283,19 @@ def test_a_child_that_ignores_termination_is_killed_at_the_timeout_too(
     assert not _alive(int(pids.read_text()))
 
 
-def test_output_before_the_timeout_is_kept(tmp_path: Path) -> None:
-    result = _run(_request("echo started; sleep 30", cwd=tmp_path, timeout_sec=0.3))
+def test_output_before_the_timeout_is_kept(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = tmp_path / "ready"
+    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(ready, timeout_sec=0.3))
+    result = _run(
+        _request(
+            f"echo started; echo up > {ready}; sleep 30",
+            cwd=tmp_path,
+            timeout_sec=0.3,
+        ),
+    )
 
     assert _out(result) == b"started\n"
     assert result.exit_code == TIMEOUT_EXIT_CODE
@@ -258,8 +303,10 @@ def test_output_before_the_timeout_is_kept(tmp_path: Path) -> None:
 
 def test_a_background_job_that_holds_the_pipes_does_not_hold_the_result(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pids = tmp_path / "pid"
+    monkeypatch.setattr(exec_command, "_DRAIN_SEC", 0.01)
 
     result = _run(
         _request(f"sleep 30 & echo $! > {pids}; echo done", cwd=tmp_path),
@@ -674,10 +721,14 @@ def test_a_command_that_cannot_spawn_is_still_logged_and_posted(
 
 def test_stderr_at_the_limit_and_a_timeout_stay_within_the_limit(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    ready = tmp_path / "ready"
+    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(ready, timeout_sec=0.5))
     result = _run(
         _request(
-            f"head -c {MAX_STREAM_BYTES - 5} /dev/zero | tr '\\0' e >&2; sleep 30",
+            f"head -c {MAX_STREAM_BYTES - 5} /dev/zero | tr '\\0' e >&2; "
+            f"echo up > {ready}; sleep 30",
             cwd=tmp_path,
             timeout_sec=0.5,
         ),
@@ -689,8 +740,19 @@ def test_stderr_at_the_limit_and_a_timeout_stay_within_the_limit(
     assert result.truncated
 
 
-def test_a_timeout_message_that_fits_leaves_the_stream_whole(tmp_path: Path) -> None:
-    result = _run(_request("echo before >&2; sleep 30", cwd=tmp_path, timeout_sec=0.5))
+def test_a_timeout_message_that_fits_leaves_the_stream_whole(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ready = tmp_path / "ready"
+    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(ready, timeout_sec=0.5))
+    result = _run(
+        _request(
+            f"echo before >&2; echo up > {ready}; sleep 30",
+            cwd=tmp_path,
+            timeout_sec=0.5,
+        ),
+    )
 
     assert _err(result) == b"before\ntimed out after 0.5 s\n"
     assert not result.truncated
