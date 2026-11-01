@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from trackinizer.trax.private import canvas
+from trackinizer.trax import canvas
 
 import pytest
 

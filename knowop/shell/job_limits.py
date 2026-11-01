@@ -54,6 +54,10 @@ IDLE_MEMORY_MB: Final = 512
 
 _PROBE_MB: Final = 64
 
+_EXPANDS_SINCE: Final = 254
+"""The first systemd whose ``systemd-run`` rewrites ``$`` in the command it runs unless
+told ``--expand-environment=no``, a switch older ones refuse."""
+
 
 class Run(Protocol):
     """Runs one argv list and returns its exit code and standard output."""
@@ -130,6 +134,7 @@ def cap_problem(run: Run = run) -> str | None:
                 "-c",
                 'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"',
             ),
+            run=run,
         ),
     )
     if code:
@@ -145,14 +150,16 @@ def scope_argv(
     memory_mb: int,
     argv: Sequence[str],
     runtime_sec: float | None = None,
+    run: Run = run,
 ) -> list[str]:
     """Return the ``systemd-run`` command that runs ``argv`` in a capped scope.
 
     Args:
       unit: The scope's name, ``NAME.scope``; empty lets systemd choose one.
       memory_mb: The cap, in MiB.
-      argv: The command to run in it.
+      argv: The command to run in it, which reaches it as written.
       runtime_sec: Kill the entire scope at this deadline, even without its host.
+      run: Runs ``systemd-run --version`` when ``argv`` holds a ``$``.
 
     Returns:
       argv: The whole command.
@@ -163,6 +170,7 @@ def scope_argv(
         "--user",
         "--scope",
         "--quiet",
+        *(["--expand-environment=no"] if _expands(argv, run=run) else []),
         *(["--unit", unit] if unit else []),
         "-p",
         f"MemoryMax={memory_mb}M",
@@ -264,3 +272,14 @@ def idle_gpus(run: Run = run) -> list[int]:
 def memory_budget_mb() -> int:
     """Return the memory this computer's jobs may hold together: half of its RAM."""
     return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 2**20 // 2
+
+
+# Only a ``$`` is rewritten, so a command without one runs alike on every systemd and
+# needs no question asked.
+def _expands(argv: Sequence[str], *, run: Run) -> bool:
+    """Whether ``systemd-run`` would rewrite a ``$`` of ``argv`` (``$$`` becomes ``$``)."""
+    if not any("$" in arg for arg in argv):
+        return False
+    code, out = run(["systemd-run", "--version"])
+    found = re.match(r"systemd (\d+)", out)
+    return code == 0 and found is not None and int(found[1]) >= _EXPANDS_SINCE

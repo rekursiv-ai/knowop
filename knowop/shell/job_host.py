@@ -198,6 +198,7 @@ class SystemdLauncher:
             memory_mb=memory_mb,
             runtime_sec=folder.spec().minutes * 60 + _STOP_GRACE_SEC,
             argv=[sys.executable, "-m", job_runner.__name__, str(folder.path)],
+            run=self._run,
         )
         with folder.log.open("ab") as log:
             # A session of its own: a Ctrl-C to ``connect`` reaches its process group,

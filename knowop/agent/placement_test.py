@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from trackinizer.client.errors import ClientError
-from trackinizer.trax.private.canvas import canvas_from_env
+from trackinizer.trax.canvas import canvas_from_env
 from trackinizer.wire.wire_sessions import SessionPlacement
 
 import pytest
