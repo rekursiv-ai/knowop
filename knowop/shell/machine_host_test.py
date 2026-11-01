@@ -759,7 +759,7 @@ def test_host_facts_report_what_the_host_says_about_itself(
         return sysconf[name]
 
     def which(cli: str) -> str | None:
-        return "/bin/" + cli if cli in {"git", "uv"} else None
+        return "/bin/" + cli if cli in {"sagent", "git", "uv"} else None
 
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(platform, "machine", lambda: "aarch64")
@@ -783,7 +783,7 @@ def test_host_facts_report_what_the_host_says_about_itself(
         "cpus": 0,
         "memory_mb": 4096,
         "user": "ada",
-        "clis": ["git", "uv"],
+        "clis": ["sagent", "git", "uv"],
         "pid": 4242,
         "started_at": facts["started_at"],
         "knowop_version": "0.1.6",

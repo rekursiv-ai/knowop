@@ -81,7 +81,7 @@ __all__ = [
     "set_sandbox",
 ]
 
-HOST_CLIS: Final = ("claude", "codex", "knowop", "gemini", "git", "uv")
+HOST_CLIS: Final = ("claude", "codex", "sagent", "knowop", "gemini", "git", "uv")
 """The commands a host reports when it finds them on ``PATH``."""
 
 

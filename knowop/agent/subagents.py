@@ -172,6 +172,12 @@ class SubagentSinks(Sink):
         for child in self._children.values():
             child.keep_session_open()
 
+    # The run's own session alone: Chat waits on it, and a sub-agent was never Chat's
+    # to start.
+    @override
+    def fail(self, reason: str) -> None:
+        self._root.fail(reason)
+
     # The children close first and the run's session after them. Closing flushes what
     # a sink holds, which opens its session if it had none, so the links come last.
     @override

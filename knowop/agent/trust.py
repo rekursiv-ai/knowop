@@ -24,13 +24,13 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol
 
 import logging
 import os
-import re
 import threading
 import time
 import tomllib
 import unicodedata
 import uuid
 
+from trackinizer.lib.posix.terminal import CSI
 from trackinizer.sagent.session.types import SystemMessage
 from treekle import PlainTree, from_plain, json_loads
 
@@ -61,7 +61,6 @@ _KEY_GAP_SEC: Final = 0.3
 
 # Neither CLI writes its dialog's words side by side: each is placed by a cursor move
 # (codex ``\x1b[5;9H``), so the screen is matched with every CSI sequence made a space.
-_CSI: Final = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 _CODEX_ASKS: Final = b"Trust this folder?"
 
 # Enough of the output's end to hold a sequence split across two reads.
@@ -334,7 +333,7 @@ class TrustScreen:
             return
         joined = self._tail + raw
         # Matched as whole words, so ``XTrust this folder?`` is not the dialog.
-        words = b" ".join([b"", *_CSI.sub(b" ", joined).split(), b""])
+        words = b" ".join([b"", *CSI.sub(b" ", joined).split(), b""])
         if b" ".join([b"", _CODEX_ASKS, b""]) in words:
             seen, self._seen = self._seen, None
             seen()

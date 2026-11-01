@@ -5932,6 +5932,109 @@ def _drain_until_stop(*args: object, armed: threading.Event, **kwargs: object) -
     _ = stop.wait(5.0)
 
 
+class TestARunThatEndsBeforeItIsSeenSaysWhy:
+    """A run whose CLI ends before the run asks for its lines was seen nowhere.
+
+    Chat waits for the run it started to go live, so the session's end says why it did
+    not: the CLI's status and the last line it wrote. A run that asked first says
+    nothing, since Chat saw it.
+    """
+
+    def test_a_cli_that_dies_at_start_ends_the_session_with_its_last_line(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        server = _EndingServer()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        monkeypatch.setattr(session, "ThreadedRelay", _DiesAtStart)
+        monkeypatch.setattr(session, "_drain_filesystem_loop", _drain_until_stop)
+        monkeypatch.setattr(shutil, "which", _always_found)
+
+        status = session._spawn_and_drain(
+            RunConfig(cli_name="claude", client=server, quiesce_seconds=0.0),
+            ClaudeAdapter(),
+            LockedSink(TrackinizerSink(server, "claude")),
+            _Stats(),
+        )
+
+        assert status == 1
+        assert [end.failed for end in server.ends] == [
+            "exited with status 1: ImportError: boom",
+        ]
+        assert not server.parked.is_set()
+
+    def test_a_run_that_asked_for_its_lines_ends_saying_nothing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        server = _EndingServer()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+        monkeypatch.setattr(session, "ThreadedRelay", partial(_FailsOnceParked, server))
+        monkeypatch.setattr(session, "_drain_filesystem_loop", _drain_until_stop)
+        monkeypatch.setattr(session, "_HOOK_READY_SEC", 0.0)
+        monkeypatch.setattr(shutil, "which", _always_found)
+
+        status = session._spawn_and_drain(
+            RunConfig(cli_name="claude", client=server, quiesce_seconds=0.0),
+            ClaudeAdapter(),
+            LockedSink(TrackinizerSink(server, "claude")),
+            _Stats(),
+        )
+
+        assert status == 1
+        assert [end.failed for end in server.ends] == [None]
+
+
+class _EndingServer(_HoldingServer):
+    """Keeps each end the run sends, and ends the held drain as the route does."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ends: list[SessionEnd] = []
+
+    @override
+    def session_end(
+        self,
+        session_id: UUID,
+        body: SessionEnd | None = None,
+    ) -> SessionEndResponse:
+        assert body is not None
+        self.ends.append(body)
+        return super().session_end(session_id, body)
+
+
+class _DiesAtStart:
+    """A CLI that writes its traceback and exits 1 before it says it is ready."""
+
+    def __init__(
+        self,
+        argv: object,
+        *,
+        on_output: Callable[[bytes], None] | None = None,
+        **kwargs: object,
+    ) -> None:
+        del argv, kwargs
+        self._on_output = on_output
+
+    def run(self) -> int:
+        assert self._on_output is not None
+        self._on_output(b"Traceback (most recent call last):\r\n")
+        # A TUI leaves the terminal's modes as it found them on the way out.
+        self._on_output(b"ImportError: boom\r\n\x1b[?25h\x1b[0m")
+        return 1
+
+
+class _FailsOnceParked(_ExitsOnceParked):
+    """A CLI that exits 1 once the run has asked the server for its lines."""
+
+    @override
+    def run(self) -> int:
+        _ = super().run()
+        return 1
+
+
 class TestARefusedRunLeavesTheChatsSessionOpen:
     """The run a chat refuses stops, and its exit does not end the chat's session.
 

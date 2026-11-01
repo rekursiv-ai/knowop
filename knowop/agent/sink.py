@@ -367,6 +367,19 @@ class Sink(Protocol):
         """
         return
 
+    def fail(self, reason: str) -> None:
+        """Make :meth:`close` end the server session saying why the run failed.
+
+        For a run that ended before it asked for its lines, which no one saw it do:
+        Chat, waiting for the run it started, says why it did not start. A sink with no
+        server session has no one to tell.
+
+        Args:
+          reason: The CLI's status and the last line it wrote.
+
+        """
+        del reason
+
     def close(self) -> None:
         """Flush and release resources; idempotent."""
         ...
@@ -669,6 +682,8 @@ class TrackinizerSink(Sink):
         self._closed = False  # pragma: no mutate -- read only for truthiness.
         # Set by a run that leaves a session which is no longer only its own.
         self._keep_open = False
+        # Set by a run that ended before it asked for its lines (``fail``).
+        self._failed: str | None = None
 
     @property
     def granted_actor(self) -> str | None:
@@ -967,6 +982,10 @@ class TrackinizerSink(Sink):
         self._keep_open = True
 
     @override
+    def fail(self, reason: str) -> None:
+        self._failed = reason
+
+    @override
     def close(self) -> None:
         if self._closed:
             return
@@ -990,6 +1009,7 @@ class TrackinizerSink(Sink):
                         cli_session_id=self._cli_session_id,
                         cli=self._cli,
                         instance=self._instance,
+                        failed=self._failed,
                     ),
                 )
         self._closed = True
@@ -1186,6 +1206,10 @@ class ResilientSink(Sink):
     @override
     def keep_session_open(self) -> None:
         self._primary.keep_session_open()
+
+    @override
+    def fail(self, reason: str) -> None:
+        self._primary.fail(reason)
 
     # A run still down at exit tries once more, whatever the backoff says, and still
     # ends the session it opened, or that session stays ``active`` for good. Ending
@@ -1424,6 +1448,11 @@ class LockedSink(Sink):
     @override
     def keep_session_open(self) -> None:
         self._inner.keep_session_open()
+
+    # Not under the lock, for the reason ``keep_session_open`` is not.
+    @override
+    def fail(self, reason: str) -> None:
+        self._inner.fail(reason)
 
     @override
     def close(self) -> None:

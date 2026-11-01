@@ -51,6 +51,7 @@ class _Recorded(Sink):
         self.commands = 0
         self.flushed = 0
         self.kept = 0
+        self.failed: list[str] = []
         self.closed = 0
         self._log = log if log is not None else []
 
@@ -118,6 +119,10 @@ class _Recorded(Sink):
     @override
     def keep_session_open(self) -> None:
         self.kept += 1
+
+    @override
+    def fail(self, reason: str) -> None:
+        self.failed.append(reason)
 
     # Closing flushes, so it opens the session as a flush does.
     @override
@@ -332,6 +337,19 @@ def test_the_runs_own_records_and_choices_stay_with_its_session() -> None:
     assert tree.sinks.session_id == tree.run.session_id
     assert tree.run.cli_ids == ["s1"]
     assert (tree.run.kept, tree.children["a1"].kept) == (1, 1)
+
+
+def test_why_the_run_failed_is_said_by_its_own_session_alone() -> None:
+    """Chat waits on the run's session; a sub-agent's never was the run's to start."""
+    tree = _Tree()
+    _ = tree.sinks.feed(_agents(), _KID, b"one\n")
+
+    tree.sinks.fail("exited with status 1")
+
+    assert (tree.run.failed, tree.children["a1"].failed) == (
+        ["exited with status 1"],
+        [],
+    )
 
 
 @pytest.mark.parametrize("seen", [None, "a1"], ids=["first", "child"])
