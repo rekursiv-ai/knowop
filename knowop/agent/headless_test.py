@@ -299,7 +299,14 @@ class TestStart:
             assert rig.join() == 1
             assert not rig.started.is_set()
             assert not rig.listening.is_set()
+            # The session's end says it, for Chat waiting for the run to start.
+            assert rig.run.failure == "could not start codex headless: claude"
         assert "could not start codex headless: claude" in capsys.readouterr().err
+
+    def test_a_run_that_started_has_no_failure_to_say(self) -> None:
+        with _Rig() as rig:
+            rig.wait_started()
+            assert rig.run.failure == ""
 
 
 class TestEvents:

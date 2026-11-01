@@ -1317,6 +1317,30 @@ class TestAKeptOpenSessionIsNotEnded:
 
         assert client.ended == [client._id]
 
+    @pytest.mark.parametrize("failed", [None, "exited with status 1: ImportError: x"])
+    def test_the_end_says_why_the_run_failed_through_every_layer(
+        self,
+        tmp_path: Path,
+        failed: str | None,
+    ) -> None:
+        """A run that ended before Chat saw it says why; one that was not told, nothing."""
+        client = _FakeClient()
+        sink = LockedSink(
+            ResilientSink(
+                TrackinizerSink(client, "sagent"),
+                fallback_path=tmp_path / "fb.jsonl",
+            ),
+        )
+        sink.emit("sagent", _event("hi"))
+
+        if failed is not None:
+            sink.fail(failed)
+        sink.close()
+
+        [end] = client.end_bodies
+        assert end is not None
+        assert end.failed == failed
+
     @pytest.mark.parametrize("cli", ["claude", "codex"])
     def test_the_end_names_the_runs_cli(self, cli: str) -> None:
         """The server keeps the chat open when a run of a CLI it left ends it."""

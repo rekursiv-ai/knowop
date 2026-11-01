@@ -320,11 +320,17 @@ class HeadlessRun:
         self._loop: asyncio.AbstractEventLoop | None = None
         # The status the run ends with: the first one put here.
         self._done = asyncio.Queue[int]()
+        self._failure = ""
 
     @property
     def state(self) -> HostState:
         """Where the run stands."""
         return self._state
+
+    @property
+    def failure(self) -> str:
+        """Why the run could not start; empty for a run whose driver started."""
+        return self._failure
 
     @property
     def session_id(self) -> str:
@@ -431,9 +437,8 @@ class HeadlessRun:
         try:
             await self._begin(self._resume)
         except _DRIVER_ERRORS as error:
-            sys.stderr.write(
-                f"[{PROGRAM}] could not start {self._cli} headless: {error}\n",
-            )
+            self._failure = f"could not start {self._cli} headless: {error}"
+            sys.stderr.write(f"[{PROGRAM}] {self._failure}\n")
             return 1
         # Listening only now: a request that came while the driver started would find
         # no driver, and say the chat was taken over.

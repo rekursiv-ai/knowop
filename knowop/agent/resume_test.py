@@ -332,7 +332,7 @@ class TestAMixedSessionResumes:
         client = _PartsClient(
             {
                 0: (
-                    "sagent",
+                    "assistant",
                     [
                         AgentToAgentMessage(sender="ada@example.com", content="q1"),
                         AgentToAgentMessage(sender="bob@example.com", content="q2"),
@@ -340,7 +340,7 @@ class TestAMixedSessionResumes:
                     ],
                 ),
                 1: (
-                    "sagent",
+                    "assistant",
                     [
                         AgentToAgentMessage(sender="carol@example.com", content="q3"),
                         AgentToAgentMessage(sender="dave@example.com", content="q4"),
@@ -380,7 +380,7 @@ class TestAMixedSessionResumes:
         client = _PartsClient(
             {
                 0: (
-                    "sagent",
+                    "assistant",
                     [AgentToAgentMessage(sender="ada@example.com", content="q1")],
                 ),
                 1: (
@@ -391,7 +391,7 @@ class TestAMixedSessionResumes:
                     ],
                 ),
                 2: (
-                    "sagent",
+                    "assistant",
                     [
                         AgentToAgentMessage(sender="bob@example.com", content="q2"),
                         AssistantMessage(content="bot says"),
@@ -420,7 +420,7 @@ class TestAMixedSessionResumes:
         client = _PartsClient(
             {
                 0: (
-                    "sagent",
+                    "assistant",
                     [
                         AgentToAgentMessage(sender="ada@example.com", content="q1"),
                         AssistantMessage(content="bot says"),
@@ -453,7 +453,7 @@ class TestAMixedSessionResumes:
         client = _PartsClient(
             {
                 0: (
-                    "sagent",
+                    "assistant",
                     [
                         AgentToAgentMessage(sender="ada@example.com", content="q1"),
                         AssistantMessage(content="bot says"),
@@ -487,7 +487,7 @@ class TestAMixedSessionResumes:
         client = _PartsClient(
             {
                 0: (
-                    "sagent",
+                    "assistant",
                     [
                         AgentToAgentMessage(sender="ada@example.com", content="q1"),
                         AssistantMessage(content="bot says"),
@@ -513,7 +513,7 @@ class TestAMixedSessionResumes:
         client = _PartsClient(
             {
                 0: (
-                    "sagent",
+                    "assistant",
                     [
                         AgentToAgentMessage(sender="ada@example.com", content="q1"),
                         AssistantMessage(content="bot says"),
@@ -544,7 +544,7 @@ class TestAMixedSessionResumes:
         client = _PartsClient(
             {
                 0: (
-                    "sagent",
+                    "assistant",
                     [
                         AgentToAgentMessage(sender="ada@example.com", content="q1"),
                         AssistantMessage(content="bot says"),
@@ -874,7 +874,11 @@ class TestTheWindowIsWhatEachSwitchLoads:
         """At the switch to codex: claude's summary, then F2, then the bot's F3."""
         bot = _bot_part(_bot_said("ada@example.com", "F3 is plums", at=60))
 
-        written = _written("codex", ("claude", _claude_compacting()), ("sagent", bot))
+        written = _written(
+            "codex",
+            ("claude", _claude_compacting()),
+            ("assistant", bot),
+        )
 
         turns = _user_turns(written, "codex")
         assert "Summary of the conversation before this (by claude):" in turns[0]
@@ -898,7 +902,7 @@ class TestTheWindowIsWhatEachSwitchLoads:
             _claude_said("assistant", "noted F3", at=61),
         )
 
-        written = _written(target, ("sagent", bot), ("claude", later))
+        written = _written(target, ("assistant", bot), ("claude", later))
 
         turns = _user_turns(written, target)
         opening = next(turn for turn in turns if "Summary of the conversation" in turn)
@@ -919,7 +923,7 @@ class TestTheWindowIsWhatEachSwitchLoads:
             _claude_said("assistant", "noted F2", at=5),
         )
 
-        written = _written("codex", ("sagent", bot), ("claude", plain))
+        written = _written("codex", ("assistant", bot), ("claude", plain))
 
         everything = "\n".join(_user_turns(written, "codex"))
         assert (
@@ -981,7 +985,7 @@ class TestJpsTwoSequencesLoadTheLinesAfterTheCut:
         written = _written(
             target,
             ("claude", _claude_compacting()),
-            ("sagent", bot),
+            ("assistant", bot),
             ("codex", codex_part),
         )
 
@@ -999,7 +1003,7 @@ class TestJpsTwoSequencesLoadTheLinesAfterTheCut:
             _claude_said("assistant", "noted F3", at=61),
         )
 
-        written = _written(target, ("sagent", compacting), ("claude", later))
+        written = _written(target, ("assistant", compacting), ("claude", later))
 
         assert _own_lines(_user_turns(written, target)) == [
             "F2 is pears",
@@ -1024,7 +1028,7 @@ class TestASealedCodexSummaryInAFile:
     def test_codex_reads_back_one_compacted_line_and_nothing_before_it(self) -> None:
         bot = _bot_part(_bot_said("ada@example.com", "F5 is limes", at=60))
 
-        written = _written("codex", self._parts(), ("sagent", bot))
+        written = _written("codex", self._parts(), ("assistant", bot))
 
         lines = written.path.read_text(encoding="utf-8").splitlines()
         compacted = [line for line in lines if '"type":"compacted"' in line]
@@ -1035,7 +1039,7 @@ class TestASealedCodexSummaryInAFile:
     def test_claude_gets_the_kept_turn_and_never_the_ciphertext(self) -> None:
         bot = _bot_part(_bot_said("ada@example.com", "F5 is limes", at=60))
 
-        written = _written("claude", self._parts(), ("sagent", bot))
+        written = _written("claude", self._parts(), ("assistant", bot))
 
         text = written.path.read_text(encoding="utf-8")
         assert "gAAAA" not in text
@@ -1046,7 +1050,7 @@ class TestASealedCodexSummaryInAFile:
 def test_a_claude_file_opens_with_the_summary_claude_flags_then_an_answer() -> None:
     """Claude builds its context from such a line, as from its own compaction."""
     bot = _bot_part(_bot_said("ada@example.com", "F3 is plums", at=60))
-    written = _written("claude", ("claude", _claude_compacting()), ("sagent", bot))
+    written = _written("claude", ("claude", _claude_compacting()), ("assistant", bot))
 
     with written.path.open(encoding="utf-8") as handle:
         acts = [
@@ -1070,7 +1074,7 @@ def test_a_claude_file_opens_with_the_summary_claude_flags_then_an_answer() -> N
 def test_a_round_trip_keeps_the_summary_once_and_never_as_a_persons_line() -> None:
     """Written for claude, read back as claude's part, loaded again for codex."""
     bot = _bot_part(_bot_said("ada@example.com", "F3 is plums", at=60))
-    first = _written("claude", ("claude", _claude_compacting()), ("sagent", bot))
+    first = _written("claude", ("claude", _claude_compacting()), ("assistant", bot))
     with first.path.open(encoding="utf-8") as handle:
         again = list(claude.normalize(handle))
 
@@ -1088,7 +1092,7 @@ def test_a_cut_session_resumes_without_the_lossy_flag() -> None:
     """The window is what the file holds; the gate measures that, and drops nothing."""
     bot = _bot_part(_bot_said("ada@example.com", "F3 is plums", at=60))
 
-    written = _written("claude", ("claude", _claude_compacting()), ("sagent", bot))
+    written = _written("claude", ("claude", _claude_compacting()), ("assistant", bot))
 
     assert written.loaded_records > 0
     assert written.estimated_tokens > 0

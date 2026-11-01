@@ -69,6 +69,14 @@ All notable knowop changes are documented here. This project follows
   (`sagent --session PATH`), so each agent the session spawns is recorded in a
   session of its own under it. `--detach`, `attach`, `send` and `resume SESSION`
   work as for claude.
+- Chat can talk to sagent on a connected computer: `knowop connect` reports
+  `sagent` among the computer's CLIs when it is on `PATH`, and a chat that picks
+  sagent starts `knowop run sagent --detach --attach SESSION` there.
+- A run whose CLI ends before the run asks for Chat's lines says why as it ends
+  its session: the CLI's status and the last line it wrote, or why a headless
+  claude or codex could not start. Chat shows `sagent did not start on MACHINE:
+  exited with status 1: ...` at once, where it waited a minute and said only that
+  the run had not started.
 
 ### Changed
 

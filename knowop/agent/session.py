@@ -75,6 +75,7 @@ from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix.follow import follow_dir, follow_tree
 from trackinizer.lib.posix.host import HostSpec
 from trackinizer.lib.posix.relay import ThreadedRelay
+from trackinizer.lib.posix.terminal import CSI
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.runs.adapters.claude import ClaudeAdapter
 from trackinizer.runs.adapters.codex import CodexAdapter
@@ -277,6 +278,11 @@ _HOOK_READY_SEC: Final = 20.0
 # How long any other CLI's run waits for the CLI's first record before taking inbound
 # anyway: a CLI that writes nothing until its first turn would otherwise never hear.
 _RECORD_READY_SEC: Final = 15.0
+
+# How much of its output's end a run keeps for the line its CLI ended on, and how much of
+# that line Chat is told: a traceback's last line, not the whole of it.
+_LAST_WORDS_BYTES: Final = 4_096
+_LAST_WORDS_CHARS: Final = 500
 
 # How many typed lines wait for the record the CLI writes of them. A line typed while
 # a turn runs is folded into that turn and never gets a record of its own, so the
@@ -768,6 +774,10 @@ class InboundState:
     noted: bool = True
     """Whether the CLI's start note holds the using-knowop skill; if not, the first
     line carries it."""
+
+    asked: bool = False
+    """Whether the run has asked the server for its lines. From then Chat sees the run,
+    live or refused; a run that ends before has to say why it did not start."""
 
     _ready: threading.Event = field(default_factory=threading.Event, init=False)
     _deadline: float = field(default=0.0, init=False)
@@ -1842,6 +1852,8 @@ def _spawn_and_drain(
     # Codex alone prints its session id as it exits, so its owner alone reads
     # the terminal -- and alone looks for that banner once the CLI is gone.
     banner_reader = owner if adapter.name == "codex" else None
+    # Only a run with a server session has anyone to tell what its CLI ended on.
+    last_words = _LastWords() if config.syncing else None
     relay = ThreadedRelay(
         argv,
         env=env,
@@ -1852,6 +1864,7 @@ def _spawn_and_drain(
             None if stream_capture is None else stream_capture.feed,
             None if banner_reader is None else banner_reader.output,
             None if screen is None else screen.output,
+            None if last_words is None else last_words.output,
         ),
         on_started=None if owner is None else owner.started,
         bracketed_paste=stream_capture is None,
@@ -1919,6 +1932,12 @@ def _spawn_and_drain(
             # this emit serializes with the drain thread's.
             stream_capture.close()
 
+        _fail_unless_asked(
+            sink,
+            inbound,
+            status=rc,
+            words="" if last_words is None else last_words.line(),
+        )
         _wind_down(
             config,
             stop,
@@ -2006,6 +2025,56 @@ def _open_session(
             deadline=time.monotonic() + _JOIN_DEADLINE_SEC,
         )
         raise
+
+
+# A run that ends before it asks for its lines was seen nowhere, and Chat, which started
+# it, would wait out its minute: the session's end says why it did not start. A run that
+# asked was seen, live or refused, and says nothing.
+def _fail_unless_asked(
+    sink: Sink,
+    inbound: InboundState,
+    *,
+    status: int | None,
+    words: str,
+) -> None:
+    """Tell ``sink`` the CLI's status and ``words`` when the run never asked."""
+    if inbound.asked or status is None:
+        return
+    said = f"exited with status {status}"
+    sink.fail(f"{said}: {words}" if words else said)
+
+
+class _LastWords:
+    """Keeps the end of what the CLI wrote, for the line it ended on."""
+
+    def __init__(self) -> None:
+        self._tail = b""
+
+    def output(self, raw: bytes) -> None:
+        """Read one chunk of the CLI's output.
+
+        Args:
+          raw: The bytes the CLI wrote to its terminal.
+
+        """
+        self._tail = (self._tail + raw)[-_LAST_WORDS_BYTES:]
+
+    def line(self) -> str:
+        """Return the last line the CLI wrote with text on it.
+
+        Returns:
+          line: Its text, without the terminal's control sequences, cut to
+            ``_LAST_WORDS_CHARS``; empty when the CLI wrote none.
+
+        """
+        text = CSI.sub(b"", self._tail).decode(errors="replace")
+        lines = (
+            "".join(c for c in line if c.isprintable()).strip()
+            for line in text.splitlines()
+        )
+        return next((line for line in reversed(list(lines)) if line), "")[
+            :_LAST_WORDS_CHARS
+        ]
 
 
 def _wind_down(
@@ -2283,14 +2352,17 @@ def _headless_and_drain(
     if reporter is not None:
         reporter.start()
     # The teardown runs even when the run raises, for the reason a terminal run's does.
+    status: int | None = None
     try:
-        return run.run(on_started=None if poll_thread is None else poll_thread.start)
+        status = run.run(on_started=None if poll_thread is None else poll_thread.start)
+        return status
     finally:
         if hook_files is not None:
             shutil.rmtree(hook_files.settings.parent, ignore_errors=True)
         # Before the sink closes the session, which a report to it would follow.
         if reporter is not None:
             reporter.close()
+        _fail_unless_asked(sink, inbound, status=status, words=run.failure)
         _wind_down(
             config,
             stop,
@@ -3279,6 +3351,8 @@ def _inbound_poll_loop(
         hold = poll_interval if held or _trusting(inbound) else wait_sec
         if runs is not None and runs.running():
             hold = min(hold, _RUN_WAIT_SEC)
+        if inbound is not None:
+            inbound.asked = True
         try:
             batch = client.drain_inbound(
                 session_id,
