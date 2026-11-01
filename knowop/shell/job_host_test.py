@@ -9,9 +9,11 @@ from typing import TYPE_CHECKING
 import base64
 import fcntl
 import hashlib
+import io
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -1496,9 +1498,8 @@ def test_the_systemd_launcher_starts_the_runner_in_a_capped_scope_of_its_own(
 
     launcher.start(folder, unit="knowop-job-ab-7", memory_mb=512, env={"A": "1"})
 
-    argv = seen["argv"]
-    assert isinstance(argv, list)
-    assert argv[:10] == [
+    # Its deadline is the job's five minutes and ten seconds' grace.
+    assert seen["argv"] == [
         "systemd-run",
         "--user",
         "--scope",
@@ -1509,8 +1510,12 @@ def test_the_systemd_launcher_starts_the_runner_in_a_capped_scope_of_its_own(
         "MemoryMax=512M",
         "-p",
         "MemorySwapMax=0",
-    ]
-    assert argv[-3:] == [
+        "-p",
+        "RuntimeMaxSec=310",
+        "-p",
+        "KillSignal=SIGKILL",
+        "--",
+        sys.executable,
         "-m",
         "knowop.shell.job_runner",
         str(folder.path),
@@ -1520,8 +1525,39 @@ def test_the_systemd_launcher_starts_the_runner_in_a_capped_scope_of_its_own(
         {"A": "1"},
         True,
     )
+    log = seen["stdout"]
+    assert isinstance(log, io.BufferedWriter)
+    assert (log.name, seen["stderr"]) == (str(folder.log), subprocess.STDOUT)
     assert seen["stdin"] == subprocess.DEVNULL
     assert launcher.alive("knowop-job-ab-7")
+
+
+def test_the_systemd_launcher_asks_its_own_systemd_whether_to_keep_a_dollar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A folder named with a ``$`` reaches the runner as named on systemd 255."""
+    seen: dict[str, object] = {}
+    asked: list[list[str]] = []
+
+    def popen(argv: list[str], **kwargs: object) -> _Child:
+        seen.update(kwargs, argv=argv)
+        return _Child(None)
+
+    def systemd(argv: Sequence[str]) -> tuple[int, str]:
+        asked.append(list(argv))
+        return 0, "systemd 255 (255.4-1ubuntu8.6)\n"
+
+    monkeypatch.setattr(job_host.subprocess, "Popen", popen)
+    folder = JobFolder.create(tmp_path / "$HOME", _spec())
+
+    SystemdLauncher(run=systemd).start(folder, unit="u", memory_mb=512, env={})
+
+    argv = seen["argv"]
+    assert isinstance(argv, list)
+    assert asked == [["systemd-run", "--version"]]
+    assert argv[4] == "--expand-environment=no"
+    assert argv[-1] == str(folder.path)
 
 
 def test_the_systemd_launcher_asks_systemd_about_a_scope_it_did_not_start(

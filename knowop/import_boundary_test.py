@@ -4,7 +4,8 @@ The client ships alone, as the public ``knowop`` package; the project around it 
 private. A shipped module may import the standard library, the client itself, and
 what a ``trackinizer`` install provides (trackinizer, the ``lib`` modules it carries,
 and its dependencies), and the ``lib`` modules knowop's export vendors itself. Any
-other import fails on a public install, or ships private code.
+other import fails on a public install, or ships private code. Every export withholds
+a module with ``private`` in its path, so none of these is allowed from any package.
 """
 
 from __future__ import annotations
@@ -75,6 +76,12 @@ def test_a_shipped_module_imports_only_the_client_trackinizer_and_the_stdlib(
     assert [name for name in _imports(path) if not _allowed(name)] == []
 
 
+def test_a_module_an_export_withholds_is_never_allowed() -> None:
+    assert _allowed("trackinizer.trax.render")
+    assert not _allowed("trackinizer.server.api.private.routers")
+    assert not _allowed(f"{_PACKAGE}.private")
+
+
 def test_the_scan_reads_the_cli_and_its_lazy_imports() -> None:
     assert _CWD / "cli.py" in _shipped()
     assert any(
@@ -84,6 +91,9 @@ def test_the_scan_reads_the_cli_and_its_lazy_imports() -> None:
 
 def _allowed(name: str) -> bool:
     """Whether a shipped module may import ``name``."""
+    # The exports leave out ``**/*private*``, so such a module is in no public install.
+    if any("private" in part for part in name.split(".")):
+        return False
     return name.split(".", maxsplit=1)[0] in sys.stdlib_module_names or any(
         name == prefix or name.startswith(f"{prefix}.") for prefix in _ALLOWED
     )

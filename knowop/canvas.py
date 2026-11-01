@@ -1,7 +1,7 @@
 """The ``knowop canvas`` command: trax's canvas verb, on knowop's login.
 
 The grammar, the requests and the output are trax's own
-(:class:`~trackinizer.trax.private.canvas.Canvas`), and ``$TRAX_CANVAS`` names the
+(:class:`~trackinizer.trax.canvas.Canvas`), and ``$TRAX_CANVAS`` names the
 canvas when the command names none. An agent that ``knowop run`` started can then drive
 the canvas it sits on from a computer where knowop is installed and trax is not.
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final, override
 
-from trackinizer.trax.private import canvas
+from trackinizer.trax import canvas
 
 
 if TYPE_CHECKING:

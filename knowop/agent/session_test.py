@@ -76,7 +76,6 @@ from trackinizer.trax.daemon.protocol import socket_address
 from trackinizer.trax.profile import LOCALHOST_FALLBACK_URL
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.audience import PRIVATE
-from trackinizer.wire.private.chat_commands import Command, classify
 from trackinizer.wire.wire_session_ir import (
     AppendRecordsResponse,
     ManifestBody,
@@ -164,7 +163,6 @@ from knowop.shell import machine_host
 
 _THIS: Final = Path(__file__).resolve()
 
-_CWD: Final = Path(__file__).resolve().parent
 
 if TYPE_CHECKING:
     from trackinizer.runs.adapters.custom_types import Adapter
@@ -8044,48 +8042,6 @@ class _CardCheckingRelay(_WiringRelay):
 
 class TestChatCommands:
     """A command from Chat is typed bare and recorded; codex keeps its goal modal shut."""
-
-    def test_the_servers_goal_is_typed_verbatim_and_recorded_as_chat_reads_it(
-        self,
-    ) -> None:
-        """The server's command for ``/Goal ship it``, typed and recorded as the web reads it.
-
-        The record is compared with ``testdata/seams/goalCommand.json``, a copy of the
-        file the web's tests render, which ``seams_test.py`` holds equal to it, so a
-        change of shape on either side fails both.
-        """
-        command = classify("/Goal ship it", "claude")
-        assert isinstance(command, Command)
-        relay = _RecordingRelay()
-        records: list[SystemMessage] = []
-
-        session._deliver_one(
-            relay,
-            InboundDrainItem(
-                text=command.text,
-                kind="command",
-                source="ada@example.com",
-            ),
-            stream=False,
-            inbound=InboundState(fallback_sec=0.0),
-            cli="claude",
-            record=records.append,
-        )
-
-        assert relay.submitted == ["/goal ship it"]
-        [record] = records
-        stored = RecordBody.of(
-            SessionRecordRow.of(
-                session_id=UUID(int=0),
-                part=1,
-                idx=2,
-                record=replace(record, timestamp="2026-10-20T00:00:01+00:00"),
-            ),
-        ).model_dump(mode="json")
-        seam = _CWD / "testdata" / "seams" / "goalCommand.json"
-        assert json_loads(json.dumps(stored)) == json_loads(
-            seam.read_text(encoding="utf-8"),
-        )
 
     def test_a_command_is_typed_bare_and_recorded_but_never_stamped(self) -> None:
         relay = _RecordingRelay()

@@ -50,6 +50,8 @@ class _Run:
         key = argv[0].replace("-", "_")
         if key == "nvidia_smi" and any("compute-apps" in each for each in argv):
             key = "apps"
+        if key == "systemd_run" and "--version" in argv:
+            key = "version"
         return self.answers.get(key, (127, ""))
 
 
@@ -102,11 +104,70 @@ def test_a_scope_caps_memory_with_no_swap_and_runs_the_command() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("version", "verbatim"),
+    [
+        ((0, "systemd 255 (255.4-1ubuntu8.6)\n+PAM +AUDIT\n"), True),
+        ((0, "systemd 254 (254.5-1)\n"), True),
+        ((0, "systemd 249 (249.11-0ubuntu3.12)\n"), False),
+        ((127, ""), False),
+    ],
+)
+def test_a_dollar_reaches_the_command_as_written(
+    version: tuple[int, str],
+    verbatim: bool,
+) -> None:
+    """From 254, systemd-run expands ``$`` unless told not to; older ones refuse that."""
+    fake = _Run(version=version)
+    command = ["sh", "-c", 'printf "%s\\n" "$$"']
+
+    argv = scope_argv(unit="u", memory_mb=64, argv=command, run=fake)
+
+    assert ("--expand-environment=no" in argv) is verbatim
+    assert argv[argv.index("--") + 1 :] == command
+    assert fake.seen == [["systemd-run", "--version"]]
+
+
+def test_a_command_without_a_dollar_asks_systemd_nothing() -> None:
+    fake = _Run(version=(0, "systemd 255 (255.4)\n"))
+
+    argv = scope_argv(unit="u", memory_mb=64, argv=["true"], run=fake)
+
+    assert "--expand-environment=no" not in argv
+    assert fake.seen == []
+
+
+@pytest.mark.parametrize(
+    ("runtime_sec", "runtime_property"),
+    [(70, "RuntimeMaxSec=70"), (0.5, "RuntimeMaxSec=0.5")],
+)
+def test_a_scope_deadline_kills_the_scope_at_its_runtime_limit(
+    runtime_sec: float,
+    runtime_property: str,
+) -> None:
+    argv = scope_argv(
+        unit="knowop-job-test",
+        memory_mb=128,
+        runtime_sec=runtime_sec,
+        argv=["true"],
+    )
+
+    assert argv[argv.index("MemorySwapMax=0") + 1 : argv.index("--")] == [
+        "-p",
+        runtime_property,
+        "-p",
+        "KillSignal=SIGKILL",
+    ]
+
+
 def test_the_cap_holds_when_a_probe_scope_reads_its_own_cap() -> None:
-    fake = _Run(systemd_run=(0, "67108864\n"))
+    fake = _Run(systemd_run=(0, "67108864\n"), version=(0, "systemd 255 (255.4)\n"))
 
     assert cap_problem(fake) is None
-    [argv] = fake.seen
+    # The probe's command reads its cgroup through ``$(...)``, so it asks the version.
+    version, argv = fake.seen
+    assert version == ["systemd-run", "--version"]
+    assert "--expand-environment=no" in argv
     assert argv[:4] == ["systemd-run", "--user", "--scope", "--quiet"]
     assert "--unit" not in argv
     assert argv[argv.index("--") + 1 :][:2] == ["sh", "-c"]
