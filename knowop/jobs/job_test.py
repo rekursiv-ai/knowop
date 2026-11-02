@@ -72,7 +72,7 @@ def _grant(role: str = "rw") -> Grant:
                 "name": "gpu-node-b",
                 "host": "203.0.113.7",
                 "port": 22,
-                "user": "gj7",
+                "user": "rai-ext-job-7",
                 "host_key": _PUBLIC,
             },
             "certificate": _CERT,
