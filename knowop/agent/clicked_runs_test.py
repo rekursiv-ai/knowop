@@ -100,6 +100,7 @@ class TestAClickedCommand:
 
         refused = _run(records[-1])
         runs.close()
+        _drain(runs)
 
         assert (refused["state"], refused["reason"]) == ("refused", "too many running")
         assert refused["run_id"] == f"{MOST_RUNNING:032x}"
@@ -255,6 +256,21 @@ def _lines(runs: ClickedRuns) -> list[InboundDrainItem]:
     while not (lines := runs.take()) and runs.running():
         if time.monotonic() > deadline:
             raise AssertionError("A clicked command did not end within 5 s.")
+        time.sleep(0.001)
+    return lines
+
+
+# A test that returns with a command still running leaves its wait thread to read the
+# command's output files after this test's user dirs are gone; pytest then charges that
+# thread's FileNotFoundError to whichever test runs next.
+def _drain(runs: ClickedRuns) -> list[InboundDrainItem]:
+    """Return every line due, waiting until no clicked command runs."""
+    lines: list[InboundDrainItem] = []
+    deadline = time.monotonic() + 5.0
+    while runs.running():
+        if time.monotonic() > deadline:
+            raise AssertionError("Clicked commands did not end within 5 s.")
+        lines += runs.take()
         time.sleep(0.001)
     return lines
 
