@@ -132,37 +132,39 @@ class Search:
             argv += ["--glob", f"!{glob}"]
         # Run in the folder: ripgrep anchors a glob with a slash (`src/**`) at its working
         # directory, where VS Code's fields mean the folder searched.
-        process = subprocess.Popen(  # noqa: S603 -- A fixed ripgrep argv, no shell.
+        hits: dict[str, list[Hit]] = {}
+        count = 0
+        truncated = False
+        # The ``with`` closes both pipes: the deadline thread holds ``process`` for
+        # up to ``deadline_sec``, so pipes left to it are finalized unclosed.
+        with subprocess.Popen(  # noqa: S603 -- A fixed ripgrep argv, no shell.
             [*argv, "--", self.query, "."],
             cwd=self.root,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-        )
-        # Killing ripgrep ends its output, which ends the read below.
-        threading.Thread(
-            target=_kill_when,
-            args=(process, self._stopped, self.deadline_sec),
-            daemon=True,
-        ).start()
-        hits: dict[str, list[Hit]] = {}
-        count = 0
-        truncated = False
-        try:
-            for line in process.stdout or ():
-                if count >= MAX_HITS or self._stopped.is_set():
-                    truncated = True
-                    break
-                if not line.startswith(b'{"type":"match"'):
-                    continue
-                found = _rg_hit(line)
-                if found is not None:
-                    path = self.root + found[0].removeprefix(".")
-                    hits.setdefault(path, []).append(found[1])
-                    count += 1
-        finally:
-            process.kill()
-            stderr = process.stderr.read() if process.stderr is not None else b""
-            code = process.wait()
+        ) as process:
+            # Killing ripgrep ends its output, which ends the read below.
+            threading.Thread(
+                target=_kill_when,
+                args=(process, self._stopped, self.deadline_sec),
+                daemon=True,
+            ).start()
+            try:
+                for line in process.stdout or ():
+                    if count >= MAX_HITS or self._stopped.is_set():
+                        truncated = True
+                        break
+                    if not line.startswith(b'{"type":"match"'):
+                        continue
+                    found = _rg_hit(line)
+                    if found is not None:
+                        path = self.root + found[0].removeprefix(".")
+                        hits.setdefault(path, []).append(found[1])
+                        count += 1
+            finally:
+                process.kill()
+                stderr = process.stderr.read() if process.stderr is not None else b""
+                code = process.wait()
         # 2 is an error: an invalid regex, or a folder ripgrep cannot read at all. One
         # unreadable file below the folder is also 2, with what was found kept.
         if code == 2 and not hits and not truncated:
@@ -303,7 +305,7 @@ def _brace(globs: Iterable[str]) -> str:
     """Join globs into one brace set, the one glob ``Query`` takes."""
     joined = list(globs)
     if len(joined) < 2:
-        return "".join(joined)
+        return joined[0] if joined else ""
     return "{" + ",".join(joined) + "}"
 
 

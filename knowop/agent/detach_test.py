@@ -19,7 +19,8 @@ import sys
 import threading
 import time
 
-from trackinizer.trax.daemon.protocol import socket_address
+from trackinizer.lib.posix.detached import Readiness, await_ready
+from trackinizer.lib.posix.sockets import socket_address
 from treekle import from_plain, json_dumps, json_loads, to_plain
 
 import pytest
@@ -149,30 +150,6 @@ class TestState:
         assert detach._state(record) == "lost"
 
 
-class TestAlive:
-    """Liveness is a probe: it must never disturb the process it asks about."""
-
-    def test_a_live_process_is_alive_and_untouched(
-        self,
-        live_child: subprocess.Popen[bytes],
-    ) -> None:
-        assert detach._alive(live_child.pid)
-        time.sleep(0.05)
-        assert live_child.poll() is None
-
-    def test_a_reaped_process_is_gone(self) -> None:
-        assert not detach._alive(_dead_pid())
-
-    def test_a_process_this_user_may_not_signal_is_alive(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Another user's process refuses the probe; it still exists."""
-        monkeypatch.setattr(detach.os, "kill", _refuse_signal)
-
-        assert detach._alive(1)
-
-
 class TestTail:
     """What the launcher repeats from a host's log."""
 
@@ -202,23 +179,6 @@ class TestExitStatus:
         """The launcher shows the host log, so the reason must reach it."""
         assert detach._exit_status("knowop run: claude not found in PATH") == 1
         assert capsys.readouterr().err == "knowop run: claude not found in PATH\n"
-
-
-class TestReadiness:
-    """The pipe a launcher waits on: one answer, then closed."""
-
-    def test_accept_answers_ok_once(self) -> None:
-        """The later ``close`` must neither write again nor close a reused fd."""
-        read_fd, write_fd = os.pipe()
-        readiness = detach._Readiness(write_fd)
-        readiness.accept()
-        readiness.close()
-        assert detach._await_ready(read_fd) == b"ok"
-
-    def test_close_without_accepting_reads_as_a_failure(self) -> None:
-        read_fd, write_fd = os.pipe()
-        detach._Readiness(write_fd).close()
-        assert detach._await_ready(read_fd) == b""
 
 
 def test_launch_execs_a_new_interpreter_without_forking_python(
@@ -281,7 +241,14 @@ def test_a_failed_spawn_closes_both_ends_of_the_ready_pipe(
 
 def launch(name: str, *, command: str, start: Callable[[HostSpec], int]) -> int:
     """Exercise host bookkeeping with an in-process runner at the spawn boundary."""
-    request = RunRequest(
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(detach, "_spawn", partial(_spawn_here, start))
+        return detach.launch(name, command=command, request=_run_request(name))
+
+
+def _run_request(name: str) -> RunRequest:
+    """Return the plain inputs of a run named ``name`` that wraps nothing."""
+    return RunRequest(
         flags={},
         cli_argv=[],
         connection=None,
@@ -293,9 +260,31 @@ def launch(name: str, *, command: str, start: Callable[[HostSpec], int]) -> int:
         compact_after_load=False,
         run_name=name,
     )
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(detach, "_spawn", partial(_spawn_here, start))
-        return detach.launch(name, command=command, request=request)
+
+
+def _spawn_refused(
+    spawned: list[tuple[HostRequest, Path]],
+    request: HostRequest,
+    *,
+    ready: int,
+    log: Path,
+) -> None:
+    """Note what a spawn was asked for, then fail as an exec would."""
+    del ready
+    spawned.append((request, log))
+    raise OSError("cannot exec")
+
+
+def _spawn_silent(
+    held: list[int],
+    request: HostRequest,
+    *,
+    ready: int,
+    log: Path,
+) -> None:
+    """Stand in for a host that starts and never answers: hold its pipe open."""
+    del request, log
+    held.append(os.dup(ready))
 
 
 def _spawn_here(
@@ -337,7 +326,7 @@ class TestTheHost:
         """The host's stdio stays the test's."""
         start, status, logged = _HOST_ENDS[how]
         redirected: list[Path] = []
-        monkeypatch.setattr(detach, "_redirect_stdio", redirected.append)
+        monkeypatch.setattr(detach, "redirect_stdio", redirected.append)
         paths = detach._paths("upsilon")
         paths.mkdir(parents=True)
         read_fd, write_fd = os.pipe()
@@ -373,31 +362,12 @@ class TestTheHost:
     ) -> None:
         read_fd, write_fd = os.pipe()
 
-        detach._listening(tmp_path, _record(tmp_path), detach._Readiness(write_fd))
+        detach._listening(tmp_path, _record(tmp_path), Readiness(write_fd))
 
         record = detach._read_record(tmp_path)
         assert record is not None
         assert record.state == "running"
-        assert detach._await_ready(read_fd) == b"ok"
-
-    def test_the_hosts_output_goes_to_its_log_and_its_input_is_empty(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        log = tmp_path / "host.log"
-        saved = [os.dup(fd) for fd in (0, 1, 2)]
-        try:
-            detach._redirect_stdio(log)
-            _ = os.write(1, b"out\n")
-            _ = os.write(2, b"err\n")
-            read = os.read(0, 1)
-        finally:
-            for fd, copy in enumerate(saved):
-                _ = os.dup2(copy, fd)
-                os.close(copy)
-
-        assert (read, log.read_bytes()) == (b"", b"out\nerr\n")
-        assert stat.S_IMODE(log.stat().st_mode) == 0o600
+        assert await_ready(read_fd, timeout_sec=1.0) is True
 
 
 class TestCommands:
@@ -648,6 +618,41 @@ class TestCommands:
         assert capsys.readouterr().err == (
             "knowop run: host 'sigma' failed to start; its log follows\n"
             "[knowop run] claude not found\n"
+        )
+
+    def test_the_host_is_spawned_in_a_private_directory_with_its_socket_and_log(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        spawned: list[tuple[HostRequest, Path]] = []
+        monkeypatch.setattr(detach, "_spawn", partial(_spawn_refused, spawned))
+
+        with pytest.raises(OSError, match="cannot exec"):
+            _ = detach.launch("lambda", command="sh", request=_run_request("lambda"))
+
+        paths = detach._paths("lambda")
+        [(request, log)] = spawned
+        assert stat.S_IMODE(paths.stat().st_mode) == 0o700
+        assert request["address"] == str(socket_address(paths / "host.sock"))
+        assert log == paths / "host.log"
+
+    def test_a_host_silent_past_the_wait_is_reported_not_killed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        held: list[int] = []
+        monkeypatch.setattr(detach, "_READY_TIMEOUT_SEC", 0.01)
+        monkeypatch.setattr(detach, "_spawn", partial(_spawn_silent, held))
+        try:
+            status = detach.launch("kappa", command="sh", request=_run_request("kappa"))
+        finally:
+            for fd in held:
+                os.close(fd)
+
+        assert status == 1
+        assert capsys.readouterr().err == (
+            "knowop run: host 'kappa' did not accept in time; its log follows\n"
         )
 
     def test_launch_refuses_a_running_name(self) -> None:
@@ -1607,11 +1612,6 @@ def _headless(
             ),
         )
         yield control
-
-
-def _refuse_signal(pid: int, signal: int) -> None:
-    """Stand in for ``os.kill`` on a process of another user."""
-    raise PermissionError(1, "Operation not permitted", f"{pid} {signal}")
 
 
 def _accept_then_end(spec: HostSpec) -> int:

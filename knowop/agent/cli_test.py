@@ -15,6 +15,7 @@ import uuid
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
+from trackinizer.lib.posix.detached import await_ready
 from trackinizer.trax import profile
 from trackinizer.trax.profile import Profile
 from treekle import json_dumps, json_loads
@@ -184,7 +185,7 @@ def test_the_host_entry_reads_and_closes_its_private_descriptor(
     read_fd, write_fd = os.pipe()
     request["ready"] = write_fd
     redirected: list[Path] = []
-    monkeypatch.setattr(detach, "_redirect_stdio", redirected.append)
+    monkeypatch.setattr(detach, "redirect_stdio", redirected.append)
     ran: list[session.RunConfig] = []
     monkeypatch.setattr(session, "run", partial(_record_host_run, ran))
     with tempfile.TemporaryFile() as payload:
@@ -193,7 +194,7 @@ def test_the_host_entry_reads_and_closes_its_private_descriptor(
         inherited = os.dup(payload.fileno())
         try:
             assert cli.main(["--_host", str(inherited)]) == 7
-            assert os.read(read_fd, 2) == b"ok"
+            assert await_ready(os.dup(read_fd), timeout_sec=1.0) is True
         finally:
             os.close(read_fd)
         with pytest.raises(OSError, match="Bad file descriptor"):

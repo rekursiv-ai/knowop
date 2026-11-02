@@ -51,6 +51,7 @@ from trackinizer.lib.posix import follow
 from trackinizer.lib.posix.follow import follow_tree
 from trackinizer.lib.posix.host import HostSpec
 from trackinizer.lib.posix.relay import ThreadedRelay
+from trackinizer.lib.posix.sockets import socket_address
 from trackinizer.lib.userdirs import data_dir
 from trackinizer.runs.adapters.claude import ClaudeAdapter
 from trackinizer.runs.adapters.codex import CodexAdapter
@@ -72,7 +73,6 @@ from trackinizer.sagent.session.types import (
     UncategorizedRecord,
     UserMessage,
 )
-from trackinizer.trax.daemon.protocol import socket_address
 from trackinizer.trax.profile import LOCALHOST_FALLBACK_URL
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.audience import PRIVATE
