@@ -106,6 +106,44 @@ class TestRecords:
         detach._write_record(tmp_path, record)
         assert detach._read_record(tmp_path) == record
 
+    @pytest.mark.parametrize(
+        "tagged_type",
+        [
+            "loop." + "knowop.client.agent.detach.HostRecord",
+            ("loop." + "experimental.") + "knowop.client.agent.detach.HostRecord",
+        ],
+    )
+    def test_reads_records_tagged_with_a_retired_type_path(
+        self,
+        tmp_path: Path,
+        tagged_type: str,
+    ) -> None:
+        """Host records from either former module path keep every field."""
+        text = (
+            '{"py/object":"__HOST_TYPE__","name":"legacy",'
+            '"command":"python worker","cwd":"/srv/work","pid":42,'
+            '"address":"/var/run/host.sock","started":"2026-10-03T00:00:00+00:00",'
+            '"state":"exited","exit_code":7,'
+            '"ended":"2026-10-03T00:01:00+00:00","machine":"host-a",'
+            '"control":"/var/run/control.sock","session":"session-1"}'
+        ).replace("__HOST_TYPE__", tagged_type)
+        (tmp_path / "host.json").write_text(text)
+
+        assert detach._read_record(tmp_path) == HostRecord(
+            name="legacy",
+            command="python worker",
+            cwd="/srv/work",
+            pid=42,
+            address="/var/run/host.sock",
+            started="2026-10-03T00:00:00+00:00",
+            state="exited",
+            exit_code=7,
+            ended="2026-10-03T00:01:00+00:00",
+            machine="host-a",
+            control="/var/run/control.sock",
+            session="session-1",
+        )
+
     def test_an_unreadable_record_is_absent(self, tmp_path: Path) -> None:
         (tmp_path / "host.json").write_text("{not json")
         assert detach._read_record(tmp_path) is None

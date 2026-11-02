@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import base64
+import errno
 import hashlib
 import os
 import threading
@@ -171,6 +172,21 @@ def test_fifo_reads_refuse_without_blocking(
 
     assert not blocked, "a FIFO occupied the read worker"
     assert isinstance(results[0], OSError if kind == "log" else ReadRefused)
+
+
+def test_a_fifo_in_place_of_the_log_is_refused_as_not_a_regular_file(
+    tmp_path: Path,
+) -> None:
+    folder = _folder(tmp_path)
+    os.mkfifo(folder.log)
+
+    with pytest.raises(OSError, match="The log is not a regular file") as raised:
+        _ = folder.read_log(0)
+
+    assert (raised.value.errno, raised.value.strerror) == (
+        errno.EINVAL,
+        "The log is not a regular file",
+    )
 
 
 def _results(folder: JobFolder) -> None:
