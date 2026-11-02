@@ -67,9 +67,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
     """Peel the connection flags in front of the verb; return them and the rest."""
     tokens = list(argv)
-    # pragma: no mutate start -- ``None`` is as falsy as ``False``: no help flag either way.
     parser = argparse.ArgumentParser(prog=PROGRAM, add_help=False)
-    # pragma: no mutate end
     connect_flags(parser)
     end = _prefix_end(tokens)
     flags, unknown = parser.parse_known_args(tokens[:end])

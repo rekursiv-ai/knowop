@@ -3062,10 +3062,7 @@ def _with_knowop(
             value.startswith("developer_instructions")
             for value in _codex_config_values(given)
         ):
-            text = json.dumps(
-                using_knowop(),
-                ensure_ascii=False,
-            )  # pragma: no mutate -- None is as falsy as False.
+            text = json.dumps(using_knowop(), ensure_ascii=False)
             skill = ["-c", f"developer_instructions={text}"]
         if tools:
             served = [

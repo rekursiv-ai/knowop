@@ -677,8 +677,8 @@ class TrackinizerSink(Sink):
         self._diff_ir_id: UUID | None = None
         # The run's own parts (``emit_run_record``), declared with no format.
         self._run_parts: set[Path] = set()
-        # Set whenever the buffer fills from empty, so this value is never read.
-        self._oldest_buffered_at: float | None = None  # pragma: no mutate
+        # Set whenever the buffer fills from empty, before anything reads it.
+        self._oldest_buffered_at: float | None
         self._closed = False  # pragma: no mutate -- read only for truthiness.
         # Set by a run that leaves a session which is no longer only its own.
         self._keep_open = False
@@ -1084,9 +1084,10 @@ class ResilientSink(Sink):
         # When to next try the server; ``None`` while it is reachable.
         self._retry_at: float | None = None
         # Last adapter name seen, to label replayed buffer events on degrade
-        # (the primary's buffered bodies don't carry the adapter name). Never read
-        # before an emit sets it: only an emit buffers a body.
-        self._adapter_for_fallback = ""  # pragma: no mutate
+        # (the primary's buffered bodies don't carry the adapter name). Before any
+        # emit only a run record can be stranded, labelled as ``emit_run_record``
+        # labels one.
+        self._adapter_for_fallback = ""
 
     # Kept through an outage, not dropped with capture: inbound needs only this id,
     # and a poller that lost it stopped for the rest of the run -- an agent alive
@@ -1306,8 +1307,7 @@ class ResilientSink(Sink):
         if self._fallback is None:
             path = self._fallback_path
             path.parent.mkdir(parents=True, exist_ok=True)
-            # json.dumps escapes non-ASCII, so no encoding is ever exercised.
-            handle = path.open("a", encoding="utf-8")  # pragma: no mutate
+            handle = path.open("a", encoding="utf-8")
             # Line by line, so a run killed before ``close`` keeps what it wrote.
             handle.reconfigure(line_buffering=True)
             self._fallback = FileSink(handle, redactor=self._redactor)

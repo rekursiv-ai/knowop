@@ -135,8 +135,7 @@ class _Handler(BaseHTTPRequestHandler):
         http = self._admitted()
         if http is None:
             return
-        # HTTPMessage ignores header-name case, so casing mutants are equivalent.
-        raw = self.headers.get("Content-Length")  # pragma: no mutate
+        raw = self.headers.get("Content-Length")
         body = self.rfile.read(int(raw or 0))
         try:
             message = json_loads(body, _Message)

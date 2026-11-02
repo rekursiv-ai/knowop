@@ -1616,6 +1616,24 @@ class TestResilientSink:
         sink.close()
         assert _fallback_texts(fallback_path) == ["one", "two", "three"]
 
+    def test_a_run_record_stranded_before_any_emit_is_labelled_as_one(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """No adapter has spoken yet, so it carries the label a run record does."""
+        client = _FlakyFlushClient()
+        fallback_path = tmp_path / "fallback.jsonl"
+        sink = ResilientSink(
+            TrackinizerSink(client, "claude", batch_size=50),
+            fallback_path=fallback_path,
+        )
+        sink.emit_run_record(
+            Event(record=SystemMessage(content="asks"), path=_RUN_PART),
+        )
+        sink.close()
+        row = json_loads(fallback_path.read_text().splitlines()[0], dict[str, object])
+        assert (row["adapter"], row["part_name"]) == ("", _RUN_PART.name)
+
     def test_a_replayed_buffer_keeps_its_own_positions(self, tmp_path: Path) -> None:
         """Replayed bodies carry the ``idx`` the primary derived, not a re-mint.
 
