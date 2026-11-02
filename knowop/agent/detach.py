@@ -36,20 +36,23 @@ import asyncio
 import logging
 import os
 import re
-import select
 import shutil
 import socket
-import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 from trackinizer.lib.posix.attach import attach, stop, submit
+from trackinizer.lib.posix.detached import (
+    Readiness,
+    await_ready,
+    redirect_stdio,
+    spawn_detached,
+)
 from trackinizer.lib.posix.host import HostSpec
-from trackinizer.lib.posix.terminal import write_all
+from trackinizer.lib.posix.pids import running
+from trackinizer.lib.posix.sockets import accepts, socket_address
 from trackinizer.lib.userdirs import state_dir
-from trackinizer.trax.daemon.protocol import socket_address
 from trackinizer.wire.wire_sessions import RUN_NAME_PATTERN
 from treekle import json_dumps, json_loads
 
@@ -203,8 +206,8 @@ def launch(
         raise
     finally:
         os.close(ready_w)
-    message = _await_ready(ready_r)
-    if message == b"ok":
+    ready = await_ready(ready_r, timeout_sec=_READY_TIMEOUT_SEC)
+    if ready is True:
         # What the host said before it accepted, such as how much of a chat it
         # loaded, is said to the person who started it.
         sys.stderr.write(_tail(paths / "host.log"))
@@ -213,7 +216,7 @@ def launch(
             f"attach with: {PROGRAM} attach {name}\n",
         )
         return 0
-    reason = "did not accept in time" if message is None else "failed to start"
+    reason = "did not accept in time" if ready is None else "failed to start"
     sys.stderr.write(f"{PROGRAM}: host {name!r} {reason}; its log follows\n")
     sys.stderr.write(_tail(paths / "host.log"))
     return 1
@@ -292,28 +295,6 @@ def build_parser(prog: str = PROGRAM) -> argparse.ArgumentParser:
     )
     _add_arguments(parser)
     return parser
-
-
-class _Readiness:
-    """The launcher's end of the readiness pipe, answered at most once."""
-
-    def __init__(self, fd: int) -> None:
-        self._fd = fd
-
-    def accept(self) -> None:
-        """Tell the launcher the host is listening."""
-        self._finish(b"ok")
-
-    def close(self) -> None:
-        """Release the pipe; a launcher still waiting reads a failure."""
-        self._finish(b"")
-
-    def _finish(self, message: bytes) -> None:
-        if self._fd < 0:
-            return
-        _ = write_all(self._fd, message)
-        os.close(self._fd)
-        self._fd = -1
 
 
 def live_hosts() -> list[HostRecord]:
@@ -434,7 +415,7 @@ def _log(name: str, *, follow: bool) -> int:
                 _ = out.write(chunk)
                 out.flush()
                 continue
-            if not follow or not _accepts(Path(record.address)):
+            if not follow or not accepts(Path(record.address)):
                 _ = out.write(source.read())
                 out.flush()
                 return 0
@@ -491,9 +472,9 @@ def _stop(name: str) -> int:
 def _wait_exit(record: HostRecord) -> bool:
     """Wait for the host process to end; return whether it did within the time."""
     deadline = time.monotonic() + _STOP_TIMEOUT_SEC
-    while _alive(record.pid) and time.monotonic() < deadline:
+    while running(record.pid) and time.monotonic() < deadline:
         time.sleep(0.05)
-    return not _alive(record.pid)
+    return not running(record.pid)
 
 
 # The launch that gives a chat its CLI back finds the run a person took over holding the
@@ -608,38 +589,13 @@ def _state(record: HostRecord) -> str:
     """Return ``record``'s live state: its own, ``exiting``, or ``lost``."""
     if record.state == "exited":
         return f"exited {record.exit_code}"
-    if _accepts(Path(record.address)) or (
-        record.control and _accepts(Path(record.control))
+    if accepts(Path(record.address)) or (
+        record.control and accepts(Path(record.control))
     ):
         return "running"
-    if not _alive(record.pid):
+    if not running(record.pid):
         return "lost"
     return "exiting" if record.state == "running" else record.state
-
-
-def _accepts(address: Path) -> bool:
-    """Whether a host is accepting connections at ``address``."""
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        probe.settimeout(0.5)
-        probe.connect(str(address))
-    except OSError:
-        return False
-    else:
-        return True
-    finally:
-        probe.close()
-
-
-def _alive(pid: int) -> bool:
-    """Whether a process with ``pid`` exists."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 def _tail(path: Path, *, lines: int = 20) -> str:
@@ -658,18 +614,10 @@ def _now() -> str:
 
 def _spawn(request: HostRequest, *, ready: int, log: Path) -> None:
     """Exec a host in a new session, passing JSON inputs and its readiness pipe."""
-    # macOS TLS/framework state cannot survive fork without exec. Pass plain
-    # inputs, never the launcher's running interpreter or clients.
-    with (
-        tempfile.TemporaryFile() as payload,
-        os.fdopen(
-            os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600),
-            "wb",
-        ) as out,
-    ):
+    with tempfile.TemporaryFile() as payload:
         _ = payload.write(json_dumps(request, target=HostRequest).encode())
         _ = payload.seek(0)
-        process = subprocess.Popen(  # noqa: S603 -- Fixed interpreter and package; only an inherited fd is passed.
+        _ = spawn_detached(
             [
                 sys.executable,
                 "-m",
@@ -677,14 +625,9 @@ def _spawn(request: HostRequest, *, ready: int, log: Path) -> None:
                 "--_host",
                 str(payload.fileno()),
             ],
-            stdin=subprocess.DEVNULL,
-            stdout=out,
-            stderr=out,
-            start_new_session=True,
+            log=log,
             pass_fds=(payload.fileno(), ready),
         )
-    # Reap while the launcher lives, without making its exit wait for the host.
-    threading.Thread(target=process.wait, daemon=True).start()
 
 
 class _Flags(Protocol):
@@ -758,7 +701,7 @@ def _detach(
 ) -> int:
     """Serve as the exec'd host in its new session; return its status."""
     os.set_inheritable(ready, False)
-    _redirect_stdio(paths / "host.log")
+    redirect_stdio(paths / "host.log")
     record = HostRecord(
         name=paths.name,
         command=command,
@@ -770,7 +713,7 @@ def _detach(
         control=str(control),
     )
     _write_record(paths, record)
-    readiness = _Readiness(ready)
+    readiness = Readiness(ready)
     status = 1
     try:
         status = start(
@@ -826,27 +769,7 @@ def _taken_over(paths: Path, session: str) -> None:
         _write_record(paths, replace(record, session=session))
 
 
-def _listening(paths: Path, record: HostRecord, readiness: _Readiness) -> None:
+def _listening(paths: Path, record: HostRecord, readiness: Readiness) -> None:
     """Record the host as running, then release the launcher."""
     _write_record(paths, replace(record, state="running"))
     readiness.accept()
-
-
-def _redirect_stdio(log: Path) -> None:
-    """Point stdin at /dev/null and stdout and stderr at ``log``."""
-    null = os.open(os.devnull, os.O_RDONLY)
-    out = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    _ = os.dup2(null, 0)
-    _ = os.dup2(out, 1)
-    _ = os.dup2(out, 2)
-    os.close(null)
-    os.close(out)
-
-
-def _await_ready(fd: int) -> bytes | None:
-    """Return the host's readiness message, or None if it never answered."""
-    try:
-        readable, _, _ = select.select([fd], (), (), _READY_TIMEOUT_SEC)
-        return os.read(fd, 2) if readable else None
-    finally:
-        os.close(fd)

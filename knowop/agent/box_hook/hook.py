@@ -36,9 +36,9 @@ import sys
 import threading
 import uuid
 
+from trackinizer.lib.posix.sockets import socket_address
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.trax.canvas import canvas_from_env
-from trackinizer.trax.daemon.protocol import socket_address
 from treekle import PlainTree, from_plain, json_loads
 
 from knowop.agent import prompt_bridge

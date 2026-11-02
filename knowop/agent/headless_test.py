@@ -19,6 +19,7 @@ import socket
 import threading
 import time
 
+from trackinizer.lib.posix.sockets import socket_address
 from trackinizer.runs.asks import (
     Answer,
     Ask,
@@ -28,7 +29,6 @@ from trackinizer.runs.asks import (
     StateChanged,
 )
 from trackinizer.sagent.session.types import SystemMessage
-from trackinizer.trax.daemon.protocol import socket_address
 from treekle import PlainTree, from_plain, json_loads
 
 import pytest

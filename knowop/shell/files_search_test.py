@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import contextlib
 import shutil
 
 from treekle import json_dumps
@@ -17,6 +18,9 @@ from knowop.shell.files_search import Search, SearchError
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import subprocess
+    import threading
 
 
 @pytest.fixture(params=["rg", "python"])
@@ -150,6 +154,38 @@ def test_a_stopped_search_returns_what_it_found_as_truncated(tmp_path: Path) -> 
     found = search.run()
 
     assert (found.matches, found.truncated) == (0, True)
+
+
+@pytest.mark.parametrize("query", ["key", "(unclosed"], ids=["found", "rg-error"])
+def test_a_ripgrep_search_closes_its_pipes_when_it_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+) -> None:
+    """The deadline thread held the open pipes 20s; at a worker's exit they leaked."""
+    if shutil.which("rg") is None:
+        pytest.skip("ripgrep is not installed")
+    (tmp_path / "a.txt").write_text("key\n")
+    started: list[subprocess.Popen[bytes]] = []
+    real_kill_when = files_search._kill_when
+
+    def recorded_kill_when(
+        process: subprocess.Popen[bytes],
+        stopped: threading.Event,
+        deadline_sec: float,
+    ) -> None:
+        started.append(process)
+        real_kill_when(process, stopped, deadline_sec)
+
+    monkeypatch.setattr(files_search, "_kill_when", recorded_kill_when)
+
+    with contextlib.suppress(SearchError):
+        Search(root=str(tmp_path), query=query, regex=True).run()
+
+    [process] = started
+    assert process.stdout is not None
+    assert process.stderr is not None
+    assert (process.stdout.closed, process.stderr.closed) == (True, True)
 
 
 def test_an_invalid_regex_says_why(tmp_path: Path, engine: str) -> None:

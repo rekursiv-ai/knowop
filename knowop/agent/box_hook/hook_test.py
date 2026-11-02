@@ -13,8 +13,8 @@ import threading
 import time
 import uuid
 
+from trackinizer.lib.posix.sockets import socket_address
 from trackinizer.trax.connection import connect
-from trackinizer.trax.daemon.protocol import socket_address
 from treekle import PlainTree, from_plain, json_loads
 
 import pytest

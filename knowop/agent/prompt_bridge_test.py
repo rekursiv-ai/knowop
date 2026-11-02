@@ -12,7 +12,7 @@ import json
 import socket
 import threading
 
-from trackinizer.trax.daemon.protocol import socket_address
+from trackinizer.lib.posix.sockets import socket_address
 from treekle import PlainTree, from_plain, json_loads
 
 import pytest
