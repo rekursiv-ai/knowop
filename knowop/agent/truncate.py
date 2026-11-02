@@ -44,8 +44,8 @@ from trackinizer.sagent.session.types import (
     UncategorizedRecord,
 )
 from trackinizer.types.session_records import (
-    SessionRecordRow,
     payload_record,
+    search_text,
     stored_payload,
 )
 from trackinizer.types.streams import Stderr, Stdin, Stdout
@@ -196,16 +196,14 @@ def _cut(body: RecordBody, record: TraxRecord, *, cap: int) -> RecordBody:
     )
     if not omitted:
         return body
-    row = SessionRecordRow.of(
-        session_id=UUID(int=0),  # pragma: no mutate -- only payload and text are read.
-        part=0,  # pragma: no mutate -- only payload and text are read.
-        idx=body.idx,  # pragma: no mutate -- only payload and text are read.
-        record=_with_note(cut, immutable({"omitted_bytes": sum(omitted)})),
+    noted = _with_note(cut, immutable({"omitted_bytes": sum(omitted)}))
+    # The body's payload holds no ciphertext, so neither does what was cut from it,
+    # and the search text is derived from what was kept. The rest of the envelope is
+    # the original's. Thawed: a copy is not validated, and pydantic cannot dump a
+    # frozen one.
+    return body.model_copy(
+        update={"payload": mutable(stored_payload(noted)), "text": search_text(noted)},
     )
-    # Through the row, so the search text is derived from what was kept. The rest
-    # of the envelope is the original's: the row knows no model or ciphertext.
-    # Thawed, because a copy is not validated and pydantic cannot dump a frozen one.
-    return body.model_copy(update={"payload": mutable(row.payload), "text": row.text})
 
 
 def _cut_tree(
