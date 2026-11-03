@@ -302,7 +302,8 @@ def test_status_of_one_job_shows_every_field(
         ended_at=datetime(2026, 10, 21, 12, 5, tzinfo=UTC),
         gpu_minutes=4,
         usd=0.2,
-        reason="finished",
+        usd_per_gpu_minute=0.05,
+        reason="Stopped: $0.01 is left today.",
     )
 
     _run(server, "status", "7")
@@ -318,8 +319,9 @@ def test_status_of_one_job_shows_every_field(
         "created:  2026-10-21T12:00:00+00:00\n"
         "started:  2026-10-21T12:01:00+00:00\n"
         "ended:    2026-10-21T12:05:00+00:00\n"
+        "rate:     usd 0.05 per gpu-min, before markup\n"
         "charged:  4 gpu-min, usd 0.2\n"
-        "reason:   finished\n"
+        "reason:   Stopped: $0.01 is left today.\n"
     )
     assert server.calls == [("machine_job", 7), ("job", 7)]
 
@@ -338,6 +340,7 @@ def test_status_of_a_job_not_yet_started_shows_dashes(
     assert out[8:] == [
         "started:  -",
         "ended:    -",
+        "rate:     -",
         "charged:  -, -",
         "reason:   -",
     ]
