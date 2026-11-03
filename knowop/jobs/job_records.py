@@ -90,6 +90,9 @@ def run_status(client: Client, job: int | None) -> None:
             "created": view.created_at.isoformat(),
             "started": view.started_at.isoformat() if view.started_at else "-",
             "ended": view.ended_at.isoformat() if view.ended_at else "-",
+            "rate": "-"
+            if view.usd_per_gpu_minute is None
+            else f"usd {view.usd_per_gpu_minute} per gpu-min, before markup",
             "charged": f"{charged}, {money}",
             "reason": view.reason or "-",
         },
