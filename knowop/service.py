@@ -10,11 +10,12 @@ gave: this interpreter's ``-m knowop``, which ``uv tool upgrade knowop`` updates
 place, or ``uvx knowop@VERSION`` when this knowop runs from uv's cache.
 
 The definition holds no secret: the host reads its saved machine credential, readable
-by this user only, each time it starts. Its environment is ``PATH``, ``LANG`` and
-``LC_*`` as the installing shell had them, so the CLIs a terminal runs (``claude``,
-``git``, ``uv``) resolve as they did there (launchd's own ``PATH`` is
-``/usr/bin:/bin:/usr/sbin:/sbin``), and the variables the per-user folders are read
-from, so the host finds the login and the credential the shell would.
+by this user only, each time it starts. Its environment is ``PATH``, ``LANG``, ``LC_*``
+(except ``LC_TRAX*``), ``SAGENT_PROVIDER`` and ``SAGENT_ALLOW_PROVIDERS`` as set in the
+installing shell, so CLIs resolve as they did there and sagent selects the same
+providers. Launchd's own ``PATH`` is ``/usr/bin:/bin:/usr/sbin:/sbin``. The service
+also gets the variables the per-user folders are read from, so the host finds the
+login and credential the shell would.
 
 Both managers append the host's output to one log,
 ``state_dir()/rekursiv-ai/knowop/connect/NAME-TAG.log``, which the host keeps under
@@ -243,7 +244,7 @@ class Services:
                 plist = from_plain(plistlib.loads(path.read_bytes()), _Plist)
                 argv = plist["ProgramArguments"]
             else:
-                argv = _exec_start(path.read_text())
+                argv = _exec_start_words(path.read_text())
             # As ``_definition`` writes it: SERVER FLAGS --name NAME --log-file LOG.
             rest = argv[argv.index("connect") + 1 :]
             found.append(
@@ -526,6 +527,11 @@ _MENUBAR: Final = "ai.rekursiv.knowop.menubar"
 _CONNECT_PLISTS: Final = "ai.rekursiv.knowop.connect.*.plist"
 """The connect agents' definitions, by file name."""
 
+_SHELL_ENVIRONMENT_VARIABLES: Final = frozenset(
+    {"PATH", "LANG", "SAGENT_PROVIDER", "SAGENT_ALLOW_PROVIDERS"},
+)
+"""Non-secret shell variables that affect which CLIs and sagent providers run."""
+
 
 # The end alone: a crash loop writes its traceback every 10 s.
 def _last_line(log: Path) -> str:
@@ -547,14 +553,13 @@ def _log(connect: Connect) -> Path:
     )
 
 
-# No TRAX_*, KNOWOP_* or key: the host reads knowop's own login, in the folders the
-# installing shell's userdirs variables name.
+# No TRAX_*, KNOWOP_* or keys: the host reads its own login from the userdirs.
 def _environment() -> dict[str, str]:
-    """Return a service's environment: the installing shell's ``PATH`` and locale."""
+    """Return the shell's selected CLIs, locale and sagent provider settings."""
     shell = {
         name: value
         for name, value in os.environ.items()
-        if name in {"PATH", "LANG"}
+        if name in _SHELL_ENVIRONMENT_VARIABLES
         or (name.startswith("LC_") and not name.startswith("LC_TRAX"))
     }
     return dict(sorted({**shell, **base_dir_variables()}.items()))
@@ -607,13 +612,11 @@ class _Plist(TypedDict):
     ProgramArguments: list[str]
 
 
-def _exec_start(unit: str) -> list[str]:
-    """Return the argv a systemd unit's ``ExecStart`` line names, unescaped."""
+# Only the words after ``connect`` are read, so the key stays on the program's word.
+def _exec_start_words(unit: str) -> list[str]:
+    """Return the words of a systemd unit's ``ExecStart`` line, unescaped."""
     line = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
-    return [
-        word.replace("$$", "$").replace("%%", "%")
-        for word in shlex.split(line.removeprefix("ExecStart="))
-    ]
+    return [word.replace("$$", "$").replace("%%", "%") for word in shlex.split(line)]
 
 
 def _unit_word(text: str) -> str:

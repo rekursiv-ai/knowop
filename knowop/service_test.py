@@ -17,6 +17,7 @@ import sys
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import config_dir, data_dir, state_dir
+from treekle import from_plain
 
 import pytest
 
@@ -71,6 +72,8 @@ def _shell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in list(os.environ):
         if name.startswith(("LC_", "TRAX_", "KNOWOP_", "TRACKINIZER_")):
             monkeypatch.delenv(name)
+    for name in ("SAGENT_PROVIDER", "SAGENT_ALLOW_PROVIDERS"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
     for name, value in _env(tmp_path).items():
         monkeypatch.setenv(name, value)
@@ -93,6 +96,24 @@ def _env(tmp_path: Path) -> dict[str, str]:
         "XDG_DATA_HOME": str(tmp_path / "data"),
         "XDG_STATE_HOME": str(tmp_path / "state"),
     }
+
+
+def _definition_environment(
+    path: Path,
+    manager: Literal["launchd", "systemd"],
+) -> dict[str, str]:
+    """Return the environment written to a launchd plist or systemd unit."""
+    if manager == "launchd":
+        return from_plain(
+            plistlib.loads(path.read_bytes())["EnvironmentVariables"],
+            dict[str, str],
+        )
+    return dict(
+        word.split("=", maxsplit=1)
+        for line in path.read_text().splitlines()
+        if line.startswith("Environment=")
+        for word in shlex.split(line.removeprefix("Environment="))
+    )
 
 
 def _launcher_program(launcher: Path) -> list[str]:
@@ -154,6 +175,26 @@ def test_a_launchd_agent_runs_this_knowop_with_its_flags_and_the_shells_paths(
         )
         == 0o755
     )
+
+
+@pytest.mark.parametrize("manager", ["launchd", "systemd"])
+def test_a_service_keeps_provider_selection_but_no_other_sagent_variables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manager: Literal["launchd", "systemd"],
+) -> None:
+    monkeypatch.setenv("SAGENT_PROVIDER", "openai-sub")
+    monkeypatch.setenv("SAGENT_ALLOW_PROVIDERS", "asub,acli,osub,gsub,gcli")
+    monkeypatch.setenv("SAGENT_LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("OPENAI_API_KEY", "not-a-service-variable")
+
+    Services(manager=manager, folder=tmp_path / "agents", run=_Manager()).start(_ADA)
+
+    env = _definition_environment(_installed(tmp_path, manager), manager)
+    assert env["SAGENT_PROVIDER"] == "openai-sub"
+    assert env["SAGENT_ALLOW_PROVIDERS"] == "asub,acli,osub,gsub,gcli"
+    assert "SAGENT_LOG_LEVEL" not in env
+    assert "OPENAI_API_KEY" not in env
 
 
 def test_a_systemd_unit_restarts_on_failure_within_limits_and_appends_to_the_log(
