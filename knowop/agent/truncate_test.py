@@ -19,9 +19,9 @@ from trackinizer.lib.agent.sessions import claude
 from trackinizer.sagent.session.types import (
     CONCRETE_TYPES,
     Attachment,
+    BashResult,
     ContextClear,
     IncompleteRecord,
-    ShellCommandResult,
     UncategorizedRecord,
     UncategorizedToolResult,
     UserMessage,
@@ -69,12 +69,12 @@ _LOG: Final = (
 the wire, which is how ~1 MB of output became 11.39 MB."""
 
 
-def _shell(output: str, *, image: PlainTree = None) -> ShellCommandResult:
+def _shell(output: str, *, image: PlainTree = None) -> BashResult:
     """Return a shell result holding ``output`` twice, as codex stores one."""
     extra: dict[str, PlainTree] = {"aggregated_output": output}
     if image is not None:
         extra["image"] = image
-    return ShellCommandResult(
+    return BashResult(
         call_id="c",
         command=("bash", "-lc", "find . -exec sed -n '1,180p' {} \\;"),
         stdout=output,
@@ -151,7 +151,7 @@ class TestARecordThatFitsIsUntouched:
     """Small results stay byte-identical: nothing is re-encoded on the way."""
 
     def test_a_tool_result_under_its_budget_sends_the_same_bytes(self) -> None:
-        body = _body(ShellCommandResult(call_id="c", stdout="é\x1b[0m" * 5_000))
+        body = _body(BashResult(call_id="c", stdout="é\x1b[0m" * 5_000))
 
         assert _wire(bounded(body)) == _wire(body)
 
@@ -176,7 +176,7 @@ class TestAnOversizedToolResult:
         output = _LOG * 4_000
         record = _read(bounded(_body(_shell(output))))
 
-        assert isinstance(record, ShellCommandResult)
+        assert isinstance(record, BashResult)
         copy = record.extra["aggregated_output"]
         assert isinstance(copy, str)
         for kept in (record.stdout, copy):
@@ -186,7 +186,7 @@ class TestAnOversizedToolResult:
         output = _LOG * 4_000
         record = _read(bounded(_body(_shell(output))))
 
-        assert isinstance(record, ShellCommandResult)
+        assert isinstance(record, BashResult)
         copy = record.extra["aggregated_output"]
         assert isinstance(copy, str)
         stated = sum(_omitted(kept) for kept in (record.stdout, copy))
@@ -227,7 +227,7 @@ class TestTheCutKeepsTextValid:
         reread = RecordBody.model_validate_json(_wire(cut))
         record = _read(reread)
 
-        assert isinstance(record, ShellCommandResult)
+        assert isinstance(record, BashResult)
         _assert_cut_from(output, record.stdout)
 
     @pytest.mark.parametrize("offset", range(4))
@@ -237,7 +237,7 @@ class TestTheCutKeepsTextValid:
 
         record = _read(bounded(_body(_shell(output))))
 
-        assert isinstance(record, ShellCommandResult)
+        assert isinstance(record, BashResult)
         _assert_cut_from(output, record.stdout)
 
 
@@ -269,7 +269,7 @@ class TestAnImageIsKeptWholeOrNamed:
 
         assert encoded_size(cut) <= MAX_TOOL_RESULT_BYTES
         record = _read(cut)
-        assert isinstance(record, ShellCommandResult)
+        assert isinstance(record, BashResult)
         assert record.extra["image"] == immutable(image)
 
     def test_an_image_over_the_share_becomes_text_naming_it(self) -> None:
@@ -277,7 +277,7 @@ class TestAnImageIsKeptWholeOrNamed:
 
         record = _read(bounded(_body(_shell("short", image=image))))
 
-        assert isinstance(record, ShellCommandResult)
+        assert isinstance(record, BashResult)
         assert record.extra["image"] == immutable(
             {
                 "type": "text",
@@ -374,7 +374,7 @@ class TestTheLossyNote:
 def test_the_size_is_what_the_http_client_sends() -> None:
     """Measured as ``httpx2`` encodes ``json=``: compact, non-ASCII kept raw."""
     body = _body(
-        ShellCommandResult(
+        BashResult(
             call_id="c",
             stdout='é€😀\x00\x1b[31m"\\\n',
             extra=immutable({"duration": 0.1, "nested": [{"a": None, "b": True}]}),

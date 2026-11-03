@@ -66,7 +66,7 @@ from trackinizer.sagent.session.types import (
     AssistantMessage,
     ContextCompaction,
     ContextState,
-    FileEditResult,
+    EditResult,
     IncompleteRecord,
     SessionRecord,
     SystemMessage,
@@ -211,7 +211,7 @@ class _RecordingSink(Sink):
     def __init__(self) -> None:
         self.events: list[tuple[int, str, Event]] = []
         self.slash: list[tuple[SlashCommand, datetime]] = []
-        self.diffs: list[list[FileEditResult]] = []
+        self.diffs: list[list[EditResult]] = []
         self.closed = False
         self.flushes = 0
         self.cli_session_ids: list[str] = []
@@ -249,7 +249,7 @@ class _RecordingSink(Sink):
         self.slash.append((command, at))
 
     @override
-    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
         self.diffs.append(list(records))
 
     @override
@@ -380,9 +380,9 @@ class _WholeFileAdapter(_FakeAdapter):
 # Each line is the absolute path of a file the session edited, so the diff
 # capture's ``note`` sees it through ``feed``'s ``on_record`` hook.
 def _edit_records(stream: TextIO) -> Iterator[SessionRecord]:
-    """One empty ``FileEditResult`` per line, its path the line's text."""
+    """One empty ``EditResult`` per line, its path the line's text."""
     for line in stream:
-        yield FileEditResult(call_id="", path=line.rstrip("\n"), edits=())
+        yield EditResult(call_id="", path=line.rstrip("\n"), edits=())
 
 
 class _FakeEditAdapter(_FakeAdapter):
@@ -1919,7 +1919,7 @@ class TestWorktreeDiffWiring:
     def test_refresh_uploads_the_diff_and_none_is_a_no_op(self, tmp_path: Path) -> None:
         """The teardown refresh uploads the net diff; no capture means nothing sent."""
         diff = WorktreeDiff(top=tmp_path, run=_diff_git, base="HEAD")
-        diff.note(FileEditResult(call_id="", path=str(tmp_path / "a.py"), edits=()))
+        diff.note(EditResult(call_id="", path=str(tmp_path / "a.py"), edits=()))
         sink = _RecordingSink()
         session._refresh_diff(diff, sink, force=True)
         [batch] = sink.diffs
@@ -1930,11 +1930,11 @@ class TestWorktreeDiffWiring:
     def test_refresh_swallows_a_sink_failure(self, tmp_path: Path) -> None:
         """A git or sink failure costs one refresh, never the run's capture."""
         diff = WorktreeDiff(top=tmp_path, run=_diff_git, base="HEAD")
-        diff.note(FileEditResult(call_id="", path=str(tmp_path / "a.py"), edits=()))
+        diff.note(EditResult(call_id="", path=str(tmp_path / "a.py"), edits=()))
 
         class _Boom(_RecordingSink):
             @override
-            def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+            def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
                 raise RuntimeError("server down")
 
         session._refresh_diff(diff, _Boom(), force=True)  # Must not raise.

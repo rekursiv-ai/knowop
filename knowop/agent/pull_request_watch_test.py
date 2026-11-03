@@ -18,7 +18,7 @@ from uuid import UUID, uuid4
 import json
 
 from trackinizer.client.errors import ClientError
-from trackinizer.sagent.session.types import ShellCommandResult, ToolCall
+from trackinizer.sagent.session.types import BashResult, ToolCall
 from treekle import from_plain
 
 import pytest
@@ -328,14 +328,14 @@ def _opened(watch: PullRequestWatch, *, call_id: str = "c1") -> None:
             arguments={"command": "gh pr create -f"},
         ),
     )
-    watch.note(ShellCommandResult(call_id=call_id, stdout=f"{_URL}\n"))
+    watch.note(BashResult(call_id=call_id, stdout=f"{_URL}\n"))
 
 
 def _pushed(watch: PullRequestWatch) -> None:
     watch.note(
         ToolCall(call_id="p", name="Bash", arguments={"command": "git push -u origin"}),
     )
-    watch.note(ShellCommandResult(call_id="p", stdout=""))
+    watch.note(BashResult(call_id="p", stdout=""))
 
 
 def _tool(watch: PullRequestWatch, name: str) -> AgentTool:
@@ -365,7 +365,7 @@ def test_a_codex_result_names_its_own_command_and_a_failed_one_counts_for_nothin
     server, gh = _Server(), _Gh()
     watch = _watch(server, gh)
     watch.note(
-        ShellCommandResult(
+        BashResult(
             call_id="x",
             command=("bash", "-lc", "gh pr create --fill"),
             stdout=_URL,
@@ -375,7 +375,7 @@ def test_a_codex_result_names_its_own_command_and_a_failed_one_counts_for_nothin
     watch._sweep()
     assert server.rows == {}
     watch.note(
-        ShellCommandResult(call_id="y", command=("gh", "pr", "create"), stdout=_URL),
+        BashResult(call_id="y", command=("gh", "pr", "create"), stdout=_URL),
     )
     watch._sweep()
     assert len(server.rows) == 1
@@ -434,7 +434,7 @@ def test_nothing_noted_reads_nothing() -> None:
     server, gh = _Server(), _Gh()
     watch = _watch(server, gh)
     watch.note(ToolCall(call_id="l", name="Bash", arguments={"command": "ls"}))
-    watch.note(ShellCommandResult(call_id="l", stdout=_URL))
+    watch.note(BashResult(call_id="l", stdout=_URL))
     watch._sweep()
     assert gh.refs == []
     assert server.rows == {}

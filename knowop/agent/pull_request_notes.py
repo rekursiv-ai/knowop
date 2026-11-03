@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Final, Literal, cast
 import re
 import threading
 
-from trackinizer.sagent.session.types import ShellCommandResult, ToolCall
+from trackinizer.sagent.session.types import BashResult, ToolCall
 
 from knowop.agent.pull_requests import links
 
@@ -76,7 +76,7 @@ class RecordNotes:
             if act is not None:
                 self._calls[record.call_id] = act
             return False
-        if not isinstance(record, ShellCommandResult):
+        if not isinstance(record, BashResult):
             return False
         act = self._calls.pop(record.call_id, None) or _act(
             " ".join(record.command or ()),

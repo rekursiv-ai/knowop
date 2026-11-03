@@ -7,8 +7,8 @@ session's records (:func:`~knowop.agent.sink.Sink.emit_worktree_diff`)
 and read by exactly the transcript's readers.
 
 What is diffed is only the paths the session's own
-:class:`~trackinizer.sagent.session.types.FileEditResult` /
-:class:`~trackinizer.sagent.session.types.FileWriteResult` records name, inside the
+:class:`~trackinizer.sagent.session.types.EditResult` /
+:class:`~trackinizer.sagent.session.types.WriteResult` records name, inside the
 tree -- so another agent's edits in a shared tree are never attributed here, and
 a credential file (:func:`held`) is neither listed nor diffed.
 
@@ -32,7 +32,7 @@ import stat
 import subprocess
 
 from trackinizer.lib.agent.sessions.udiff import parse_udiff
-from trackinizer.sagent.session.types import FileEditResult, FileWriteResult, Splice
+from trackinizer.sagent.session.types import EditResult, Splice, WriteResult
 
 
 if TYPE_CHECKING:
@@ -143,7 +143,7 @@ class Output:
 type Runner = Callable[[Sequence[str], int], Output]
 """Runs one git command ``argv``, its output kept to ``max_bytes``."""
 
-type EmitDiff = Callable[[Sequence[FileEditResult]], None]
+type EmitDiff = Callable[[Sequence[EditResult]], None]
 """Uploads one refresh's diff records to the session's store."""
 
 
@@ -270,7 +270,7 @@ class WorktreeDiff:
           record: A record the session just emitted.
 
         """
-        if not isinstance(record, FileEditResult | FileWriteResult):
+        if not isinstance(record, EditResult | WriteResult):
             return
         path = record.path
         if path is None or not path:
@@ -308,10 +308,10 @@ class WorktreeDiff:
             return gap >= MIN_REFRESH_SEC
         return bool(self._touched) and gap >= REFRESH_INTERVAL_SEC
 
-    def _build(self) -> tuple[list[FileEditResult], str]:
+    def _build(self) -> tuple[list[EditResult], str]:
         """Render each touched file's diff, within the file and total byte caps."""
         base = self._effective_base()
-        records: list[FileEditResult] = []
+        records: list[EditResult] = []
         parts: list[str] = []
         used = 0
         for rel in sorted(self._touched):
@@ -337,7 +337,7 @@ class WorktreeDiff:
             used += cost
         return records, "\n".join(parts)
 
-    def _file(self, rel: str, base: str) -> tuple[FileEditResult, str, int] | None:
+    def _file(self, rel: str, base: str) -> tuple[EditResult, str, int] | None:
         """One file's record, its dedup key and byte cost; ``None`` when unchanged."""
         size = self._size(rel)
         if size is not None and size > SOURCE_BYTES:
@@ -351,7 +351,7 @@ class WorktreeDiff:
         if not edits:
             return _note(rel, "binary or no textual change"), "binary", 0
         return (
-            FileEditResult(call_id="", path=rel, edits=edits),
+            EditResult(call_id="", path=rel, edits=edits),
             text,
             len(text.encode()),
         )
@@ -429,9 +429,9 @@ class WorktreeDiff:
         return self._run(_argv(self._top, args), max_bytes)
 
 
-def _note(path: str, message: str) -> FileEditResult:
+def _note(path: str, message: str) -> EditResult:
     """Build a placeholder edit whose line explains why a file's diff is not shown."""
-    return FileEditResult(call_id="", path=path, edits=(Splice(lead=f"({message})\n"),))
+    return EditResult(call_id="", path=path, edits=(Splice(lead=f"({message})\n"),))
 
 
 def _argv(directory: Path, args: Sequence[str]) -> list[str]:
