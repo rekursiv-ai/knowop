@@ -1048,29 +1048,30 @@ def test_a_call_into_a_module_with_no_function_named_is_no_edge(
     tmp_path: Path,
 ) -> None:
     module = tmp_path / "module_call_test.py"
+    # ``resources`` is the one sibling every export ships beside this test.
     module.write_text(
-        "import knowop.lib.testing.checks\n"
-        "from knowop.lib.testing import checks as helpers\n"
-        "\ndef test_calls():\n    checks()\n    helpers.smuggle(1, int)\n",
+        "import knowop.lib.testing.resources\n"
+        "from knowop.lib.testing import resources as helpers\n"
+        "\ndef test_calls():\n    resources()\n    helpers.smuggle(1, int)\n",
         encoding="utf-8",
     )
 
     assert resources._function_facts(module, "test_calls") == (
         False,
-        ((_CWD / "checks.py", "smuggle"),),
+        ((Path(resources.__file__), "smuggle"),),
     )
 
 
 def test_a_dotted_import_is_known_by_its_last_name(tmp_path: Path) -> None:
     module = tmp_path / "dotted_test.py"
     module.write_text(
-        "import knowop.lib.testing.checks\n\ndef test_dotted():\n    checks.smuggle()\n",
+        "import knowop.lib.testing.resources\n\ndef test_dotted():\n    resources.smuggle()\n",
         encoding="utf-8",
     )
 
     assert resources._function_facts(module, "test_dotted") == (
         False,
-        ((_CWD / "checks.py", "smuggle"),),
+        ((Path(resources.__file__), "smuggle"),),
     )
 
 
