@@ -69,9 +69,11 @@ only when its flags, its environment, its knowop or the CLIs it finds changed. T
 service runs the knowop that installed it: an installed one in place, so after `uv
 tool upgrade knowop` run `knowop connect` again, and one `uvx` ran as `uvx
 knowop@VERSION`, which `uv cache clean` cannot take away; `uvx knowop@latest
-connect` moves it to the latest. It keeps your shell's `PATH`, `LANG`, `LC_*` and
-the variables your per-user folders are read from (`HOME`, `XDG_*_HOME`), so it
-finds your CLIs and your login as your shell does. It holds no secret: it reads the
+connect` moves it to the latest. It keeps your shell's `PATH`, `LANG`, `LC_*`
+(except `LC_TRAX*`), `SAGENT_PROVIDER` and `SAGENT_ALLOW_PROVIDERS`, plus the
+variables your per-user folders are read from (`HOME`, `XDG_*_HOME`), so it finds
+your CLIs and your login as your shell does and selects sagent providers the same
+way. It holds no secret: it reads the
 machine credential saved for your user each time it starts. It is never installed
 as root. Over ssh on Linux, `sudo
 loginctl enable-linger $USER` keeps it running after you log out; knowop says so.

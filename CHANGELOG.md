@@ -18,8 +18,9 @@ All notable knowop changes are documented here. This project follows
   returns once the server shows the computer online, and starts again at login
   and after a crash. Its definition names the knowop that installed it (`uvx
   knowop@VERSION` when that one ran from uv's cache, which `uv cache clean`
-  deletes) and the flags given, and copies `PATH`, `LANG`, `LC_*` and the
-  variables the per-user folders are read from (`HOME`, `XDG_*_HOME`), so it finds
+  deletes) and the flags given, and copies `PATH`, `LANG`, `LC_*` (except
+  `LC_TRAX*`), `SAGENT_PROVIDER`, `SAGENT_ALLOW_PROVIDERS` and the variables
+  the per-user folders are read from (`HOME`, `XDG_*_HOME`), so it finds
   the login the shell would; it holds no secret, and it is never installed as
   root. A refusal no restart can change ends it with exit
   0, so the manager does not restart it. Running `knowop connect` again restarts
