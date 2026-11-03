@@ -11592,6 +11592,21 @@ class TestSubagentSessions:
         assert len(client.ends) == 2
 
 
+@pytest.mark.parametrize("count", [0, 1, 2, 3])
+def test_every_observer_given_sees_each_chunk_in_order(count: int) -> None:
+    seen: list[tuple[int, bytes]] = []
+    observers = [partial(_saw, seen, i) for i in range(count)]
+    observe = session._observers(None, *observers, None)
+    if observe is not None:
+        observe(b"x")
+    assert seen == [(i, b"x") for i in range(count)]
+    assert (observe is None) is (count == 0)
+
+
+def _saw(seen: list[tuple[int, bytes]], who: int, raw: bytes) -> None:
+    seen.append((who, raw))
+
+
 if __name__ == "__main__":
     from knowop.lib.testing.runner import test_main
 
