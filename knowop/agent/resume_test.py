@@ -23,10 +23,11 @@ from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.sagent.session.types import (
     AgentToAgentMessage,
     AssistantMessage,
+    BashResult,
     ContextClear,
-    FileReadResult,
+    GrepResult,
     IncompleteRecord,
-    ShellCommandResult,
+    ReadResult,
     Thinking,
     ToolCall,
     UncategorizedRecord,
@@ -281,7 +282,7 @@ class TestWhichTargetsResume:
                     [
                         UserMessage(content="what is in a.py?"),
                         ToolCall(call_id="c1", name="Read", arguments={"path": "a.py"}),
-                        FileReadResult(call_id="c1", content="x = 1"),
+                        ReadResult(call_id="c1", content="x = 1"),
                         AssistantMessage(content="it sets x"),
                     ],
                 ),
@@ -295,7 +296,7 @@ class TestWhichTargetsResume:
         with written.path.open(encoding="utf-8") as handle:
             journal = list(sagent.normalize(handle))
         # Stamped on the way: a record crossing formats gets the time it lacked.
-        assert [r.content for r in journal if isinstance(r, FileReadResult)] == [
+        assert [r.content for r in journal if isinstance(r, ReadResult)] == [
             "x = 1",
         ]
 
@@ -448,7 +449,7 @@ class TestAMixedSessionResumes:
                     [
                         UserMessage(content="look it up"),
                         ToolCall(call_id="t1", name="Grep"),
-                        UncategorizedToolResult(call_id="t1", content="nothing"),
+                        GrepResult(call_id="t1", content="nothing"),
                         AssistantMessage(content="claude says"),
                     ],
                 ),
@@ -481,7 +482,7 @@ class TestAMixedSessionResumes:
                     [
                         UserMessage(content="look it up"),
                         ToolCall(call_id="t1", name="Grep"),
-                        UncategorizedToolResult(call_id="t1", content="nothing"),
+                        GrepResult(call_id="t1", content="nothing"),
                         UserMessage(content="stop, wrong file"),
                         AssistantMessage(content="ok"),
                     ],
@@ -540,14 +541,14 @@ class TestAMixedSessionResumes:
                     "claude",
                     [
                         UserMessage(content="look it up"),
-                        ShellCommandResult(call_id="orphan", command=("ls",)),
+                        BashResult(call_id="orphan", command=("ls",)),
                         AssistantMessage(content="claude says"),
                     ],
                 ),
             },
         )
 
-        with pytest.raises(LossyConversionError, match="drops ShellCommandResult"):
+        with pytest.raises(LossyConversionError, match="drops BashResult"):
             prepare_resume(client, uuid4(), "claude")
 
     def test_a_real_capture_with_a_result_it_never_calls_resumes_as_claude(
@@ -1154,7 +1155,7 @@ class _CapturedClient(_FakeClient):
         )
         self.records = [
             _inflated(record)
-            if index == line or isinstance(record, ShellCommandResult)
+            if index == line or isinstance(record, BashResult)
             else record
             for index, record in enumerate(self.records)
         ]
@@ -1202,7 +1203,7 @@ class TestTruncatedAtCapture:
 
 def _inflated(record: TraxRecord) -> TraxRecord:
     """Return ``record`` grown past its budget, if it is one this suite cuts."""
-    if isinstance(record, ShellCommandResult):
+    if isinstance(record, BashResult):
         return replace(record, stdout="x" * MAX_TOOL_RESULT_BYTES)
     if isinstance(record, UncategorizedRecord):
         return replace(

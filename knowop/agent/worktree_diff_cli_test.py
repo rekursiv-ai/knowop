@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import os
 
-from trackinizer.sagent.session.types import FileEditResult
+from trackinizer.sagent.session.types import EditResult
 
 import pytest
 
@@ -62,12 +62,12 @@ def _init_repo(tmp_path: Path) -> None:
     _git(tmp_path, "commit", "-m", "init")
 
 
-def _refresh(tmp_path: Path) -> list[FileEditResult]:
+def _refresh(tmp_path: Path) -> list[EditResult]:
     """Open a capture at ``tmp_path``, note ``a.py``, and return one refresh."""
     diff = open_worktree_diff(tmp_path)
     assert diff is not None
-    diff.note(FileEditResult(call_id="", path=str(tmp_path / "a.py")))
-    batches: list[Sequence[FileEditResult]] = []
+    diff.note(EditResult(call_id="", path=str(tmp_path / "a.py")))
+    batches: list[Sequence[EditResult]] = []
     diff.refresh(batches.append, now=0.0)
     [batch] = batches
     return list(batch)
@@ -95,8 +95,8 @@ def test_a_commit_in_the_first_turn_still_shows(tmp_path: Path) -> None:
     assert diff is not None
     (tmp_path / "a.py").write_text("two\n")
     _git(tmp_path, "commit", "-am", "edit in the first turn")  # HEAD moves past base.
-    diff.note(FileEditResult(call_id="", path=str(tmp_path / "a.py")))
-    batches: list[Sequence[FileEditResult]] = []
+    diff.note(EditResult(call_id="", path=str(tmp_path / "a.py")))
+    batches: list[Sequence[EditResult]] = []
     diff.refresh(batches.append, now=0.0)
     [record] = batches[0]
     assert record.edits[0].before == "one\n"

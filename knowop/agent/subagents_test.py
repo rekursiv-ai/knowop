@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from trackinizer.lib.agent.sessions.tail import Tail
     from trackinizer.runs.adapters.custom_types import Adapter
-    from trackinizer.sagent.session.types import FileEditResult
+    from trackinizer.sagent.session.types import EditResult
     from trackinizer.types.streams import TraxRecord
     from trackinizer.wire.wire_session_ir import RecordBody
 
@@ -86,7 +86,7 @@ class _Recorded(Sink):
         self.commands += 1
 
     @override
-    def emit_worktree_diff(self, records: Sequence[FileEditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
         del records
 
     @override
