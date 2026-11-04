@@ -1,6 +1,6 @@
 # NEVER EDIT THIS FILE!
-# uv sync --all-groups --frozen  # cu132 aka "cuda"
-# uv sync --all-groups --frozen --no-group cuda --extra cpu
+# uv sync --all-groups --no-group jax --no-group tf --frozen  # cu132 aka "cuda"
+# uv sync --all-groups --no-group jax --no-group tf --frozen --no-group cuda --extra cpu
 
 [project]
 name = "knowop"
@@ -65,42 +65,31 @@ dependencies = [
 cpu = [
     "torch",
     "torchao",
-    "torchaudio",
     "torchvision",
 ]
 cu126 = [
-    "jax[cuda12] ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torch",
     "torchao",
-    "torchaudio",
     "torchvision",
 ]
 cu128 = [
-    "jax[cuda12] ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torch",
     "torchao",
-    "torchaudio",
     "torchvision",
 ]
 cu130 = [
-    "jax[cuda13] ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torch",
     "torchao",
-    "torchaudio",
     "torchvision",
 ]
 cu132 = [
-    "jax[cuda13] ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torch",
     "torchao",
-    "torchaudio",
     "torchvision",
 ]
 cu134 = [
-    "jax[cuda13] ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torch",
     "torchao",
-    "torchaudio",
     "torchvision",
 ]
 
@@ -111,10 +100,8 @@ knowop = "knowop.cli:main"
 # NEVER ADD MORE DEPENDENCIES!
 
 cuda = [
-    "jax[cuda13] ; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "torch",
     "torchao",
-    "torchaudio",
     "torchvision",
 ]
 
@@ -141,8 +128,6 @@ typecheck = [
     "basedpyright>=1.40.2",
     "pyrefly>=1.4.0",
     "ty>=0.0.95",
-    # Extra.
-    "basedtyping>=0.1.10",
     "rekursiv-ai-typings>=0.1.11",
 ]
 "pre-commit" = [
@@ -156,7 +141,7 @@ dev = [
     {include-group = "debug"},
 ]
 
-# NEVER ADD MORE DEPENDENCY GROUPS!
+# NEVER ADD OTHER DEPENDENCY GROUPS: A NEW GROUP SERVES A PROJECT, AS ABOVE.
 
 [project.urls]
 Homepage = "https://www.rekursiv.ai"
