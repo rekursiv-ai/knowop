@@ -304,6 +304,7 @@ class _FakeClient:
         self.ended: list[UUID] = []
         self.end_bodies: list[SessionEnd | None] = []
         self.granted_actor: str | None = None
+        self.account: str | None = None
         self.start_seq = 0
         self._id = uuid4()
         # How the server answers a start: what it was asked, or a fixed audience.
@@ -316,6 +317,7 @@ class _FakeClient:
             id=self._id,
             seq=self.start_seq,
             actor=self.granted_actor or body.actor,
+            account=self.account,
             audience=("private" if body.private else "open")
             if self.hides
             else self.audience,
@@ -520,6 +522,24 @@ class TestTrackinizerSink:
         sink.sync()
         assert client.started[0].actor == "scientist"
         assert sink.granted_actor == "scientist#2"
+
+    def test_the_sessions_account_is_known_through_every_wrapper(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeClient()
+        client.account = "dan@x"
+        primary = TrackinizerSink(client, "claude", actor="scientist")
+        sink = LockedSink(
+            ResilientSink(primary, fallback_path=tmp_path / "local.jsonl"),
+        )
+        assert sink.account is None
+        _ = sink.open()
+        assert sink.account == "dan@x"
+
+    def test_a_file_sink_holds_no_session_and_no_account(self, tmp_path: Path) -> None:
+        with (tmp_path / "local.jsonl").open("w") as handle:
+            assert FileSink(handle).account is None
 
     def test_granted_actor_is_none_before_session_opens(self) -> None:
         client = _FakeClient()
