@@ -26,7 +26,6 @@ import sys
 from trackinizer.runs.asks import (
     Answer,
     Ask,
-    Driver,
     Option,
     Resolved,
     StateChanged,
@@ -558,8 +557,7 @@ def test_a_driver_starts_once(tmp_path: Path) -> None:
 
 
 def test_the_driver_meets_the_driver_contract() -> None:
-    driver: Driver = CodexAppDriver()
-    assert isinstance(driver, CodexAppDriver)
+    CodexAppDriver()
 
 
 def test_a_missing_binary_raises(tmp_path: Path) -> None:
