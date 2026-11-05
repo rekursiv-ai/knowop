@@ -1799,7 +1799,7 @@ wheels = [
 [[package]]
 name = "rekursiv-ai-typings"
 version = "0.1.13"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#289de561abbafdcfa8e8900870777662b24b4026" }
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#5ca13a5b53d14a67dbd89d40906a583d8ba37ed3" }
 
 [[package]]
 name = "rignore"
@@ -2030,7 +2030,7 @@ wheels = [
 [[package]]
 name = "trackinizer"
 version = "0.1.13"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#1b57b61c8454f69b2a4829819646b44ae4192bd3" }
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#695e298dc695abd0482b0341726914fee97b9e94" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
