@@ -8324,10 +8324,10 @@ class TestAnAttachedRunLoadsTheChat:
             "[knowop run] loaded 2 records (~2 tokens) into claude; 0 earlier not loaded\n"
         )
 
+    @pytest.mark.usefixtures("local_session_dirs")
     def test_a_chat_that_compacted_loads_from_its_summary(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """A switch to codex loads claude's window: the summary, then what follows.
@@ -8335,7 +8335,6 @@ class TestAnAttachedRunLoadsTheChat:
         Claude resumes its own file whole, and honours its own boundary; another CLI is
         handed the window the one cut every switch makes.
         """
-        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
         boundary = {
             "type": "system",
             "subtype": "compact_boundary",
@@ -8373,13 +8372,12 @@ class TestAnAttachedRunLoadsTheChat:
         assert told[-1] == "the terminal user: F2 is pears"
         assert "earlier not loaded" in capsys.readouterr().err
 
+    @pytest.mark.usefixtures("local_session_dirs")
     def test_a_load_past_the_fit_asks_the_cli_to_compact_it(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
     ) -> None:
         """Codex holds 480 kB comfortably: 40 lines of 15 kB are past it."""
-        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
         lines = [_claude_line(f"{n:02} " + "x" * 15_000) for n in range(40)]
 
         config = _keep_attached(
@@ -8473,6 +8471,7 @@ class TestAChatRunIsHeadless:
         [config] = ran
         return config
 
+    @pytest.mark.usefixtures("local_session_dirs")
     @pytest.mark.parametrize("cli", ["claude", "codex"])
     def test_a_detached_run_attached_to_a_chat_is_headless(
         self,
@@ -8486,6 +8485,7 @@ class TestAChatRunIsHeadless:
         assert config.headless
         assert config.attach == _CHAT
 
+    @pytest.mark.usefixtures("local_session_dirs")
     @pytest.mark.parametrize("cli", ["claude", "codex"])
     def test_the_driver_resumes_the_loaded_session_by_id_not_by_argument(
         self,

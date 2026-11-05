@@ -64,6 +64,9 @@ if TYPE_CHECKING:
     from trackinizer.types.streams import TraxRecord
 
 
+pytestmark: Final = pytest.mark.usefixtures("local_session_dirs")
+
+
 # Captured transcripts, kept beside the readers that parse them. trackinizer's wheel
 # leaves them out, so the public export carries copies beside this module instead.
 _TESTDATA: Final = Path(__file__).resolve().parent / "testdata" / "sessions"
@@ -199,23 +202,6 @@ def _direct_segments(
 ) -> list[Segment]:
     del client, session_id
     return segments
-
-
-@pytest.fixture(autouse=True)
-def local_session_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Materialize into temp roots, never the operator's own.
-
-    BOTH CLIs: each adapter derives its own directory, so isolating one leaves
-    the other writing real rollouts into ``~/.codex`` -- which the operator's
-    codex then offers in its resume picker, and which makes the suite's result
-    depend on what is already on the machine.
-    """
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-    monkeypatch.setattr(
-        "knowop.agent.materialize._codex_cli_version",
-        lambda: "0.999.0",
-    )
 
 
 class TestWhichTargetsResume:
