@@ -88,6 +88,7 @@ from trackinizer.wire.wire_sessions import (
     ConsoleRelay,
     ConsoleTarget,
     InboundDrainItem,
+    InboundKind,
     SessionEnd,
     SessionEndResponse,
     SessionPlacement,
@@ -6311,9 +6312,61 @@ class TestInboundIsWaitDriven:
 class TestAClickedCommandInTheInboundLoop:
     """A command clicked Run on is run here, never typed, and its end is typed."""
 
+    @pytest.mark.parametrize("kind", ["run", "answer"])
+    def test_what_only_the_owner_sends_is_refused_from_anyone_else(
+        self,
+        tmp_path: Path,
+        kind: InboundKind,
+    ) -> None:
+        """A server that queued it anyway reaches no shell and no prompt here."""
+        stop = threading.Event()
+        relay = _RecordingRelay()
+        ran = tmp_path / "ran"
+        client = _ClickClient(
+            stop,
+            relay,
+            InboundDrainItem(
+                text=f"touch {ran}",
+                kind=kind,
+                payload={"run_id": "a" * 32, "block": "k@0", "prompt_id": "p"},
+                source="mallory@x",
+            ),
+        )
+        runs = ClickedRuns(
+            record=lambda _: None,
+            cwd=tmp_path,
+            env={"PATH": "/usr/bin:/bin"},
+            shell_path="/bin/sh",
+        )
+        bridge = Mock(spec=PromptBridge)
+        refused: list[SystemMessage] = []
+
+        def said(message: SystemMessage) -> None:
+            refused.append(message)
+            stop.set()
+
+        _inbound_poll_loop(
+            client,
+            _SessionSink(account="Dan@X"),
+            relay,
+            stop,
+            runs=runs,
+            bridge=bridge,
+            record=said,
+        )
+
+        assert not ran.exists()
+        assert not runs.running()
+        assert relay.submitted == []
+        bridge.answer.assert_not_called()
+        [message] = refused
+        assert message.subtype == "delivery_failed"
+
+    @pytest.mark.parametrize("account", [None, "Dan@X"])
     def test_it_runs_and_the_line_that_says_how_it_ended_is_typed(
         self,
         tmp_path: Path,
+        account: str | None,
     ) -> None:
         stop = threading.Event()
         relay = _RecordingRelay()
@@ -6334,7 +6387,13 @@ class TestAClickedCommandInTheInboundLoop:
             shell_path="/bin/sh",
         )
 
-        _inbound_poll_loop(client, _SessionSink(), relay, stop, runs=runs)
+        _inbound_poll_loop(
+            client,
+            _SessionSink(account=account),
+            relay,
+            stop,
+            runs=runs,
+        )
 
         [typed] = relay.submitted
         assert typed.startswith("knowop-run: <knowop-run ")
@@ -6693,8 +6752,9 @@ class _SessionSink:
 
     session_id = UUID("11111111-2222-3333-4444-555555555555")
 
-    def __init__(self) -> None:
+    def __init__(self, *, account: str | None = None) -> None:
         self.kept_open = False
+        self.account = account
 
     def keep_session_open(self) -> None:
         self.kept_open = True
@@ -11354,6 +11414,8 @@ _DEAD_PID: Final = 2**22 + 1
 
 class _NoSessionSink:
     """A sink whose session the server has not opened yet."""
+
+    account: str | None = None
 
     session_id: UUID | None = None
 

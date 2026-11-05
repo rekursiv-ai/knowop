@@ -119,6 +119,11 @@ class Sink(Protocol):
         """
         ...
 
+    @property
+    def account(self) -> str | None:
+        """The account that holds the server session once it is open, else None."""
+        return None
+
     def open(self) -> str | None:
         """Open the session eagerly; return the granted routing handle (or None).
 
@@ -653,6 +658,7 @@ class TrackinizerSink(Sink):
         # down) still records the run's real start when it opens later.
         self._started = datetime.now(UTC)
         self._session_id: UUID | None = None
+        self._account: str | None = None
         self._granted_actor: str | None = None
         # The CLI's own session id, discovered mid-run and backfilled at close
         # so a fresh run becomes resumable on its next ``--resume``.
@@ -698,6 +704,12 @@ class TrackinizerSink(Sink):
     def session_id(self) -> UUID | None:
         """The server session id once opened (lazily, on first event)."""
         return self._session_id
+
+    @property
+    @override
+    def account(self) -> str | None:
+        """The account that holds the session, once opened."""
+        return self._account
 
     @override
     def emit(self, adapter_name: str, event: Event) -> None:
@@ -856,6 +868,7 @@ class TrackinizerSink(Sink):
             )
             raise PrivateNotHeldError(self._refusal)
         self._session_id = resp.id
+        self._account = resp.account
         # ``resp.seq`` is deliberately unread. It continued the legacy event
         # log, which a resumed run had to seed from; a record's key is derived
         # from its position in its file, so a resumed run re-derives the same
@@ -1096,6 +1109,11 @@ class ResilientSink(Sink):
     @override
     def session_id(self) -> UUID | None:
         return self._primary.session_id
+
+    @property
+    @override
+    def account(self) -> str | None:
+        return self._primary.account
 
     # The runner feeds this wrapper, but the primary is what tells the server how each
     # file spells its bytes, and it reads that off the file's reader.
@@ -1349,6 +1367,12 @@ class LockedSink(Sink):
     def session_id(self) -> UUID | None:
         with self._lock:
             return self._inner.session_id
+
+    # Not under the lock, for the reason ``keep_session_open`` is not.
+    @property
+    @override
+    def account(self) -> str | None:
+        return self._inner.account
 
     # Shares the inner sink's readers, for the reason ``ResilientSink`` gives.
     @property

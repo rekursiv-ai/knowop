@@ -3195,6 +3195,11 @@ class _InboundSink(Protocol):
         """The server session the drains name, once it is open."""
         ...
 
+    @property
+    def account(self) -> str | None:
+        """The account that holds that session; ``None`` from an older server."""
+        ...
+
     def keep_session_open(self) -> None:
         """Leave the server session open when the run ends."""
         ...
@@ -3366,7 +3371,14 @@ def _inbound_poll_loop(
             # message that cannot be typed must not take its siblings with it,
             # since no later drain will ever return them again.
             for item in batch:
-                if item.kind == "run" and runs is not None:
+                if _from_a_stranger(item, account=sink.account):
+                    _record_delivery_failure(
+                        item,
+                        PermissionError(f"{item.source} does not hold this run"),
+                        record=record,
+                        refused=True,
+                    )
+                elif item.kind == "run" and runs is not None:
                     _start_clicked(runs, item, record=record)
                 elif item.kind in {"line", "command"} and (held or _holding(inbound)):
                     held.append(item)
@@ -3407,6 +3419,18 @@ def _inbound_poll_loop(
         # outage is not a hot retry loop.
         if stop.wait(poll_interval):
             break
+
+
+# The server checks this as a message comes in, and it is checked again here, where the
+# harm is done: a ``run`` runs a shell and an ``answer`` allows a tool, as this person,
+# so a server route that misses its check still reaches neither.
+def _from_a_stranger(item: InboundDrainItem, *, account: str | None) -> bool:
+    """Say whether ``item`` acts on this machine for anyone but the session's account."""
+    return (
+        item.kind in {"answer", "run"}
+        and account is not None
+        and (item.source or "").lower() != account.lower()
+    )
 
 
 def _start_clicked(
