@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, TextIO, cast, override
-from unittest.mock import Mock
+from unittest.mock import Mock, call, patch
 from uuid import UUID
 
 import asyncio
@@ -101,6 +101,7 @@ import pytest
 from knowop.agent import (
     detach,
     headless,
+    placement,
     prompt_bridge,
     session,
 )
@@ -117,7 +118,7 @@ from knowop.agent.headless import (
     Tui,
 )
 from knowop.agent.inbound import render_inbound, using_knowop
-from knowop.agent.placement import place_run
+from knowop.agent.placement import git_ref, place_run
 from knowop.agent.prompt_bridge import PromptBridge
 from knowop.agent.pull_request_watch import PullRequestWatch
 from knowop.agent.pull_requests import AUTOFIX_SOURCE
@@ -150,13 +151,9 @@ from knowop.agent.sink import (
 )
 from knowop.agent.sink_test import _Server
 from knowop.agent.slash import SlashCommand
-from knowop.agent.tool_server import BEARER_ENV
+from knowop.agent.tool_server import BEARER_ENV, ToolServer
 from knowop.agent.trust import TrustGate
-from knowop.agent.worktree_diff import (
-    Output,
-    WorktreeDiff,
-    run_git,
-)
+from knowop.agent.worktree_diff import Output, WorktreeDiff
 from knowop.lib.testing.posix import poll_fsevents
 from knowop.shell import machine_host
 
@@ -185,6 +182,21 @@ def short_queue_drain_interval(monkeypatch: pytest.MonkeyPatch) -> None:
 def prompt_fsevents(monkeypatch: pytest.MonkeyPatch) -> None:
     """Watch on a poll rather than on ``fseventsd``'s schedule; see ``poll_fsevents``."""
     poll_fsevents(monkeypatch, writes=True)
+
+
+@pytest.fixture(autouse=True)
+def local_external_boundaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep session wiring on explicit git replies and a non-listening tool server."""
+    monkeypatch.setattr(
+        placement,
+        "git_ref",
+        partial(
+            git_ref,
+            run=Mock(return_value=Output(returncode=128, stdout=b"", cut=False)),
+        ),
+    )
+    tools = Mock(spec=ToolServer, url="http://127.0.0.1:8765/mcp", token="7" * 32)
+    monkeypatch.setattr(session, "ToolServer", Mock(return_value=tools))
 
 
 # A synced claude run reads claude's trust config before it starts. Sandboxed, claude
@@ -521,17 +533,6 @@ def _drain_once(
         worker.join(timeout=5.0)
         assert not worker.is_alive(), "session drain did not stop"
     return stats, sink
-
-
-# The trailing pause is a settle window, not a spawn guess: the test proves NOTHING
-# arrives after the identical rewrite, and absence has no event to wait on. Ten drain
-# intervals is ample for a duplicate to have been emitted.
-def _rewrite_identically(log: Path, body: str, sink: _RecordingSink) -> None:
-    """Write ``body``, wait for its turn to land, then write the same bytes."""
-    log.write_text(body)
-    _wait_for_events(sink, 1)
-    log.write_text(body)
-    time.sleep(10 * session._QUEUE_DRAIN_SEC)
 
 
 class _RecordingStop(threading.Event):
@@ -1458,14 +1459,13 @@ class TestARunSaysWhereItIs:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """An older trax meets ``session_ended`` as an unknown 409: it warns once and waits."""
-        stop = threading.Event()
+        stop = _RecordingStop()
         client = _RefusingClient(
             ClientError("409", status_code=409, code="a_future_refusal"),
             stop_after=3,
             stop=stop,
         )
         relay = _RecordingRelay()
-        started = time.monotonic()
 
         _inbound_poll_loop(
             client,
@@ -1476,7 +1476,7 @@ class TestARunSaysWhereItIs:
             cli="claude",
         )
 
-        assert time.monotonic() - started >= 2 * 0.03
+        assert stop.timeouts == [0.03, 0.03, 0.03]
         assert (client.drains, relay.terminated) == (3, 0)
         assert capsys.readouterr().err.count("inbound delivery failed") == 1
 
@@ -2142,6 +2142,26 @@ class TestProjectDirectoryBornMidRun:
         assert texts == ["captured"], "a first-ever run captured nothing"
 
 
+@asynccontextmanager
+async def _duplicate_body_wakes(
+    *folders: Path,
+    path: Path,
+    until: asyncio.Event,
+) -> AsyncGenerator[AsyncIterator[set[Path]], None]:
+    del folders
+    yield _same_body_twice(path, until=until)
+
+
+async def _same_body_twice(
+    path: Path,
+    *,
+    until: asyncio.Event,
+) -> AsyncIterator[set[Path]]:
+    yield {path}
+    yield {path}
+    await until.wait()
+
+
 class TestWholeFileDrain:
     """A whole-file adapter (gemini) must receive the entire file, re-read."""
 
@@ -2178,7 +2198,11 @@ class TestWholeFileDrain:
         texts = _texts(sink)
         assert texts == ["a", "b"]
 
-    def test_an_unchanged_body_is_emitted_once(self, tmp_path: Path) -> None:
+    def test_an_unchanged_body_is_emitted_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """The same bytes read twice are one turn, not two.
 
         ``write_text`` truncates and then writes, so ONE rewrite queues two
@@ -2189,15 +2213,18 @@ class TestWholeFileDrain:
         """
         adapter = _WholeFileAdapter(tmp_path)
         log = tmp_path / "session-x.json"
-        body = json.dumps({"messages": ["b"]})
-        sink = _RecordingSink()
-
-        _drain_once(
-            adapter,
-            partial(_rewrite_identically, log, body, sink),
-            sink=sink,
+        log.write_text(json.dumps({"messages": ["b"]}))
+        monkeypatch.setattr(
+            session,
+            "follow_dir",
+            partial(_duplicate_body_wakes, path=log),
         )
+        read = Mock(wraps=session._read_bytes)
+        monkeypatch.setattr(session, "_read_bytes", read)
 
+        _, sink = _drain_once(adapter, lambda: None)
+
+        assert read.call_args_list == [call(log), call(log)]
         texts = _texts(sink)
         assert texts == ["b"]
 
@@ -4968,6 +4995,7 @@ class _Wiring:
     drain: dict[str, object] = field(default_factory=dict[str, object])
     inbound: list[object] = field(default_factory=list[object])
     daemons: list[bool] = field(default_factory=list[bool])
+    thread_names: list[str] = field(default_factory=list[str])
 
 
 class _WiringRelay:
@@ -5004,6 +5032,7 @@ def _wiring_drain(
     """Record the drain's inputs, and that it runs as a daemon; release the spawn."""
     wiring.drain = {"args": args, **kwargs}
     wiring.daemons.append(threading.current_thread().daemon)
+    wiring.thread_names.append(threading.current_thread().name)
     armed.set()
 
 
@@ -5011,6 +5040,7 @@ def _wiring_inbound(wiring: _Wiring, *args: object, **kwargs: object) -> None:
     """Record inbound delivery's inputs, and that it runs as a daemon."""
     wiring.inbound = [*args, kwargs]
     wiring.daemons.append(threading.current_thread().daemon)
+    wiring.thread_names.append(threading.current_thread().name)
 
 
 def _wire(
@@ -5228,13 +5258,15 @@ class TestSpawnWiring:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
-        for argv in (
-            ("init", "-q", "-b", "feature"),
-            ("remote", "add", "origin", "https://github.com/o/r.git"),
-        ):
-            assert run_git(["git", "-C", str(tmp_path), *argv], 4096).returncode == 0
+        read = Mock(
+            side_effect=[
+                Output(returncode=0, stdout=b"feature\n", cut=False),
+                Output(returncode=0, stdout=b"https://github.com/o/r.git\n", cut=False),
+            ],
+        )
+        monkeypatch.setattr(placement, "git_ref", partial(git_ref, run=read))
         monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("TRAX_CANVAS", raising=False)
         monkeypatch.setenv("LC_TRAX_CANVAS", str(UUID(int=5)))
         client = _PlacingClient()
         wiring, _ = _wire(
@@ -5260,6 +5292,16 @@ class TestSpawnWiring:
                         "branch": "feature",
                     },
                 },
+            ),
+        ]
+        assert read.call_args_list == [
+            call(
+                ["git", "-C", str(tmp_path), "symbolic-ref", "--short", "-q", "HEAD"],
+                4096,
+            ),
+            call(
+                ["git", "-C", str(tmp_path), "config", "--get", "remote.origin.url"],
+                4096,
             ),
         ]
 
@@ -5640,6 +5682,7 @@ class TestSpawnWiring:
         assert inbound is wiring.drain["inbound"]
         assert inbound.marker is None if stream else inbound.marker is not None
         assert sorted(wiring.daemons) == [True, True]
+        assert sorted(wiring.thread_names) == ["drain", "inbound poll"]
 
     def test_a_local_capture_never_waits_on_the_server(
         self,
@@ -5682,41 +5725,28 @@ class TestSpawnWiring:
     def test_workers_outliving_the_teardown_are_named(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        release = threading.Event()
         monkeypatch.setattr(session, "_JOIN_DEADLINE_SEC", 0.05)
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-        monkeypatch.setattr(
-            session,
-            "ThreadedRelay",
-            partial(_WiringRelay, wiring=_Wiring(), rc=0, output=b""),
+        monkeypatch.setattr(time, "monotonic", lambda: 0.0)
+        drain = Mock(spec=threading.Thread)
+        drain.name = "drain"
+        drain.is_alive.return_value = True
+        poll = Mock(spec=threading.Thread)
+        poll.name = "inbound poll"
+        poll.ident = 7
+        poll.is_alive.return_value = True
+
+        session._wind_down(
+            RunConfig(cli_name="claude", quiesce_seconds=0.0),
+            threading.Event(),
+            drain,
+            poll,
+            _RecordingSink(),
         )
-        monkeypatch.setattr(
-            session,
-            "_drain_filesystem_loop",
-            partial(_held_drain, release),
-        )
-        monkeypatch.setattr(
-            session,
-            "_inbound_poll_loop",
-            partial(_held_inbound, release),
-        )
-        monkeypatch.setattr(shutil, "which", _always_found)
-        try:
-            _ = session._spawn_and_drain(
-                RunConfig(
-                    cli_name="claude",
-                    client=_NoServer(),
-                    quiesce_seconds=0.0,
-                ),
-                ClaudeAdapter(),
-                _RecordingSink(),
-                _Stats(),
-            )
-        finally:
-            release.set()
+
+        drain.join.assert_called_once_with(timeout=0.05)
+        poll.join.assert_called_once_with(timeout=0.05)
         err = capsys.readouterr().err
         assert (
             "[knowop run] drain thread did not stop before the teardown deadline" in err
@@ -5835,24 +5865,6 @@ def _never_arming_drain(
     stop = args[4]
     assert isinstance(stop, threading.Event)
     _ = stop.wait()
-
-
-def _held_drain(
-    release: threading.Event,
-    *args: object,
-    armed: threading.Event,
-    **kwargs: object,
-) -> None:
-    """Arm, then stay alive past any teardown until ``release``."""
-    del args, kwargs
-    armed.set()
-    _ = release.wait(5.0)
-
-
-def _held_inbound(release: threading.Event, *args: object, **kwargs: object) -> None:
-    """Stay alive past any teardown until ``release``."""
-    del args, kwargs
-    _ = release.wait(5.0)
 
 
 class TestTeardownRunsEvenWhenTheRelayRaises:
@@ -6222,72 +6234,40 @@ class TestInboundIsWaitDriven:
 
     def test_asks_the_server_to_hold_the_request(self) -> None:
         """Every drain must carry a non-zero hold, or it is still a poll."""
-        client = _WaitingClient(hold_sec=0.05)
-        stop = threading.Event()
+        client = Mock()
+        client.drain_inbound.return_value = list[InboundDrainItem]()
+        stop = Mock(spec=threading.Event)
+        stop.is_set.side_effect = [False, True]
 
-        worker = threading.Thread(
-            target=lambda: _inbound_poll_loop(
-                client,
-                _SessionSink(),
-                _RecordingRelay(),
-                stop,
-            ),
-            daemon=True,
-        )
-        worker.start()
-        try:
-            deadline = time.monotonic() + 3.0
-            while not client.waits and time.monotonic() < deadline:
-                time.sleep(0.01)
-        finally:
-            stop.set()
-            worker.join(timeout=5.0)
+        _inbound_poll_loop(client, _SessionSink(), _RecordingRelay(), stop)
 
-        assert client.waits, "inbound never called the server"
-        assert all(w > 0 for w in client.waits), (
-            f"drained without asking the server to wait: {client.waits}"
-        )
+        client.drain_inbound.assert_called_once()
+        assert client.drain_inbound.call_args.kwargs["wait_sec"] > 0
+        stop.wait.assert_not_called()
 
-    def test_does_not_sleep_between_successful_waits(self) -> None:
+    def test_does_not_sleep_between_successful_waits(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Re-arming must be immediate: the request itself was the wait.
 
         A sleep after a successful hold adds latency on top of a mechanism
         whose whole purpose is to remove it.
         """
-        client = _WaitingClient(hold_sec=0.02)
-        stop = threading.Event()
-        drain_thread: list[int] = []
-        slept: list[float] = []
-        real_sleep = time.sleep
+        client = Mock()
+        client.drain_inbound.return_value = list[InboundDrainItem]()
+        stop = Mock(spec=threading.Event)
+        stop.is_set.side_effect = [False, False, False, True]
+        slept = Mock()
+        monkeypatch.setattr(time, "sleep", slept)
 
-        def watched_sleep(seconds: float) -> None:
-            if threading.get_ident() in drain_thread:
-                slept.append(seconds)
-            real_sleep(seconds)
+        _inbound_poll_loop(client, _SessionSink(), _RecordingRelay(), stop)
 
-        def _run() -> None:
-            drain_thread.append(threading.get_ident())
-            _inbound_poll_loop(
-                client,
-                _SessionSink(),
-                _RecordingRelay(),
-                stop,
-            )
-
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(time, "sleep", watched_sleep)
-            worker = threading.Thread(target=_run, daemon=True)
-            worker.start()
-            try:
-                deadline = time.monotonic() + 3.0
-                while len(client.waits) < 3 and time.monotonic() < deadline:
-                    real_sleep(0.01)
-            finally:
-                stop.set()
-                worker.join(timeout=5.0)
-
-        assert len(client.waits) >= 3, "did not re-arm after a successful wait"
-        assert slept == [], f"slept between waits: {slept}"
+        assert client.drain_inbound.call_count == 3, (
+            "did not re-arm after a successful wait"
+        )
+        slept.assert_not_called()
+        stop.wait.assert_not_called()
 
     def test_a_failure_backs_off_before_re_arming(self) -> None:
         """A persistent outage must not become a hot retry loop.
@@ -6595,31 +6575,13 @@ class TestInboundAfterALateOpen:
             Event(record=UserMessage(content="hi"), path=tmp_path / "s.jsonl"),
         )
         relay = _RecordingRelay()
-        stop = threading.Event()
-        worker = threading.Thread(
-            target=lambda: _inbound_poll_loop(
-                client,
-                sink,
-                relay,
-                stop,
-                poll_interval=0.01,
-            ),
-            daemon=True,
-        )
-        worker.start()
-        try:
-            _real_pause(0.05)
-            assert client.drained_for == set(), "polled a session that never opened"
-            client.up = True
-            now[0] = 30.0
-            sink.flush()
-            deadline = time.monotonic() + 3.0
-            while not relay.submitted and time.monotonic() < deadline:
-                time.sleep(0.01)
-        finally:
-            stop.set()
-            worker.join(timeout=5.0)
+        stop = Mock(spec=threading.Event)
+        stop.is_set.side_effect = [False, False, True]
+        stop.wait.side_effect = partial(_recover_server_on_wait, client, sink, now)
 
+        _inbound_poll_loop(client, sink, relay, stop, poll_interval=0.01)
+
+        stop.wait.assert_called_once_with(0.01)
         assert relay.submitted == ["now you hear me"]
         assert client.drained_for == {client.session}
 
@@ -6712,6 +6674,20 @@ class _ServerComesBackClient(_UploadOutageClient):
         return AppendRecordsResponse(part=0, written=1, skipped=0)
 
 
+def _recover_server_on_wait(
+    client: _ServerComesBackClient,
+    sink: ResilientSink,
+    now: list[float],
+    timeout: float,
+) -> bool:
+    assert timeout == 0.01
+    assert client.drained_for == set(), "polled a session that never opened"
+    client.up = True
+    now[0] = 30.0
+    sink.flush()
+    return False
+
+
 class _SessionSink:
     """A sink whose session is already open, so inbound has an id to use."""
 
@@ -6787,30 +6763,6 @@ class _PickyRelay(_RecordingRelay):
 def _real_pause(seconds: float) -> None:
     """Block without ``time.sleep``, so a sleep assertion stays meaningful."""
     threading.Event().wait(seconds)
-
-
-class _WaitingClient:
-    """A client whose drain holds, as the real long-poll route does."""
-
-    def __init__(self, *, hold_sec: float) -> None:
-        self._hold_sec = hold_sec
-        self.waits: list[float] = []
-
-    def drain_inbound(
-        self,
-        session_id: UUID,
-        *,
-        wait_sec: float = 0.0,
-        **where: str | bool | None,
-    ) -> list[InboundDrainItem]:
-        del where
-        del session_id
-        self.waits.append(wait_sec)
-        # A real hold blocks in the transport, not in ``time.sleep``: a fake
-        # that slept here would be indistinguishable from the loop sleeping,
-        # which is the very thing the caller asserts about.
-        _real_pause(self._hold_sec)
-        return []
 
 
 class _FailingClient:
@@ -10541,15 +10493,30 @@ class TestAHeadlessRunsWiring:
     ) -> None:
         wiring = _HeadlessWiring(drivers=[_ScriptedDriver()])
         wiring.after_ending = 0.05
+        real_sleep = time.sleep
 
-        _ = _wire_headless(
-            monkeypatch,
-            tmp_path,
-            _headless_config(),
-            ClaudeAdapter(),
-            wiring=wiring,
-        )
+        def sleep(seconds: float) -> None:
+            if seconds != wiring.after_ending:
+                real_sleep(seconds)
 
+        sleeping = Mock(side_effect=sleep)
+        monkeypatch.setattr(time, "sleep", sleeping)
+        with patch.object(
+            threading.Thread,
+            "join",
+            autospec=True,
+            side_effect=threading.Thread.join,
+        ) as joined:
+            _ = _wire_headless(
+                monkeypatch,
+                tmp_path,
+                _headless_config(),
+                ClaudeAdapter(),
+                wiring=wiring,
+            )
+
+        sleeping.assert_any_call(0.05)
+        assert any(args[0].name == "inbound poll" for args, _ in joined.call_args_list)
         assert wiring.poll_done.is_set()
 
     def test_a_loaded_history_past_the_fit_is_compacted_first(

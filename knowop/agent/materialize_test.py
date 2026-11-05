@@ -55,7 +55,6 @@ if TYPE_CHECKING:
 # leaves them out, so the public export carries copies beside this module instead.
 _TESTDATA: Final = Path(__file__).resolve().parent / "testdata" / "sessions"
 _FIXTURE: Final = _TESTDATA / "claude_sidechain.jsonl"
-_CODEX_FIXTURE: Final = _TESTDATA / "codex_main.jsonl"
 
 
 # Real rather than synthetic: claude's writer reconstructs LINES from the provider-
@@ -269,17 +268,27 @@ class TestTheRewriteIsReadableBack:
         assert _without_session_id(reread) == _without_session_id(_records())
 
     def test_a_codex_capture_materializes_as_claude(self) -> None:
-        """What captured a session does not decide what resumes it.
-
-        Codex cannot be re-entered (it has no stable per-session id), but its
-        transcript is IR records like any other, so claude can be handed them. A
-        conversion across formats is lossy in the envelope, not the content.
-        """
+        """The provider that captured a session need not resume it."""
         reader = Tail(codex.normalize)
         captured: list[TraxRecord] = []
-        with _CODEX_FIXTURE.open(encoding="utf-8") as handle:
-            for line in handle:
-                captured.extend(reader.feed(line))
+        for line in (
+            (
+                '{"timestamp":"2026-01-01T00:00:00Z","type":"response_item",'
+                '"payload":{"type":"message","role":"user",'
+                '"content":[{"type":"input_text","text":"hi"}]}}\n'
+            ),
+            (
+                '{"timestamp":"2026-01-01T00:00:01Z","type":"response_item",'
+                '"payload":{"type":"reasoning","summary":[],"encrypted_content":"sealed"}}\n'
+            ),
+            (
+                '{"timestamp":"2026-01-01T00:00:02Z","type":"response_item",'
+                '"payload":{"type":"message","role":"assistant",'
+                '"content":[{"type":"output_text","text":"hello"}]}}\n'
+            ),
+            "{",
+        ):
+            captured.extend(reader.feed(line))
         captured.extend(reader.close())
         # As the store hands them to a resume: the sealed half split off each row.
         rows = [
@@ -303,6 +312,16 @@ class TestTheRewriteIsReadableBack:
         with written.path.open(encoding="utf-8") as handle:
             reread = list(claude.normalize(handle))
         assert reread, "a codex capture materialized to an empty transcript"
+        assert [
+            record.content
+            for record in reread
+            if isinstance(record, UserMessage | AssistantMessage)
+        ] == ["hi", "hello"]
+        assert [
+            record.encrypted for record in reread if isinstance(record, Thinking)
+        ] == [
+            "sealed",
+        ]
 
     def test_the_reread_file_declares_the_minted_id(self) -> None:
         """The reader reads back the id the rewrite stamped in.

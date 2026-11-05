@@ -1,14 +1,18 @@
-"""The command runner's edges; the exec host's tests run it end to end."""
+"""Exercise command supervision with explicit process replies and real streams."""
 
 from __future__ import annotations
 
-from typing import IO, TYPE_CHECKING
+from asyncio.subprocess import Process
+from functools import partial
+from typing import TYPE_CHECKING, TypedDict, Unpack, cast
+from unittest.mock import AsyncMock, Mock
 
 import asyncio
 import base64
+import os
+import signal
 
 from trackinizer.lib.posix.child import Child
-from trackinizer.lib.posix.pids import gone_within, kill_and_reap, written_pid
 from trackinizer.wire.wire_exec import (
     MAX_STREAM_BYTES,
     TIMEOUT_EXIT_CODE,
@@ -27,17 +31,9 @@ from knowop.shell.exec_stream import Cut
 
 
 if TYPE_CHECKING:
-    from asyncio.subprocess import Process
-    from collections.abc import Collection, Iterator, Mapping
+    from asyncio import Future
+    from collections.abc import Awaitable, Callable, Iterable
     from pathlib import Path
-
-
-@pytest.fixture
-def started() -> Iterator[list[int]]:
-    """Collect the pids a test starts; whatever still runs at teardown is killed."""
-    pids: list[int] = []
-    yield pids
-    kill_and_reap(pids)
 
 
 @pytest.fixture(autouse=True)
@@ -51,38 +47,84 @@ def empty_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def test_the_shells_exit_ends_the_wait_where_waiting_waits_for_the_pipes(
     tmp_path: Path,
+    empty_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Before Python 3.13, ``Process.wait`` returns only once the pipes close.
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            "HOME": str(empty_home),
+            "PATH": os.defpath,
+            "KEPT": "yes",
+            "TRACKINIZER_TOKEN": "secret",
+            "TRAX_CANVAS": "hidden",
+        },
+    )
+    request = _request("echo done", cwd=tmp_path)
 
-    A job the shell left in the background holds them, so the runner must not
-    wait on it: here it never returns at all.
-    """
-    monkeypatch.setattr(asyncio.subprocess.Process, "wait", _never)
-
-    result = asyncio.run(
-        asyncio.wait_for(run_command(_request("echo done", cwd=tmp_path)), 5),
+    result, process, start = asyncio.run(
+        asyncio.wait_for(
+            _run_reply(request, monkeypatch=monkeypatch, stdout=b"done\n"),
+            5,
+        ),
     )
 
     assert (result.exit_code, _out(result)) == (0, b"done\n")
+    process.wait.assert_not_called()
+    process.stdin.write.assert_not_called()
+    process.stdin.close.assert_called_once_with()
+    _, options = start.call_args
+    (report_fd,) = options["pass_fds"]
+    start.assert_awaited_once_with(
+        "bash",
+        "-lc",
+        f"trap 'printf %s \"$PWD\" >&{report_fd}' EXIT\necho done",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=tmp_path,
+        env={"HOME": str(empty_home), "PATH": os.defpath, "KEPT": "yes"},
+        pass_fds=(report_fd,),
+        limit=2**16,
+        start_new_session=True,
+    )
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        os.fstat(report_fd)
 
 
-def test_a_command_past_its_timeout_is_reported_as_one(tmp_path: Path) -> None:
-    result = asyncio.run(
-        run_command(_request("echo started; sleep 30", cwd=tmp_path, timeout_sec=0.2)),
+def test_a_command_past_its_timeout_is_reported_as_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, process, _ = asyncio.run(
+        _run_reply(
+            _request("echo started; sleep 30", cwd=tmp_path, timeout_sec=0.2),
+            monkeypatch=monkeypatch,
+            stdout=b"started\n",
+            code=None,
+            expired=True,
+        ),
     )
 
     assert result.exit_code == TIMEOUT_EXIT_CODE
     assert (_out(result), _err(result)) == (b"started\n", b"timed out after 0.2 s\n")
+    assert process.returncode == -signal.SIGKILL
 
 
 def test_both_streams_are_reported_and_either_one_cut_marks_the_result(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     long = MAX_STREAM_BYTES + 1
 
-    result = asyncio.run(
-        run_command(_request(f"echo oops >&2; head -c {long} /dev/zero", cwd=tmp_path)),
+    result, _, _ = asyncio.run(
+        _run_reply(
+            _request(f"echo oops >&2; head -c {long} /dev/zero", cwd=tmp_path),
+            monkeypatch=monkeypatch,
+            stdout=b"\x00" * long,
+            stderr=b"oops\n",
+        ),
     )
 
     assert result.exit_code == 0
@@ -92,8 +134,11 @@ def test_both_streams_are_reported_and_either_one_cut_marks_the_result(
 
 def test_a_home_folder_of_a_user_this_machine_lacks_runs_nothing(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     folder = "~no-such-user-of-knowop"
+    start = AsyncMock(side_effect=AssertionError("A refused request started a shell."))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
 
     result, ending = asyncio.run(
         run_until_ended(_request(f"touch {tmp_path}/ran", cwd=folder), ended=None),
@@ -103,6 +148,7 @@ def test_a_home_folder_of_a_user_this_machine_lacks_runs_nothing(
     assert result.exit_code == 1
     assert _err(result) == f"{folder} is not a folder on this machine\n".encode()
     assert not (tmp_path / "ran").exists()
+    start.assert_not_called()
 
 
 def test_a_command_started_without_its_pipes_is_refused(tmp_path: Path) -> None:
@@ -113,73 +159,144 @@ def test_a_command_started_without_its_pipes_is_refused(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_a_cancelled_run_kills_the_command_and_what_it_started(
     tmp_path: Path,
-    started: list[int],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    process = _process(code=None)
+    ready = asyncio.Event()
+    process.stdin.close.side_effect = ready.set
+    start = AsyncMock(return_value=cast(Process, process))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    kill = Mock(side_effect=partial(_kill_group, process))
+    monkeypatch.setattr(os, "killpg", kill)
     running = asyncio.create_task(
-        run_command(
-            _request(f"sleep 60 & echo $! > {tmp_path}/job.pid; wait", cwd=tmp_path),
-        ),
+        run_command(_request("sleep 60 & wait", cwd=tmp_path)),
     )
-    started.append(await written_pid(tmp_path / "job.pid"))
+    await ready.wait()
+
     running.cancel()
+
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(running, timeout=5)
-    assert await gone_within(started)
+    kill.assert_called_once_with(process.pid, signal.SIGKILL)
+    assert process.returncode == -signal.SIGKILL
+    assert process.stdout.at_eof()
+    assert process.stderr.at_eof()
 
 
 @pytest.mark.asyncio
 async def test_a_run_cancelled_while_its_shell_starts_kills_what_it_started(
     tmp_path: Path,
-    started: list[int],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The cancel lands before the runner holds the shell, so no one else can stop it."""
-    real = asyncio.create_subprocess_exec
-    handed = asyncio.Event()
-
-    async def slow(
-        *argv: str,
-        stdin: int | IO[bytes] | None,
-        stdout: int | IO[bytes] | None,
-        stderr: int | IO[bytes] | None,
-        cwd: str | Path | None,
-        env: Mapping[str, str] | None,
-        pass_fds: Collection[int],
-        limit: int,
-        start_new_session: bool,
-    ) -> Process:
-        process = await real(
-            *argv,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            cwd=cwd,
-            env=env,
-            pass_fds=pass_fds,
-            limit=limit,
-            start_new_session=start_new_session,
-        )
-        await handed.wait()
-        return process
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", slow)
+    process = _process(code=None)
+    starting, handed = asyncio.Event(), asyncio.Event()
+    start = AsyncMock(side_effect=partial(_hand_over, process, starting, handed))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    kill = Mock(side_effect=partial(_kill_group, process))
+    monkeypatch.setattr(os, "killpg", kill)
     running = asyncio.create_task(
-        run_command(
-            _request(f"sleep 60 & echo $! > {tmp_path}/job.pid; wait", cwd=tmp_path),
-        ),
+        run_command(_request("sleep 60 & wait", cwd=tmp_path)),
     )
-    started.append(await written_pid(tmp_path / "job.pid"))
+    await starting.wait()
+
     running.cancel()
     handed.set()
+
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(running, timeout=5)
-    assert await gone_within(started)
+    kill.assert_called_once_with(process.pid, signal.SIGKILL)
+    assert process.returncode == -signal.SIGKILL
+    assert process.stdout.at_eof()
+    assert process.stderr.at_eof()
+
+
+async def _hand_over(
+    process: Mock,
+    starting: asyncio.Event,
+    handed: asyncio.Event,
+    *argv: str,
+    **options: object,
+) -> Process:
+    del argv, options
+    starting.set()
+    await handed.wait()
+    return cast(Process, process)
+
+
+def _process(*, stdout: bytes = b"", stderr: bytes = b"", code: int | None = 0) -> Mock:
+    out, err = asyncio.StreamReader(), asyncio.StreamReader()
+    out.feed_data(stdout)
+    err.feed_data(stderr)
+    if code is not None:
+        out.feed_eof()
+        err.feed_eof()
+    process = Mock(
+        spec=Process,
+        pid=7,
+        returncode=code,
+        stdin=Mock(spec=asyncio.StreamWriter, drain=AsyncMock()),
+        stdout=out,
+        stderr=err,
+        wait=AsyncMock(side_effect=AssertionError("The pipe-bound wait was used.")),
+    )
+    process.send_signal.side_effect = partial(_signal_process, process)
+    return process
+
+
+def _signal_process(process: Mock, signum: int) -> None:
+    process.returncode = -signum
+    process.stdout.feed_eof()
+    process.stderr.feed_eof()
+
+
+def _kill_group(process: Mock, pgid: int, signum: int) -> None:
+    assert pgid == process.pid
+    _signal_process(process, signum)
+
+
+class _WaitOptions(TypedDict, total=False):
+    timeout: float | None
+    return_when: str
+
+
+async def _expire(
+    wait: Callable[..., Awaitable[tuple[set[Future[object]], set[Future[object]]]]],
+    futures: Iterable[Future[object]],
+    **options: Unpack[_WaitOptions],
+) -> tuple[set[Future[object]], set[Future[object]]]:
+    if options.get("return_when") == asyncio.FIRST_COMPLETED:
+        assert options["timeout"] == 0.2
+        await asyncio.sleep(0)
+        return set(), set(futures)
+    return await wait(futures, **options)
+
+
+async def _run_reply(
+    request: ExecRequest,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    stdout: bytes = b"",
+    stderr: bytes = b"",
+    code: int | None = 0,
+    expired: bool = False,
+) -> tuple[ExecResult, Mock, AsyncMock]:
+    process = _process(stdout=stdout, stderr=stderr, code=code)
+    start = AsyncMock(return_value=cast(Process, process))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    if expired:
+        monkeypatch.setattr(asyncio, "wait", partial(_expire, asyncio.wait))
+        monkeypatch.setattr(os, "killpg", partial(_kill_group, process))
+    return await run_command(request), process, start
 
 
 async def _supervise_without_pipes(cwd: Path) -> None:
-    """Supervise a process started with none of the pipes the runner feeds and reads."""
-    async with await Child.start("true") as child:
-        _ = await _supervise(
+    process = Mock(spec=Process, stdin=None, stdout=None, stderr=None, returncode=0)
+    async with Child(
+        process=cast(Process, process),
+        group=False,
+        grace_sec=0.0,
+    ) as child:
+        await _supervise(
             child,
             _request("true", cwd=cwd),
             ended=None,
@@ -188,16 +305,7 @@ async def _supervise_without_pipes(cwd: Path) -> None:
         )
 
 
-async def _never(process: asyncio.subprocess.Process) -> int:
-    """Stand in for ``Process.wait`` while something still holds the pipes."""
-    del process
-    await asyncio.Event().wait()
-    return 0
-
-
 def _request(command: str, *, cwd: Path | str, timeout_sec: float = 10) -> ExecRequest:
-    # A fraction of a second, which the wire's whole seconds cannot say, keeps the
-    # timeout test from waiting out a real one.
     return ExecRequest.model_construct(
         command=command,
         cwd=str(cwd),

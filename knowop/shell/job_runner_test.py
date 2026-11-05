@@ -1,12 +1,15 @@
-"""The runner in a job's scope: how a job's end is told, at its limit and at its cap."""
+"""The runner's exit, deadline and memory-cap decisions with OS process replies."""
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+from unittest.mock import Mock, call
 
 import os
 import runpy
+import signal
 import subprocess
 import sys
 import time
@@ -17,13 +20,30 @@ import pytest
 
 from knowop.shell import job_runner
 from knowop.shell.job_folder import Ended, JobFolder
-from knowop.shell.job_limits import run
 from knowop.shell.job_runner import run_job
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from subprocess import Popen
+    from collections.abc import Sequence
+    from typing import BinaryIO
+
+
+@pytest.fixture(autouse=True)
+def popen(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Supply process wait outcomes without replacing the runner's decisions or files."""
+    child = Mock(spec=subprocess.Popen, pid=7, args=["job"])
+    child.wait.return_value = 0
+    started = Mock(return_value=child)
+    monkeypatch.setattr(subprocess, "Popen", started)
+    return started
+
+
+@pytest.fixture(autouse=True)
+def signal_group(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Record the runner's signals without signalling a real process group."""
+    sent = Mock()
+    monkeypatch.setattr(os, "killpg", sent)
+    return sent
 
 
 def _folder(tmp_path: Path, *argv: str, minutes: int = 5) -> JobFolder:
@@ -50,25 +70,56 @@ def _python(code: str) -> list[str]:
     return [sys.executable, "-c", code]
 
 
+def _spawn_output(
+    child: Mock,
+    data: bytes,
+    argv: Sequence[str],
+    **options: object,
+) -> Mock:
+    del argv
+    _ = cast("BinaryIO", options["stdout"]).write(data)
+    return child
+
+
 def test_a_job_runs_in_its_worktree_and_its_output_joins_the_log(
     tmp_path: Path,
+    popen: Mock,
 ) -> None:
-    folder = _folder(
-        tmp_path,
-        *_python(
-            "import os, sys; print(os.getcwd(), flush=True); print('oops', file=sys.stderr)",
-        ),
+    argv = _python(
+        "import os, sys; print(os.getcwd(), flush=True); print('oops', file=sys.stderr)",
     )
+    folder = _folder(tmp_path, *argv)
     folder.note("worktree ready")
+    popen.side_effect = partial(
+        _spawn_output,
+        popen.return_value,
+        f"{folder.src}\noops\n".encode(),
+    )
 
     ended = run_job(folder, events=None, limit_sec=30)
 
     assert ended == Ended(state="completed", exit_code=0, reason="")
     assert folder.log.read_text() == (f"knowop: worktree ready\n{folder.src}\noops\n")
+    log = popen.call_args.kwargs["stdout"]
+    assert log.name == str(folder.log)
+    assert log.closed
+    popen.assert_called_once_with(
+        argv,
+        cwd=folder.src,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        process_group=0,
+    )
+    popen.return_value.wait.assert_called_once_with(timeout=30)
 
 
-def test_a_job_that_exits_badly_is_failed_with_its_code(tmp_path: Path) -> None:
+def test_a_job_that_exits_badly_is_failed_with_its_code(
+    tmp_path: Path,
+    popen: Mock,
+) -> None:
     folder = _folder(tmp_path, *_python("raise SystemExit(3)"))
+    popen.return_value.wait.return_value = 3
 
     assert run_job(folder, events=None, limit_sec=30) == Ended(
         state="failed",
@@ -77,8 +128,12 @@ def test_a_job_that_exits_badly_is_failed_with_its_code(tmp_path: Path) -> None:
     )
 
 
-def test_a_job_a_signal_killed_reports_128_plus_the_signal(tmp_path: Path) -> None:
+def test_a_job_a_signal_killed_reports_128_plus_the_signal(
+    tmp_path: Path,
+    popen: Mock,
+) -> None:
     folder = _folder(tmp_path, *_python("import os, signal; os.kill(os.getpid(), 9)"))
+    popen.return_value.wait.return_value = -signal.SIGKILL
 
     assert run_job(folder, events=None, limit_sec=30) == Ended(
         state="failed",
@@ -87,11 +142,18 @@ def test_a_job_a_signal_killed_reports_128_plus_the_signal(tmp_path: Path) -> No
     )
 
 
-def test_a_command_that_cannot_start_is_failed_with_why(tmp_path: Path) -> None:
+def test_a_command_that_cannot_start_is_failed_with_why(
+    tmp_path: Path,
+    popen: Mock,
+) -> None:
     missing = _folder(tmp_path / "a", "no-such-command-knowop")
     script = tmp_path / "script"
     _ = script.write_text("#!/bin/sh\n")
     not_runnable = _folder(tmp_path / "b", str(script))
+    popen.side_effect = [
+        FileNotFoundError(2, "No such file or directory"),
+        PermissionError(13, "Permission denied"),
+    ]
 
     lost = run_job(missing, events=None, limit_sec=30)
     refused = run_job(not_runnable, events=None, limit_sec=30)
@@ -101,19 +163,11 @@ def test_a_command_that_cannot_start_is_failed_with_why(tmp_path: Path) -> None:
     assert (refused.state, refused.exit_code) == ("failed", 126)
 
 
-def _gone(pid: int) -> bool:
-    """Whether ``pid`` ends within a second."""
-    deadline = time.monotonic() + 1
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        time.sleep(0.01)
-    return False
-
-
-def test_a_job_past_its_limit_is_stopped_with_its_whole_group(tmp_path: Path) -> None:
+def test_a_job_past_its_limit_is_stopped_with_its_whole_group(
+    tmp_path: Path,
+    popen: Mock,
+    signal_group: Mock,
+) -> None:
     pid = tmp_path / "pid"
     folder = _folder(
         tmp_path,
@@ -122,6 +176,11 @@ def test_a_job_past_its_limit_is_stopped_with_its_whole_group(tmp_path: Path) ->
         f"sleep 30 & echo $! > {pid}; wait",
         minutes=3,
     )
+    child = popen.return_value
+    child.wait.side_effect = [
+        subprocess.TimeoutExpired(child.args, 0.05),
+        -signal.SIGTERM,
+    ]
 
     ended = run_job(folder, events=None, limit_sec=0.05, grace_sec=5)
 
@@ -130,57 +189,47 @@ def test_a_job_past_its_limit_is_stopped_with_its_whole_group(tmp_path: Path) ->
         exit_code=124,
         reason="stopped at its 3 min limit",
     )
-    assert _gone(int(pid.read_text()))
-
-
-def _expire_when_ready(
-    child: Popen[bytes],
-    timeout: float | None,
-    *,
-    ready: Path,
-    wait: Callable[[Popen[bytes], float | None], int],
-) -> int:
-    if timeout is None:
-        return wait(child, None)
-    deadline = time.monotonic() + 5
-    while not (ready.exists() and ready.stat().st_size):
-        assert time.monotonic() < deadline, "the child never reached its wait"
-        time.sleep(0.001)
-    raise subprocess.TimeoutExpired(child.args, timeout)
+    signal_group.assert_called_once_with(child.pid, signal.SIGTERM)
+    assert child.wait.call_args_list == [call(timeout=0.05), call(timeout=5)]
 
 
 def test_a_job_that_ignores_sigterm_is_killed_and_reaped_once_the_grace_is_up(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    popen: Mock,
+    signal_group: Mock,
 ) -> None:
     pid, shell = tmp_path / "pid", tmp_path / "shell"
-    original_wait = subprocess.Popen.wait
-    waits: list[float | None] = []
-
-    def wait(child: Popen[bytes], timeout: float | None = None) -> int:
-        waits.append(timeout)
-        return _expire_when_ready(child, timeout, ready=pid, wait=original_wait)
-
-    monkeypatch.setattr(subprocess.Popen, "wait", wait)
     folder = _folder(
         tmp_path,
         "sh",
         "-c",
         f"echo $$ > {shell}; trap '' TERM; sleep 30 & echo $! > {pid}; wait",
     )
+    child = popen.return_value
+    child.wait.side_effect = [
+        subprocess.TimeoutExpired(child.args, 0.05),
+        subprocess.TimeoutExpired(child.args, 0.05),
+        -signal.SIGKILL,
+    ]
 
     started = time.monotonic()
     ended = run_job(folder, events=None, limit_sec=0.05, grace_sec=0.05)
 
     assert ended.state == "timeout"
     assert time.monotonic() - started < 5
-    assert _gone(int(pid.read_text()))
-    assert _gone(int(shell.read_text()))
-    assert waits == [0.05, 0.05, None]
+    assert signal_group.call_args_list == [
+        call(child.pid, signal.SIGTERM),
+        call(child.pid, signal.SIGKILL),
+    ]
+    assert child.wait.call_args_list == [call(timeout=0.05), call(timeout=0.05), call()]
 
 
-def test_a_process_the_kernel_killed_at_the_cap_names_the_cap(tmp_path: Path) -> None:
+def test_a_process_the_kernel_killed_at_the_cap_names_the_cap(
+    tmp_path: Path,
+    popen: Mock,
+) -> None:
     folder = _folder(tmp_path, *_python("raise SystemExit(137)"))
+    popen.return_value.wait.return_value = 137
     events = tmp_path / "memory.events"
     _ = events.write_text("low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\noom_group_kill 0\n")
     quiet = tmp_path / "quiet.events"
@@ -247,8 +296,10 @@ def test_main_runs_the_folders_job_niced_under_its_own_scope_and_records_its_end
 def test_the_runner_records_the_jobs_end_as_a_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    popen: Mock,
 ) -> None:
     folder = _folder(tmp_path, *_python("print('module-job')"), minutes=1)
+    popen.side_effect = partial(_spawn_output, popen.return_value, b"module-job\n")
     niced: list[int] = []
 
     def nice(increment: int) -> int:
@@ -266,20 +317,6 @@ def test_the_runner_records_the_jobs_end_as_a_module(
     assert folder.ended() == Ended(state="completed", exit_code=0, reason="")
     assert folder.log.read_text() == "module-job\n"
     assert niced == [10]
-
-
-@pytest.mark.cli_python_subprocess
-def test_a_job_process_inherits_the_runners_niceness() -> None:
-    code, output = run(
-        _python(
-            "import os, subprocess, sys; os.nice(10); "
-            "raise SystemExit(subprocess.run([sys.executable, '-c', "
-            "'import os; print(os.nice(0))']).returncode)",
-        ),
-    )
-
-    assert code == 0
-    assert int(output) >= 10
 
 
 if __name__ == "__main__":

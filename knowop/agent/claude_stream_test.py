@@ -10,11 +10,19 @@ against a scripted fake that speaks the same lines.
 
 from __future__ import annotations
 
+from asyncio.subprocess import Process
+from collections.abc import Callable
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from functools import partial
+from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Self
+from typing import TYPE_CHECKING, Final, Self, cast
+from unittest.mock import AsyncMock, Mock, patch
 
 import asyncio
 import json
+import os
+import runpy
 import sys
 import uuid
 
@@ -36,10 +44,12 @@ from knowop.agent.claude_stream import (
     ClaudeWire,
     Reading,
 )
+from knowop.agent.codex_app_test import _signal_app
+from knowop.shell.exec_command_test import _process
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterator, Mapping
 
 
 type _Frame = dict[str, PlainTree]
@@ -816,7 +826,7 @@ def matches(want, got):
     return want == got
 
 
-for line in sys.stdin:
+def answer(line):
     frame = json.loads(line)
     log.write(line)
     log.flush()
@@ -835,9 +845,77 @@ for line in sys.stdin:
             if "exit" in step:
                 sys.exit(step["exit"])
             break
+
+
+for line in sys.stdin:
+    answer(line)
 """
 """A claude that answers from a script: each step names a frame to match and the frames
 to print back, with ``$request_id`` filled in from the frame it matched."""
+
+
+@pytest.fixture(autouse=True)
+def stream_process() -> Iterator[AsyncMock]:
+    """Run the same scripted fake without launching an interpreter or signalling a PID."""
+    processes: dict[int, Mock] = {}
+    with ExitStack() as cleanup, pytest.MonkeyPatch.context() as boundary:
+        start = AsyncMock(side_effect=partial(_spawn_stream, cleanup, processes))
+        boundary.setattr(asyncio, "create_subprocess_exec", start)
+        boundary.setattr(os, "killpg", partial(_signal_app, processes))
+        yield start
+
+
+async def _spawn_stream(
+    cleanup: ExitStack,
+    processes: dict[int, Mock],
+    *argv: str,
+    cwd: Path,
+    env: Mapping[str, str],
+    **options: object,
+) -> Process:
+    del options
+    with (
+        patch.object(sys, "stdin", StringIO()),
+        patch.object(sys, "argv", list(argv[3:])),
+        patch.object(os, "getcwd", return_value=str(cwd)),
+        patch.dict(os.environ, env, clear=True),
+    ):
+        namespace = runpy.run_path(argv[3])
+    cleanup.callback(cast(TextIOWrapper, namespace["log"]).close)
+    answer = cast(Callable[[str], None], namespace["answer"])
+    process = _process(code=None)
+    processes[process.pid] = process
+    process.stdin.write.side_effect = partial(_answer_stream, process, answer)
+    return cast(Process, process)
+
+
+def _answer_stream(process: Mock, answer: Callable[[str], None], data: bytes) -> None:
+    if process.returncode is not None:
+        raise BrokenPipeError
+    output, error_bytes = StringIO(), BytesIO()
+    status = None
+    with TextIOWrapper(error_bytes, encoding="utf-8") as errors:
+        with redirect_stdout(output), redirect_stderr(errors):
+            try:
+                for line in data.decode().splitlines(keepends=True):
+                    answer(line)
+            except SystemExit as ended:
+                status = cast(int, ended.code)
+        errors.flush()
+        process.stderr.feed_data(error_bytes.getvalue())
+    process.stdout.feed_data(output.getvalue().encode())
+    if status is not None:
+        process.returncode = status
+        process.stdout.feed_eof()
+        process.stderr.feed_eof()
+
+
+def _expired(
+    timeout: Callable[[float | None], asyncio.Timeout],
+    delay: float | None,
+) -> asyncio.Timeout:
+    assert delay == 0.05
+    return timeout(0)
 
 
 def _ack(**body: PlainTree) -> _Frame:
@@ -1507,7 +1585,12 @@ def test_start_fails_when_the_cli_exits_before_it_answers(tmp_path: Path) -> Non
         asyncio.run(go())
 
 
-def test_start_fails_when_the_cli_never_answers(tmp_path: Path) -> None:
+def test_start_fails_when_the_cli_never_answers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(asyncio, "timeout", partial(_expired, asyncio.timeout))
+
     async def go() -> None:
         async with _Run(tmp_path, request_timeout_sec=0.05) as run:
             _ = await run.start()

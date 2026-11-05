@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import argparse
 import ast
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -309,51 +310,39 @@ def _ran(argv: Sequence[str], **kwargs: object) -> int:
     return 0
 
 
-def _import_root() -> Path:
-    """Return the directory ``loop`` imports from, so a child process finds this tree."""
-    return Path(cli.__file__).resolve().parents[len(cli.__name__.split(".")) - 1]
-
-
-def _child_env(tmp_path: Path, *, path: str) -> dict[str, str]:
-    """Return an environment whose runs and profiles live in ``tmp_path``."""
-    return {
-        "PATH": path,
-        "PYTHONPATH": str(_import_root()),
-        "XDG_STATE_HOME": str(tmp_path / "state"),
-        "XDG_CONFIG_HOME": str(tmp_path / "config"),
-        "HOME": str(tmp_path),
-    }
-
-
 @pytest.mark.cli_python_subprocess
-def test_the_module_lists_its_hosts_as_a_process(tmp_path: Path) -> None:
-    done = subprocess.run(  # noqa: S603 -- the current interpreter running this package.
-        [sys.executable, "-m", cli.__package__ or "", "ls"],
-        env=_child_env(tmp_path, path=os.defpath),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def test_the_module_lists_its_hosts_as_a_process(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = cli.__package__ or ""
+    monkeypatch.setattr(sys, "argv", [module, "ls"])
 
-    assert (done.returncode, done.stdout) == (0, "NAME  STATE  PID  STARTED  COMMAND\n")
+    with pytest.raises(SystemExit) as exited:
+        _ = runpy.run_module(module, run_name="__main__", alter_sys=True)
+
+    assert (exited.value.code, capsys.readouterr().out) == (
+        0,
+        "NAME  STATE  PID  STARTED  COMMAND\n",
+    )
 
 
 @pytest.mark.cli_python_subprocess
 def test_knowop_run_reaches_the_runner_as_a_process_with_no_login(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``knowop run ls`` asks no server, so it needs no login, and prints the hosts."""
     knowop = (cli.__package__ or "").rpartition(".")[0]
+    monkeypatch.setattr(sys, "argv", [knowop, "run", "ls"])
 
-    done = subprocess.run(  # noqa: S603 -- the current interpreter running knowop.
-        [sys.executable, "-m", knowop, "run", "ls"],
-        env=_child_env(tmp_path, path=os.defpath),
-        capture_output=True,
-        text=True,
-        check=False,
+    with pytest.raises(SystemExit) as exited:
+        _ = runpy.run_module(knowop, run_name="__main__", alter_sys=True)
+
+    assert (exited.value.code, capsys.readouterr().out) == (
+        0,
+        "NAME  STATE  PID  STARTED  COMMAND\n",
     )
-
-    assert (done.returncode, done.stdout) == (0, "NAME  STATE  PID  STARTED  COMMAND\n")
 
 
 def test_a_client_error_is_one_line_and_status_2(

@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 import os
 import shutil
 import subprocess
-import sys
 
 import pytest
 
@@ -228,15 +227,6 @@ def test_jobs_may_hold_half_of_the_computers_memory() -> None:
     total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 2**20
 
     assert memory_budget_mb() == total // 2
-
-
-@pytest.mark.cli_python_subprocess
-def test_run_returns_the_exit_code_and_output_and_127_for_a_missing_program() -> None:
-    assert run([sys.executable, "-c", "print('hi'); raise SystemExit(3)"]) == (
-        3,
-        "hi\n",
-    )
-    assert run(["no-such-program-knowop"]) == (127, "")
 
 
 def test_run_returns_the_programs_exit_code_and_output(

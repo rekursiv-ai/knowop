@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
+from unittest.mock import Mock, call
 
 import base64
 import hashlib
 import io
+import os
+import shutil
 import subprocess
 
 from trackinizer.client.errors import ClientError
@@ -26,6 +29,7 @@ import pytest
 
 from knowop.jobs import machine_job
 from knowop.jobs.job_fetch import IntegrityError
+from knowop.jobs.job_source_test import _done
 from knowop.jobs.machine_job import (
     Pushed,
     pushed,
@@ -37,94 +41,139 @@ from knowop.shell.job_folder import Ended, JobFolder
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
+    from subprocess import CompletedProcess
 
 
 _REMOTE = "https://example.invalid/o/r.git"
-
-
-def _git(repo: Path, *args: str) -> str:
-    done = subprocess.run(  # noqa: S603 -- fixed git argv on a tmp_path repo.
-        ["git", "-C", str(repo), *args],  # noqa: S607 -- git is the tool under test.
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return done.stdout.strip()
+_HEAD = "a" * 40
 
 
 @pytest.fixture
-def bare(tmp_path: Path) -> Path:
-    found = tmp_path / "remote.git"
-    _ = _git(tmp_path, "init", "--quiet", "--bare", str(found))
-    return found
-
-
-@pytest.fixture(autouse=True)
-def _git_config(tmp_path: Path, bare: Path) -> Iterator[None]:
-    """Set a git identity; serve the https remote from a folder by ``insteadOf``."""
-    config = tmp_path / "gitconfig"
-    _ = config.write_text(
-        "[user]\n\tname = t\n\temail = t@example.com\n"
-        f'[url "file://{bare}"]\n\tinsteadOf = {_REMOTE}\n',
+def git(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    run = Mock()
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(shutil, "which", Mock(return_value="/tools/git"))
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {"PATH": "/tools", "KEEP": "value", "GIT_DIR": "/callers/repository"},
     )
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setenv("GIT_CONFIG_GLOBAL", str(config))
-        patch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-        patch.delenv("GIT_DIR", raising=False)
-        yield
+    return run
 
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    """Return a repository whose ``main`` is pushed to the remote as it stands."""
     work = tmp_path / "work"
     work.mkdir()
-    _ = _git(work, "init", "--quiet", "--initial-branch=main")
-    _ = (work / "train.py").write_text("print(1)\n")
-    _ = (work / ".gitignore").write_text("*.log\n")
-    _ = _git(work, "add", "-A")
-    _ = _git(work, "commit", "--quiet", "-m", "one")
-    _ = _git(work, "remote", "add", "origin", _REMOTE)
-    _ = _git(work, "push", "--quiet", "-u", "origin", "main")
     return work
 
 
-def test_a_pushed_clean_branch_names_its_remote_branch_and_commit(repo: Path) -> None:
+@pytest.fixture(autouse=True)
+def replies(repo: Path, git: Mock) -> dict[str, CompletedProcess[bytes]]:
+    answers = {
+        "top": _done(f" {repo}\n".encode()),
+        "branch": _done(b" main\n"),
+        "remote": _done(b" origin\n"),
+        "ref": _done(b" refs/heads/main\n"),
+        "url": _done(f" {_REMOTE}\n".encode()),
+        "status": _done(),
+        "head": _done(f" {_HEAD}\n".encode()),
+        "tip": _done(f"{_HEAD}\trefs/heads/main\n".encode()),
+    }
+    git.side_effect = answers.values()
+    return answers
+
+
+def test_a_pushed_clean_branch_names_its_remote_branch_and_commit(
+    repo: Path,
+    git: Mock,
+) -> None:
     (repo / "sub").mkdir()
-    _ = (repo / "run.log").write_text("ignored\n")
 
     found = pushed(repo / "sub")
 
     assert found == Pushed(
         remote=_REMOTE,
         ref="refs/heads/main",
-        commit=_git(repo, "rev-parse", "HEAD"),
+        commit=_HEAD,
         branch="main",
     )
+    env = {
+        "PATH": "/tools",
+        "KEEP": "value",
+        "PYTEST_CURRENT_TEST": os.environ["PYTEST_CURRENT_TEST"],
+    }
+    git.assert_has_calls(
+        [
+            call(
+                ["/tools/git", "rev-parse", "--show-toplevel"],
+                cwd=repo / "sub",
+                env=env,
+                input=b"",
+                capture_output=True,
+                check=False,
+            ),
+            *[
+                call(
+                    ["/tools/git", *args],
+                    cwd=repo,
+                    env=env,
+                    input=b"",
+                    capture_output=True,
+                    check=False,
+                )
+                for args in (
+                    ("symbolic-ref", "--short", "HEAD"),
+                    ("config", "branch.main.remote"),
+                    ("config", "branch.main.merge"),
+                    ("config", "remote.origin.url"),
+                    ("status", "--porcelain=v1", "--untracked-files=normal", "-z"),
+                    ("rev-parse", "HEAD"),
+                    ("ls-remote", _REMOTE, "refs/heads/main"),
+                )
+            ],
+        ],
+    )
+    assert git.call_count == 8
 
 
-def test_a_file_that_differs_from_the_pushed_commit_is_refused(repo: Path) -> None:
-    _ = (repo / "train.py").write_text("print(2)\n")
-    _ = (repo / "new.py").write_text("x\n")
+def test_a_file_that_differs_from_the_pushed_commit_is_refused(
+    repo: Path,
+    replies: dict[str, CompletedProcess[bytes]],
+    git: Mock,
+) -> None:
+    replies["status"] = _done(b" M train.py\0?? new.py\0")
 
-    with pytest.raises(ClientError, match=r"^2 files differ from the pushed commit: "):
+    with pytest.raises(
+        ClientError,
+        match=r"^2 files differ from the pushed commit: ",
+    ) as refused:
         _ = pushed(repo)
 
+    assert str(refused.value) == (
+        "2 files differ from the pushed commit: train.py, new.py; a job on a "
+        "machine runs what was pushed, so commit and push them first"
+    )
+    assert git.call_count == 6
 
-def test_more_than_ten_changed_files_are_counted_not_all_named(repo: Path) -> None:
-    for n in range(12):
-        _ = (repo / f"f{n:02d}.py").write_text("x\n")
+
+def test_more_than_ten_changed_files_are_counted_not_all_named(
+    repo: Path,
+    replies: dict[str, CompletedProcess[bytes]],
+) -> None:
+    replies["status"] = _done("".join(f"?? f{n:02d}.py\0" for n in range(12)).encode())
 
     with pytest.raises(ClientError, match=r"f09\.py and 2 more; a job on a machine"):
         _ = pushed(repo)
 
 
-def test_a_commit_not_yet_pushed_is_refused(repo: Path) -> None:
-    _ = _git(repo, "commit", "--quiet", "--allow-empty", "-m", "two")
-    head = _git(repo, "rev-parse", "HEAD")
-    tip = _git(repo, "rev-parse", "origin/main")
+def test_a_commit_not_yet_pushed_is_refused(
+    repo: Path,
+    replies: dict[str, CompletedProcess[bytes]],
+) -> None:
+    head, tip = "b" * 40, _HEAD
+    replies["head"] = _done(f"{head}\n".encode())
 
     with pytest.raises(
         ClientError,
@@ -133,17 +182,32 @@ def test_a_commit_not_yet_pushed_is_refused(repo: Path) -> None:
         _ = pushed(repo)
 
 
-def test_a_branch_the_remote_does_not_hold_is_refused(repo: Path) -> None:
-    _ = _git(repo, "checkout", "--quiet", "-b", "side")
-    _ = _git(repo, "config", "branch.side.remote", "origin")
-    _ = _git(repo, "config", "branch.side.merge", "refs/heads/side")
+def test_a_branch_the_remote_does_not_hold_is_refused(
+    repo: Path,
+    replies: dict[str, CompletedProcess[bytes]],
+    git: Mock,
+) -> None:
+    replies["branch"] = _done(b"side\n")
+    replies["ref"] = _done(b"refs/heads/side\n")
+    replies["tip"] = _done()
 
     with pytest.raises(ClientError, match="origin/side is at nothing"):
         _ = pushed(repo)
 
+    assert git.call_args.args[0] == [
+        "/tools/git",
+        "ls-remote",
+        _REMOTE,
+        "refs/heads/side",
+    ]
 
-def test_a_detached_head_is_refused(repo: Path) -> None:
-    _ = _git(repo, "checkout", "--quiet", "--detach")
+
+def test_a_detached_head_is_refused(
+    repo: Path,
+    replies: dict[str, CompletedProcess[bytes]],
+    git: Mock,
+) -> None:
+    replies["branch"] = _done(b"discard failed output", code=1)
 
     with pytest.raises(
         ClientError,
@@ -151,12 +215,22 @@ def test_a_detached_head_is_refused(repo: Path) -> None:
     ):
         _ = pushed(repo)
 
+    assert git.call_count == 2
 
-def test_a_branch_with_no_upstream_is_refused(repo: Path) -> None:
-    _ = _git(repo, "checkout", "--quiet", "-b", "local")
+
+def test_a_branch_with_no_upstream_is_refused(
+    repo: Path,
+    replies: dict[str, CompletedProcess[bytes]],
+    git: Mock,
+) -> None:
+    replies["branch"] = _done(b"local\n")
+    for key in ("remote", "ref", "url"):
+        replies[key] = _done(code=1)
 
     with pytest.raises(ClientError, match="push it with git push -u origin local"):
         _ = pushed(repo)
+
+    assert git.call_count == 5
 
 
 @pytest.mark.parametrize(
@@ -165,11 +239,19 @@ def test_a_branch_with_no_upstream_is_refused(repo: Path) -> None:
 )
 def test_a_branch_with_half_an_upstream_has_no_upstream(
     repo: Path,
+    replies: dict[str, CompletedProcess[bytes]],
     key: str,
     value: str,
 ) -> None:
-    _ = _git(repo, "checkout", "--quiet", "-b", "local")
-    _ = _git(repo, "config", key, value)
+    replies["branch"] = _done(b"local\n")
+    replies["remote"] = _done(code=1)
+    replies["ref"] = _done(code=1)
+    replies["url"] = _done(code=1)
+    if key.endswith(".merge"):
+        replies["ref"] = _done(f"{value}\n".encode())
+    else:
+        replies["remote"] = _done(f"{value}\n".encode())
+        replies["url"] = _done(f"{_REMOTE}\n".encode())
 
     with pytest.raises(ClientError, match=r"^branch local has no upstream on a remote"):
         _ = pushed(repo)
@@ -178,9 +260,11 @@ def test_a_branch_with_half_an_upstream_has_no_upstream(
 @pytest.mark.parametrize("merge", ["refs/tags/v1", "--upload-pack=touch x"])
 def test_an_upstream_that_is_not_a_branch_is_refused_before_git_reads_it(
     repo: Path,
+    replies: dict[str, CompletedProcess[bytes]],
+    git: Mock,
     merge: str,
 ) -> None:
-    _ = _git(repo, "config", "branch.main.merge", merge)
+    replies["ref"] = _done(f"{merge}\n".encode())
 
     with pytest.raises(
         ClientError,
@@ -188,15 +272,15 @@ def test_an_upstream_that_is_not_a_branch_is_refused_before_git_reads_it(
     ):
         _ = pushed(repo)
 
+    assert git.call_count == 5
 
-def test_a_remote_whose_url_holds_a_token_is_refused(repo: Path) -> None:
-    _ = _git(
-        repo,
-        "remote",
-        "set-url",
-        "origin",
-        "https://ghp_x@example.invalid/o/r.git",
-    )
+
+def test_a_remote_whose_url_holds_a_token_is_refused(
+    repo: Path,
+    replies: dict[str, CompletedProcess[bytes]],
+    git: Mock,
+) -> None:
+    replies["url"] = _done(b"https://ghp_x@example.invalid/o/r.git\n")
 
     with pytest.raises(
         ClientError,
@@ -204,15 +288,20 @@ def test_a_remote_whose_url_holds_a_token_is_refused(repo: Path) -> None:
     ):
         _ = pushed(repo)
 
+    assert git.call_count == 5
 
-def test_a_folder_outside_any_repository_is_refused(tmp_path: Path) -> None:
+
+def test_a_folder_outside_any_repository_is_refused(tmp_path: Path, git: Mock) -> None:
     (tmp_path / "plain").mkdir()
+    git.side_effect = [_done(code=128)]
 
     with pytest.raises(
         ClientError,
         match=r"^submit --machine runs from inside a git repository$",
     ):
         _ = pushed(tmp_path / "plain")
+
+    assert git.call_count == 1
 
 
 def _view(state: str, **fields: object) -> MachineJobView:
@@ -355,6 +444,7 @@ def _submit(machine: _Machine, repo: Path, clock: _Clock, *, gpus: int = 0) -> i
 def test_submit_names_the_pushed_commit_and_waits_until_the_machine_takes_it(
     machine: _Machine,
     repo: Path,
+    git: Mock,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     machine.views = [_view("queued")]
@@ -362,9 +452,10 @@ def test_submit_names_the_pushed_commit_and_waits_until_the_machine_takes_it(
 
     job = _submit(machine, repo, clock)
 
+    assert git.call_args_list[0].kwargs["cwd"] == repo
     assert job == 9
     [body] = machine.submitted
-    head = _git(repo, "rev-parse", "HEAD")
+    head = _HEAD
     assert (body.machine, body.argv, body.label) == (
         "gx10",
         ["python", "train.py"],

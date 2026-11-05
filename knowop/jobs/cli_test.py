@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-import subprocess
 import sys
 
 from trackinizer.client.client import Client
@@ -18,6 +17,7 @@ import pytest
 
 from knowop.jobs.cli import main
 from knowop.jobs.job import JOB_WORD, Job
+from knowop.lib.testing.import_graph import Counted, import_graph
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -29,18 +29,6 @@ if TYPE_CHECKING:
 # Counted from the module's dotted name, not a fixed hop: the export republishes this
 # tree shallower.
 _ROOT: Final = _CWD.parents[__name__.count(".") - 1]
-
-_PROBE: Final = """\\
-import sys
-sys.path.insert(0, sys.argv[1])
-import knowop.jobs.cli
-loaded = sorted(
-    name.removeprefix("trackinizer.trax.")
-    for name in sys.modules
-    if name.startswith("trackinizer.trax.")
-)
-print(" ".join(loaded))
-"""
 
 _ALLOWED: Final = frozenset(
     {"client_cache", "commands", "connection", "context", "profile", "render"},
@@ -64,7 +52,12 @@ def no_terminal_server(monkeypatch: pytest.MonkeyPatch) -> None:
     A shell a terminal opened names its server, and with no profile for it every
     command first says how to add one, which the stderr tests here would read.
     """
-    for name in ("TRAX_SERVER", "LC_TRAX_SERVER"):
+    for name in (
+        "TRAX_SERVER",
+        "LC_TRAX_SERVER",
+        "TRACKINIZER_PROFILE",
+        "TRACKINIZER_URL",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -91,14 +84,16 @@ def seen(monkeypatch: pytest.MonkeyPatch) -> _Seen:
 @pytest.mark.cli_python_subprocess
 def test_importing_the_endpoint_loads_no_trax_verb() -> None:
     """``trax.cli`` and the verbs behind it move out; this endpoint must stay light."""
-    done = subprocess.run(  # noqa: S603 -- fixed interpreter and probe.
-        [sys.executable, "-c", _PROBE, str(_ROOT)],
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=_ROOT,
+    graph = import_graph(
+        [main.__module__],
+        path=[str(_ROOT), *sys.path],
+        follow=lambda name: name.startswith(
+            (main.__module__.split(".jobs")[0], profile.__package__ or ""),
+        ),
+        counted=Counted.IMPORT_TIME_AND_HANDLERS,
     )
-    trax = set(done.stdout.split())
+    prefix = f"{profile.__package__}."
+    trax = {name.removeprefix(prefix) for name in graph if name.startswith(prefix)}
 
     assert "connection" in trax
     assert trax <= _ALLOWED, sorted(trax - _ALLOWED)

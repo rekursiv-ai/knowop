@@ -779,6 +779,9 @@ def test_a_pipe_nobody_writes_to_is_not_waited_on_for_a_token(
 ) -> None:
     """An agent shell or a CI step leaves an open pipe; the login must still start."""
     monkeypatch.setattr(serve, "_STDIN_WAIT_SEC", 0.05)
+    poller = Mock(wraps=select.poll())
+    poller.poll.return_value = list[tuple[int, int]]()
+    monkeypatch.setattr(select, "poll", lambda: poller)
     read_end, write_end = os.pipe()
     try:
         with os.fdopen(read_end) as pipe:
@@ -788,6 +791,8 @@ def test_a_pipe_nobody_writes_to_is_not_waited_on_for_a_token(
             assert serve.piped_token() == ""
 
             assert time.monotonic() - started < 2
+            poller.register.assert_called_once_with(read_end, select.POLLIN)
+            poller.poll.assert_called_once_with(50)
     finally:
         os.close(write_end)
 

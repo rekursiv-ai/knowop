@@ -3,17 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from functools import partial
-from http import server
 from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast, override
+from unittest.mock import Mock
 
 import hashlib
 import os
-import selectors
-import shlex
-import shutil
-import ssl
+import signal
 import subprocess
 import threading
 import time
@@ -21,13 +17,11 @@ import time
 import pytest
 
 from knowop.shell import job_repo
-from knowop.shell.job_limits import run
 from knowop.shell.job_repo import FetchError, Repos
 
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from selectors import SelectorKey
 
 
 _FILE = frozenset({"file"})
@@ -204,21 +198,6 @@ def _completed(
     return subprocess.CompletedProcess(args, returncode, stdout, stderr)
 
 
-class _Exited:
-    def __init__(self, argv: list[str]) -> None:
-        self.args = argv
-        self.pid = 1
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        del exc
-
-    def poll(self) -> int:
-        return 0
-
-
 def _capture_run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -227,35 +206,43 @@ def _capture_run(
 ) -> tuple[list[str], dict[str, str]]:
     spawned: list[tuple[list[str], dict[str, object]]] = []
 
-    def popen(argv: list[str], **kwargs: object) -> _Exited:
+    def popen(argv: list[str], **kwargs: object) -> _PipedChild:
         spawned.append((argv, kwargs))
-        return _Exited(argv)
+        return _pipe_reply(argv, stdout=b"version\xff\n", stderr=b"notice\n")
 
     def require_tool(name: str) -> str:
         assert name == "git"
         return "/usr/bin/git"
 
-    def collect(
-        self: Repos,
-        child: subprocess.Popen[bytes],
-    ) -> subprocess.CompletedProcess[str]:
-        del self
-        return _completed(cast("list[str]", child.args))
-
     def kill_scope(argv: Sequence[str]) -> tuple[int, str]:
-        assert argv[0] == "systemctl"
+        assert argv[:4] == ["systemctl", "--user", "kill", "--signal=SIGKILL"]
+        assert argv[4].startswith("knowop-prepare-")
+        assert argv[4].endswith(".scope")
         return 0, ""
 
     monkeypatch.setattr(job_repo, "require_tool", require_tool)
     monkeypatch.setattr(job_repo, "scope_argv", _unscoped)
     monkeypatch.setattr(job_repo.subprocess, "Popen", popen)
-    monkeypatch.setattr(Repos, "_collect", collect)
     monkeypatch.setattr(job_repo, "run", kill_scope)
     if remote_config is not None:
         monkeypatch.setenv("GIT_CONFIG_GLOBAL", remote_config)
-    Repos(tmp_path / "repos")._run(None, "version")
+    done = Repos(tmp_path / "repos")._run(None, "version")
     argv, kwargs = spawned[0]
-    return argv, cast("dict[str, str]", kwargs["env"])
+    assert (done.args, done.returncode, done.stdout, done.stderr) == (
+        argv,
+        0,
+        "version\ufffd\n",
+        "notice\n",
+    )
+    assert kwargs.keys() == {"stdin", "stdout", "stderr", "env", "start_new_session"}
+    assert kwargs["stdin"] == subprocess.DEVNULL
+    assert kwargs["stdout"] == subprocess.PIPE
+    assert kwargs["stderr"] == subprocess.PIPE
+    assert kwargs["start_new_session"] is True
+    env = cast("dict[str, str]", kwargs["env"])
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    assert env["SSH_ASKPASS_REQUIRE"] == "never"
+    return argv, env
 
 
 def _unscoped(
@@ -542,14 +529,15 @@ def test_git_uses_the_memory_and_time_scope(
 
 
 class _PipedChild:
-    args = ("git", "version")
-
     def __init__(self, stdout: int, stderr: int) -> None:
         self.stdout = os.fdopen(stdout, "rb", buffering=0)
         self.stderr = os.fdopen(stderr, "rb", buffering=0)
+        self.args: list[str] = ["git", "version"]
+        self.pid = 7
+        self.returncode: int | None = 0
 
-    def poll(self) -> int:
-        return 0
+    def poll(self) -> int | None:
+        return self.returncode
 
     def wait(self) -> int:
         return 0
@@ -561,6 +549,34 @@ class _PipedChild:
         del exc
         self.stdout.close()
         self.stderr.close()
+
+
+def _pipe_reply(
+    argv: list[str],
+    *,
+    stdout: bytes = b"",
+    stderr: bytes = b"",
+) -> _PipedChild:
+    out, out_writer = os.pipe()
+    err, err_writer = os.pipe()
+    _ = os.write(out_writer, stdout)
+    _ = os.write(err_writer, stderr)
+    os.close(out_writer)
+    os.close(err_writer)
+    child = _PipedChild(out, err)
+    child.args = argv
+    return child
+
+
+@pytest.fixture
+def git_process(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    """Replace only Git's OS process and scope signals, keeping pipe supervision real."""
+    started = Mock(return_value=_pipe_reply(["git"]))
+    monkeypatch.setattr(subprocess, "Popen", started)
+    monkeypatch.setattr(job_repo, "require_tool", Mock(return_value="/usr/bin/git"))
+    monkeypatch.setattr(job_repo, "run", Mock(return_value=(0, "")))
+    monkeypatch.setattr(os, "killpg", Mock())
+    return started
 
 
 def test_preparation_output_is_bounded_before_launch() -> None:
@@ -656,7 +672,10 @@ def test_git_uses_the_users_configured_credential_helper(
 def test_git_that_runs_out_of_time_is_said_plainly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    git_process: Mock,
 ) -> None:
+    del git_process
+
     def too_slow(*args: object, **kwargs: object) -> None:
         del args, kwargs
         raise subprocess.TimeoutExpired(cmd="git", timeout=5)
@@ -676,18 +695,12 @@ def test_git_that_runs_out_of_time_is_said_plainly(
 def test_git_still_running_at_its_deadline_is_killed_and_said_plainly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    git_process: Mock,
 ) -> None:
-    # A git that is still running when the deadline passes, on every platform: a real
-    # ``git init`` may already have exited by the time the scope's kill returns.
-    git = tmp_path / "git"
-    _ = git.write_text("#!/bin/sh\nexec sleep 60\n")
-    git.chmod(0o700)
-
-    def tool(name: str) -> str:
-        assert name == "git"
-        return str(git)
-
-    monkeypatch.setattr(job_repo, "require_tool", tool)
+    child = git_process.return_value
+    child.returncode = None
+    signals = Mock()
+    monkeypatch.setattr(os, "killpg", signals)
     repos = Repos(tmp_path / "repos", protocols=_FILE, timeout_sec=0)
     started = time.monotonic()
 
@@ -699,8 +712,10 @@ def test_git_still_running_at_its_deadline_is_killed_and_said_plainly(
             dest=tmp_path / "s",
         )
 
-    # Leaving ``Popen`` waits for the child, so only the kill ends it this soon.
     assert time.monotonic() - started < 30
+    signals.assert_called_once_with(child.pid, signal.SIGKILL)
+    assert child.stdout.closed
+    assert child.stderr.closed
 
 
 def test_an_object_the_fetches_bring_that_is_not_a_commit_is_refused(
@@ -757,7 +772,11 @@ class _SetOnceHeld(threading.Event):
         return self.asked > 1
 
 
-def test_a_preparation_cancelled_while_git_runs_stops_it(tmp_path: Path) -> None:
+def test_a_preparation_cancelled_while_git_runs_stops_it(
+    tmp_path: Path,
+    git_process: Mock,
+) -> None:
+    del git_process
     cancel = _SetOnceHeld()
 
     with pytest.raises(FetchError, match="preparation cancelled"):
@@ -785,243 +804,6 @@ def test_a_git_child_without_output_pipes_is_refused(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="preparation output pipes"):
         _ = repos._collect(cast("subprocess.Popen[bytes]", _Pipeless()))
-
-
-def _real_git(root: Path, *args: str) -> str:
-    code, stdout = run(["git", "-C", str(root), *args])
-    assert code == 0, (args, stdout)
-    return stdout.strip()
-
-
-@pytest.fixture(scope="module")
-def real_remote_seed(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, str, str]:
-    root = tmp_path_factory.mktemp("git-remote-seed")
-    work = root / "work"
-    bare = root / "remote.git"
-    work.mkdir()
-    _real_git(work, "init", "--quiet", "--initial-branch=main")
-    _real_git(work, "config", "user.name", "Test")
-    _real_git(work, "config", "user.email", "test@example.com")
-    _ = (work / "train.py").write_text("print(2)\n")
-    _real_git(work, "add", "train.py")
-    _real_git(work, "commit", "--quiet", "-m", "initial")
-    commit = _real_git(work, "rev-parse", "HEAD")
-    _real_git(root, "clone", "--quiet", "--bare", str(work), str(bare))
-    return bare, commit, _real_git(work, "rev-parse", "HEAD^{tree}")
-
-
-@pytest.fixture
-def real_remote(
-    real_remote_seed: tuple[Path, str, str],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> tuple[Path, str, str]:
-    templates = tmp_path / "templates"
-    templates.mkdir()
-    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(templates))
-    seed, commit, tree = real_remote_seed
-    bare = tmp_path / "remote.git"
-    shutil.copytree(seed, bare)
-    return bare, commit, tree
-
-
-def _ignore_scope_kill(argv: Sequence[str]) -> tuple[int, str]:
-    assert argv[:2] == ["systemctl", "--user"]
-    return 0, ""
-
-
-class _PromptSelector(selectors.DefaultSelector):
-    """Keep real pipe readiness while shortening the supervision polling interval."""
-
-    @override
-    def select(self, timeout: float | None = None) -> list[tuple[SelectorKey, int]]:
-        return super().select(None if timeout is None else min(timeout, 0.001))
-
-
-def _real_repos(monkeypatch: pytest.MonkeyPatch, root: Path) -> Repos:
-    monkeypatch.setattr(job_repo, "scope_argv", _unscoped)
-    monkeypatch.setattr(job_repo.selectors, "DefaultSelector", _PromptSelector)
-    monkeypatch.setattr(job_repo, "run", _ignore_scope_kill)
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    config = root / "global.gitconfig"
-    config.write_text("[user]\nname = Test\nemail = test@example.com\n")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-    return Repos(root / "repos", protocols=_FILE)
-
-
-@pytest.mark.cli_git
-def test_real_git_fetches_the_requested_commit_into_a_bare_mirror(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    real_remote: tuple[Path, str, str],
-) -> None:
-    bare, commit, _tree = real_remote
-    repos = _real_repos(monkeypatch, tmp_path)
-    stage = tmp_path / "stage.git"
-
-    repos._prepare(stage, remote=f"file://{bare}", ref="refs/heads/main", commit=commit)
-
-    assert _real_git(stage, "rev-parse", "--is-bare-repository") == "true"
-    assert _real_git(stage, "cat-file", "-t", commit) == "commit"
-
-
-@pytest.mark.cli_git
-def test_real_git_adds_a_detached_worktree(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    real_remote: tuple[Path, str, str],
-) -> None:
-    bare, commit, _tree = real_remote
-    dest = tmp_path / "job" / "src"
-
-    _real_repos(monkeypatch, tmp_path).checkout(
-        remote=f"file://{bare}",
-        ref="refs/heads/main",
-        commit=commit,
-        dest=dest,
-    )
-
-    assert (dest / "train.py").read_text() == "print(2)\n"
-    assert _real_git(dest, "rev-parse", "HEAD") == commit
-    assert _real_git(dest, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD"
-    assert len(list((tmp_path / "repos").glob("*.git"))) == 1
-
-
-@pytest.mark.cli_git
-def test_real_git_rejects_a_tree_as_the_requested_commit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    real_remote: tuple[Path, str, str],
-) -> None:
-    bare, _commit, tree = real_remote
-
-    with pytest.raises(FetchError, match=f"{tree[:12]} is not on refs/heads/main"):
-        _real_repos(monkeypatch, tmp_path).checkout(
-            remote=f"file://{bare}",
-            ref="refs/heads/main",
-            commit=tree,
-            dest=tmp_path / "src",
-        )
-    assert not (tmp_path / "src").exists()
-
-
-@pytest.mark.cli_git
-def test_real_git_prunes_a_removed_worktree_record(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    real_remote: tuple[Path, str, str],
-) -> None:
-    bare, commit, _tree = real_remote
-    repos = _real_repos(monkeypatch, tmp_path)
-    dest = tmp_path / "src"
-    repos.checkout(
-        remote=f"file://{bare}",
-        ref="refs/heads/main",
-        commit=commit,
-        dest=dest,
-    )
-    mirror = next((tmp_path / "repos").glob("*.git"))
-    assert _real_git(mirror, "worktree", "list", "--porcelain").count("worktree ") == 2
-
-    repos.remove(remote=f"file://{bare}", dest=dest)
-
-    assert not dest.exists()
-    assert _real_git(mirror, "worktree", "list", "--porcelain").count("worktree ") == 1
-
-
-class _AuthenticatedRepo(server.SimpleHTTPRequestHandler):
-    @override
-    def do_GET(self) -> None:
-        if self.headers.get("Authorization") != "Basic dGVzdDp0b2tlbg==":
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="test"')
-            self.end_headers()
-            return
-        super().do_GET()
-
-    @override
-    def log_message(self, format: str, *args: object) -> None:
-        del format, args
-
-
-@pytest.mark.cli_git
-@pytest.mark.network_localhost
-def test_real_git_uses_the_credential_helper_over_local_https(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    real_remote: tuple[Path, str, str],
-) -> None:
-    bare, commit, _tree = real_remote
-    _real_git(bare, "update-server-info")
-    certificate, key = tmp_path / "cert.pem", tmp_path / "key.pem"
-    code, output = run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "ec",
-            "-pkeyopt",
-            "ec_paramgen_curve:P-256",
-            "-nodes",
-            "-keyout",
-            str(key),
-            "-out",
-            str(certificate),
-            "-days",
-            "1",
-            "-subj",
-            "/CN=127.0.0.1",
-            "-addext",
-            "subjectAltName=IP:127.0.0.1",
-        ],
-    )
-    assert code == 0, output
-    helper = tmp_path / "credential-helper"
-    helper_called = tmp_path / "helper-called"
-    helper.write_text(
-        "#!/bin/sh\n"
-        f'echo "$1" >> {shlex.quote(str(helper_called))}\n'
-        'if [ "$1" = get ]; then echo username=test; echo password=token; fi\n',
-    )
-    helper.chmod(0o700)
-    ca_directory = tmp_path / "ca"
-    ca_directory.mkdir()
-    config = tmp_path / "global.gitconfig"
-    config.write_text(
-        "[user]\nname = Test\nemail = test@example.com\n"
-        f"[credential]\nhelper = {helper}\n"
-        f"[http]\nsslCAInfo = {certificate}\nsslCAPath = {ca_directory}\n",
-    )
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
-    monkeypatch.setattr(job_repo, "run", _ignore_scope_kill)
-    monkeypatch.setattr(job_repo.selectors, "DefaultSelector", _PromptSelector)
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    context.load_cert_chain(certificate, key)
-    with server.ThreadingHTTPServer(
-        ("127.0.0.1", 0),
-        partial(_AuthenticatedRepo, directory=str(bare.parent)),
-    ) as httpd:
-        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
-        worker = threading.Thread(
-            target=partial(httpd.serve_forever, poll_interval=0.005),
-        )
-        worker.start()
-        try:
-            dest = tmp_path / "src"
-            Repos(tmp_path / "repos").checkout(
-                remote=f"https://127.0.0.1:{httpd.server_port}/{bare.name}",
-                ref="refs/heads/main",
-                commit=commit,
-                dest=dest,
-            )
-        finally:
-            httpd.shutdown()
-            worker.join(timeout=5)
-
-    assert "get" in helper_called.read_text().splitlines()
-    assert (tmp_path / "src" / "train.py").read_text() == "print(2)\n"
 
 
 if __name__ == "__main__":

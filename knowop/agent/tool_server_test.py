@@ -1,22 +1,27 @@
 """Tests for the MCP server a run offers its agent's CLI its tools on.
 
-Each test serves on ``127.0.0.1`` and posts JSON-RPC as claude and codex do.
+The real HTTP handler reads request bytes from an in-memory socket. Listening,
+thread shutdown and a disconnected peer are checked by the hand-run parity script.
 """
 
 from __future__ import annotations
 
-from http.client import HTTPConnection
-from typing import TYPE_CHECKING, override
+from functools import partial
+from http.client import HTTPResponse
+from io import BytesIO
+from typing import TYPE_CHECKING
+from unittest.mock import Mock
 from urllib.parse import urlsplit
 
 import json
 import socket
-import time
+import threading
 
 from treekle import json_loads
 
 import pytest
 
+from knowop.agent import tool_server
 from knowop.agent.tool_server import (
     PROTOCOL,
     AgentTool,
@@ -26,7 +31,7 @@ from knowop.agent.tool_server import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Buffer, Iterator, Mapping
+    from collections.abc import Iterator, Mapping
 
 
 def _echo(arguments: Mapping[str, object]) -> str:
@@ -46,6 +51,13 @@ def _break(arguments: Mapping[str, object]) -> str:
 _SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}}}
 
 
+@pytest.fixture(autouse=True)
+def no_listener(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the real HTTP server's constructor off the listening socket boundary."""
+    monkeypatch.setattr(tool_server._Http, "server_bind", Mock())
+    monkeypatch.setattr(tool_server._Http, "server_activate", Mock())
+
+
 @pytest.fixture
 def server() -> Iterator[ToolServer]:
     served = ToolServer(
@@ -55,7 +67,6 @@ def server() -> Iterator[ToolServer]:
             AgentTool(name="break", description="Fail.", schema=_SCHEMA, call=_break),
         ],
     )
-    served.start()
     yield served
     served.close()
 
@@ -89,21 +100,39 @@ def _send(
     path: str = "/mcp",
     body: bytes = b"",
     headers: Mapping[str, str] | None = None,
+    content_length: bool = True,
 ) -> tuple[int, bytes, str | None]:
-    """Send one request with the token, unless ``headers`` replace it."""
-    parts = urlsplit(server.url)
-    connection = HTTPConnection(parts.hostname or "", parts.port, timeout=5)
-    try:
-        connection.request(
-            method,
-            path,
-            body=body,
-            headers={"Authorization": f"Bearer {server.token}", **(headers or {})},
-        )
-        response = connection.getresponse()
+    """Pass wire bytes through the real handler and parse its HTTP response."""
+    fields = {"Host": "127.0.0.1", "Authorization": f"Bearer {server.token}"}
+    if content_length:
+        fields["Content-Length"] = str(len(body))
+    fields.update(headers or {})
+    raw = (
+        f"{method} {path} HTTP/1.1\r\n"
+        + "".join(f"{key}: {value}\r\n" for key, value in fields.items())
+        + "\r\n"
+    ).encode("latin-1") + body
+    peer = Mock(spec=socket.socket)
+    peer.makefile.return_value = BytesIO(_exchange(server, raw))
+    with HTTPResponse(peer) as response:
+        response.begin()
         return response.status, response.read(), response.getheader("Allow")
-    finally:
-        connection.close()
+
+
+def _exchange(server: ToolServer, raw: bytes, *, headers_only: bool = False) -> bytes:
+    """Run one handler against a socket's input and collect exactly its output."""
+    sent = bytearray()
+    peer = Mock(spec=socket.socket)
+    peer.makefile.return_value = BytesIO(raw)
+    peer.sendall.side_effect = partial(_write_response, sent, headers_only=headers_only)
+    server._http.finish_request(peer, ("127.0.0.1", 1))
+    return bytes(sent)
+
+
+def _write_response(sent: bytearray, data: bytes, *, headers_only: bool) -> None:
+    if headers_only and b"\r\n\r\n" in sent:
+        raise BrokenPipeError(32, "Broken pipe")
+    sent.extend(data)
 
 
 def _rpc(server: ToolServer, method: str, params: object = None) -> dict[str, object]:
@@ -233,25 +262,16 @@ def test_a_message_with_the_wrong_shape_is_a_parse_error(
 
 
 def test_a_request_without_content_length_reads_no_body(server: ToolServer) -> None:
-    parts = urlsplit(server.url)
-    connection = HTTPConnection(parts.hostname or "", parts.port, timeout=1.0)
-    try:
-        connection.putrequest("POST", "/mcp")
-        connection.putheader("Authorization", f"Bearer {server.token}")
-        connection.endheaders()
-        connection.send(b" ")
-        response = connection.getresponse()
-        assert response.status == 400
-        assert json_loads(response.read(), dict[str, object]) == {
-            "jsonrpc": "2.0",
-            "id": None,
-            "error": {
-                "code": -32_700,
-                "message": "Expecting value: line 1 column 1 (char 0)",
-            },
-        }
-    finally:
-        connection.close()
+    status, body, _ = _send(server, "POST", body=b" ", content_length=False)
+    assert status == 400
+    assert json_loads(body, dict[str, object]) == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {
+            "code": -32_700,
+            "message": "Expecting value: line 1 column 1 (char 0)",
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -283,6 +303,7 @@ def test_the_url_holds_no_secret(server: ToolServer) -> None:
     assert len(server.token) == 32
     assert server.token not in server.url
     assert urlsplit(server.url).path == "/mcp"
+    assert server._http.server_address == ("127.0.0.1", 0)
     other = ToolServer([])
     other.close()
     assert other.token != server.token
@@ -292,25 +313,13 @@ def test_a_stream_is_refused(server: ToolServer) -> None:
     assert _send(server, "GET") == (405, b"", "POST")
 
 
-class _GoneAfterTheHeaders(socket.socket):
-    """A client that closes after response headers, as for an empty body."""
-
-    sent: bytes = b""
-
-    @override
-    def sendall(self, data: Buffer, flags: int = 0, /) -> None:
-        del flags
-        if b"\r\n\r\n" in self.sent:
-            raise BrokenPipeError(32, "Broken pipe")
-        self.sent += bytes(data)
-
-
 def test_an_empty_answer_ends_with_its_headers(server: ToolServer) -> None:
-    ours, theirs = socket.socketpair()
-    with ours, _GoneAfterTheHeaders(fileno=theirs.detach()) as client:
-        ours.sendall(b"GET /mcp HTTP/1.1\r\nHost: x\r\n\r\n")
-        server._http.finish_request(client, ("127.0.0.1", 1))
-    assert client.sent.startswith(b"HTTP/1.0 401 Unauthorized\r\n")
+    sent = _exchange(
+        server,
+        b"GET /mcp HTTP/1.1\r\nHost: x\r\n\r\n",
+        headers_only=True,
+    )
+    assert sent.startswith(b"HTTP/1.0 401 Unauthorized\r\n")
 
 
 def test_a_request_writes_nothing_to_the_persons_terminal(
@@ -326,41 +335,27 @@ def test_a_server_never_started_closes() -> None:
     ToolServer([]).close()
 
 
-def test_close_returns_before_the_next_server_poll() -> None:
+def test_close_stops_the_server_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     server = ToolServer([])
+    worker = Mock(spec=threading.Thread)
+    spawn = Mock(return_value=worker)
+    shutdown = Mock()
+    monkeypatch.setattr(tool_server.threading, "Thread", spawn)
+    monkeypatch.setattr(server._http, "shutdown", shutdown)
+
     server.start()
-    parts = urlsplit(server.url)
-    connection = HTTPConnection(parts.hostname or "", parts.port, timeout=1.0)
-    try:
-        connection.request("GET", "/mcp")
-        response = connection.getresponse()
-        assert response.status == 401
-        _ = response.read()
-    finally:
-        connection.close()
-
-    time.sleep(0.02)
-    started = time.monotonic()
-    server.close()
-    elapsed = time.monotonic() - started
-
-    thread = server._serving
-    assert thread is not None
-    thread.join(timeout=1.0)
-    assert elapsed < 0.1, f"close waited {elapsed:.3f}s for serve_forever"
-    assert not thread.is_alive()
-
-
-def test_close_stops_the_server_thread() -> None:
-    server = ToolServer([])
-    server.start()
-    thread = server._serving
-    assert thread is not None
+    spawn.assert_called_once_with(
+        name="agent tools",
+        target=server._http.serve_forever,
+        kwargs={"poll_interval": 0.01},
+        daemon=True,
+    )
+    worker.start.assert_called_once_with()
+    assert server._serving is worker
 
     server.close()
-    thread.join(timeout=1)
 
-    assert not thread.is_alive()
+    shutdown.assert_called_once_with()
     assert server._http.socket.fileno() == -1
 
 

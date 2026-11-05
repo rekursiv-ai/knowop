@@ -1,4 +1,4 @@
-"""Tests for ``knowop run --detach`` and the commands that reach a host by name."""
+"""Host bookkeeping over process and socket fakes; private/detach_parity.py is live."""
 
 from __future__ import annotations
 
@@ -6,26 +6,28 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Self
+from typing import TYPE_CHECKING, Final, Literal
 from unittest.mock import Mock
 
 import contextlib
+import errno
+import itertools
 import json
 import os
+import shlex
 import socket
 import stat
 import subprocess
 import sys
-import threading
 import time
 
 from trackinizer.lib.posix.detached import Readiness, await_ready
-from trackinizer.lib.posix.sockets import socket_address
-from treekle import from_plain, json_dumps, json_loads, to_plain
+from trackinizer.lib.posix.sockets import UNIX_SOCKET_PATH_MAX_BYTES, socket_address
+from treekle import from_plain, json_loads, to_plain
 
 import pytest
 
-from knowop.agent import detach, session
+from knowop.agent import detach, headless, session
 from knowop.agent.custom_types import HostRequest, RunRequest
 from knowop.agent.detach import (
     HeadlessSpec,
@@ -46,22 +48,109 @@ if TYPE_CHECKING:
 _LONG_NAME = "nightly-regression-sweep-shards-20260101-0900-" + "x" * 80
 
 
-# A process of its own rather than the test's: a liveness probe that wrongly sent a
-# real signal would otherwise hit the test runner itself.
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.on_sleep: Callable[[], None] | None = None
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        if self.on_sleep is not None:
+            self.on_sleep()
+
+
+class _Hosts:
+    """The process and socket table at detach's external boundaries."""
+
+    def __init__(self) -> None:
+        self.clock = _Clock()
+        self._listening: set[Path] = set()
+        self._live: set[int] = set()
+        self._runs: dict[Path, _Control] = {}
+        self._pids = itertools.count((1 << 30) + 1)
+
+    def start(self) -> int:
+        pid = next(self._pids)
+        self._live.add(pid)
+        return pid
+
+    def end(self, pid: int) -> None:
+        self._live.discard(pid)
+
+    def accepts(self, address: Path, *, timeout_sec: float = 0.5) -> bool:
+        del timeout_sec
+        return address in self._listening or address in self._runs
+
+    def running(self, pid: int) -> bool:
+        return pid == os.getpid() or pid in self._live
+
+    def request(
+        self,
+        address: Path,
+        op: Literal["state", "takeover", "stop"],
+        *,
+        timeout_sec: float = 60.0,
+    ) -> Reply:
+        del timeout_sec
+        return self._run(address).answer(Request(op=op))
+
+    def say(self, address: Path, text: str, *, timeout_sec: float = 60.0) -> Reply:
+        del timeout_sec
+        return self._run(address).answer(Request(op="send", text=text))
+
+    @contextlib.contextmanager
+    def listen(self, path: Path) -> Generator[Path]:
+        address = socket_address(path)
+        self._listening.add(address)
+        try:
+            yield address
+        finally:
+            self._listening.discard(address)
+
+    @contextlib.contextmanager
+    def serve(
+        self,
+        path: Path,
+        reply: Reply | Mapping[str, Reply],
+        steps: list[str] | None = None,
+    ) -> Generator[_Control]:
+        control = _Control(socket_address(path), reply, steps)
+        self._runs[control.address] = control
+        try:
+            yield control
+        finally:
+            del self._runs[control.address]
+
+    def _run(self, address: Path) -> _Control:
+        control = self._runs.get(address)
+        if control is None:
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "refused", str(address))
+        return control
+
+
+@pytest.fixture(autouse=True)
+def hosts(monkeypatch: pytest.MonkeyPatch) -> _Hosts:
+    """Replace liveness, socket calls and polling time with the host table."""
+    table = _Hosts()
+    monkeypatch.setattr(detach, "accepts", table.accepts)
+    monkeypatch.setattr(detach, "running", table.running)
+    monkeypatch.setattr(detach, "time", table.clock)
+    monkeypatch.setattr(headless, "request", table.request)
+    monkeypatch.setattr(headless, "say", table.say)
+    return table
+
+
 @pytest.fixture
-def live_child() -> Generator[subprocess.Popen[bytes]]:
-    """Yield a running process that outlives the test, then end it.
-
-    Yields:
-      child: The running process.
-
-    """
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+def live_child(hosts: _Hosts) -> Generator[int]:
+    """Yield a synthetic live pid, then end it."""
+    pid = hosts.start()
     try:
-        yield child
+        yield pid
     finally:
-        child.kill()
-        _ = child.wait()
+        hosts.end(pid)
 
 
 class TestNames:
@@ -90,12 +179,9 @@ class TestSocketAddress:
         logical = root / "host.sock"
         assert len(os.fsencode(logical)) > 103, "the regression needs a long path"
         address = socket_address(logical)
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            listener.bind(str(address))
-        finally:
-            listener.close()
-        assert logical.exists()
+        assert len(os.fsencode(address)) <= UNIX_SOCKET_PATH_MAX_BYTES
+        assert address.name == logical.name
+        assert address.parent.resolve() == root.resolve()
 
 
 class TestRecords:
@@ -150,7 +236,7 @@ class TestRecords:
 
     def test_the_record_is_json(self, tmp_path: Path) -> None:
         detach._write_record(tmp_path, _record(tmp_path))
-        assert json.loads((tmp_path / "host.json").read_text())["name"] == "h"
+        assert json_loads((tmp_path / "host.json").read_text(), HostRecord).name == "h"
 
 
 class TestState:
@@ -161,25 +247,25 @@ class TestState:
             detach._state(_record(tmp_path, state="exited", exit_code=7)) == "exited 7"
         )
 
-    def test_a_listening_host_is_running(self, tmp_path: Path) -> None:
-        with _listening(tmp_path / "s") as address:
+    def test_a_listening_host_is_running(self, tmp_path: Path, hosts: _Hosts) -> None:
+        with hosts.listen(tmp_path / "s") as address:
             record = _record(tmp_path, address=address)
             assert detach._state(record) == "running"
 
     def test_a_live_host_that_stopped_listening_is_exiting(
         self,
         tmp_path: Path,
-        live_child: subprocess.Popen[bytes],
+        live_child: int,
     ) -> None:
-        record = _record(tmp_path, state="running", pid=live_child.pid)
+        record = _record(tmp_path, state="running", pid=live_child)
         assert detach._state(record) == "exiting"
 
     def test_a_live_host_not_yet_listening_is_starting(
         self,
         tmp_path: Path,
-        live_child: subprocess.Popen[bytes],
+        live_child: int,
     ) -> None:
-        record = _record(tmp_path, state="starting", pid=live_child.pid)
+        record = _record(tmp_path, state="starting", pid=live_child)
         assert detach._state(record) == "starting"
 
     def test_a_vanished_host_is_lost(self, tmp_path: Path) -> None:
@@ -224,40 +310,78 @@ def test_launch_execs_a_new_interpreter_without_forking_python(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(os, "fork", _forbid_fork)
+    spawned: list[tuple[HostRequest, Path]] = []
+    monkeypatch.setattr(detach, "_spawn", partial(_spawn_accepting, spawned))
+    argv = [sys.executable, "-c", "input()"]
 
     assert (
         session.main(
-            [
-                "--detach",
-                "--no-sync",
-                "--name",
-                "exec-host",
-                "sh",
-                "--",
-                sys.executable,
-                "-c",
-                "input()",
-            ],
+            ["--detach", "--no-sync", "--name", "exec-host", "sh", "--", *argv],
         )
         == 0
     )
-    try:
-        assert "exec-host is running detached" in capsys.readouterr().err
-        record = detach._read_record(detach._paths("exec-host"))
-        assert record is not None
-        assert record.pid != os.getpid()
-        assert os.getsid(record.pid) == record.pid
-        assert record.cwd == str(Path.cwd())
-        assert (
-            stat.S_IMODE((detach._paths("exec-host") / "host.log").stat().st_mode)
-            == 0o600
-        )
-    finally:
-        assert main(["stop", "exec-host"]) == 0
+    assert "exec-host is running detached" in capsys.readouterr().err
+    [(request, log)] = spawned
+    paths = detach._paths("exec-host")
+    assert (request["paths"], log) == (str(paths), paths / "host.log")
+    assert request["command"] == shlex.join(["sh", *argv])
+    assert (request["run"]["cli_argv"], request["run"]["run_name"]) == (
+        argv,
+        "exec-host",
+    )
+    assert request["run"]["flags"]["sync"] is False
+
+
+def _spawn_accepting(
+    spawned: list[tuple[HostRequest, Path]],
+    request: HostRequest,
+    *,
+    ready: int,
+    log: Path,
+) -> None:
+    spawned.append((request, log))
+    _ = os.write(ready, b"ok\n")
 
 
 def _forbid_fork() -> int:
     raise AssertionError("detached hosts must exec, never fork and run Python")
+
+
+def test_spawn_passes_the_payload_and_readiness_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started: list[tuple[list[str], Path, tuple[int, ...], bytes]] = []
+    monkeypatch.setattr(detach, "spawn_detached", partial(_spawn_noted, started))
+    request = HostRequest(
+        paths=str(tmp_path),
+        address=str(tmp_path / "host.sock"),
+        control=str(tmp_path / "control.sock"),
+        resume="sess-1",
+        command="sh",
+        ready=9,
+        run=_run_request("host"),
+    )
+
+    detach._spawn(request, ready=9, log=tmp_path / "host.log")
+
+    [(argv, log, pass_fds, payload)] = started
+    assert argv[:4] == [sys.executable, "-m", "knowop.agent", "--_host"]
+    assert (log, pass_fds) == (tmp_path / "host.log", (int(argv[4]), 9))
+    assert json_loads(payload.decode(), HostRequest) == request
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        _ = os.fstat(int(argv[4]))
+
+
+def _spawn_noted(
+    started: list[tuple[list[str], Path, tuple[int, ...], bytes]],
+    argv: list[str],
+    *,
+    log: Path,
+    pass_fds: tuple[int, ...],
+) -> int:
+    started.append((argv, log, pass_fds, os.pread(int(argv[4]), 1 << 16, 0)))
+    return _dead_pid()
 
 
 def test_a_failed_spawn_closes_both_ends_of_the_ready_pipe(
@@ -391,6 +515,7 @@ class TestTheHost:
             "sh -- true",
         )
         assert record.pid == os.getpid()
+        assert record.cwd == str(Path.cwd())
         assert record.ended is not None
         assert logged in capsys.readouterr().err + caplog.text
 
@@ -615,6 +740,7 @@ class TestCommands:
 
     def test_following_a_running_host_waits_for_more_until_it_stops_accepting(
         self,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
         capfdbinary: pytest.CaptureFixture[bytes],
     ) -> None:
@@ -624,7 +750,7 @@ class TestCommands:
         scrollback = root / "scrollback.log"
         scrollback.write_bytes(b"one\r\n")
         with contextlib.ExitStack() as host:
-            address = host.enter_context(_listening(root / "s"))
+            address = host.enter_context(hosts.listen(root / "s"))
             detach._write_record(root, _record(root, name="zeta", address=address))
             monkeypatch.setattr(
                 detach.time,
@@ -693,11 +819,11 @@ class TestCommands:
             "knowop run: host 'kappa' did not accept in time; its log follows\n"
         )
 
-    def test_launch_refuses_a_running_name(self) -> None:
+    def test_launch_refuses_a_running_name(self, hosts: _Hosts) -> None:
         """Checked before forking, so a refusal never leaves a stray process."""
         root = detach._paths("delta")
         root.mkdir(parents=True)
-        with _listening(root / "s") as address:
+        with hosts.listen(root / "s") as address:
             detach._write_record(root, _record(root, name="delta", address=address))
             with pytest.raises(SystemExit) as refused:
                 _ = launch("delta", command="sh", start=_never)
@@ -744,20 +870,21 @@ class TestAHeadlessHostIsRecordedAndFound:
     def test_a_host_listening_on_its_control_socket_alone_is_running(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
     ) -> None:
-        with _Control(tmp_path / "c", Reply(ok=True)) as control:
+        with hosts.serve(tmp_path / "c", Reply(ok=True)) as control:
             record = _record(tmp_path, control=control.address)
             assert detach._state(record) == "running"
 
     def test_a_control_socket_nothing_listens_on_does_not_make_a_host_run(
         self,
         tmp_path: Path,
-        live_child: subprocess.Popen[bytes],
+        live_child: int,
     ) -> None:
         record = _record(
             tmp_path,
             state="running",
-            pid=live_child.pid,
+            pid=live_child,
             control=tmp_path / "dead.sock",
         )
         assert detach._state(record) == "exiting"
@@ -784,10 +911,11 @@ class TestTakingAHeadlessRunOver:
     def test_the_run_is_asked_to_hand_over_before_the_terminal_is_attached(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         steps: list[str] = []
-        with _headless(tmp_path, monkeypatch, steps, Reply(ok=True)) as control:
+        with _headless(hosts, tmp_path, monkeypatch, steps, Reply(ok=True)) as control:
             assert main(["attach", "kappa"]) == 0
             assert [asked.op for asked in control.asked] == ["takeover"]
         assert steps == ["takeover", "attach"]
@@ -795,10 +923,11 @@ class TestTakingAHeadlessRunOver:
     def test_it_says_how_the_chat_gets_the_cli_back_once_the_terminal_exits(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        with _headless(tmp_path, monkeypatch, [], Reply(ok=True), status=0):
+        with _headless(hosts, tmp_path, monkeypatch, [], Reply(ok=True), status=0):
             assert main(["attach", "kappa"]) == 0
         assert capsys.readouterr().err == (
             "\n[knowop run] kappa exited with status 0\n"
@@ -808,18 +937,20 @@ class TestTakingAHeadlessRunOver:
     def test_the_status_the_terminal_ended_with_is_the_commands(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        with _headless(tmp_path, monkeypatch, [], Reply(ok=True), status=3):
+        with _headless(hosts, tmp_path, monkeypatch, [], Reply(ok=True), status=3):
             assert main(["attach", "kappa"]) == 3
 
     def test_a_terminal_left_with_ctrl_backslash_leaves_the_cli_running(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        with _headless(tmp_path, monkeypatch, [], Reply(ok=True)):
+        with _headless(hosts, tmp_path, monkeypatch, [], Reply(ok=True)):
             assert main(["attach", "kappa"]) == 0
         assert capsys.readouterr().err == (
             "\n[knowop run] detached from kappa; it is still running\n"
@@ -829,12 +960,13 @@ class TestTakingAHeadlessRunOver:
     def test_a_run_that_will_not_hand_over_is_not_attached(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         steps: list[str] = []
         refusal = Reply(ok=False, reason="claude could not start")
         with (
-            _headless(tmp_path, monkeypatch, steps, refusal),
+            _headless(hosts, tmp_path, monkeypatch, steps, refusal),
             pytest.raises(SystemExit, match="cannot be taken over: claude could"),
         ):
             _ = main(["attach", "kappa"])
@@ -842,6 +974,7 @@ class TestTakingAHeadlessRunOver:
 
     def test_a_pty_host_is_attached_as_it_always_was(
         self,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -849,7 +982,7 @@ class TestTakingAHeadlessRunOver:
         _fake_attach(monkeypatch, steps, status=None)
         root = detach._paths("lambda")
         root.mkdir(parents=True)
-        with _listening(root / "s") as address:
+        with hosts.listen(root / "s") as address:
             detach._write_record(
                 root,
                 _record(root, name="lambda", address=address, machine=_HERE),
@@ -863,11 +996,13 @@ class TestTakingAHeadlessRunOver:
     def test_a_host_of_another_machine_is_refused_with_its_name(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         steps: list[str] = []
         with (
             _headless(
+                hosts,
                 tmp_path,
                 monkeypatch,
                 steps,
@@ -887,11 +1022,13 @@ class TestTakingAHeadlessRunOver:
         self,
         command: str,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         argv = [command, "kappa", *(["hi"] if command == "send" else [])]
         with (
             _headless(
+                hosts,
                 tmp_path,
                 monkeypatch,
                 [],
@@ -905,10 +1042,11 @@ class TestTakingAHeadlessRunOver:
     def test_a_record_that_names_no_machine_is_attached_anywhere(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         steps: list[str] = []
-        with _headless(tmp_path, monkeypatch, steps, Reply(ok=True), machine=""):
+        with _headless(hosts, tmp_path, monkeypatch, steps, Reply(ok=True), machine=""):
             assert main(["attach", "kappa"]) == 0
         assert steps == ["takeover", "attach"]
 
@@ -929,6 +1067,7 @@ class TestReachingAHeadlessRun:
     def test_stop_ends_the_run_through_its_socket_and_waits_for_the_process(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -939,7 +1078,7 @@ class TestReachingAHeadlessRun:
             return 0
 
         monkeypatch.setattr(detach, "stop", stop_terminal)
-        with _headless(tmp_path, monkeypatch, [], Reply(ok=True)) as control:
+        with _headless(hosts, tmp_path, monkeypatch, [], Reply(ok=True)) as control:
             assert main(["stop", "kappa"]) == 0
             assert [asked.op for asked in control.asked] == ["stop"]
         assert stopped == []
@@ -947,6 +1086,7 @@ class TestReachingAHeadlessRun:
 
     def test_a_host_with_a_terminal_of_its_own_is_stopped_through_it(
         self,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -959,7 +1099,7 @@ class TestReachingAHeadlessRun:
         monkeypatch.setattr(detach, "stop", stop_terminal)
         root = detach._paths("omicron")
         root.mkdir(parents=True)
-        with _listening(root / "s") as address:
+        with hosts.listen(root / "s") as address:
             detach._write_record(
                 root,
                 _record(root, name="omicron", address=address, pid=_dead_pid()),
@@ -971,9 +1111,10 @@ class TestReachingAHeadlessRun:
     def test_send_types_through_the_socket(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        with _headless(tmp_path, monkeypatch, [], Reply(ok=True)) as control:
+        with _headless(hosts, tmp_path, monkeypatch, [], Reply(ok=True)) as control:
             assert main(["send", "kappa", "two", "words"]) == 0
             assert [(asked.op, asked.text) for asked in control.asked] == [
                 ("send", "two words"),
@@ -982,6 +1123,7 @@ class TestReachingAHeadlessRun:
     @pytest.mark.parametrize(("taken", "code"), [(True, 0), (False, 1)])
     def test_a_host_with_a_terminal_of_its_own_takes_a_line_through_it(
         self,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
         taken: bool,
@@ -995,7 +1137,7 @@ class TestReachingAHeadlessRun:
         root = detach._paths("psi")
         root.mkdir(parents=True)
         detach._write_record(root, _record(root, name="psi"))
-        with _listening(root / "s") as address:
+        with hosts.listen(root / "s") as address:
             detach._write_record(root, _record(root, name="psi", address=address))
             assert main(["send", "psi", "two", "words"]) == code
         assert capsys.readouterr().err == (
@@ -1004,7 +1146,7 @@ class TestReachingAHeadlessRun:
 
     def test_a_host_that_will_not_exit_is_said_to_be_still_closing(
         self,
-        live_child: subprocess.Popen[bytes],
+        live_child: int,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
@@ -1018,22 +1160,23 @@ class TestReachingAHeadlessRun:
         root.mkdir(parents=True)
         detach._write_record(
             root,
-            _record(root, name="omega", pid=live_child.pid),
+            _record(root, name="omega", pid=live_child),
         )
         assert main(["stop", "omega"]) == 1
         assert capsys.readouterr().err == (
-            f"knowop run: omega stopped its CLI but the host (pid {live_child.pid}) "
+            f"knowop run: omega stopped its CLI but the host (pid {live_child}) "
             "is still closing after 0s\n"
         )
 
     def test_a_line_the_run_refuses_is_said_and_fails(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         refusal = Reply(ok=False, reason="taken over in a terminal")
-        with _headless(tmp_path, monkeypatch, [], refusal):
+        with _headless(hosts, tmp_path, monkeypatch, [], refusal):
             assert main(["send", "kappa", "hi"]) == 1
         assert capsys.readouterr().err == (
             "knowop run: kappa did not take the message: taken over in a terminal\n"
@@ -1046,6 +1189,7 @@ class TestALaunchOfATakenOverName:
     def test_the_run_is_ended_and_the_new_one_resumes_its_session(
         self,
         tmp_path: Path,
+        hosts: _Hosts,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         root = detach._paths("mu")
@@ -1054,7 +1198,7 @@ class TestALaunchOfATakenOverName:
             "state": Reply(ok=True, state="taken_over", cli="claude", session="sess-1"),
             "stop": Reply(ok=True),
         }
-        with _Control(tmp_path / "c", replies) as control:
+        with hosts.serve(tmp_path / "c", replies) as control:
             detach._write_record(
                 root,
                 _record(
@@ -1069,11 +1213,15 @@ class TestALaunchOfATakenOverName:
             assert [asked.op for asked in control.asked] == ["state", "stop"]
         assert capsys.readouterr().err.splitlines()[0].endswith("resume 'sess-1'")
 
-    def test_a_run_that_is_not_taken_over_keeps_its_name(self, tmp_path: Path) -> None:
+    def test_a_run_that_is_not_taken_over_keeps_its_name(
+        self,
+        tmp_path: Path,
+        hosts: _Hosts,
+    ) -> None:
         root = detach._paths("nu")
         root.mkdir(parents=True)
         replies = {"state": Reply(ok=True, state="running"), "stop": Reply(ok=True)}
-        with _Control(tmp_path / "c", replies) as control:
+        with hosts.serve(tmp_path / "c", replies) as control:
             detach._write_record(
                 root,
                 _record(root, name="nu", control=control.address, command="claude"),
@@ -1087,7 +1235,8 @@ class TestALaunchOfATakenOverName:
 
     def test_a_taken_over_run_on_its_way_out_is_waited_for(
         self,
-        live_child: subprocess.Popen[bytes],
+        hosts: _Hosts,
+        live_child: int,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         """The server turns the old run away as it opens the new one, so both race."""
@@ -1098,24 +1247,21 @@ class TestALaunchOfATakenOverName:
             _record(
                 root,
                 name="xi",
-                pid=live_child.pid,
+                pid=live_child,
                 session="sess-2",
                 command="claude",
             ),
         )
-        ending = threading.Timer(0.03, _end, args=(live_child,))
-        ending.start()
+        hosts.clock.on_sleep = partial(hosts.end, live_child)
         began = time.monotonic()
-        try:
-            assert launch("xi", command="claude", start=_say_the_spec) == 0
-            assert time.monotonic() - began < 0.5
-        finally:
-            ending.join()
+        assert launch("xi", command="claude", start=_say_the_spec) == 0
+        assert time.monotonic() - began < 0.5
+        assert hosts.clock.now == 0.05
         assert capsys.readouterr().err.splitlines()[0].endswith("resume 'sess-2'")
 
     def test_a_run_that_will_not_go_keeps_its_name(
         self,
-        live_child: subprocess.Popen[bytes],
+        live_child: int,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(detach, "_STOP_TIMEOUT_SEC", 0.05)
@@ -1126,7 +1272,7 @@ class TestALaunchOfATakenOverName:
             _record(
                 root,
                 name="pi",
-                pid=live_child.pid,
+                pid=live_child,
                 session="sess-3",
                 command="claude",
             ),
@@ -1163,13 +1309,13 @@ class TestALaunchOfATakenOverName:
 
     def test_a_run_that_started_by_itself_and_has_not_answered_keeps_its_name(
         self,
-        live_child: subprocess.Popen[bytes],
+        live_child: int,
     ) -> None:
         root = detach._paths("phi")
         root.mkdir(parents=True)
         detach._write_record(
             root,
-            _record(root, name="phi", state="starting", pid=live_child.pid),
+            _record(root, name="phi", state="starting", pid=live_child),
         )
         with pytest.raises(SystemExit) as refused:
             _ = launch("phi", command="claude", start=_never)
@@ -1288,161 +1434,6 @@ def _ago(seconds: int) -> str:
     )
 
 
-def _end(child: subprocess.Popen[bytes]) -> None:
-    """End a process and reap it, as a host ends."""
-    child.kill()
-    _ = child.wait()
-
-
-@pytest.mark.cli_python_subprocess
-class TestDetachedLifecycle:
-    """A real ``knowop run --detach``: launch, watch, type, leave, return, stop."""
-
-    def test_full_lifecycle_through_the_cli(self) -> None:
-        name = _LONG_NAME
-        child = (
-            "import sys\n"
-            "print('host up', flush=True)\n"
-            "for line in sys.stdin:\n"
-            "    print('ECHO:' + line.strip(), flush=True)\n"
-        )
-        launched = _trax(
-            "--detach",
-            "--no-sync",
-            "--name",
-            name,
-            "sh",
-            "--",
-            sys.executable,
-            "-u",
-            "-c",
-            child,
-        )
-        assert launched.returncode == 0, launched.stderr
-        assert f"knowop run attach {name}" in launched.stderr
-
-        listed = _trax("ls")
-        assert any(
-            line.split()[:2] == [name, "running"] for line in listed.stdout.splitlines()
-        ), listed.stdout
-
-        assert _trax("send", name, "from", "send").returncode == 0
-        _wait_for_log(name, b"ECHO:from send")
-
-        attached = _trax(
-            "attach",
-            name,
-            stdin=b"typed\n",
-            detach_after=b"ECHO:typed",
-        )
-        assert attached.returncode == 0, attached.stderr
-        assert "still running" in attached.stderr
-        assert b"host up" in attached.stdout_bytes
-        assert b"ECHO:typed" in attached.stdout_bytes
-
-        # Reattaching is resuming: the replay shows what happened before.
-        again = _trax("attach", name, stdin=b"", detach_after=b"ECHO:typed")
-        assert again.returncode == 0, again.stderr
-
-        stopped = _trax("stop", name)
-        assert stopped.returncode == 0, stopped.stderr
-        assert "stopped (status 143)" in stopped.stderr
-        final = _trax("ls", "--all")
-        assert any(
-            line.split()[:3] == [name, "exited", "143"]
-            for line in final.stdout.splitlines()
-        ), final.stdout
-        log = _trax("log", name)
-        assert log.stdout.index("host up") < log.stdout.index("ECHO:from send")
-        assert log.stdout.index("ECHO:from send") < log.stdout.index("ECHO:typed")
-
-    def test_a_host_that_cannot_start_reports_why(self) -> None:
-        launched = _trax(
-            "--detach",
-            "--no-sync",
-            "--name",
-            "broken",
-            "sh",
-            "--",
-            "definitely-not-a-real-binary-xyz",
-        )
-        assert launched.returncode == 1
-        assert "failed to start" in launched.stderr
-        assert "definitely-not-a-real-binary-xyz not found in PATH" in launched.stderr
-        assert "exited 1" in _trax("ls", "--all").stdout
-
-
-class _Completed:
-    """A finished CLI invocation: its status and both streams."""
-
-    def __init__(self, returncode: int, stdout: bytes, stderr: bytes) -> None:
-        self.returncode = returncode
-        self.stdout_bytes = stdout
-        self.stdout = stdout.decode(errors="replace")
-        self.stderr = stderr.decode(errors="replace")
-
-
-# ``-m`` resolves the package from the working directory, so the CLI runs from the root
-# THIS checkout's package was imported from -- not wherever pytest was started.
-def _trax(
-    *argv: str,
-    stdin: bytes | None = None,
-    detach_after: bytes | None = None,
-) -> _Completed:
-    """Run the ``knowop run`` CLI; with ``detach_after``, detach once it shows."""
-    package = detach.__name__.rsplit(".", 1)[0]
-    root = Path(detach.__file__).parents[detach.__name__.count(".")]
-    process = subprocess.Popen(  # noqa: S603 -- fixed interpreter and module; test argv.
-        [sys.executable, "-m", package, *argv],
-        cwd=root,
-        stdin=subprocess.PIPE if detach_after is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    if detach_after is None:
-        out, err = process.communicate(timeout=60)
-        return _Completed(process.returncode, out, err)
-    return _drive_attach(process, stdin or b"", detach_after)
-
-
-def _drive_attach(
-    process: subprocess.Popen[bytes],
-    typed: bytes,
-    detach_after: bytes,
-) -> _Completed:
-    """Type into an attach, wait to see ``detach_after``, then detach."""
-    assert process.stdin is not None
-    assert process.stdout is not None
-    process.stdin.write(typed)
-    process.stdin.flush()
-    seen = bytearray()
-    os.set_blocking(process.stdout.fileno(), False)
-    deadline = time.monotonic() + 30
-    while detach_after not in seen and time.monotonic() < deadline:
-        chunk = process.stdout.read()
-        seen += chunk or b""
-        time.sleep(0.05)
-    process.stdin.write(b"\x1c")
-    process.stdin.flush()
-    process.stdin.close()
-    _ = process.wait(timeout=30)
-    os.set_blocking(process.stdout.fileno(), True)
-    seen += process.stdout.read()
-    assert process.stderr is not None
-    return _Completed(process.returncode, bytes(seen), process.stderr.read())
-
-
-def _wait_for_log(name: str, needle: bytes) -> None:
-    """Wait until ``name``'s scrollback holds ``needle``."""
-    scrollback = detach._paths(name) / "scrollback.log"
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if scrollback.exists() and needle in scrollback.read_bytes():
-            return
-        time.sleep(0.05)
-    raise AssertionError(f"{needle!r} never reached {scrollback}")
-
-
 def _record(
     root: Path,
     *,
@@ -1474,25 +1465,9 @@ def _record(
     )
 
 
-@contextlib.contextmanager
-def _listening(path: Path) -> Generator[Path]:
-    """Listen on a short alias of ``path`` for the duration of a block."""
-    address = socket_address(path)
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        listener.bind(str(address))
-        listener.listen(1)
-        yield address
-    finally:
-        listener.close()
-        address.unlink(missing_ok=True)
-
-
 def _dead_pid() -> int:
-    """Return the pid of a process that has already exited and been reaped."""
-    finished = subprocess.Popen([sys.executable, "-c", "pass"])
-    _ = finished.wait()
-    return finished.pid
+    """Return a synthetic pid absent from the host table."""
+    return 1 << 30
 
 
 def _noting_is_dir(
@@ -1549,61 +1524,24 @@ _HERE = socket.gethostname()
 
 
 class _Control:
-    """A headless run's control socket: it answers each request with one canned reply.
-
-    Every request is noted in :attr:`asked`, and its op in ``steps`` when given, so a
-    test can say what was asked before what.
-    """
+    """A headless run's canned control replies and the requests it received."""
 
     def __init__(
         self,
-        path: Path,
+        address: Path,
         reply: Reply | Mapping[str, Reply],
-        steps: list[str] | None = None,
+        steps: list[str] | None,
     ) -> None:
-        self.address = socket_address(path)
+        self.address = address
         self.asked: list[Request] = []
         self._reply = reply
         self._steps = steps
-        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._listener.settimeout(0.01)
-        self._over = threading.Event()
-        self._thread = threading.Thread(target=self._serve, daemon=True)
 
-    def __enter__(self) -> Self:
-        self._listener.bind(str(self.address))
-        self._listener.listen(4)
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self._over.set()
-        self._thread.join(5.0)
-        self._listener.close()
-        self.address.unlink(missing_ok=True)
-
-    def _serve(self) -> None:
-        while not self._over.is_set():
-            try:
-                connection, _ = self._listener.accept()
-            except TimeoutError:
-                continue
-            with connection, connection.makefile("rwb") as stream:
-                line = stream.readline().decode()
-                # A liveness probe connects and leaves without a word.
-                if not line:
-                    continue
-                asked = json_loads(line, Request)
-                self.asked.append(asked)
-                if self._steps is not None:
-                    self._steps.append(asked.op)
-                reply = (
-                    self._reply
-                    if isinstance(self._reply, Reply)
-                    else self._reply[asked.op]
-                )
-                stream.write(json_dumps(reply).encode() + b"\n")
-                stream.flush()
+    def answer(self, asked: Request) -> Reply:
+        self.asked.append(asked)
+        if self._steps is not None:
+            self._steps.append(asked.op)
+        return self._reply if isinstance(self._reply, Reply) else self._reply[asked.op]
 
 
 def _fake_attach(
@@ -1626,6 +1564,7 @@ def _fake_attach(
 # attach is faked.
 @contextlib.contextmanager
 def _headless(
+    hosts: _Hosts,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     steps: list[str],
@@ -1638,7 +1577,7 @@ def _headless(
     _fake_attach(monkeypatch, steps, status=status)
     root = detach._paths("kappa")
     root.mkdir(parents=True)
-    with _Control(tmp_path / "c", reply, steps) as control:
+    with hosts.serve(tmp_path / "c", reply, steps) as control:
         detach._write_record(
             root,
             _record(
