@@ -51,6 +51,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
 
+pytestmark: Final = pytest.mark.usefixtures("local_session_dirs")
+
+
 # Captured transcripts, kept beside the readers that parse them. trackinizer's wheel
 # leaves them out, so the public export carries copies beside this module instead.
 _TESTDATA: Final = Path(__file__).resolve().parent / "testdata" / "sessions"
@@ -103,23 +106,6 @@ def _without_session_id(records: Sequence[TraxRecord]) -> list[TraxRecord]:
             ),
         )
     return out
-
-
-@pytest.fixture(autouse=True)
-def local_session_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point BOTH CLIs' session roots at temp dirs for every test here.
-
-    Each adapter derives its own, so isolating one leaves the other writing
-    real files into the operator's home -- rollouts codex then offers in its
-    own resume picker, and which make this suite's result depend on what is
-    already on the machine.
-    """
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-    monkeypatch.setattr(
-        "knowop.agent.materialize._codex_cli_version",
-        lambda: "0.999.0",
-    )
 
 
 class TestTheFileIsThisMachinesOwn:
