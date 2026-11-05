@@ -182,6 +182,7 @@ _OVERSIZED: Final[dict[str, Callable[[str], TraxRecord]]] = {
     "FunctionResult": lambda text: types.FunctionResult(call_id="c", content=text),
     "ToolResult": lambda text: ToolResult(call_id="c", stub="pending", shown=text),
     "UserMessage": lambda text: UserMessage(content=text),
+    "WebBrowserResult": lambda text: types.WebBrowserResult(call_id="c", content=text),
     "WebFetchResult": lambda text: WebFetchResult(call_id="c", content=text),
     "WebSearchResult": lambda text: WebSearchResult(
         call_id="c",
