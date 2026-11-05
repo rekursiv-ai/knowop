@@ -1,6 +1,6 @@
 # NEVER EDIT THIS FILE!
-# uv sync --all-groups --no-group jax --no-group tf --frozen  # cu132 aka "cuda"
-# uv sync --all-groups --no-group jax --no-group tf --frozen --no-group cuda --extra cpu
+# uv sync --all-groups --frozen  # cu132 aka "cuda"
+# uv sync --all-groups --frozen --no-group cuda --extra cpu
 
 [project]
 name = "knowop"
@@ -61,43 +61,13 @@ dependencies = [
     "pyobjc-framework-Cocoa>=13.0 ; sys_platform == 'darwin'",
 ]
 
-[project.optional-dependencies]
-cpu = [
-    "torch",
-    "torchao",
-    "torchvision",
-]
-cu126 = [
-    "torch",
-    "torchao",
-    "torchvision",
-]
-cu128 = [
-    "torch",
-    "torchao",
-    "torchvision",
-]
-cu130 = [
-    "torch",
-    "torchao",
-    "torchvision",
-]
-cu132 = [
-    "torch",
-    "torchao",
-    "torchvision",
-]
-cu134 = [
-    "torch",
-    "torchao",
-    "torchvision",
-]
-
 [project.scripts]
 knowop = "knowop.cli:main"
 
 [dependency-groups]
-# NEVER ADD MORE DEPENDENCIES!
+
+# Requirements are floors; uv.lock fixes versions. Never cap a dependency.
+# Public package deltas replace project.dependencies; these groups are monorepo-only.
 
 cuda = [
     "torch",
@@ -105,10 +75,6 @@ cuda = [
     "torchvision",
 ]
 
-debug = [
-    "ipython>=9.18.0",
-    "tqdm>=4.70.1",
-]
 lint = [
     "codespell>=2.4.3",
     "ruff>=0.17.3",
@@ -140,8 +106,42 @@ dev = [
     {include-group = "pre-commit"},
     {include-group = "debug"},
 ]
+debug = [
+    "ipython>=9.18.0",
+    "tqdm>=4.70.1",
+]
 
-# NEVER ADD OTHER DEPENDENCY GROUPS: A NEW GROUP SERVES A PROJECT, AS ABOVE.
+[project.optional-dependencies]
+cpu = [
+    "torch",
+    "torchao",
+    "torchvision",
+]
+cu126 = [
+    "torch",
+    "torchao",
+    "torchvision",
+]
+cu128 = [
+    "torch",
+    "torchao",
+    "torchvision",
+]
+cu130 = [
+    "torch",
+    "torchao",
+    "torchvision",
+]
+cu132 = [
+    "torch",
+    "torchao",
+    "torchvision",
+]
+cu134 = [
+    "torch",
+    "torchao",
+    "torchvision",
+]
 
 [project.urls]
 Homepage = "https://www.rekursiv.ai"
