@@ -3,6 +3,15 @@
 All notable knowop changes are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Changed
+
+- On macOS, the launchd agents of `knowop connect` run under a `KnowOp.app` that
+  `knowop connect` builds from a copy of its Python, so permission dialogs name
+  KnowOp, not `python3.14`. An app that will not start falls back to the command
+  as before.
+
 ## 0.1.6 - 2026-11-05
 
 ### Changed

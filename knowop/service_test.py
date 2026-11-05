@@ -21,12 +21,14 @@ from treekle import from_plain
 
 import pytest
 
-from knowop import menubar, service
+from knowop import macos_app, menubar, service
 from knowop.service import Connect, Services
 
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from knowop.shell.job_limits import Run
 
 
 _SERVER: Final = "https://acme.knowop.ai"
@@ -713,6 +715,47 @@ def test_a_launcher_runs_knowop_with_the_arguments_launchd_gives_it(
     assert done.stdout.splitlines() == ["[-m]", f"[{package}]", "[connect]", "[a b]"]
 
 
+def test_a_launcher_runs_knowop_under_the_app_that_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def install(app: Path, run: Run) -> None:
+        # Stands in for the app: answers its probe, and prints what it is told to run.
+        del run
+        executable = app / "Contents" / "MacOS" / "KnowOp"
+        executable.parent.mkdir(parents=True)
+        executable.write_text('#!/bin/sh\nfor each; do echo "[$each]"; done\n')
+        executable.chmod(0o755)
+
+    monkeypatch.setattr(sys, "executable", "/the/python")
+    Services(
+        manager="launchd",
+        folder=tmp_path / "agents",
+        run=_Manager(),
+        install_app=install,
+    ).start(_ADA)
+    launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"
+
+    done = subprocess.run(  # noqa: S603 -- the launcher just written, fixed words.
+        [launcher, "connect"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    app = data_dir() / "rekursiv-ai" / "knowop" / "KnowOp.app"
+    package = service.__name__.rpartition(".")[0]
+    assert done.stdout.splitlines() == [
+        "[-I]",
+        "[-S]",
+        f"[{app / 'Contents' / 'Resources' / 'keep.py'}]",
+        "[/the/python]",
+        "[-m]",
+        f"[{package}]",
+        "[connect]",
+    ]
+
+
 def test_a_launcher_changed_since_is_not_the_service_as_installed(
     tmp_path: Path,
 ) -> None:
@@ -985,6 +1028,7 @@ def test_a_mac_has_launchd_with_the_users_launch_agents(
         run=run,
         menubar_problem=menubar.problem,
         set_icon=menubar.set_icon,
+        install_app=macos_app.install,
     )
     assert run.calls == []
 
