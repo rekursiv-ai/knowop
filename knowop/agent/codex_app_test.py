@@ -8,12 +8,19 @@ the ones a live codex 0.163.0 sent.
 
 from __future__ import annotations
 
+from asyncio.subprocess import Process
+from contextlib import redirect_stderr, redirect_stdout
+from functools import partial
+from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
+from unittest.mock import AsyncMock, Mock, patch
 
 import asyncio
 import logging
+import os
 import re
+import shutil
 import sys
 
 from trackinizer.runs.asks import (
@@ -32,6 +39,8 @@ from knowop.agent.codex_app import (
     CodexAppDriver,
     CodexAppError,
 )
+from knowop.agent.codex_app_fake import serve
+from knowop.shell.exec_command_test import _process, _signal_process
 
 
 _THIS: Final = Path(__file__).resolve()
@@ -60,6 +69,67 @@ _AMEND: Final[PlainTree] = {
     "acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["touch"]},
 }
 _ASK_ID: Final = re.compile(r"[0-9a-f]{8}-\d+")
+
+
+@pytest.fixture(autouse=True)
+def app_process(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Run the existing fake on each input frame, behind the real pipe and child APIs."""
+    processes: dict[int, Mock] = {}
+    start = AsyncMock(side_effect=partial(_spawn_app, processes))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    monkeypatch.setattr(os, "killpg", partial(_signal_app, processes))
+    return start
+
+
+async def _spawn_app(
+    processes: dict[int, Mock],
+    *argv: str,
+    cwd: Path | None = None,
+    **options: object,
+) -> Process:
+    del options
+    process = _process(code=None)
+    processes[process.pid] = process
+    process.stdin.write.side_effect = partial(
+        _answer_app,
+        process,
+        Path(argv[2]),
+        cwd or Path.cwd(),
+    )
+    return cast(Process, process)
+
+
+def _answer_app(process: Mock, script: Path, cwd: Path, data: bytes) -> None:
+    if process.returncode is not None:
+        raise BrokenPipeError
+    output, error_bytes = StringIO(), BytesIO()
+    status = None
+    with TextIOWrapper(error_bytes, encoding="utf-8") as errors:
+        with (
+            patch.object(sys, "stdin", StringIO(data.decode())),
+            patch.object(Path, "cwd", return_value=cwd),
+            redirect_stdout(output),
+            redirect_stderr(errors),
+        ):
+            try:
+                serve(script)
+            except SystemExit as ended:
+                status = cast(int, ended.code)
+        errors.flush()
+        process.stderr.feed_data(error_bytes.getvalue())
+    process.stdout.feed_data(output.getvalue().encode())
+    if status is not None:
+        process.returncode = status
+        process.stdout.feed_eof()
+        process.stderr.feed_eof()
+
+
+def _signal_app(processes: dict[int, Mock], pgid: int, signum: int) -> None:
+    process = processes[pgid]
+    if process.returncode is not None:
+        raise ProcessLookupError
+    if signum:
+        _signal_process(process, signum)
 
 
 def _amend() -> PlainTree:
@@ -345,7 +415,10 @@ async def _stopped(rig: _Rig) -> None:
 # ---------------------------------------------------------------- start and resume.
 
 
-def test_start_runs_the_handshake_then_starts_a_thread(tmp_path: Path) -> None:
+def test_start_runs_the_handshake_then_starts_a_thread(
+    tmp_path: Path,
+    app_process: AsyncMock,
+) -> None:
     rig = _Rig(tmp_path)
 
     async def scenario() -> str:
@@ -358,6 +431,19 @@ def test_start_runs_the_handshake_then_starts_a_thread(tmp_path: Path) -> None:
     assert rig.methods() == ["initialize", "initialized", "thread/start"]
     assert [each.get("id") for each in rig.frames()] == [1, None, 2]
     assert Path(f"{rig.log}.cwd").read_text() == str(tmp_path)
+    app_process.assert_awaited_once_with(
+        shutil.which(sys.executable),
+        str(_FAKE),
+        str(tmp_path / "script.json"),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=tmp_path,
+        env=None,
+        pass_fds=(),
+        limit=2**16,
+        start_new_session=True,
+    )
     init = rig.params("initialize")
     assert init["clientInfo"] == {
         "name": "trax-run",

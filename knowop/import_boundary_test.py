@@ -63,9 +63,10 @@ def _shipped() -> list[Path]:
     return sorted(
         path
         for path in _CWD.rglob("*.py")
-        if not path.name.endswith("_test.py")
+        if not path.name.endswith(("_test.py", "_parity.py"))
         and path.name != "conftest.py"
         and not {".export", "testing"} & set(path.relative_to(_CWD).parts)
+        and all("private" not in part for part in path.relative_to(_CWD).parts)
     )
 
 
@@ -80,6 +81,26 @@ def test_a_module_an_export_withholds_is_never_allowed() -> None:
     assert _allowed("trackinizer.trax.render")
     assert not _allowed("trackinizer.server.api.private.routers")
     assert not _allowed(f"{_PACKAGE}.private")
+
+
+def test_the_scan_excludes_tests_parity_and_every_private_path_segment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "cli.py",
+        "agent/private/check.py",
+        "shell/private_checks/check.py",
+        "private_check.py",
+        "cli_test.py",
+        "cli_parity.py",
+    ):
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+    monkeypatch.setattr(f"{__name__}._CWD", tmp_path)
+
+    assert _shipped() == [tmp_path / "cli.py"]
 
 
 def test_the_scan_reads_the_cli_and_its_lazy_imports() -> None:

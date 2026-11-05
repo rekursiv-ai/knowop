@@ -1,9 +1,11 @@
-"""The terminal host: real shells on real ptys, bridged to a local WebSocket server."""
+"""The terminal host with process and WebSocket boundaries supplied inline."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast, override
+from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call
 
 import asyncio
 import functools
@@ -12,26 +14,26 @@ import os
 import pwd
 import shutil
 import stat
-import subprocess
 import sys
 import threading
 import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix.host import Frame, decode_frame, encode_frame, encode_winsize
+from trackinizer.lib.posix.terminal import Terminal
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.wire import wire_terminals
 from trackinizer.wire.wire_terminals import TerminalWait
-from treekle import from_plain, json_loads
-from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.frames import Close
 from websockets.http11 import Response
 
 import pytest
+import pytest_asyncio
 
 from knowop.shell import terminal_host
-from knowop.shell.files_channel import FilesChannel
+from knowop.shell.files_channel import FilesChannel, Info
 from knowop.shell.terminal_direct import DirectRouter
 from knowop.shell.terminal_host import (
     TerminalHost,
@@ -44,9 +46,7 @@ from knowop.shell.terminal_host import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-    from pathlib import Path
 
-    from trackinizer.lib.posix.terminal import Terminal
     from websockets.asyncio.client import ClientConnection
 
     from knowop.shell.terminal_direct import PeerFactory
@@ -57,8 +57,6 @@ _MACHINE = uuid.UUID(int=1)
 _INSTANCE = uuid.UUID(int=2)
 _CREDENTIAL = "trax_machine_" + "0" * 32 + "_" + "c" * 43
 _INPUT = encode_frame(Frame.INPUT, b"typed\n")
-
-type _Handler = Callable[[ServerConnection], Awaitable[None]]
 
 
 class _Client:
@@ -124,44 +122,6 @@ def _host(
     )
 
 
-async def _listening(handler: _Handler) -> tuple[Server, str]:
-    server = await serve(functools.partial(_ready_handler, handler), "127.0.0.1", 0)
-    return server, f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
-
-
-async def _ready_handler(handler: _Handler, ws: ServerConnection) -> None:
-    assert await ws.recv() == encode_frame(Frame.ACK)
-    await ws.send(encode_frame(Frame.ACK))
-    assert await ws.recv() == encode_frame(Frame.ACK)
-    await handler(ws)
-
-
-async def _until_exit(ws: ServerConnection) -> tuple[bytes, int]:
-    """Collect output until the shell's exit frame; return both."""
-    output = b""
-    async for message in ws:
-        assert isinstance(message, bytes)
-        kind, payload = decode_frame(message)
-        if kind is Frame.OUTPUT:
-            output += payload
-        elif kind is Frame.EXIT:
-            return output, int.from_bytes(payload)
-    raise AssertionError("closed before the shell exited")
-
-
-async def _first_line(ws: ServerConnection) -> int:
-    """Collect output to its first newline, which may span frames; parse it."""
-    output = b""
-    async for message in ws:
-        assert isinstance(message, bytes)
-        kind, payload = decode_frame(message)
-        if kind is Frame.OUTPUT:
-            output += payload
-        if b"\n" in output:
-            return int(output.split()[0])
-    raise AssertionError("closed before the shell wrote a line")
-
-
 async def _run(host: TerminalHost, opened: TerminalWait) -> None:
     await asyncio.to_thread(
         host.serve,
@@ -171,33 +131,32 @@ async def _run(host: TerminalHost, opened: TerminalWait) -> None:
     )
 
 
-async def test_a_shell_runs_on_a_real_pty_and_its_output_and_exit_status_arrive() -> (
-    None
-):
-    seen: dict[str, object] = {}
-
-    async def handler(ws: ServerConnection) -> None:
-        assert ws.request is not None
-        seen["path"] = ws.request.path
-        seen["auth"] = ws.request.headers["Authorization"]
-        seen["result"] = await _until_exit(ws)
-
-    server, url = await _listening(handler)
+async def test_a_shells_output_and_exit_status_arrive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leg = _FakeSocket()
+    connector = _connector(monkeypatch, leg)
+    _, launch = _terminal(monkeypatch, b"ok", status=3)
     opened = _opened()
-    await _run(_host(url, "/bin/sh", "-c", "printf ok; exit 3"), opened)
-    server.close()
+
+    await _run(
+        _host("http://box.invalid", "/bin/sh", "-c", "printf ok; exit 3"),
+        opened,
+    )
 
     path = wire_terminals.MACHINE_TERMINAL_WS_PATH.format(
         machine_id=_MACHINE,
         terminal_id=opened.terminal_id,
     )
-    assert seen["path"] == f"{path}?instance={_INSTANCE}&ready=true"
-    assert seen["auth"] == f"Bearer {_CREDENTIAL}"
-    assert seen["result"] == (b"ok", 3)
+    assert connector.urls == [f"ws://box.invalid{path}?instance={_INSTANCE}&ready=true"]
+    assert connector.calls[0]["additional_headers"] == {
+        "Authorization": f"Bearer {_CREDENTIAL}",
+    }
+    assert _result(leg) == (b"ok", 3)
+    assert launch.call_args.args == (["/bin/sh", "-c", "printf ok; exit 3"],)
 
 
 async def test_startup_retries_handshake_timeouts_and_launches_the_cli_once(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -209,147 +168,225 @@ async def test_startup_retries_handshake_timeouts_and_launches_the_cli_once(
             retry_sec=0.001,
         ),
     )
-    launches = tmp_path / "launches"
-    trax = _fake_knowop(tmp_path, f"echo started >> '{launches}'\nprintf ready\n")
-    _runs_as_knowop(monkeypatch, trax)
-    attempts: list[str] = []
-    output: list[tuple[bytes, int]] = []
+    leg = _FakeSocket()
+    connector = _connector(monkeypatch, TimeoutError(), TimeoutError(), leg)
+    _, launch = _terminal(monkeypatch, b"ready")
+    opened = _opened(command="claude", run_name="chat-retry")
 
-    async def handshake(ws: ServerConnection) -> None:
-        assert await ws.recv() == encode_frame(Frame.ACK)
-        attempts.append("connected")
-        if len(attempts) < 3:
-            await ws.wait_closed()
-            return
-        await ws.send(encode_frame(Frame.ACK))
-        assert await ws.recv() == encode_frame(Frame.ACK)
-        output.append(await _until_exit(ws))
+    await asyncio.wait_for(_run(_host("http://box.invalid"), opened), 3)
 
-    server = await serve(handshake, "127.0.0.1", 0)
-    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
-    try:
-        await asyncio.wait_for(
-            _run(_host(url), _opened(command="claude", run_name="chat-retry")),
-            3,
-        )
-    finally:
-        server.close()
-        await server.wait_closed()
-
-    assert attempts == ["connected"] * 3
-    assert launches.read_text().splitlines() == ["started"]
-    assert output[0][0].endswith(b"ready")
-    assert output[0][1] == 0
+    path = wire_terminals.MACHINE_TERMINAL_WS_PATH.format(
+        machine_id=_MACHINE,
+        terminal_id=opened.terminal_id,
+    )
+    assert (
+        connector.urls
+        == [f"ws://box.invalid{path}?instance={_INSTANCE}&ready=true"] * 3
+    )
+    assert len(connector.calls) == 3
+    assert all(
+        0 < cast(float, kwargs["open_timeout"]) <= 0.02 for kwargs in connector.calls
+    )
+    launch.assert_called_once_with(
+        [sys.executable, *_KNOWOP, "claude", "--detach", "--name", "chat-retry"],
+        cwd=ANY,
+        env=ANY,
+        clean_env=False,
+        drop_env=ANY,
+        terminate_grace_sec=2.0,
+        winsize=(24, 80),
+    )
+    assert leg.sent[:2] == [encode_frame(Frame.ACK)] * 2
+    assert b"".join(
+        payload for kind, payload in map(decode_frame, leg.sent) if kind is Frame.OUTPUT
+    ).endswith(b"ready")
+    assert leg.sent[-1] == encode_frame(Frame.EXIT, (0).to_bytes(4))
+    assert leg.closed
 
 
 async def test_a_refused_startup_never_launches_the_cli_and_reports_one_error(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    launches = tmp_path / "launches"
-    trax = _fake_knowop(tmp_path, f"echo started >> '{launches}'\n")
-    _runs_as_knowop(monkeypatch, trax)
+    _ = _connector(
+        monkeypatch,
+        ConnectionClosed(Close(wire_terminals.CLOSE_REFUSED, ""), None),
+    )
+    _, launch = _terminal(monkeypatch)
 
-    async def refuse(ws: ServerConnection) -> None:
-        await ws.close(wire_terminals.CLOSE_REFUSED)
+    await _run(
+        _host("http://box.invalid"),
+        _opened(command="claude", run_name="chat-refused"),
+    )
 
-    server = await serve(refuse, "127.0.0.1", 0)
-    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
-    try:
-        await _run(_host(url), _opened(command="claude", run_name="chat-refused"))
-    finally:
-        server.close()
-        await server.wait_closed()
-
-    assert not launches.exists()
+    launch.assert_not_called()
     error = capsys.readouterr().err
     assert "terminal startup failed" in error
     assert "Traceback" not in error
 
 
 async def test_stop_cancels_startup_while_waiting_for_the_server_acknowledgement(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    launches = tmp_path / "launches"
-    trax = _fake_knowop(tmp_path, f"echo started >> '{launches}'\n")
-    _runs_as_knowop(monkeypatch, trax)
-    arrived = asyncio.Event()
-    requests: list[str | bytes] = []
-
-    async def stall(ws: ServerConnection) -> None:
-        requests.append(await ws.recv())
-        arrived.set()
-        await ws.wait_closed()
-
-    server = await serve(stall, "127.0.0.1", 0)
-    url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
-    host = _host(url)
+    leg = _FakeSocket(hang=True)
+    _ = _connector(monkeypatch, leg)
+    _, launch = _terminal(monkeypatch)
+    host = _host("http://box.invalid")
     running = asyncio.create_task(
         _run(host, _opened(command="claude", run_name="chat-stopped")),
     )
     try:
-        await asyncio.wait_for(arrived.wait(), 2)
+        assert await asyncio.wait_for(asyncio.to_thread(leg.received.wait, 2), 2)
         await asyncio.to_thread(host.stop)
         await asyncio.wait_for(running, 1)
     finally:
-        server.close()
-        await server.wait_closed()
+        await asyncio.to_thread(host.stop)
+        await running
 
-    assert requests == [encode_frame(Frame.ACK)]
-    assert not launches.exists()
+    assert leg.sent == [encode_frame(Frame.ACK)]
+    assert leg.closed
+    launch.assert_not_called()
 
 
-async def test_input_reaches_the_shell_and_a_resize_is_clamped() -> None:
-    result: list[tuple[bytes, int]] = []
+async def test_input_reaches_the_shell_and_a_resize_is_clamped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leg = _FakeSocket(
+        messages=(
+            encode_frame(Frame.RESIZE, encode_winsize(0, 5_000)),
+            encode_frame(Frame.INPUT, b"go\n"),
+        ),
+    )
+    _ = _connector(monkeypatch, leg)
+    terminal, launch = _terminal(monkeypatch)
+    typed, finished = asyncio.Event(), asyncio.Event()
+    terminal.write.side_effect = functools.partial(_typed, typed)
+    terminal.output.return_value = _output_when(
+        typed,
+        finished,
+        b"1 1000\r\ngot-go\r\n",
+    )
+    terminal.wait.side_effect = functools.partial(_terminal_status, finished, status=0)
 
-    async def handler(ws: ServerConnection) -> None:
-        await ws.send(encode_frame(Frame.RESIZE, encode_winsize(0, 5_000)))
-        await ws.send(encode_frame(Frame.INPUT, b"go\n"))
-        result.append(await _until_exit(ws))
+    await _run(
+        _host("http://box.invalid", "/bin/sh", "-c", "read x; stty size; echo got-$x"),
+        _opened(),
+    )
 
-    server, url = await _listening(handler)
-    await _run(_host(url, "/bin/sh", "-c", "read x; stty size; echo got-$x"), _opened())
-    server.close()
-
-    output, status = result[0]
+    output, status = _result(leg)
     assert status == 0
     assert b"1 1000" in output
     assert b"got-go" in output
+    terminal.write.assert_awaited_once_with(b"go\n")
+    terminal.set_winsize.assert_called_once_with(1, 1000)
+    assert launch.call_args.args == (
+        ["/bin/sh", "-c", "read x; stty size; echo got-$x"],
+    )
 
 
-async def test_stop_and_a_closed_socket_each_kill_the_shells_whole_group() -> None:
-    pids: list[int] = []
+async def test_stop_and_a_closed_socket_each_terminate_and_reap_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = "printf %s $$; sleep 0.02; echo; sleep 30"
+    for messages, closes in (((encode_frame(Frame.STOP),), False), ((), True)):
+        leg = _FakeSocket(messages=messages, closes=closes)
+        _ = _connector(monkeypatch, leg)
+        finished, drained = asyncio.Event(), asyncio.Event()
+        terminal, launch = _terminal(monkeypatch, status=143)
+        terminal.output.return_value = _held_output(finished, drained)
+        terminal.wait.side_effect = functools.partial(_terminal_status, finished)
+        terminal.terminate.side_effect = finished.set
 
-    # The pid and its newline are written apart, as a pty may deliver them anyway.
-    pid_line = "printf %s $$; sleep 0.02; echo; sleep 30"
+        await _run(_host("http://box.invalid", "/bin/sh", "-c", command), _opened())
 
-    async def stopper(ws: ServerConnection) -> None:
-        pids.append(await _first_line(ws))
-        await ws.send(encode_frame(Frame.STOP))
-        _, status = await _until_exit(ws)
-        pids.append(status)
+        launch.assert_called_once_with(
+            ["/bin/sh", "-c", command],
+            cwd=ANY,
+            env=ANY,
+            clean_env=True,
+            drop_env=(),
+            terminate_grace_sec=2.0,
+            winsize=(24, 80),
+        )
+        assert terminal.mock_calls.index(call.terminate()) < terminal.mock_calls.index(
+            call.__aexit__(None, None, None),
+        )
+        terminal.terminate.assert_awaited_once_with()
+        terminal.wait.assert_awaited_once_with()
+        assert drained.is_set()
+        assert leg.closed
+        assert leg.sent[-1] == encode_frame(Frame.EXIT, (143).to_bytes(4))
 
-    server, url = await _listening(stopper)
-    await _run(_host(url, "/bin/sh", "-c", pid_line), _opened())
-    server.close()
-    pid, status = pids
-    assert status > 128
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
 
-    gone: list[int] = []
+def _terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    *chunks: bytes,
+    status: int = 0,
+) -> tuple[MagicMock, Mock]:
+    terminal = MagicMock(spec=Terminal)
+    terminal.__aenter__.return_value = terminal
+    terminal.wait.return_value = status
+    terminal.output.return_value = _Output(*chunks).output()
+    launch = Mock(return_value=terminal)
+    monkeypatch.setattr(terminal_host, "Terminal", launch)
+    return terminal, launch
 
-    async def leaver(ws: ServerConnection) -> None:
-        gone.append(await _first_line(ws))
-        await ws.close()
 
-    server, url = await _listening(leaver)
-    await _run(_host(url, "/bin/sh", "-c", pid_line), _opened())
-    server.close()
-    with pytest.raises(ProcessLookupError):
-        os.kill(gone[0], 0)
+def _result(leg: _FakeSocket) -> tuple[bytes, int]:
+    output = b""
+    for message in leg.sent:
+        kind, payload = decode_frame(message)
+        if kind is Frame.OUTPUT:
+            output += payload
+        elif kind is Frame.EXIT:
+            return output, int.from_bytes(payload)
+    raise AssertionError("closed before the shell exited")
+
+
+async def _typed(ready: asyncio.Event, data: bytes) -> bool:
+    del data
+    ready.set()
+    return True
+
+
+async def _output_when(
+    ready: asyncio.Event,
+    finished: asyncio.Event,
+    *chunks: bytes,
+) -> AsyncIterator[bytes]:
+    await ready.wait()
+    for chunk in chunks:
+        yield chunk
+    finished.set()
+
+
+def _environment(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    monkeypatch.setattr(Terminal, "start", AsyncMock())
+    monkeypatch.setattr(Terminal, "output", _environment_output)
+    launch = Mock(wraps=Terminal)
+    monkeypatch.setattr(terminal_host, "Terminal", launch)
+    return launch
+
+
+async def _environment_output(terminal: Terminal) -> AsyncIterator[bytes]:
+    yield "\r\n".join(
+        f"{name}={value}" for name, value in terminal._child_env().items()
+    ).encode()
+
+
+async def _held_output(
+    finished: asyncio.Event,
+    drained: asyncio.Event,
+) -> AsyncIterator[bytes]:
+    yield b"17"
+    yield b"\n"
+    await finished.wait()
+    drained.set()
+
+
+async def _terminal_status(finished: asyncio.Event, *, status: int = 143) -> int:
+    await finished.wait()
+    return status
 
 
 async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
@@ -357,12 +394,10 @@ async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
 ) -> None:
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "sentinel-secret")
     monkeypatch.setenv("TRACKINIZER_TOKEN", "sentinel-token")
-    result: list[tuple[bytes, int]] = []
-
-    async def handler(ws: ServerConnection) -> None:
-        result.append(await _until_exit(ws))
-
-    server, url = await _listening(handler)
+    leg = _FakeSocket()
+    _ = _connector(monkeypatch, leg)
+    launch = _environment(monkeypatch)
+    url = "http://box.invalid"
     canvas, workspace = uuid.uuid4(), uuid.uuid4()
     host = _host(
         url,
@@ -372,9 +407,10 @@ async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
         trax_env={"LC_TRAX_SERVER": url, "TRACKINIZER_PROFILE": "hosted"},
     )
     await _run(host, _opened(canvas=canvas, workspace=workspace))
-    server.close()
 
-    lines = set(result[0][0].decode().split())
+    assert launch.call_args.kwargs["clean_env"] is True
+    assert launch.call_args.kwargs["drop_env"] == ()
+    lines = set(_result(leg)[0].decode().split())
     assert {
         "TERM=xterm-256color",
         "COLORTERM=truecolor",
@@ -389,38 +425,30 @@ async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
 
 
 async def _run_env(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     trax_env: dict[str, str],
     canvas: uuid.UUID,
 ) -> set[str]:
-    """Return the environment a run dumps; the fake knowop is ``env``."""
-    trax = _fake_knowop(tmp_path, "env\n")
-    _runs_as_knowop(monkeypatch, trax)
-    result: list[tuple[bytes, int]] = []
-
-    async def handler(ws: ServerConnection) -> None:
-        result.append(await _until_exit(ws))
-
-    server, url = await _listening(handler)
-    host = _host(url, trax_env=trax_env)
+    """Return the real child's environment without spawning the process."""
+    leg = _FakeSocket()
+    _ = _connector(monkeypatch, leg)
+    launch = _environment(monkeypatch)
+    host = _host("http://box.invalid", trax_env=trax_env)
     await _run(
         host,
         _opened(command="claude", run_name="run-1a2b3c4d", canvas=canvas),
     )
-    server.close()
-    return set(result[0][0].decode().split())
+    assert launch.call_args.kwargs["clean_env"] is False
+    return set(_result(leg)[0].decode().split())
 
 
 async def test_a_run_inherits_the_host_environment_like_a_typed_knowop_run(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1/bus")
     monkeypatch.setenv("SENTINEL_FROM_HOST", "kept")
     canvas = uuid.uuid4()
     lines = await _run_env(
-        tmp_path,
         monkeypatch,
         {"TRACKINIZER_PROFILE": "hosted"},
         canvas,
@@ -434,7 +462,6 @@ async def test_a_run_inherits_the_host_environment_like_a_typed_knowop_run(
 
 
 async def test_the_canvases_trax_context_replaces_any_the_host_inherited(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("TRACKINIZER_URL", "http://elsewhere.invalid")
@@ -444,7 +471,6 @@ async def test_the_canvases_trax_context_replaces_any_the_host_inherited(
     monkeypatch.setenv("LC_TRAX_CANVAS", "sentinel-canvas")
     canvas = uuid.uuid4()
     lines = await _run_env(
-        tmp_path,
         monkeypatch,
         {"TRACKINIZER_PROFILE": "hosted"},
         canvas,
@@ -456,15 +482,15 @@ async def test_the_canvases_trax_context_replaces_any_the_host_inherited(
     assert not [line for line in lines if "sentinel" in line or "elsewhere" in line]
 
 
-async def test_each_open_and_close_is_logged_once_for_this_user_only() -> None:
-    async def handler(ws: ServerConnection) -> None:
-        await _until_exit(ws)
-
-    server, url = await _listening(handler)
+async def test_each_open_and_close_is_logged_once_for_this_user_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = _connector(monkeypatch, _FakeSocket())
+    _, launch = _terminal(monkeypatch, status=5)
     opened = _opened(requested_by="helper-1")
-    await _run(_host(url, "/bin/sh", "-c", "exit 5"), opened)
-    server.close()
+    await _run(_host("http://box.invalid", "/bin/sh", "-c", "exit 5"), opened)
 
+    launch.assert_called_once()
     path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box.terminals.log"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     first, second = path.read_text().splitlines()
@@ -475,19 +501,19 @@ async def test_each_open_and_close_is_logged_once_for_this_user_only() -> None:
     assert '"status":5' in second
 
 
-async def test_a_terminal_without_a_folder_starts_in_the_home_directory() -> None:
-    result: list[tuple[bytes, int]] = []
-
-    async def handler(ws: ServerConnection) -> None:
-        result.append(await _until_exit(ws))
-
-    server, url = await _listening(handler)
-    await _run(_host(url, "/bin/sh", "-c", "pwd -P"), _opened())
-    server.close()
-
+async def test_a_terminal_without_a_folder_starts_in_the_home_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # ``pwd -P`` prints the physical path, which a symlinked home does not share.
     home = await asyncio.to_thread(os.path.realpath, pwd.getpwuid(os.getuid()).pw_dir)
-    assert result[0] == (f"{home}\r\n".encode(), 0)
+    leg = _FakeSocket()
+    _ = _connector(monkeypatch, leg)
+    _, launch = _terminal(monkeypatch, f"{home}\r\n".encode())
+
+    await _run(_host("http://box.invalid", "/bin/sh", "-c", "pwd -P"), _opened())
+
+    assert _result(leg) == (f"{home}\r\n".encode(), 0)
+    assert launch.call_args.kwargs["cwd"] == Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
 async def test_a_run_starts_in_the_folder_it_names_and_says_so_on_its_first_line(
@@ -496,27 +522,22 @@ async def test_a_run_starts_in_the_folder_it_names_and_says_so_on_its_first_line
 ) -> None:
     folder = tmp_path / "project"
     folder.mkdir()
-    # The fake knowop prints the folder its run starts in, as the CLI would see it.
-    trax = _fake_knowop(tmp_path, "pwd -P\n")
-    _runs_as_knowop(monkeypatch, trax)
-    result: list[tuple[bytes, int]] = []
+    physical = await asyncio.to_thread(folder.resolve)
+    leg = _FakeSocket()
+    _ = _connector(monkeypatch, leg)
+    _, launch = _terminal(monkeypatch, f"{physical}\r\n".encode())
 
-    async def handler(ws: ServerConnection) -> None:
-        result.append(await _until_exit(ws))
-
-    server, url = await _listening(handler)
     await _run(
-        _host(url),
+        _host("http://box.invalid"),
         _opened(command="claude", run_name="run-1a2b3c4d", cwd=str(folder)),
     )
-    server.close()
 
-    output, status = result[0]
+    output, status = _result(leg)
     first, _, shell = output.partition(b"\r\n")
-    physical = await asyncio.to_thread(folder.resolve)
     assert status == 0
     assert first == f"knowop: started in {folder}".encode()
     assert shell.split() == [str(physical).encode()]
+    assert launch.call_args.kwargs["cwd"] == folder
 
 
 async def test_a_tilde_folder_is_resolved_against_the_home_directory(
@@ -526,64 +547,59 @@ async def test_a_tilde_folder_is_resolved_against_the_home_directory(
     home = tmp_path / "home"
     (home / "project").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
-    trax = _fake_knowop(tmp_path, "pwd -P\n")
-    _runs_as_knowop(monkeypatch, trax)
-    result: list[tuple[bytes, int]] = []
+    physical = await asyncio.to_thread((home / "project").resolve)
+    leg = _FakeSocket()
+    _ = _connector(monkeypatch, leg)
+    _, launch = _terminal(monkeypatch, f"{physical}\r\n".encode())
 
-    async def handler(ws: ServerConnection) -> None:
-        result.append(await _until_exit(ws))
-
-    server, url = await _listening(handler)
     await _run(
-        _host(url),
+        _host("http://box.invalid"),
         _opened(command="claude", run_name="run-1a2b3c4d", cwd="~/project"),
     )
-    server.close()
 
-    first, _, shell = result[0][0].partition(b"\r\n")
-    physical = await asyncio.to_thread((home / "project").resolve)
+    first, _, shell = _result(leg)[0].partition(b"\r\n")
     assert first == f"knowop: started in {home / 'project'}".encode()
     assert shell.split() == [str(physical).encode()]
+    assert launch.call_args.kwargs["cwd"] == home / "project"
 
 
 async def test_a_run_without_a_folder_says_it_starts_in_the_home_directory(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    trax = _fake_knowop(tmp_path)
-    _runs_as_knowop(monkeypatch, trax)
-    result: list[tuple[bytes, int]] = []
+    leg = _FakeSocket()
+    _ = _connector(monkeypatch, leg)
+    _, launch = _terminal(monkeypatch)
 
-    async def handler(ws: ServerConnection) -> None:
-        result.append(await _until_exit(ws))
-
-    server, url = await _listening(handler)
-    await _run(_host(url), _opened(command="codex", run_name="run-1a2b3c4d"))
-    server.close()
+    await _run(
+        _host("http://box.invalid"),
+        _opened(command="codex", run_name="run-1a2b3c4d"),
+    )
 
     home = pwd.getpwuid(os.getuid()).pw_dir
-    assert result[0] == (f"knowop: started in {home}\r\n".encode(), 0)
+    assert _result(leg) == (f"knowop: started in {home}\r\n".encode(), 0)
+    assert launch.call_args.kwargs["cwd"] == Path(home)
 
 
 async def test_a_folder_that_is_missing_or_a_file_ends_the_terminal_and_runs_nothing(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     file = tmp_path / "notes.txt"
     _ = file.write_text("not a folder")
     refusals: list[tuple[bytes, int]] = []
-
-    async def handler(ws: ServerConnection) -> None:
-        refusals.append(await _until_exit(ws))
+    _, launch = _terminal(monkeypatch)
 
     # A ``~name`` of a user this machine lacks has no home to resolve against.
     stranger = "~no-such-user-c8/project"
-    server, url = await _listening(handler)
     for folder in (str(tmp_path / "gone"), str(file), stranger):
+        leg = _FakeSocket()
+        _ = _connector(monkeypatch, leg)
         await _run(
-            _host(url, "/bin/sh", "-c", "echo ran"),
+            _host("http://box.invalid", "/bin/sh", "-c", "echo ran"),
             _opened(cwd=folder),
         )
-    server.close()
+        refusals.append(_result(leg))
+    launch.assert_not_called()
 
     assert refusals == [
         (
@@ -605,34 +621,31 @@ async def test_a_folder_that_is_missing_or_a_file_ends_the_terminal_and_runs_not
 
 async def test_a_files_open_answers_requests_and_starts_no_shell(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (tmp_path / "a.txt").write_text("a")
     marker = tmp_path / "shell-ran"
-    replies: list[bytes] = []
+    request = f'{{"id": 1, "op": "info", "path": "{tmp_path}"}}\n'
+    leg = _FakeSocket(
+        messages=(encode_frame(Frame.INPUT, request.encode()),),
+        end_after_output=True,
+    )
+    _ = _connector(monkeypatch, leg)
+    _, launch = _terminal(monkeypatch)
 
-    async def handler(ws: ServerConnection) -> None:
-        request = f'{{"id": 1, "op": "info", "path": "{tmp_path}"}}\n'
-        await ws.send(encode_frame(Frame.INPUT, request.encode()))
-        line = b""
-        while not line.endswith(b"\n"):
-            message = await ws.recv()
-            assert isinstance(message, bytes)
-            kind, payload = decode_frame(message)
-            if kind is Frame.OUTPUT:
-                line += payload
-        replies.append(line)
-        await ws.send(encode_frame(Frame.STOP))
-        replies.append(b"exit %d" % (await _until_exit(ws))[1])
+    await _run(
+        _host("http://box.invalid", "/bin/sh", "-c", f"touch {marker}"),
+        _opened(kind="files"),
+    )
 
-    server, url = await _listening(handler)
-    await _run(_host(url, "/bin/sh", "-c", f"touch {marker}"), _opened(kind="files"))
-    server.close()
-
-    reply = json_loads(replies[0], dict[str, object])
-    assert (reply["id"], reply["kind"]) == (1, "dir")
-    assert from_plain(reply["entries"], list[dict[str, object]])[0]["name"] == "a.txt"
-    assert replies[1:] == [b"exit 0"]
+    output, status = _result(leg)
+    reply = Info.model_validate_json(output)
+    assert (reply.id, reply.kind) == (1, "dir")
+    assert reply.entries is not None
+    assert reply.entries[0].name == "a.txt"
+    assert status == 0
     assert not marker.exists()
+    launch.assert_not_called()
     path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box.terminals.log"
     assert '"kind":"files"' in path.read_text().splitlines()[0]
 
@@ -649,19 +662,13 @@ async def test_a_completed_files_service_reports_a_successful_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(FilesChannel, "serve", _finish_files)
-    results: list[tuple[bytes, int]] = []
+    leg = _FakeSocket()
+    _ = _connector(monkeypatch, leg)
 
-    async def handler(ws: ServerConnection) -> None:
-        results.append(await _until_exit(ws))
+    await _run(_host("http://box.invalid"), _opened(kind="files"))
 
-    server, url = await _listening(handler)
-    try:
-        await _run(_host(url), _opened(kind="files"))
-    finally:
-        server.close()
-        await server.wait_closed()
-
-    assert results == [(b"finished\n", 0)]
+    assert _result(leg) == (b"finished\n", 0)
+    assert leg.closed
 
 
 async def _fail_files(
@@ -676,17 +683,12 @@ async def test_a_failed_files_service_propagates_its_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(FilesChannel, "serve", _fail_files)
+    leg = _FakeSocket()
+    _ = _connector(monkeypatch, leg)
 
-    async def handler(ws: ServerConnection) -> None:
-        await ws.wait_closed()
-
-    server, url = await _listening(handler)
-    try:
-        with pytest.raises(RuntimeError, match="file service failed"):
-            await _run(_host(url), _opened(kind="files"))
-    finally:
-        server.close()
-        await server.wait_closed()
+    with pytest.raises(RuntimeError, match="file service failed"):
+        await _run(_host("http://box.invalid"), _opened(kind="files"))
+    assert leg.closed
 
 
 class _Leg:
@@ -721,47 +723,55 @@ async def test_a_refusal_to_a_leg_already_closed_is_not_an_error() -> None:
 
 
 async def _five_opens(
-    wait_for: Callable[[list[ServerConnection]], bool],
-) -> tuple[TerminalHost, _Client, list[ServerConnection], Server]:
-    """Start a host that is asked for five terminals; return once ``wait_for`` is true."""
-    conns: list[ServerConnection] = []
-    arrived = asyncio.Event()
-
-    async def handler(ws: ServerConnection) -> None:
-        conns.append(ws)
-        arrived.set()
-        await ws.wait_closed()
-
-    server, url = await _listening(handler)
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[TerminalHost, _Client, list[_FakeSocket], list[MagicMock]]:
+    """Open five independent fake legs and terminals through the real host threads."""
+    legs = [_FakeSocket() for _ in range(5)]
+    _ = _connector(monkeypatch, *legs)
+    terminals: list[MagicMock] = []
+    for _ in range(5):
+        finished, drained = asyncio.Event(), asyncio.Event()
+        terminal, _ = _terminal(monkeypatch, status=143)
+        terminal.output.return_value = _held_output(finished, drained)
+        terminal.wait.side_effect = functools.partial(_terminal_status, finished)
+        terminal.terminate.side_effect = finished.set
+        terminals.append(terminal)
+    monkeypatch.setattr(terminal_host, "Terminal", Mock(side_effect=terminals))
     client = _Client([_opened() for _ in range(5)])
-    host = _host(url, "/bin/sh", "-c", "sleep 30", client=client)
+    host = _host("http://box.invalid", "/bin/sh", "-c", "sleep 30", client=client)
     host.start(_MACHINE, _INSTANCE)
     for _ in range(500):
         await asyncio.sleep(0.002)
-        if wait_for(conns):
+        if all(terminal.__aenter__.await_count == 1 for terminal in terminals):
             break
-    return host, client, conns, server
+    return host, client, legs, terminals
 
 
-async def test_a_host_serves_five_terminals_at_once_and_refuses_none() -> None:
-    host, _, conns, server = await _five_opens(lambda conns: len(conns) == 5)
+async def test_a_host_serves_five_terminals_at_once_and_refuses_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host, _, legs, terminals = await _five_opens(monkeypatch)
 
-    open_now = [ws.close_code is None for ws in conns]
+    open_now = [
+        not leg.closed and terminal.__aenter__.await_count == 1
+        for leg, terminal in zip(legs, terminals, strict=True)
+    ]
     await asyncio.to_thread(host.stop)
-    server.close()
 
     assert open_now == [True] * 5
 
 
-async def test_stop_ends_every_bridge_and_the_listener_lets_go_of_its_client() -> None:
-    host, client, conns, server = await _five_opens(
-        lambda conns: len(conns) == 5,
-    )
+async def test_stop_ends_every_bridge_and_the_listener_lets_go_of_its_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    host, client, legs, terminals = await _five_opens(monkeypatch)
 
     await asyncio.to_thread(host.stop)
-    server.close()
 
-    assert all(ws.close_code is not None for ws in conns)
+    assert all(leg.closed for leg in legs)
+    for terminal in terminals:
+        terminal.terminate.assert_awaited_once_with()
+        terminal.wait.assert_awaited_once_with()
     # The listener's held request ends by itself, then it lets go of its client.
     assert await asyncio.to_thread(client.closed.wait, 10)
     path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box.terminals.log"
@@ -801,6 +811,7 @@ async def test_shutdown_cannot_join_a_bridge_before_its_thread_starts(
             resume=resume,
         ),
     )
+    _ = _connector(monkeypatch, _FakeSocket(hang=True))
     host = _host("http://127.0.0.1:1")
     opening = asyncio.create_task(
         asyncio.to_thread(
@@ -836,35 +847,30 @@ async def test_a_closed_loop_in_the_shutdown_snapshot_does_not_skip_other_bridge
     await asyncio.wait_for(ended.wait(), 1)
 
 
-async def test_the_exit_is_reported_though_a_job_the_shell_left_still_holds_the_pty() -> (
-    None
-):
-    result: list[tuple[bytes, int]] = []
-
-    async def handler(ws: ServerConnection) -> None:
-        result.append(await _until_exit(ws))
-
-    server, url = await _listening(handler)
-    # ``setsid`` puts the job in a group of its own, as a job of an interactive shell
-    # is, so it holds the pty open after the shell is gone.
+async def test_the_exit_is_reported_though_a_job_the_shell_left_still_holds_the_pty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leg = _FakeSocket()
+    _ = _connector(monkeypatch, leg)
+    terminal, launch = _terminal(monkeypatch, status=4)
+    drained = asyncio.Event()
+    terminal.output.return_value = _held_output(asyncio.Event(), drained)
     host = _host(
-        url,
+        "http://box.invalid",
         "/bin/sh",
         "-c",
         "setsid sleep 7.31 & exit 4",
         drain_sec=0.02,
     )
-    try:
-        await asyncio.wait_for(_run(host, _opened()), 3)
-    finally:
-        server.close()
-        await asyncio.to_thread(
-            subprocess.run,
-            ["pkill", "-f", "^sleep 7[.]31$"],
-            check=False,
-        )
 
-    assert result[0][1] == 4
+    await asyncio.wait_for(_run(host, _opened()), 3)
+
+    assert _result(leg)[1] == 4
+    assert not drained.is_set()
+    assert launch.call_args.args == (["/bin/sh", "-c", "setsid sleep 7.31 & exit 4"],)
+    terminal.terminate.assert_awaited_once_with()
+    terminal.wait.assert_awaited_once_with()
+    assert leg.closed
 
 
 async def test_a_410_ends_the_listener_and_any_other_failure_is_retried() -> None:
@@ -976,24 +982,36 @@ class _ScriptedPeer:
         self.is_open = False
 
 
-async def test_an_offer_is_answered_and_the_shells_output_then_goes_direct() -> None:
+async def test_an_offer_is_answered_and_the_shells_output_then_goes_direct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     peer = _ScriptedPeer()
-    relayed: list[tuple[Frame, bytes]] = []
+    offer = wire_terminals.DirectSignal(gen=1, type="offer", sdp="offer-sdp")
+    leg = _FakeSocket(
+        messages=(encode_frame(Frame.SIGNAL, offer.model_dump_json().encode()),),
+    )
+    _ = _connector(monkeypatch, leg)
+    terminal, _ = _terminal(monkeypatch)
+    typed, finished = asyncio.Event(), asyncio.Event()
+    terminal.write.side_effect = functools.partial(_typed, typed)
+    terminal.output.return_value = _output_when(typed, finished, b"got-go\r\n")
+    terminal.wait.side_effect = functools.partial(_terminal_status, finished, status=0)
+    host = _host(
+        "http://box.invalid",
+        "/bin/sh",
+        "-c",
+        "read x; echo got-$x",
+        direct=lambda: peer,
+    )
 
-    async def handler(ws: ServerConnection) -> None:
-        offer = wire_terminals.DirectSignal(gen=1, type="offer", sdp="offer-sdp")
-        await ws.send(encode_frame(Frame.SIGNAL, offer.model_dump_json().encode()))
-        async for message in ws:
-            assert isinstance(message, bytes)
-            relayed.append(decode_frame(message))
-            if relayed[-1][0] is Frame.EXIT:
-                return
-
-    server, url = await _listening(handler)
-    host = _host(url, "/bin/sh", "-c", "read x; echo got-$x", direct=lambda: peer)
     await _run(host, _opened(ice_servers=["stun:s.test:3478"]))
-    server.close()
 
+    terminal.write.assert_awaited_once_with(b"go\n")
+    relayed = [
+        frame
+        for message in leg.sent
+        if (frame := decode_frame(message))[0] is not Frame.ACK
+    ]
     answer = wire_terminals.DirectSignal.model_validate_json(relayed[0][1])
     assert (relayed[0][0], answer.type, answer.sdp) == (
         Frame.SIGNAL,
@@ -1005,18 +1023,6 @@ async def test_an_offer_is_answered_and_the_shells_output_then_goes_direct() -> 
     assert (Frame.EXIT, (0).to_bytes(4)) in peer.sent
     assert all(kind is not Frame.OUTPUT for kind, _ in relayed)
     assert relayed[-1] == (Frame.EXIT, (0).to_bytes(4))
-
-
-def _fake_knowop(tmp_path: Path, body: str = "") -> Path:
-    trax = tmp_path / "trax"
-    _ = trax.write_text(f"#!/bin/sh\n{body}")
-    trax.chmod(0o755)
-    return trax
-
-
-def _runs_as_knowop(monkeypatch: pytest.MonkeyPatch, trax: Path) -> None:
-    """Make the given script the interpreter a run starts, so it stands in for knowop."""
-    monkeypatch.setattr(sys, "executable", str(trax))
 
 
 def _in_opt_bin(name: str) -> str | None:
@@ -1094,19 +1100,39 @@ class _FakeSocket:
         reply: bytes = encode_frame(Frame.ACK),
         send_error: ConnectionClosed | None = None,
         hang: bool = False,
+        messages: tuple[bytes, ...] = (),
+        closes: bool = False,
+        end_after_output: bool = False,
     ) -> None:
         self.reply = reply
         self.send_error = send_error
         self.hang = hang
         self.closed = False
         self.waiting = asyncio.Event()
+        self.received = threading.Event()
+        self.sent: list[bytes] = []
+        self.messages = messages
+        self.closes = closes
+        self.end_after_output = end_after_output
+        self.output_sent = asyncio.Event()
+
+    def __aiter__(self) -> _Messages:
+        return _Messages(
+            *self.messages,
+            closes=self.closes,
+            hold=not self.end_after_output,
+            until=self.output_sent if self.end_after_output else None,
+        )
 
     async def send(self, data: bytes) -> None:
-        del data
+        self.sent.append(data)
+        if decode_frame(data)[0] is Frame.OUTPUT:
+            self.output_sent.set()
         if self.send_error is not None:
             raise self.send_error
 
     async def recv(self) -> bytes:
+        self.received.set()
         if self.hang:
             self.waiting.set()
             await asyncio.Event().wait()
@@ -1122,9 +1148,10 @@ class _Connector:
     def __init__(self, *outcomes: _FakeSocket | Exception) -> None:
         self.outcomes = list(outcomes)
         self.calls: list[dict[str, object]] = []
+        self.urls: list[str] = []
 
     async def __call__(self, url: str, **kwargs: object) -> _FakeSocket:
-        del url
+        self.urls.append(url)
         self.calls.append(kwargs)
         outcome = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
         if isinstance(outcome, Exception):
@@ -1160,6 +1187,28 @@ def _status(code: int) -> InvalidStatus:
 def _startup_log() -> str:
     path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box.terminals.log"
     return path.read_text()
+
+
+@dataclass(slots=True, kw_only=True)
+class _StartupClock:
+    now: float = 100.0
+    pauses: list[float] = field(default_factory=list[float])
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        self.pauses.append(delay)
+        self.now += delay
+
+
+@pytest_asyncio.fixture
+async def startup_clock(monkeypatch: pytest.MonkeyPatch) -> _StartupClock:
+    """Advance startup time only by the delays the real retry loop requests."""
+    clock = _StartupClock()
+    monkeypatch.setattr(asyncio.get_running_loop(), "time", clock)
+    monkeypatch.setattr(asyncio, "sleep", clock.sleep)
+    return clock
 
 
 async def test_connect_sends_the_credential_and_the_timeouts_a_leg_needs(
@@ -1239,19 +1288,23 @@ async def test_connect_stops_on_a_wrong_acknowledgement_and_closes_the_leg(
 async def test_connect_names_the_error_that_ended_the_attempts(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    startup_clock: _StartupClock,
 ) -> None:
     _ = _connector(monkeypatch, OSError("boom"))
     assert await _connect(startup_timeout_sec=0.03, retry_sec=0.005) is None
     assert capsys.readouterr().err.endswith("): boom\n")
+    assert sum(startup_clock.pauses) == pytest.approx(0.03)
 
 
 async def test_connect_names_an_error_without_a_message_by_its_type(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    startup_clock: _StartupClock,
 ) -> None:
     _ = _connector(monkeypatch, OSError())
     assert await _connect(startup_timeout_sec=0.03, retry_sec=0.005) is None
     assert capsys.readouterr().err.endswith("): OSError\n")
+    assert sum(startup_clock.pauses) == pytest.approx(0.03)
 
 
 async def test_connect_logs_each_retry_with_the_terminal_and_reason(
@@ -1277,18 +1330,21 @@ async def test_connect_retries_only_what_a_retry_can_fix(
     capsys: pytest.CaptureFixture[str],
     code: int,
     retried: bool,
+    startup_clock: _StartupClock,
 ) -> None:
     connector = _connector(monkeypatch, _status(code))
     assert await _connect(startup_timeout_sec=0.05, retry_sec=0.002) is None
     assert (len(connector.calls) > 2) is retried
     if not retried:
         assert len(connector.calls) == 1
+    assert sum(startup_clock.pauses) == pytest.approx(0.05 if retried else 0)
     assert "knowop: terminal startup failed" in capsys.readouterr().err
     assert '"event":"startup_failed"' in _startup_log()
 
 
 async def test_connect_never_sleeps_past_the_deadline(
     monkeypatch: pytest.MonkeyPatch,
+    startup_clock: _StartupClock,
 ) -> None:
     _ = _connector(monkeypatch, OSError("down"))
     result = await asyncio.wait_for(
@@ -1296,15 +1352,18 @@ async def test_connect_never_sleeps_past_the_deadline(
         1,
     )
     assert result is None
+    assert startup_clock.pauses == [pytest.approx(0.05)]
 
 
 async def test_connect_closes_a_leg_that_fails_during_the_handshake(
     monkeypatch: pytest.MonkeyPatch,
+    startup_clock: _StartupClock,
 ) -> None:
     leg = _FakeSocket(send_error=ConnectionClosed(None, None))
     _ = _connector(monkeypatch, leg)
     assert await _connect(startup_timeout_sec=0.03, retry_sec=0.005) is None
     assert leg.closed
+    assert sum(startup_clock.pauses) == pytest.approx(0.03)
 
 
 async def test_connect_closes_a_leg_when_cancelled_mid_handshake(
@@ -1363,9 +1422,17 @@ class _Output:
 class _Messages:
     """The server's leg as it is read: scripted messages, then its end."""
 
-    def __init__(self, *messages: str | bytes, closes: bool) -> None:
+    def __init__(
+        self,
+        *messages: str | bytes,
+        closes: bool,
+        hold: bool = False,
+        until: asyncio.Event | None = None,
+    ) -> None:
         self._messages = list(messages)
         self._closes = closes
+        self._hold = hold
+        self._until = until
 
     def __aiter__(self) -> Self:
         return self
@@ -1375,6 +1442,10 @@ class _Messages:
             return self._messages.pop(0)
         if self._closes:
             raise ConnectionClosed(None, None)
+        if self._until is not None:
+            await self._until.wait()
+        if self._hold:
+            await asyncio.Event().wait()
         raise StopAsyncIteration
 
 

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from functools import partial
+from typing import TYPE_CHECKING, BinaryIO, cast
+from unittest.mock import ANY, Mock
 
+import subprocess
 import time
 
+from trackinizer.lib.userdirs import state_dir
 from trackinizer.wire.wire_sessions import InboundDrainItem
 
 from knowop.agent.clicked_runs import (
@@ -19,10 +23,12 @@ from knowop.agent.clicked_runs import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterator, Mapping
     from pathlib import Path
 
     from trackinizer.sagent.session.types import SystemMessage
+
+    import pytest
 
 
 ME = "dan@x"
@@ -154,15 +160,43 @@ class TestOutputWhileACommandRuns:
     def test_output_is_shown_as_it_grows_and_not_again_while_it_stays(
         self,
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         shown: list[tuple[str, str]] = []
+        command = "printf a; sleep 0.03; printf b >&2; sleep 0.03"
+        directory = state_dir() / "rekursiv-ai" / "knowop" / "runs" / ("2" * 32)
+        child = Mock(spec=subprocess.Popen)
+        child.wait.side_effect = partial(
+            _publish_step,
+            command=command,
+            directory=directory,
+            steps=iter(((b"a", b""), (b"", b""), (b"", b"b"), (b"", b""), 0)),
+        )
+        popen = Mock(return_value=child)
+        monkeypatch.setattr(subprocess, "Popen", popen)
         runs = _runs(tmp_path, [], publish=lambda run, text: shown.append((run, text)))
 
-        runs.handle(_click("2" * 32, "printf a; sleep 0.03; printf b >&2; sleep 0.03"))
+        runs.handle(_click("2" * 32, command))
         _ = _lines(runs)
 
         assert [run for run, _ in shown] == ["2" * 32] * len(shown)
         assert [text for _, text in shown] == ["a", "a\nb"]
+        popen.assert_called_once_with(
+            ["/bin/sh", "-c", command],
+            cwd=tmp_path,
+            env={"PATH": "/usr/bin:/bin"},
+            stdin=subprocess.DEVNULL,
+            stdout=ANY,
+            stderr=ANY,
+            start_new_session=True,
+        )
+        stdout = cast(BinaryIO, popen.call_args.kwargs["stdout"])
+        stderr = cast(BinaryIO, popen.call_args.kwargs["stderr"])
+        assert stdout.name == str(directory / "stdout")
+        assert stderr.name == str(directory / "stderr")
+        assert stdout.closed
+        assert stderr.closed
+        assert child.wait.call_count == 5
 
     def test_a_show_that_fails_costs_the_command_nothing(self, tmp_path: Path) -> None:
         records: list[SystemMessage] = []
@@ -207,6 +241,27 @@ class TestWakeText:
             "<stderr></stderr>",
             f"</{RUN_SOURCE}>",
         ]
+
+
+def _publish_step(
+    *,
+    timeout: float,
+    command: str,
+    directory: Path,
+    steps: Iterator[tuple[bytes, bytes] | int],
+) -> int:
+    """Supply OS output and wait outcomes; the real observer decides when to publish."""
+    assert timeout == 0.005
+    step = next(steps)
+    if isinstance(step, int):
+        return step
+    with (
+        (directory / "stdout").open("ab") as stdout,
+        (directory / "stderr").open("ab") as stderr,
+    ):
+        _ = stdout.write(step[0])
+        _ = stderr.write(step[1])
+    raise subprocess.TimeoutExpired(["/bin/sh", "-c", command], timeout)
 
 
 def _runs(

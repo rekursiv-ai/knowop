@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, TypeGuard, override
+from unittest.mock import Mock, call, patch
 from uuid import UUID, uuid4
 
 import asyncio
@@ -18,7 +19,6 @@ from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix.follow import follow_tree
 from trackinizer.runs.adapters.claude import ClaudeAdapter
-from trackinizer.runs.adapters.codex import CodexAdapter
 from trackinizer.runs.adapters.iostream import IOStreamAdapter
 from trackinizer.runs.redact import Redactor
 from trackinizer.sagent.session import types
@@ -2258,27 +2258,29 @@ class TestLockedSink:
         position out from under it, and the two turns would be stored out of
         order.
         """
-        release = threading.Event()
-        inner = _BlockingSink(release)
+        inner = Mock(spec=Sink)
+        inner.feed.return_value = ["Stdout"]
         sink = LockedSink(inner)
-        flusher = threading.Thread(target=sink.flush, daemon=True)
-        flusher.start()
-        assert inner.entered.wait(2.0)
+        adapter = IOStreamAdapter()
+        calls = Mock()
+        with patch.object(sink, "_lock") as lock:
+            calls.attach_mock(lock, "lock")
+            calls.attach_mock(inner, "inner")
+            assert sink.feed(adapter, _PART, b"x\n") == ["Stdout"]
 
-        fed = threading.Event()
-
-        def _feed() -> None:
-            sink.feed(IOStreamAdapter(), _PART, b"x\n")
-            fed.set()
-
-        feeder = threading.Thread(target=_feed, daemon=True)
-        feeder.start()
-        assert not fed.wait(0.05), "feed ran while flush held the lock"
-
-        release.set()
-        assert fed.wait(5.0), "feed never completed after the lock was released"
-        flusher.join(timeout=5.0)
-        feeder.join(timeout=5.0)
+        assert calls.mock_calls == [
+            call.lock.__enter__(),
+            call.inner.feed(
+                adapter,
+                _PART,
+                b"x\n",
+                restart=False,
+                on_record=None,
+                upload=True,
+                annotate=None,
+            ),
+            call.lock.__exit__(None, None, None),
+        ]
 
     def test_delegates_session_id_and_emit(self) -> None:
         client = _FakeClient()
@@ -2787,16 +2789,19 @@ class TestOneRecordOverTheProxyLimit:
 
     def test_an_oversized_codex_result_uploads_with_its_marker(self) -> None:
         """Codex repeats its output; every copy is bounded before upload."""
-        line = _codex_shell_line((_WORKER_LOG * 200)[:8_000])
-        reader = CodexAdapter().reader()
-        (failing,) = [
-            r for r in reader.feed(line.decode()) if isinstance(r, BashResult)
-        ]
+        output = (_WORKER_LOG * 200)[:8_000]
+        record = BashResult(
+            call_id="exec-1",
+            stdout=output,
+            extra=immutable(
+                {"item": {"aggregated_output": output, "formatted_output": output}},
+            ),
+        )
         server = _Server(proxy_limit=_SMALL_PROXY_LIMIT)
-        assert encoded_size(_uncut(failing)) > server.proxy_limit
+        assert encoded_size(_uncut(record)) > server.proxy_limit
         sink = TrackinizerSink(server.client(), "codex")
 
-        _ = sink.feed(CodexAdapter(), _PART, line)
+        sink.emit("codex", Event(record=record, path=_PART))
         sink.close()
 
         assert server.uploads
@@ -2943,34 +2948,6 @@ class _Server:
         if path.endswith("/end"):
             self.ended = True
         return httpx2.Response(200, json={"id": str(self.session_id)})
-
-
-# Codex states the output three times -- ``stdout``, ``aggregated_output`` and
-# ``formatted_output`` -- and capture adds a fourth copy for search.
-def _codex_shell_line(output: str) -> bytes:
-    """Return one codex rollout line for a shell command that printed ``output``."""
-    item = {
-        "type": "CommandExecution",
-        "id": "exec-1",
-        "command": [
-            "/bin/bash",
-            "-lc",
-            "find runs -name '*.log' -exec sed -n '1,180p' {} \\;",
-        ],
-        "status": "completed",
-        "stdout": output,
-        "stderr": "",
-        "aggregated_output": output,
-        "exit_code": 0,
-        "duration": {"secs": 3, "nanos": 0},
-        "formatted_output": output,
-    }
-    event = {
-        "timestamp": "2026-09-17T22:45:02.000Z",
-        "type": "event_msg",
-        "payload": {"type": "item_completed", "item": item},
-    }
-    return (json.dumps(event) + "\n").encode()
 
 
 def _uncut(record: TraxRecord) -> RecordBody:

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Final
 
 import os
-import subprocess
+import runpy
 import sys
 
 import pytest
@@ -22,9 +22,6 @@ from knowop.agent.cli import codex_main
 
 
 _CWD: Final = Path(__file__).resolve().parent
-# Counted from the module's dotted name, not a fixed hop: the export republishes this
-# tree shallower.
-_ROOT: Final = _CWD.parents[__name__.count(".") - 1]
 
 _ENTRIES: Final = {
     "claude": (
@@ -62,20 +59,20 @@ def test_importing_the_codex_entry_runs_nothing_and_names_the_runners_main() -> 
 
 @pytest.mark.cli_python_subprocess
 @pytest.mark.parametrize("cli", sorted(_ENTRIES))
-def test_the_runner_runs_as_a_module(cli: str, tmp_path: Path) -> None:
-    """The whole chain -- module, imports, argparse -- works."""
-    completed = subprocess.run(  # noqa: S603 -- fixed repository module.
-        [sys.executable, "-m", _ENTRIES[cli][2], "--help"],
-        # The checkout under test first, so a worktree does not import the shared
-        # environment's editable install of another checkout.
-        env={**os.environ, "PYTHONPATH": str(_ROOT), "XDG_STATE_HOME": str(tmp_path)},
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=_ROOT,
-    )
+def test_the_runner_runs_as_a_module(
+    cli: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The entry file imports its runner and parses arguments without a process."""
+    entry = _CWD / _ENTRIES[cli][0]
+    monkeypatch.setattr(sys, "argv", [str(entry), "--help"])
 
-    assert completed.stdout.startswith(f"usage: knowop run {cli} ")
+    with pytest.raises(SystemExit) as exited:
+        _ = runpy.run_path(str(entry), run_name="__main__")
+
+    assert exited.value.code == 0
+    assert capsys.readouterr().out.startswith(f"usage: knowop run {cli} ")
 
 
 if __name__ == "__main__":

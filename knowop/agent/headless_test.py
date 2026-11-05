@@ -6,14 +6,15 @@ real one in a temp folder.
 
 from __future__ import annotations
 
+from concurrent import futures
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, Self, cast
+from unittest.mock import ANY, Mock, call, patch
 
 import asyncio
 import logging
-import os
 import signal
 import socket
 import threading
@@ -47,7 +48,7 @@ from knowop.agent.headless import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Coroutine
 
     from trackinizer.runs.asks import Driver
 
@@ -814,11 +815,20 @@ class TestAHungDriver:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(headless, "_CALL_SEC", 0.05)
-        with _Rig() as rig:
-            rig.wait_started()
-            rig.drivers[0].hang = True
-            with pytest.raises(TimeoutError):
-                rig.run.send_line("hello")
+        future = Mock(spec=futures.Future)
+        future.result.side_effect = TimeoutError
+        submitted = Mock(return_value=future)
+        monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submitted)
+        with asyncio.Runner() as runner:
+            run = _Rig().run
+            run._loop = runner.get_loop()
+            try:
+                with pytest.raises(TimeoutError):
+                    run.send_line("hello")
+            finally:
+                cast("Coroutine[None, None, None]", submitted.call_args.args[0]).close()
+            assert submitted.call_args.args[1] is run._loop
+        future.result.assert_called_once_with(0.05)
 
     def test_a_call_in_flight_when_the_run_ends_says_the_run_ended(self) -> None:
         caught: list[Exception] = []
@@ -882,7 +892,20 @@ class TestTheTerminalsEdges:
         monkeypatch.setattr(headless, "_TUI_START_SEC", 0.05)
         control = socket_address(tmp_path / "c.sock")
         drivers = [_FakeDriver(), _FakeDriver()]
-        with _Rig(control=control, drivers=drivers, tui_mode="silent") as rig:
+        real_wait = threading.Event.wait
+
+        def wait(event: threading.Event, timeout: float | None = None) -> bool:
+            return False if timeout == 0.05 else real_wait(event, timeout)
+
+        with (
+            patch.object(
+                threading.Event,
+                "wait",
+                autospec=True,
+                side_effect=wait,
+            ) as waited,
+            _Rig(control=control, drivers=drivers, tui_mode="silent") as rig,
+        ):
             rig.wait_started()
             reply = request(control, "takeover")
             assert (reply.ok, reply.reason) == (
@@ -891,6 +914,7 @@ class TestTheTerminalsEdges:
             )
             assert reply.state == "idle"
             assert rig.tuis[0].over.wait(_WAIT)
+        waited.assert_any_call(ANY, 0.05)
 
     def test_a_terminal_that_listens_a_moment_late_is_waited_for(
         self,
@@ -1004,28 +1028,28 @@ class TestSignals:
     def test_a_signal_ends_the_run_with_its_number_and_the_handler_goes(
         self,
         number: signal.Signals,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        noted: list[int] = []
-        # A handler of ours first, so a run that did not take the signal fails the
-        # test and does not end the process running it.
-        previous = signal.signal(number, lambda sent, _frame: noted.append(sent))
-        rig = _Rig()
-        try:
-            status = rig.run.run(
-                on_started=lambda: threading.Timer(
-                    0.05,
-                    os.kill,
-                    args=(os.getpid(), number),
-                ).start(),
+        installed, removed = Mock(), Mock(return_value=True)
+        monkeypatch.setattr(asyncio.SelectorEventLoop, "add_signal_handler", installed)
+        monkeypatch.setattr(asyncio.SelectorEventLoop, "remove_signal_handler", removed)
+
+        def received() -> None:
+            handler = next(
+                each for each in installed.call_args_list if each.args[0] == number
             )
-        finally:
-            restored = signal.getsignal(number)
-            _ = signal.signal(number, previous)
-        assert noted == []
-        assert status == 128 + number
-        assert restored == (
-            signal.default_int_handler if number == signal.SIGINT else signal.SIG_DFL
+            cast("Callable[[int], None]", handler.args[1])(handler.args[2])
+
+        rig = _Rig()
+        status = rig.run.run(on_started=received)
+        numbers = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+        installed.assert_has_calls(
+            [call(each, rig.run._finish, 128 + each) for each in numbers],
         )
+        assert installed.call_count == len(numbers)
+        removed.assert_has_calls([call(each) for each in reversed(numbers)])
+        assert removed.call_count == len(numbers)
+        assert status == 128 + number
         assert rig.drivers[0].stopped
 
 

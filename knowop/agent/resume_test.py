@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import replace
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast, override
+from typing import TYPE_CHECKING, Final
 from uuid import UUID, uuid4
 
 import functools
@@ -33,6 +32,7 @@ from trackinizer.sagent.session.types import (
     UncategorizedRecord,
     UncategorizedToolResult,
     UserMessage,
+    WebSearchResult,
 )
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.refs import UuidRef
@@ -41,7 +41,6 @@ from treekle import PlainTree, immutable
 
 import pytest
 
-from knowop.agent.custom_types import Event
 from knowop.agent.errors import (
     CiphertextDroppedError,
     LossyConversionError,
@@ -53,12 +52,7 @@ from knowop.agent.resume import (
     _undroppable,
     prepare_resume,
 )
-from knowop.agent.sink import _record_body
-from knowop.agent.truncate import (
-    MAX_RECORD_BYTES,
-    MAX_TOOL_RESULT_BYTES,
-    NOTE,
-)
+from knowop.agent.truncate import NOTE
 
 
 if TYPE_CHECKING:
@@ -248,13 +242,45 @@ class TestWhichTargetsResume:
         assert written.path.exists()
 
     def test_codex_resumes(self) -> None:
-        """``codex resume <uuid>`` re-enters a rollout, so codex is a target."""
-        client = _FakeClient("codex_main.jsonl", session_format="codex")
+        """``codex resume <uuid>`` re-enters its native acts and sealed reasoning."""
+        client = _PartsClient(
+            {
+                0: (
+                    "codex",
+                    _codex_part(
+                        _codex_said("user", "hi", at=1),
+                        {
+                            "timestamp": _stamp(2),
+                            "type": "response_item",
+                            "payload": {
+                                "type": "reasoning",
+                                "encrypted_content": _SEALED,
+                            },
+                        },
+                        {
+                            "timestamp": _stamp(3),
+                            "type": "event_msg",
+                            "payload": {"type": "task_started", "turn_id": "t1"},
+                        },
+                    ),
+                ),
+            },
+        )
 
         written = prepare_resume(client, uuid4(), "codex")
 
         assert written.path.exists()
         assert written.path.name.startswith("rollout-")
+        with written.path.open(encoding="utf-8") as handle:
+            records = list(codex.normalize(handle))
+        assert [
+            record.encrypted for record in records if isinstance(record, Thinking)
+        ] == [
+            _SEALED,
+        ]
+        assert [
+            record.kind for record in records if isinstance(record, UncategorizedRecord)
+        ] == ["event_msg/task_started"]
 
     def test_a_claude_capture_resumes_as_codex(self) -> None:
         """The crossing that was previously impossible in this direction.
@@ -551,16 +577,31 @@ class TestAMixedSessionResumes:
         with pytest.raises(LossyConversionError, match="drops BashResult"):
             prepare_resume(client, uuid4(), "claude")
 
-    def test_a_real_capture_with_a_result_it_never_calls_resumes_as_claude(
+    def test_a_capture_with_a_result_it_never_calls_resumes_as_claude(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The captured claude transcript carries a result with no call in it.
-
-        Behind a bot part it resumed as a refused conversion, which dropped the result.
-        """
-        records, _ = _records("claude_main.jsonl")
-        full_capture = cast("Sequence[SessionRecord]", records)
+        """A native Claude result with no call survives behind a bot part."""
+        full_capture = _claude_part(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "orphan",
+                            "content": "found it",
+                        },
+                    ],
+                },
+            },
+        )
+        assert [
+            record.content
+            for record in full_capture
+            if isinstance(record, UncategorizedToolResult)
+        ] == ["found it"]
         bot_records: list[SessionRecord] = [
             AgentToAgentMessage(sender="ada@example.com", content="q1"),
             AssistantMessage(content="bot says"),
@@ -589,6 +630,7 @@ class TestAMixedSessionResumes:
         written = prepare_resume(client, uuid4(), "claude")
 
         assert written.path.exists()
+        assert "found it" in written.path.read_text(encoding="utf-8")
 
     def test_a_truncated_line_of_the_same_cli_requires_lossy(self) -> None:
         """A single codex part the target already speaks is replayed, so it must parse."""
@@ -644,14 +686,71 @@ class TestLossyConversion:
         bookkeeping, which claude restates for itself, so refusing on them made
         every real rollout need ``--lossy`` for a transcript that lost no turn.
         """
-        client = _FakeClient("codex_main.jsonl", session_format="codex")
+        client = _PartsClient(
+            {
+                0: (
+                    "codex",
+                    _codex_part(
+                        _codex_said("user", "hi", at=1),
+                        {
+                            "timestamp": _stamp(2),
+                            "type": "response_item",
+                            "payload": {
+                                "type": "web_search_call",
+                                "id": "search-1",
+                                "action": {"type": "search", "query": "which fruit?"},
+                            },
+                        },
+                        {
+                            "timestamp": _stamp(3),
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "web_search_end",
+                                "call_id": "search-1",
+                                "query": "which fruit?",
+                                "results": [],
+                            },
+                        },
+                    ),
+                ),
+            },
+        )
 
         written = prepare_resume(client, uuid4(), "claude")
 
         assert written.path.exists()
+        with written.path.open(encoding="utf-8") as handle:
+            searches = [
+                record
+                for record in claude.normalize(handle)
+                if isinstance(record, WebSearchResult)
+            ]
+        assert [(record.call_id, record.query) for record in searches] == [
+            ("search-1", "which fruit?"),
+        ]
 
     def test_the_flag_accepts_the_loss(self) -> None:
-        client = _FakeClient("codex_main.jsonl", session_format="codex")
+        client = _PartsClient(
+            {
+                0: (
+                    "assistant",
+                    [
+                        AgentToAgentMessage(sender="ada@example.com", content="q1"),
+                        AssistantMessage(content="bot says"),
+                    ],
+                ),
+                1: (
+                    "claude",
+                    [
+                        UserMessage(content="look it up"),
+                        BashResult(call_id="orphan", command=("ls",)),
+                        AssistantMessage(content="claude says"),
+                    ],
+                ),
+            },
+        )
+        with pytest.raises(LossyConversionError, match="drops BashResult"):
+            prepare_resume(client, uuid4(), "claude")
 
         written = prepare_resume(client, uuid4(), "claude", lossy=True)
 
@@ -732,7 +831,19 @@ class TestLossyConversion:
         capture cut at upload is refused on the merged path too, so it stands in for
         the refusal.
         """
-        client = _CapturedClient()
+        client = _PartsClient(
+            {
+                0: (
+                    "claude",
+                    [
+                        UncategorizedRecord(
+                            kind="queue-operation",
+                            payload=immutable({NOTE: {"omitted_bytes": 1}}),
+                        ),
+                    ],
+                ),
+            },
+        )
 
         with pytest.raises(LossyConversionError, match="truncated at capture"):
             prepare_resume(client, uuid4(), "codex")
@@ -1139,54 +1250,63 @@ def test_a_single_part_of_the_targets_own_format_reports_its_window() -> None:
     assert not written.compact_after_load
 
 
-class _CapturedClient(_FakeClient):
-    """Serves each record as capture uploaded it: bounded, so a huge one arrives cut.
-
-    Inflates the fixture's one shell result past the tool-result budget and one
-    uncategorized line past every record's, the two places a cut leaves its note.
-    """
-
-    def __init__(self) -> None:
-        super().__init__("claude_main.jsonl", session_format="claude")
-        line = next(
-            index
-            for index, record in enumerate(self.records)
-            if isinstance(record, UncategorizedRecord)
-        )
-        self.records = [
-            _inflated(record)
-            if index == line or isinstance(record, BashResult)
-            else record
-            for index, record in enumerate(self.records)
-        ]
-
-    @override
-    def read_session_records(
-        self,
-        session_id: UUID,
-        *,
-        part: int = 0,
-        **_: object,
-    ) -> list[RecordBody]:
-        del session_id, part
-        return [
-            _record_body(idx, Event(record=record, path=Path("s.jsonl")), redactor=None)
-            for idx, record in enumerate(self.records)
-        ]
-
-
 class TestTruncatedAtCapture:
     """A record capture cut is a transcript the model never saw."""
 
     def test_resuming_it_is_refused_without_the_flag(self) -> None:
-        client = _CapturedClient()
+        client = _PartsClient(
+            {
+                0: (
+                    "claude",
+                    [
+                        BashResult(
+                            call_id="cut",
+                            command=("ls",),
+                            extra=immutable({NOTE: {"omitted_bytes": 1}}),
+                        ),
+                    ],
+                ),
+            },
+        )
 
         with pytest.raises(LossyConversionError, match="truncated at capture"):
             prepare_resume(client, uuid4(), "claude")
 
     def test_the_flag_resumes_it_with_the_marker_and_without_the_note(self) -> None:
         """The note is Trackinizer's, never the CLI's; the marker is what the model reads."""
-        client = _CapturedClient()
+        marker = (
+            "[Trackinizer capture truncated: kept beginning/end; omitted 1 UTF-8 bytes]"
+        )
+        client = _PartsClient(
+            {
+                0: (
+                    "claude",
+                    [
+                        ToolCall(
+                            call_id="cut",
+                            name="Bash",
+                            arguments={"command": "ls"},
+                        ),
+                        BashResult(
+                            call_id="cut",
+                            command=("ls",),
+                            stdout=marker,
+                            extra=immutable({NOTE: {"omitted_bytes": 1}}),
+                        ),
+                        UncategorizedRecord(
+                            kind="queue-operation",
+                            payload=immutable(
+                                {
+                                    "type": "queue-operation",
+                                    "content": marker,
+                                    NOTE: {"omitted_bytes": 1},
+                                },
+                            ),
+                        ),
+                    ],
+                ),
+            },
+        )
 
         written = prepare_resume(client, uuid4(), "claude", lossy=True)
 
@@ -1195,22 +1315,11 @@ class TestTruncatedAtCapture:
         assert NOTE not in text
 
     def test_a_session_nothing_was_cut_from_needs_no_flag(self) -> None:
-        client = _CapturedClient()
-        client.records = _records("claude_main.jsonl")[0]
+        client = _PartsClient(
+            {0: ("claude", _claude_part(_claude_said("user", "kept", at=1)))},
+        )
 
         assert prepare_resume(client, uuid4(), "claude").path.exists()
-
-
-def _inflated(record: TraxRecord) -> TraxRecord:
-    """Return ``record`` grown past its budget, if it is one this suite cuts."""
-    if isinstance(record, BashResult):
-        return replace(record, stdout="x" * MAX_TOOL_RESULT_BYTES)
-    if isinstance(record, UncategorizedRecord):
-        return replace(
-            record,
-            payload=immutable({**record.payload, "content": "y" * MAX_RECORD_BYTES}),
-        )
-    return record
 
 
 if __name__ == "__main__":

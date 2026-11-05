@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
 import base64
 import fcntl
@@ -35,7 +37,7 @@ from trackinizer.wire.wire_machine_job import (
 
 import pytest
 
-from knowop.shell import job_host
+from knowop.shell import job_host, job_repo
 from knowop.shell.job_folder import (
     Ended,
     JobBinding,
@@ -237,7 +239,40 @@ class _Rig:
     root: Path
 
 
-def test_preparation_has_only_one_active_fetch(tmp_path: Path) -> None:
+@pytest.fixture
+def started_threads(monkeypatch: pytest.MonkeyPatch) -> list[threading.Thread]:
+    """Record worker starts while retaining the real thread lifecycle."""
+    threads: list[threading.Thread] = []
+    start = threading.Thread.start
+
+    def record(thread: threading.Thread) -> None:
+        threads.append(thread)
+        start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", record)
+    return threads
+
+
+@pytest.fixture
+def lock_retries_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[threading.Event]:
+    """Hold a real lock's retry at its clock boundary until the lock is released."""
+    release = threading.Event()
+
+    def pause(timeout_sec: float) -> None:
+        assert timeout_sec == 0.05
+        assert release.wait(5)
+
+    monkeypatch.setattr(job_repo, "time", SimpleNamespace(sleep=pause))
+    yield release
+    release.set()
+
+
+def test_preparation_has_only_one_active_fetch(
+    tmp_path: Path,
+    started_threads: list[threading.Thread],
+) -> None:
     gate = threading.Event()
     repos = _Repos(gate=gate)
     rig = _host(tmp_path, repos=repos)
@@ -247,7 +282,11 @@ def test_preparation_has_only_one_active_fetch(tmp_path: Path) -> None:
             rig.host.handle(StartWork(job=_spec(job_id)))
         rig.host.step()
         _until(lambda: bool(repos.fetching))
-        time.sleep(0.05)
+        assert [
+            t.name for t in started_threads if t.name.startswith("jobs-fetch-")
+        ] == [
+            "jobs-fetch-7",
+        ]
         assert len(repos.fetching) == 1
     finally:
         gate.set()
@@ -279,6 +318,7 @@ def test_cancellation_interrupts_preparation(tmp_path: Path) -> None:
 def test_scheduler_cannot_pass_an_unanswered_queued_report(
     rig: _Rig,
     monkeypatch: pytest.MonkeyPatch,
+    started_threads: list[threading.Thread],
 ) -> None:
     entered, release = threading.Event(), threading.Event()
 
@@ -294,7 +334,9 @@ def test_scheduler_cannot_pass_an_unanswered_queued_report(
     try:
         assert entered.wait(1)
         rig.host.step()
-        time.sleep(0.05)
+        assert [
+            t.name for t in started_threads if t.name.startswith("jobs-fetch-")
+        ] == []
         assert not rig.repos.fetching
         assert not rig.launcher.started
     finally:
@@ -729,13 +771,14 @@ def test_a_report_the_server_did_not_take_is_sent_again(rig: _Rig) -> None:
 def test_rejected_queued_report_prevents_checkout_and_launch(
     rig: _Rig,
     status: int | None,
+    started_threads: list[threading.Thread],
 ) -> None:
     rig.server.report_errors = [ClientError("refused", status_code=status)] * 10
     _ = _start(rig)
     rig.host.step()
-    time.sleep(0.05)
     rig.host.step()
 
+    assert [t.name for t in started_threads if t.name.startswith("jobs-fetch-")] == []
     assert not (rig.root / "7" / "src").exists()
     assert rig.launcher.started == []
 
@@ -982,6 +1025,7 @@ def test_cleanup_waiting_for_preparation_does_not_delay_another_cancel(
     rig: _Rig,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lock_retries_released: threading.Event,
 ) -> None:
     finished = _running(rig, 7)
     _running(rig, 9)
@@ -1003,6 +1047,7 @@ def test_cleanup_waiting_for_preparation_does_not_delay_another_cancel(
         assert (f"knowop-job-{_TAG}-9", signal.SIGTERM) in rig.launcher.signals
     finally:
         os.close(fd)
+        lock_retries_released.set()
         scheduler.join(timeout=5)
 
 
@@ -1026,6 +1071,8 @@ def test_only_one_worktree_cleanup_runs_at_a_time(
     rig: _Rig,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    lock_retries_released: threading.Event,
+    started_threads: list[threading.Thread],
 ) -> None:
     folders = [_running(rig, job_id) for job_id in (7, 8)]
     root = tmp_path / "repos"
@@ -1048,10 +1095,15 @@ def test_only_one_worktree_cleanup_runs_at_a_time(
         rig.host.step()
         _until(lambda: bool(entered))
         rig.host.step()
-        time.sleep(0.05)
+        assert [
+            t.name for t in started_threads if t.name.startswith("jobs-clean-")
+        ] == [
+            "jobs-clean-7",
+        ]
         assert entered == [folders[0].src]
     finally:
         os.close(fd)
+        lock_retries_released.set()
         _cleaned(rig, 7)
         rig.host.step()
         _cleaned(rig, 8)
@@ -1142,6 +1194,7 @@ def test_a_read_returns_the_log_the_manifest_or_a_result_file(rig: _Rig) -> None
 def test_host_read_workers_remain_bounded_after_relay_timeouts(
     rig: _Rig,
     monkeypatch: pytest.MonkeyPatch,
+    started_threads: list[threading.Thread],
 ) -> None:
     release = threading.Event()
     entered: list[ReadWork] = []
@@ -1155,10 +1208,13 @@ def test_host_read_workers_remain_bounded_after_relay_timeouts(
     try:
         for _ in range(20):
             rig.host.handle(ReadWork(read_id=uuid.uuid4(), job_id=7, what="log"))
-        time.sleep(0.05)
+        assert len(started_threads) == 4
         assert len(entered) <= 4
     finally:
         release.set()
+        for thread in started_threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
 
 
 def test_results_over_this_machines_limit_are_refused_with_where_they_stay(
@@ -1192,16 +1248,26 @@ def test_a_read_of_a_job_that_is_not_here_or_not_this_accounts_is_refused(
     assert foreign == ReadRefused(reason="job 8 is not on gx10")
 
 
-def test_a_log_read_holds_for_new_bytes_while_the_job_runs(rig: _Rig) -> None:
+def test_a_log_read_holds_for_new_bytes_while_the_job_runs(
+    rig: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     folder = _running(rig)
     size = folder.log.stat().st_size
-    timer = threading.Timer(0.1, lambda: folder.note("more"))
-    timer.start()
+
+    def append(timeout: float | None = None) -> bool:
+        assert timeout == 0.5
+        folder.note("more")
+        return False
+
+    waited = Mock(side_effect=append)
+    monkeypatch.setattr(rig.host._stop, "wait", waited)
 
     held = _read(rig, offset=size, wait_sec=5).reply
 
     assert isinstance(held, Chunk)
     assert base64.b64decode(held.data_b64) == b"knowop: more\n"
+    waited.assert_called_once_with(0.5)
 
 
 def test_a_log_read_past_its_hold_returns_what_there_is(rig: _Rig) -> None:
@@ -1229,6 +1295,7 @@ def test_a_read_that_fails_on_the_disk_is_refused(rig: _Rig) -> None:
 
 def test_an_answer_the_server_did_not_take_is_sent_again_and_a_refused_one_not(
     rig: _Rig,
+    started_threads: list[threading.Thread],
 ) -> None:
     _ = _running(rig)
     rig.server.reply_errors = [ClientError("down", status_code=503)]
@@ -1237,19 +1304,24 @@ def test_an_answer_the_server_did_not_take_is_sent_again_and_a_refused_one_not(
     count = len(rig.server.replies)
 
     rig.host.handle(ReadWork(read_id=uuid.uuid4(), job_id=7, what="log"))
-    time.sleep(0.05)
+    started_threads[-1].join(timeout=5)
 
+    assert not started_threads[-1].is_alive()
     assert len(rig.server.replies) == count
 
 
-def test_an_answer_that_never_lands_is_given_up_after_three_tries(rig: _Rig) -> None:
+def test_an_answer_that_never_lands_is_given_up_after_three_tries(
+    rig: _Rig,
+    started_threads: list[threading.Thread],
+) -> None:
     _ = _running(rig)
     rig.server.reply_errors = [ClientError("down", status_code=None)] * 3
 
     rig.host.handle(ReadWork(read_id=uuid.uuid4(), job_id=7, what="log"))
     _until(lambda: rig.server.reply_errors == [])
-    time.sleep(0.02)
+    started_threads[-1].join(timeout=5)
 
+    assert not started_threads[-1].is_alive()
     assert rig.server.replies == []
 
 
@@ -1302,6 +1374,7 @@ def test_revocation_signals_running_jobs_before_waiting_for_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     revoked_at: str,
+    lock_retries_released: threading.Event,
 ) -> None:
     finished = _running(rig, 7)
     running = [_running(rig, job_id) for job_id in (9, 10)]
@@ -1320,6 +1393,7 @@ def test_revocation_signals_running_jobs_before_waiting_for_cleanup(
         refused = ClientError("revoked", status_code=410)
         if revoked_at == "listener":
             rig.server.offers.append(refused)
+            rig.server.idle.set()
         else:
             rig.server.stop_answer = refused
             stopper.start()
@@ -1334,6 +1408,7 @@ def test_revocation_signals_running_jobs_before_waiting_for_cleanup(
         assert not rig.launcher.alive_units
     finally:
         os.close(fd)
+        lock_retries_released.set()
         if stopper.ident is not None:
             stopper.join(timeout=5)
         _until(lambda: all(folder.reported_at() is not None for folder in running))
@@ -1353,11 +1428,18 @@ def test_a_stubborn_job_of_a_revoked_machine_is_killed_after_the_grace(
     server.stop_answer = ClientError("revoked", status_code=410)
     rig = _host(tmp_path, server=server, launcher=launcher)
     rig.host.start(_MACHINE, _INSTANCE)
+    clock = SimpleNamespace(
+        monotonic=Mock(side_effect=[10.0, 10.049, 10.051]),
+        sleep=Mock(),
+    )
+    monkeypatch.setattr(job_host, "time", clock)
 
     rig.host.stop()
 
     assert launcher.signals == [(unit, signal.SIGTERM), (unit, signal.SIGKILL)]
     assert alive.reported_at() is not None
+    clock.sleep.assert_called_once_with(0.2)
+    assert clock.monotonic.call_count == 3
 
 
 def test_stopping_the_host_leaves_running_jobs_running(rig: _Rig) -> None:

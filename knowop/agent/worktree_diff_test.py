@@ -1,14 +1,18 @@
 """Tests for the session worktree-diff capture.
 
 Git is injected as a :class:`~knowop.agent.worktree_diff.Runner`,
-so these are hermetic and fast -- no real repository, no subprocess. One
-real-git smoke lives in ``worktree_diff_cli_test`` behind the ``cli_git`` marker.
+and its runner sees explicit process replies. Real Git and shell checks live in the
+hand-run parity script.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from subprocess import CompletedProcess, TimeoutExpired
 from typing import TYPE_CHECKING
+from unittest.mock import Mock, call
+
+import os
 
 from trackinizer.sagent.session.types import (
     AssistantMessage,
@@ -444,10 +448,16 @@ class TestFileCases:
 
 
 class TestRunGit:
-    """The real subprocess runner: bounded output, and a missing binary."""
+    """The subprocess runner's output bounds, missing binary, and deadline result."""
 
-    def test_reads_output_up_to_the_byte_cap(self) -> None:
+    def test_reads_output_up_to_the_byte_cap(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Output is kept to ``max_bytes`` and the cut is reported."""
+        execute = Mock(return_value=CompletedProcess(["printf", "hello"], 0, b"hello"))
+        monkeypatch.setattr(worktree_diff.subprocess, "run", execute)
+
         done = run_git(["printf", "hello"], 100)
         assert done.returncode == 0
         assert done.stdout == b"hello"
@@ -455,22 +465,58 @@ class TestRunGit:
         cut = run_git(["printf", "hello"], 2)
         assert cut.stdout == b"he"
         assert cut.cut
+        assert (
+            execute.call_args_list
+            == [
+                call(
+                    ["printf", "hello"],
+                    env={
+                        **os.environ,
+                        "GIT_OPTIONAL_LOCKS": "0",
+                        "GIT_TERMINAL_PROMPT": "0",
+                    },
+                    stdin=worktree_diff.subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=20.0,
+                    check=False,
+                ),
+            ]
+            * 2
+        )
 
-    def test_a_missing_binary_is_not_an_exception(self) -> None:
+    def test_a_missing_binary_is_not_an_exception(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """A git that cannot start ends as ``-1``, not a crash."""
+        execute = Mock(side_effect=FileNotFoundError("trax-run-no-such-binary-xyz"))
+        monkeypatch.setattr(worktree_diff.subprocess, "run", execute)
+
         done = run_git(["trax-run-no-such-binary-xyz"], 100)
         assert done.returncode == -1
         assert done.stdout == b""
+        assert execute.call_args.args == (["trax-run-no-such-binary-xyz"],)
 
     def test_a_git_past_its_time_ends_as_minus_one_with_what_it_printed(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(worktree_diff, "GIT_SEC", 0.02)
+        argv = ["sh", "-c", "printf partial; exec sleep 30"]
+        execute = Mock(side_effect=TimeoutExpired(argv, 0.02, output=b"partial"))
+        monkeypatch.setattr(worktree_diff.subprocess, "run", execute)
 
-        done = run_git(["sh", "-c", "printf partial; exec sleep 30"], 4)
+        done = run_git(argv, 4)
 
         assert (done.returncode, done.stdout, done.cut) == (-1, b"part", True)
+        execute.assert_called_once_with(
+            argv,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+            stdin=worktree_diff.subprocess.DEVNULL,
+            capture_output=True,
+            timeout=0.02,
+            check=False,
+        )
 
 
 if __name__ == "__main__":

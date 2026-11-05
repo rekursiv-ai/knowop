@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
+from unittest.mock import Mock, call
 from uuid import UUID
 
 from trackinizer.client.errors import ClientError
@@ -11,13 +13,14 @@ from trackinizer.wire.wire_sessions import SessionPlacement
 
 import pytest
 
+from knowop.agent import placement
 from knowop.agent.placement import (
     chat_placement,
     git_ref,
     place_run,
     placement_env,
 )
-from knowop.agent.worktree_diff import run_git
+from knowop.agent.worktree_diff import Output
 
 
 if TYPE_CHECKING:
@@ -84,19 +87,14 @@ def _listed(
     }
 
 
-def _git(cwd: Path, *argv: str) -> None:
-    done = run_git(
-        ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t", *argv],
-        4096,
-    )
-    assert done.returncode == 0, done.stdout
-    assert not done.cut
-
-
 @pytest.fixture(autouse=True)
-def _own_git_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def git_commands(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Mock:
+    """Keep placement on explicit Git replies, isolated from the launching checkout."""
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    read = Mock(return_value=Output(returncode=128, stdout=b"", cut=False))
+    monkeypatch.setattr(placement, "git_ref", partial(git_ref, run=read))
+    return read
 
 
 def test_the_canvas_comes_from_trax_canvas_before_its_ssh_twin() -> None:
@@ -108,32 +106,71 @@ def test_the_canvas_comes_from_trax_canvas_before_its_ssh_twin() -> None:
     assert canvas_from_env({}) is None
 
 
-def test_a_checkout_on_a_branch_names_its_origin_and_branch(tmp_path: Path) -> None:
-    _git(tmp_path, "init", "-q", "-b", "feature")
-    _git(tmp_path, "remote", "add", "origin", "https://github.com/o/r.git")
+def test_a_checkout_on_a_branch_names_its_origin_and_branch(
+    tmp_path: Path,
+    git_commands: Mock,
+) -> None:
+    git_commands.side_effect = [
+        Output(returncode=0, stdout=b"feature\n", cut=False),
+        Output(returncode=0, stdout=b"https://github.com/o/r.git\n", cut=False),
+    ]
 
-    ref = git_ref(tmp_path)
+    ref = git_ref(tmp_path, run=git_commands)
 
     assert ref is not None
     assert (ref.origin, ref.branch) == ("https://github.com/o/r.git", "feature")
+    assert git_commands.call_args_list == [
+        call(
+            ["git", "-C", str(tmp_path), "symbolic-ref", "--short", "-q", "HEAD"],
+            4096,
+        ),
+        call(
+            ["git", "-C", str(tmp_path), "config", "--get", "remote.origin.url"],
+            4096,
+        ),
+    ]
 
 
 def test_no_ref_for_a_directory_that_is_not_a_checkout_on_a_branch(
     tmp_path: Path,
+    git_commands: Mock,
 ) -> None:
-    assert git_ref(tmp_path) is None
-    _git(tmp_path, "init", "-q", "-b", "main")
-    assert git_ref(tmp_path) is None  # No origin.
-    _git(tmp_path, "remote", "add", "origin", "https://github.com/o/r.git")
-    _git(tmp_path, "commit", "-q", "--allow-empty", "-m", "x")
-    _git(tmp_path, "checkout", "-q", "--detach")
-    assert git_ref(tmp_path) is None  # Detached HEAD.
+    git_commands.side_effect = [
+        Output(returncode=128, stdout=b"", cut=False),
+        Output(returncode=128, stdout=b"", cut=False),
+        Output(returncode=0, stdout=b"main\n", cut=False),
+        Output(returncode=1, stdout=b"", cut=False),
+        Output(returncode=1, stdout=b"", cut=False),
+        Output(returncode=0, stdout=b"https://github.com/o/r.git\n", cut=False),
+    ]
+    assert git_ref(tmp_path, run=git_commands) is None
+    assert git_ref(tmp_path, run=git_commands) is None  # No origin.
+    assert git_ref(tmp_path, run=git_commands) is None  # Detached HEAD.
+    assert (
+        git_commands.call_args_list
+        == [
+            call(
+                ["git", "-C", str(tmp_path), "symbolic-ref", "--short", "-q", "HEAD"],
+                4096,
+            ),
+            call(
+                ["git", "-C", str(tmp_path), "config", "--get", "remote.origin.url"],
+                4096,
+            ),
+        ]
+        * 3
+    )
 
 
-def test_a_run_asks_the_server_with_its_canvas_and_checkout(tmp_path: Path) -> None:
+def test_a_run_asks_the_server_with_its_canvas_and_checkout(
+    tmp_path: Path,
+    git_commands: Mock,
+) -> None:
     client = _Client()
-    _git(tmp_path, "init", "-q", "-b", "main")
-    _git(tmp_path, "remote", "add", "origin", "https://github.com/o/r.git")
+    git_commands.side_effect = [
+        Output(returncode=0, stdout=b"main\n", cut=False),
+        Output(returncode=0, stdout=b"https://github.com/o/r.git\n", cut=False),
+    ]
 
     placed = place_run(
         client,
@@ -150,6 +187,16 @@ def test_a_run_asks_the_server_with_its_canvas_and_checkout(tmp_path: Path) -> N
                 "canvas": str(_CANVAS),
                 "git": {"origin": "https://github.com/o/r.git", "branch": "main"},
             },
+        ),
+    ]
+    assert git_commands.call_args_list == [
+        call(
+            ["git", "-C", str(tmp_path), "symbolic-ref", "--short", "-q", "HEAD"],
+            4096,
+        ),
+        call(
+            ["git", "-C", str(tmp_path), "config", "--get", "remote.origin.url"],
+            4096,
         ),
     ]
 

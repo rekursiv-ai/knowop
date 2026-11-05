@@ -1,43 +1,38 @@
-"""The exec host and its command runner, with real shell commands."""
+"""Exercise host execution and private logs with scripted process replies."""
 
 from __future__ import annotations
 
+from asyncio.subprocess import Process
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, TypedDict, Unpack
+from typing import TYPE_CHECKING, Final, cast
+from unittest.mock import AsyncMock, Mock
 
 import asyncio
 import base64
-import gc
-import json
 import os
 import queue
+import signal
 import stat
-import subprocess
 import threading
 import time
 import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import state_dir
-from trackinizer.wire.wire_exec import (
-    MAX_STREAM_BYTES,
-    TIMEOUT_EXIT_CODE,
-    ExecRequest,
-    ExecResult,
-    ExecWait,
-)
+from trackinizer.wire.wire_exec import ExecRequest, ExecResult, ExecWait
+from treekle import json_loads
 
 import pytest
 
-from knowop.shell import exec_command, exec_host
+from knowop.shell import exec_host
 from knowop.shell.exec_command import run_command
+from knowop.shell.exec_command_test import _kill_group, _process
 from knowop.shell.exec_host import ExecHost
 
 
 if TYPE_CHECKING:
-    from asyncio import Future
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable
 
 
 _MACHINE: Final = uuid.UUID(int=1)
@@ -53,6 +48,42 @@ def empty_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     return home
+
+
+@pytest.fixture(autouse=True)
+def shell(monkeypatch: pytest.MonkeyPatch) -> _Shell:
+    """Keep the command runner and Child real, supplying only OS process replies."""
+    reply = _Shell()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", reply.start)
+    monkeypatch.setattr(os, "killpg", reply.kill)
+    return reply
+
+
+class _Shell:
+    """Explicit stdout/status replies and the processes started to deliver them."""
+
+    def __init__(self) -> None:
+        self.replies: dict[str, tuple[bytes, int | None]] = {}
+        self.processes: list[Mock] = []
+        self.ready = threading.Event()
+        self.start = AsyncMock(side_effect=self._spawn)
+        self.kill = Mock(side_effect=self._signal)
+
+    async def _spawn(self, *argv: str, **options: object) -> Process:
+        del options
+        stdout, code = self.replies.get(argv[2].partition("\n")[2], (b"", 0))
+        process = _process(stdout=stdout, code=code)
+        process.pid += len(self.processes)
+        self.processes.append(process)
+        self.ready.set()
+        return cast(Process, process)
+
+    def _signal(self, pgid: int, signum: int) -> None:
+        process = next(each for each in self.processes if each.pid == pgid)
+        if process.returncode is not None:
+            raise ProcessLookupError
+        if signum:
+            _kill_group(process, pgid, signum)
 
 
 def _request(
@@ -90,132 +121,11 @@ def _err(result: ExecResult) -> bytes:
     return base64.b64decode(result.stderr_b64)
 
 
-def _alive(pid: int) -> bool:
-    """Whether ``pid`` still runs; a process that only awaits its reaping is dead."""
-    state = subprocess.run(  # noqa: S603 -- fixed command, an int argument.
-        ["ps", "-o", "stat=", "-p", str(pid)],  # noqa: S607 -- ps is on every PATH.
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout.strip()
-    return bool(state) and not state.startswith("Z")
-
-
 def _wait_until(done: Callable[[], bool]) -> None:
     deadline = time.monotonic() + 5
     while not done():
         assert time.monotonic() < deadline, "the awaited change never came"
         time.sleep(0.005)
-
-
-def _wait_for(path: Path) -> None:
-    """Wait until ``path`` holds output; the shell creates it before it writes."""
-    _wait_until(lambda: path.exists() and path.stat().st_size > 0)
-
-
-class _WaitOptions(TypedDict, total=False):
-    timeout: float | None
-    return_when: str
-
-
-class _ReadyDeadline:
-    """Expire supervision once the real shell has reached the exercised state."""
-
-    def __init__(self, ready: Path, *, timeout_sec: float) -> None:
-        self.ready = ready
-        self.timeout_sec = timeout_sec
-        self.wait = asyncio.wait
-
-    async def __call__(
-        self,
-        futures: Iterable[Future[object]],
-        **options: Unpack[_WaitOptions],
-    ) -> tuple[set[Future[object]], set[Future[object]]]:
-        if options.get("return_when") == asyncio.FIRST_COMPLETED:
-            assert options["timeout"] == self.timeout_sec
-            await asyncio.to_thread(_wait_for, self.ready)
-            options["timeout"] = 0
-        return await self.wait(
-            futures,
-            timeout=options.get("timeout"),
-            return_when=options.get("return_when", asyncio.ALL_COMPLETED),
-        )
-
-
-def test_the_commands_exit_code_and_both_streams_are_reported(tmp_path: Path) -> None:
-    result = _run(_request("echo out; echo err >&2; exit 3", cwd=tmp_path))
-
-    assert (result.exit_code, _out(result), _err(result)) == (3, b"out\n", b"err\n")
-    assert not result.truncated
-
-
-def test_a_command_that_fails_to_parse_reports_the_shells_status(
-    tmp_path: Path,
-) -> None:
-    result = _run(_request("if then", cwd=tmp_path))
-
-    assert result.exit_code == 2
-    assert b"syntax error" in _err(result)
-
-
-def test_a_command_killed_by_a_signal_reports_the_shell_convention(
-    tmp_path: Path,
-) -> None:
-    result = _run(_request("kill -9 $$", cwd=tmp_path))
-
-    assert result.exit_code == 128 + 9
-
-
-def test_the_command_runs_in_a_login_shell(tmp_path: Path) -> None:
-    result = _run(_request("shopt -q login_shell && echo login", cwd=tmp_path))
-
-    assert _out(result) == b"login\n"
-
-
-def test_stdin_comes_from_the_request(tmp_path: Path) -> None:
-    result = _run(_request("cat", cwd=tmp_path, stdin=b"from the request\n"))
-
-    assert _out(result) == b"from the request\n"
-
-
-def test_a_command_with_no_stdin_reads_end_of_file(tmp_path: Path) -> None:
-    result = _run(_request("cat; echo done", cwd=tmp_path))
-
-    assert (result.exit_code, _out(result)) == (0, b"done\n")
-
-
-def test_a_command_that_never_reads_a_large_stdin_still_finishes(
-    tmp_path: Path,
-) -> None:
-    result = _run(_request("echo done", cwd=tmp_path, stdin=b"x" * 900_000))
-
-    assert (result.exit_code, _out(result)) == (0, b"done\n")
-
-
-def test_the_command_starts_in_the_folder_and_reports_where_it_ended(
-    tmp_path: Path,
-) -> None:
-    (tmp_path / "sub").mkdir()
-
-    result = _run(_request("pwd; cd sub", cwd=tmp_path))
-
-    assert _out(result) == f"{tmp_path}\n".encode()
-    assert result.cwd == str(tmp_path / "sub")
-
-
-def test_a_command_that_exits_inside_a_folder_still_reports_it(tmp_path: Path) -> None:
-    (tmp_path / "sub").mkdir()
-
-    result = _run(_request("cd sub; exit 5", cwd=tmp_path))
-
-    assert (result.exit_code, result.cwd) == (5, str(tmp_path / "sub"))
-
-
-def test_a_home_relative_folder_is_this_users_home(empty_home: Path) -> None:
-    result = _run(_request("pwd", cwd="~"))
-
-    assert _out(result) == f"{empty_home}\n".encode()
-    assert result.cwd == str(empty_home)
 
 
 def test_a_folder_that_does_not_exist_runs_nothing(tmp_path: Path) -> None:
@@ -227,161 +137,6 @@ def test_a_folder_that_does_not_exist_runs_nothing(tmp_path: Path) -> None:
     assert _err(result) == f"{missing} is not a folder on this machine\n".encode()
     assert result.cwd == str(missing)
     assert not (tmp_path / "ran").exists()
-
-
-def test_a_folder_with_a_control_character_is_not_reported_as_the_end(
-    tmp_path: Path,
-) -> None:
-    odd = tmp_path / "a\nb"
-    odd.mkdir()
-
-    result = _run(_request("cd 'a\nb'", cwd=tmp_path))
-
-    assert result.cwd == str(tmp_path)
-
-
-def test_the_request_adds_variables_to_the_hosts_environment(tmp_path: Path) -> None:
-    result = _run(
-        _request('echo "$GREETING $HOME"', cwd=tmp_path, env={"GREETING": "hi"}),
-    )
-
-    assert _out(result).startswith(b"hi /")
-
-
-def test_a_command_past_its_timeout_is_killed_with_its_children(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pids = tmp_path / "pid"
-    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(pids, timeout_sec=0.3))
-
-    result = _run(
-        _request(f"sleep 30 & echo $! > {pids}; wait", cwd=tmp_path, timeout_sec=0.3),
-    )
-
-    assert result.exit_code == TIMEOUT_EXIT_CODE
-    assert b"timed out after 0.3 s" in _err(result)
-    assert not _alive(int(pids.read_text()))
-
-
-def test_a_child_that_ignores_termination_is_killed_at_the_timeout_too(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pids = tmp_path / "pid"
-    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(pids, timeout_sec=0.3))
-
-    result = _run(
-        _request(
-            f"(trap '' TERM; exec sleep 30) & echo $! > {pids}; wait",
-            cwd=tmp_path,
-            timeout_sec=0.3,
-        ),
-    )
-
-    assert result.exit_code == TIMEOUT_EXIT_CODE
-    assert not _alive(int(pids.read_text()))
-
-
-def test_output_before_the_timeout_is_kept(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ready = tmp_path / "ready"
-    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(ready, timeout_sec=0.3))
-    result = _run(
-        _request(
-            f"echo started; echo up > {ready}; sleep 30",
-            cwd=tmp_path,
-            timeout_sec=0.3,
-        ),
-    )
-
-    assert _out(result) == b"started\n"
-    assert result.exit_code == TIMEOUT_EXIT_CODE
-
-
-def test_a_background_job_that_holds_the_pipes_does_not_hold_the_result(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pids = tmp_path / "pid"
-    monkeypatch.setattr(exec_command, "_DRAIN_SEC", 0.01)
-
-    result = _run(
-        _request(f"sleep 30 & echo $! > {pids}; echo done", cwd=tmp_path),
-    )
-
-    try:
-        assert (result.exit_code, _out(result)) == (0, b"done\n")
-    finally:
-        os.kill(int(pids.read_text()), 9)
-
-
-def test_ending_the_wait_kills_the_command_and_reports_what_it_had_printed(
-    tmp_path: Path,
-) -> None:
-    pids = tmp_path / "pid"
-
-    async def end_after_start() -> ExecResult:
-        ended = asyncio.Event()
-        running = asyncio.create_task(
-            run_command(
-                _request(f"echo up; sleep 30 & echo $! > {pids}; wait", cwd=tmp_path),
-                ended=ended,
-            ),
-        )
-        await asyncio.to_thread(_wait_for, pids)
-        ended.set()
-        return await running
-
-    started = time.monotonic()
-    result = asyncio.run(end_after_start())
-
-    assert time.monotonic() - started < 5
-    assert _out(result) == b"up\n"
-    assert not _alive(int(pids.read_text()))
-
-
-def test_output_over_the_limit_is_cut_from_the_middle_and_marked(
-    tmp_path: Path,
-) -> None:
-    result = _run(
-        _request(
-            "printf HEAD; head -c 2000000 /dev/zero | tr '\\0' x; printf TAIL",
-            cwd=tmp_path,
-        ),
-    )
-
-    out = _out(result)
-    assert result.truncated
-    assert len(out) <= MAX_STREAM_BYTES
-    assert out.startswith(b"HEADxxxx")
-    assert out.endswith(b"xxxxTAIL")
-    assert b"bytes cut" in out
-
-
-def test_each_stream_is_cut_on_its_own(tmp_path: Path) -> None:
-    result = _run(
-        _request(
-            "echo small; head -c 1100000 /dev/zero | tr '\\0' e >&2",
-            cwd=tmp_path,
-        ),
-    )
-
-    assert _out(result) == b"small\n"
-    assert len(_err(result)) <= MAX_STREAM_BYTES
-    assert b"bytes cut" in _err(result)
-    assert result.truncated
-
-
-def test_output_exactly_at_the_limit_is_not_cut(tmp_path: Path) -> None:
-    result = _run(
-        _request(f"head -c {MAX_STREAM_BYTES} /dev/zero | tr '\\0' x", cwd=tmp_path),
-    )
-
-    assert len(_out(result)) == MAX_STREAM_BYTES
-    assert not result.truncated
 
 
 class _Server:
@@ -463,7 +218,9 @@ def _host(server: _Server) -> ExecHost:
 
 def _log_lines() -> list[dict[str, object]]:
     path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box-1.exec.log"
-    return [json.loads(line) for line in path.read_text().splitlines()]
+    return [
+        json_loads(line, dict[str, object]) for line in path.read_text().splitlines()
+    ]
 
 
 def _serve_one(server: _Server, host: ExecHost, command: ExecWait) -> None:
@@ -477,7 +234,9 @@ def _serve_one(server: _Server, host: ExecHost, command: ExecWait) -> None:
 
 def test_a_command_is_run_and_its_result_posted_under_the_commands_id(
     tmp_path: Path,
+    shell: _Shell,
 ) -> None:
+    shell.replies["echo hello"] = (b"hello\n", 0)
     server = _Server()
     host = _host(server)
     command = _command("echo hello", cwd=tmp_path)
@@ -494,11 +253,34 @@ def test_a_command_is_run_and_its_result_posted_under_the_commands_id(
     assert server.keys == [_CREDENTIAL, _CREDENTIAL]
     # The listener closes its client as it leaves, which may follow ``stop``.
     _wait_until(lambda: server.closed >= 2)
+    _, options = shell.start.call_args
+    (report_fd,) = options["pass_fds"]
+    shell.start.assert_awaited_once_with(
+        "bash",
+        "-lc",
+        f"trap 'printf %s \"$PWD\" >&{report_fd}' EXIT\necho hello",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=tmp_path,
+        env={
+            name: value
+            for name, value in os.environ.items()
+            if name
+            not in {"TRACKINIZER_URL", "TRACKINIZER_TOKEN", "TRACKINIZER_PROFILE"}
+            and not name.startswith(("TRAX_", "LC_TRAX_"))
+        },
+        pass_fds=(report_fd,),
+        limit=2**16,
+        start_new_session=True,
+    )
 
 
 def test_each_command_leaves_one_private_log_line_naming_who_asked(
     tmp_path: Path,
+    shell: _Shell,
 ) -> None:
+    shell.replies.update({"exit 4": (b"", 4), "true": (b"", 0)})
     server = _Server()
     host = _host(server)
     first = _command("exit 4", cwd=tmp_path)
@@ -525,58 +307,66 @@ def test_each_command_leaves_one_private_log_line_naming_who_asked(
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
 
 
-def test_a_revoked_machine_kills_the_commands_still_running(tmp_path: Path) -> None:
+def test_a_revoked_machine_kills_the_commands_still_running(
+    tmp_path: Path,
+    shell: _Shell,
+) -> None:
+    shell.replies["sleep 30 & wait"] = (b"", None)
     server = _Server()
     host = _host(server)
-    pids = tmp_path / "pid"
 
     host.start(_MACHINE, _INSTANCE)
-    server.waits.put(
-        _command(f"sleep 30 & echo $! > {pids}; wait", cwd=tmp_path),
-    )
-    _wait_for(pids)
+    server.waits.put(_command("sleep 30 & wait", cwd=tmp_path))
+    assert shell.ready.wait(5)
     server.waits.put(_REVOKED)
-    # Before the host is stopped: the revoke alone ends the command.
-    _wait_until(lambda: not _alive(int(pids.read_text())))
+    _wait_until(lambda: shell.processes[0].returncode is not None)
     host.stop()
 
     assert server.results == []
     [line] = _log_lines()
     assert line["exit_code"] == 128 + 9
+    shell.kill.assert_called_once_with(shell.processes[0].pid, signal.SIGKILL)
 
 
-def test_a_command_that_starts_after_a_stop_is_ended_at_once(tmp_path: Path) -> None:
+def test_a_command_that_starts_after_a_stop_is_ended_at_once(
+    tmp_path: Path,
+    shell: _Shell,
+) -> None:
+    shell.replies["sleep 30 & wait"] = (b"", None)
     host = _host(_Server())
     host._stop.set()
-    pids = tmp_path / "pid"
 
     started = time.monotonic()
     result, killed = asyncio.run(
-        host._execute(_command(f"sleep 30 & echo $! > {pids}; wait", cwd=tmp_path)),
+        host._execute(_command("sleep 30 & wait", cwd=tmp_path)),
     )
 
     assert killed
     assert time.monotonic() - started < 5
     assert result.exit_code == 128 + 9
+    shell.kill.assert_called_once_with(shell.processes[0].pid, signal.SIGKILL)
 
 
-def test_stopping_the_host_kills_the_commands_still_running(tmp_path: Path) -> None:
+def test_stopping_the_host_kills_the_commands_still_running(
+    tmp_path: Path,
+    shell: _Shell,
+) -> None:
+    shell.replies["sleep 30 & wait"] = (b"", None)
     server = _Server()
     host = _host(server)
-    pids = tmp_path / "pid"
 
     host.start(_MACHINE, _INSTANCE)
-    server.waits.put(
-        _command(f"sleep 30 & echo $! > {pids}; wait", cwd=tmp_path),
-    )
-    _wait_for(pids)
-    server.waits.put(_REVOKED)
+    server.waits.put(_command("sleep 30 & wait", cwd=tmp_path))
+    assert shell.ready.wait(5)
     started = time.monotonic()
     host.stop()
+    server.waits.put(_REVOKED)
+    _wait_until(lambda: server.closed >= 1)
 
     assert time.monotonic() - started < 5
-    assert not _alive(int(pids.read_text()))
+    assert shell.processes[0].returncode == -signal.SIGKILL
     assert server.results == []
+    shell.kill.assert_called_once_with(shell.processes[0].pid, signal.SIGKILL)
 
 
 def test_a_result_the_server_no_longer_wants_is_dropped_without_a_retry(
@@ -597,7 +387,11 @@ def test_a_result_the_server_no_longer_wants_is_dropped_without_a_retry(
     assert capsys.readouterr().err == ""
 
 
-def test_a_result_that_failed_in_transit_is_sent_again(tmp_path: Path) -> None:
+def test_a_result_that_failed_in_transit_is_sent_again(
+    tmp_path: Path,
+    shell: _Shell,
+) -> None:
+    shell.replies["echo again"] = (b"again\n", 0)
     server = _Server()
     server.post_errors.extend(
         [
@@ -653,16 +447,6 @@ def test_a_failed_wait_is_reported_and_the_host_goes_on(
     assert "exec wait failed" in capsys.readouterr().err
 
 
-def _cannot_spawn(error: OSError) -> Callable[..., object]:
-    """Stand in for the event loop's ``subprocess_exec``, which the runner starts with."""
-
-    async def subprocess_exec(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        raise error
-
-    return subprocess_exec
-
-
 # ``/dev/fd`` lists this process's descriptors on Linux and macOS alike; ``/proc``
 # exists on Linux alone.
 def _open_descriptors() -> int:
@@ -683,11 +467,7 @@ def test_a_command_that_cannot_spawn_reports_why_and_leaks_nothing(
     error: OSError,
     code: int,
 ) -> None:
-    monkeypatch.setattr(asyncio.BaseEventLoop, "subprocess_exec", _cannot_spawn(error))
-    # An earlier test's command, whose background job still held its pipes, left its
-    # transport to the collector, which closes those pipe ends whenever it runs.
-    # Collected first, they cannot count as descriptors this run closed.
-    _ = gc.collect()
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(side_effect=error))
     before = _open_descriptors()
 
     result = _run(_request("true", cwd=tmp_path))
@@ -705,9 +485,9 @@ def test_a_command_that_cannot_spawn_is_still_logged_and_posted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        asyncio.BaseEventLoop,
-        "subprocess_exec",
-        _cannot_spawn(PermissionError(13, "Permission denied")),
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(side_effect=PermissionError(13, "Permission denied")),
     )
     server = _Server()
 
@@ -719,75 +499,12 @@ def test_a_command_that_cannot_spawn_is_still_logged_and_posted(
     assert line["exit_code"] == 126
 
 
-def test_stderr_at_the_limit_and_a_timeout_stay_within_the_limit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ready = tmp_path / "ready"
-    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(ready, timeout_sec=0.5))
-    result = _run(
-        _request(
-            f"head -c {MAX_STREAM_BYTES - 5} /dev/zero | tr '\\0' e >&2; "
-            f"echo up > {ready}; sleep 30",
-            cwd=tmp_path,
-            timeout_sec=0.5,
-        ),
-    )
-
-    assert result.exit_code == TIMEOUT_EXIT_CODE
-    assert len(_err(result)) <= MAX_STREAM_BYTES
-    assert _err(result).endswith(b"timed out after 0.5 s\n")
-    assert result.truncated
-
-
-def test_a_timeout_message_that_fits_leaves_the_stream_whole(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    ready = tmp_path / "ready"
-    monkeypatch.setattr(asyncio, "wait", _ReadyDeadline(ready, timeout_sec=0.5))
-    result = _run(
-        _request(
-            f"echo before >&2; echo up > {ready}; sleep 30",
-            cwd=tmp_path,
-            timeout_sec=0.5,
-        ),
-    )
-
-    assert _err(result) == b"before\ntimed out after 0.5 s\n"
-    assert not result.truncated
-
-
-def test_the_hosts_trax_server_credential_and_profile_never_reach_a_command(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    for name in ("TRACKINIZER_TOKEN", "TRACKINIZER_URL", "TRACKINIZER_PROFILE"):
-        monkeypatch.setenv(name, "secret-" + name)
-    monkeypatch.setenv("TRAX_CANVAS", "w")
-    monkeypatch.setenv("LC_TRAX_SERVER", "https://hidden.example")
-    monkeypatch.setenv("KEPT_BY_THE_HOST", "kept")
-
-    result = _run(
-        _request(
-            "env | sort",
-            cwd=tmp_path,
-            env={"TRAX_CANVAS": "from-the-request"},
-        ),
-    )
-
-    shown = _out(result).decode()
-    assert "secret-" not in shown
-    assert "hidden.example" not in shown
-    assert "KEPT_BY_THE_HOST=kept" in shown
-    # What the request sets is the server's own word, and it is not withheld.
-    assert "TRAX_CANVAS=from-the-request" in shown
-
-
 def test_a_log_that_cannot_be_written_never_holds_the_result_back(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    shell: _Shell,
 ) -> None:
+    shell.replies["echo ran"] = (b"ran\n", 0)
     log = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box-1.exec.log"
     # A file where the machines folder belongs.
     log.parent.parent.mkdir(parents=True)
