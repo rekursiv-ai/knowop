@@ -52,7 +52,7 @@ from trackinizer.lib.userdirs import (
 )
 from treekle import from_plain
 
-from knowop import menubar
+from knowop import macos_app, menubar
 from knowop.shell import job_limits
 
 
@@ -102,6 +102,9 @@ class Services:
         ``None`` when it can. :func:`here` asks AppKit; others show no menu bar.
       set_icon: Gives a file the knowop icon, which Login Items shows for an agent
         that runs it; called only where the menu bar can start.
+      install_app: Builds the ``.app`` the launchers run knowop under, at the path
+        given, with ``run``. :func:`here` builds it; others go without, as a failed
+        build does.
 
     """
 
@@ -113,6 +116,7 @@ class Services:
         "AppKit not asked: here() asks it"
     )
     set_icon: Callable[[Path], None] = menubar.set_icon
+    install_app: Callable[[Path, job_limits.Run], None] = lambda _app, _run: None
 
     def start(self, connect: Connect) -> None:
         """Install ``connect``'s service and start it, or restart it when it runs.
@@ -377,6 +381,10 @@ class Services:
     def _launcher(self, name: str) -> bool:
         """Install the launcher ``name``, which runs this knowop; say if it was so."""
         path = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / name
+        self.install_app(
+            data_dir() / "rekursiv-ai" / "knowop" / "KnowOp.app",
+            self.run,
+        )
         unchanged = _put(path, _script(self._program()), mode=0o755)
         # Set again at each write, which drops it: it is the file's extended attributes.
         if self.menubar_problem() is None:
@@ -468,6 +476,7 @@ def here(
             run=run,
             menubar_problem=menubar.problem,
             set_icon=menubar.set_icon,
+            install_app=macos_app.install,
         )
     # A login without PAM (sshd's ``UsePAM no``) sets no runtime folder, and
     # ``systemctl --user`` then finds no manager, though linger keeps one running.
@@ -565,12 +574,19 @@ def _environment() -> dict[str, str]:
     return dict(sorted({**shell, **base_dir_variables()}.items()))
 
 
+# ``exec`` keeps the process launchd started, so the app is what macOS holds responsible
+# (:mod:`macos_app`). An app that won't start, its Python gone, costs only that name.
 def _script(program: list[str]) -> str:
     """Return a launcher: it runs ``program`` with the arguments it is given."""
+    app = data_dir() / "rekursiv-ai" / "knowop" / "KnowOp.app"
+    plain = shlex.join(program)
     return (
         "#!/bin/sh\n"
         "# knowop connect writes it: launchd runs knowop through it, under its name.\n"
-        f'exec {shlex.join(program)} "$@"\n'
+        f"if {shlex.join(macos_app.probe(app))} >/dev/null 2>&1; then\n"
+        f'  exec {shlex.join(macos_app.command(app))} {plain} "$@"\n'
+        "fi\n"
+        f'exec {plain} "$@"\n'
     )
 
 

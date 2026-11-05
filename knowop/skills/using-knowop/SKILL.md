@@ -44,6 +44,13 @@ RECORD_UUID is page.record.id or any record's uuid.
   '#/console', '#/search/TEXT')
 - knowop canvas hide chat (show chat); knowop canvas hide INSTANCE_UUID, never the page
 
+## This computer's folders
+
+Never search a whole home folder or disk: no `find ~`, `grep -r ~`, `rg PATTERN ~`,
+`du ~` or `find /`, however shallow. On a Mac that walks Photos, Music, Desktop,
+Documents and iCloud Drive, and macOS stops the person to ask about each. Look in your
+own folder and the ones the task names; when a project isn't there, ask where it is.
+
 ## Handing the person a command
 
 Run your own work yourself. Hand the person a command when the decision is theirs:
