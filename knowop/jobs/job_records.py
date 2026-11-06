@@ -76,7 +76,7 @@ def run_status(client: Client, job: int | None) -> None:
         _show_machine(machine)
         return
     view = client.job_view(job)
-    charged = "-" if view.gpu_minutes is None else f"{view.gpu_minutes} gpu-min"
+    charged = "-" if view.gpu_seconds is None else f"{view.gpu_seconds} gpu-s"
     money = "-" if view.usd is None else f"usd {view.usd}"
     _show(
         {
@@ -100,7 +100,7 @@ def run_status(client: Client, job: int | None) -> None:
 
 
 def run_cancel(client: Client, job: int) -> None:
-    """Ask the server to stop a job; a GPU job's minutes that already ran are charged.
+    """Ask the server to stop a job; a GPU job's seconds that already ran are charged.
 
     Args:
       client: The server.

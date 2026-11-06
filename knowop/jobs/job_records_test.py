@@ -40,7 +40,7 @@ def _job(state: str = "queued", **fields: object) -> JobView:
             "created_at": datetime(2026, 10, 21, 12, tzinfo=UTC),
             "started_at": None,
             "ended_at": None,
-            "gpu_minutes": None,
+            "gpu_seconds": None,
             "usd": None,
             "reason": "",
             "upload_serial": 3,
@@ -300,7 +300,7 @@ def test_status_of_one_job_shows_every_field(
         "completed",
         started_at=datetime(2026, 10, 21, 12, 1, tzinfo=UTC),
         ended_at=datetime(2026, 10, 21, 12, 5, tzinfo=UTC),
-        gpu_minutes=4,
+        gpu_seconds=240,
         usd=0.2,
         usd_per_gpu_minute=0.05,
         reason="Stopped: $0.01 is left today.",
@@ -320,7 +320,7 @@ def test_status_of_one_job_shows_every_field(
         "started:  2026-10-21T12:01:00+00:00\n"
         "ended:    2026-10-21T12:05:00+00:00\n"
         "rate:     usd 0.05 per gpu-min, before markup\n"
-        "charged:  4 gpu-min, usd 0.2\n"
+        "charged:  240 gpu-s, usd 0.2\n"
         "reason:   Stopped: $0.01 is left today.\n"
     )
     assert server.calls == [("machine_job", 7), ("job", 7)]
