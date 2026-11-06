@@ -97,7 +97,7 @@ def _job(state: str = "queued", **fields: object) -> JobView:
             "created_at": datetime(2026, 10, 21, 12, tzinfo=UTC),
             "started_at": None,
             "ended_at": None,
-            "gpu_minutes": None,
+            "gpu_seconds": None,
             "usd": None,
             "reason": "",
             "upload_serial": 3,
