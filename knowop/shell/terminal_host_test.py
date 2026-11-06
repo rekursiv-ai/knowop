@@ -309,8 +309,10 @@ async def test_stop_and_a_closed_socket_each_terminate_and_reap_the_terminal(
             terminate_grace_sec=2.0,
             winsize=(24, 80),
         )
-        assert terminal.mock_calls.index(call.terminate()) < terminal.mock_calls.index(
-            call.__aexit__(None, None, None),
+        assert terminal.mock_calls.index(
+            type(call)(("terminate", (), {})),
+        ) < terminal.mock_calls.index(
+            type(call)(("__aexit__", (None, None, None), {})),
         )
         terminal.terminate.assert_awaited_once_with()
         terminal.wait.assert_awaited_once_with()
