@@ -205,6 +205,10 @@ class ClaudeWire:
                 match _text(frame, "state"):
                     case "idle" | "running" | "requires_action" as state:
                         return Reading(events=(StateChanged(state=state),))
+                    case _:
+                        pass
+            case _:
+                pass
         return Reading()
 
     def _request(self, frame: Mapping[str, PlainTree]) -> Reading:
@@ -288,6 +292,8 @@ class ClaudeWire:
                         options=_choices("Approve plan", "Keep planning"),
                     ),
                 )
+            case _:
+                pass
         grants = _grants(request)
         options = (
             Option(id="allow_once", label="Allow", kind="allow_once"),

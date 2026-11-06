@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from functools import partial
 from importlib import metadata
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, TypedDict
+from typing import TYPE_CHECKING, Final, Literal, TypedDict, cast
 
 import getpass
 import hashlib
@@ -245,7 +245,10 @@ class Services:
         found: list[Connect] = []
         for path in paths:
             if launchd:
-                plist = from_plain(plistlib.loads(path.read_bytes()), _Plist)
+                plist = from_plain(
+                    cast(object, plistlib.loads(path.read_bytes())),
+                    _Plist,
+                )
                 argv = plist["ProgramArguments"]
             else:
                 argv = _exec_start_words(path.read_text())

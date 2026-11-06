@@ -17,7 +17,6 @@ from threading import Thread
 from typing import IO, TYPE_CHECKING, Protocol
 
 import hashlib
-import io
 import os
 import shutil
 import tarfile
@@ -199,7 +198,8 @@ def _extract(
                 f"{name} is {member.size} bytes, the manifest says {entry.size}",
             )
         source = tar.extractfile(member)
-        assert isinstance(source, io.BufferedReader)
+        if source is None:
+            raise IntegrityError(f"{name!r} in the download has no readable file")
         target = partial / name
         target.parent.mkdir(parents=True, exist_ok=True)
         with target.open("wb") as file:

@@ -59,6 +59,7 @@ from knowop.agent.truncate import was_truncated, without_note
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
+    from trackinizer.lib.agent.sessions.convert import _Adapter
     from trackinizer.wire.wire_session_ir import PartBody
 
     from knowop.agent.custom_types import ResumeClient
@@ -332,7 +333,8 @@ def _undroppable(
             session_id=uuid4(),
         )
     # The target's own writer: another format's names losses the file never has.
-    writer = {"claude": claude, "codex": codex, "sagent": sagent}[target]
+    writers: dict[str, _Adapter] = {"claude": claude, "codex": codex, "sagent": sagent}
+    writer = writers[target]
     out = StringIO()
     writer.denormalize(ready, out)
     rebuilt = writer.normalize(StringIO(out.getvalue()))

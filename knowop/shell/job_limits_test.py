@@ -10,7 +10,6 @@ import subprocess
 
 import pytest
 
-from knowop.shell import job_limits
 from knowop.shell.job_limits import (
     DEFAULT_RESULTS_MAX,
     Gpu,
@@ -239,7 +238,7 @@ def test_run_returns_the_programs_exit_code_and_output(
         seen.append(argv)
         return subprocess.CompletedProcess(argv, 3, stdout="hi\n", stderr="")
 
-    monkeypatch.setattr(job_limits.subprocess, "run", finished)
+    monkeypatch.setattr(subprocess, "run", finished)
 
     assert run(["sh", "-c", "exit 3"]) == (3, "hi\n")
     assert run(["no-such-program-knowop"]) == (127, "")
@@ -251,9 +250,9 @@ def test_run_says_124_for_a_program_that_runs_out_of_time(
 ) -> None:
     def too_slow(*args: object, **kwargs: object) -> None:
         del args, kwargs
-        raise job_limits.subprocess.TimeoutExpired(cmd="sleep", timeout=30)
+        raise subprocess.TimeoutExpired(cmd="sleep", timeout=30)
 
-    monkeypatch.setattr(job_limits.subprocess, "run", too_slow)
+    monkeypatch.setattr(subprocess, "run", too_slow)
 
     assert run(["sh"]) == (124, "")
 

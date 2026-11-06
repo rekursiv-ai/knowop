@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 from unittest.mock import Mock, call
 
 import os
@@ -27,13 +27,24 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import BinaryIO
 
+    from trackinizer.mock_test_support import MockProtocol
+
+
+class _Child(Protocol):
+    pid: int
+    args: list[str]
+    wait: MockProtocol[int]
+
+
+class _Popen(Mock):
+    return_value: _Child
+
 
 @pytest.fixture(autouse=True)
-def popen(monkeypatch: pytest.MonkeyPatch) -> Mock:
+def popen(monkeypatch: pytest.MonkeyPatch) -> _Popen:
     """Supply process wait outcomes without replacing the runner's decisions or files."""
-    child = Mock(spec=subprocess.Popen, pid=7, args=["job"])
-    child.wait.return_value = 0
-    started = Mock(return_value=child)
+    child = Mock(spec=subprocess.Popen, pid=7, args=["job"], wait=Mock(return_value=0))
+    started = _Popen(return_value=child)
     monkeypatch.setattr(subprocess, "Popen", started)
     return started
 
@@ -71,11 +82,11 @@ def _python(code: str) -> list[str]:
 
 
 def _spawn_output(
-    child: Mock,
+    child: _Child,
     data: bytes,
     argv: Sequence[str],
     **options: object,
-) -> Mock:
+) -> _Child:
     del argv
     _ = cast("BinaryIO", options["stdout"]).write(data)
     return child
@@ -83,7 +94,7 @@ def _spawn_output(
 
 def test_a_job_runs_in_its_worktree_and_its_output_joins_the_log(
     tmp_path: Path,
-    popen: Mock,
+    popen: _Popen,
 ) -> None:
     argv = _python(
         "import os, sys; print(os.getcwd(), flush=True); print('oops', file=sys.stderr)",
@@ -100,7 +111,8 @@ def test_a_job_runs_in_its_worktree_and_its_output_joins_the_log(
 
     assert ended == Ended(state="completed", exit_code=0, reason="")
     assert folder.log.read_text() == (f"knowop: worktree ready\n{folder.src}\noops\n")
-    log = popen.call_args.kwargs["stdout"]
+    assert popen.call_args is not None
+    log = cast("BinaryIO", popen.call_args.kwargs["stdout"])
     assert log.name == str(folder.log)
     assert log.closed
     popen.assert_called_once_with(
@@ -116,7 +128,7 @@ def test_a_job_runs_in_its_worktree_and_its_output_joins_the_log(
 
 def test_a_job_that_exits_badly_is_failed_with_its_code(
     tmp_path: Path,
-    popen: Mock,
+    popen: _Popen,
 ) -> None:
     folder = _folder(tmp_path, *_python("raise SystemExit(3)"))
     popen.return_value.wait.return_value = 3
@@ -130,7 +142,7 @@ def test_a_job_that_exits_badly_is_failed_with_its_code(
 
 def test_a_job_a_signal_killed_reports_128_plus_the_signal(
     tmp_path: Path,
-    popen: Mock,
+    popen: _Popen,
 ) -> None:
     folder = _folder(tmp_path, *_python("import os, signal; os.kill(os.getpid(), 9)"))
     popen.return_value.wait.return_value = -signal.SIGKILL
@@ -144,7 +156,7 @@ def test_a_job_a_signal_killed_reports_128_plus_the_signal(
 
 def test_a_command_that_cannot_start_is_failed_with_why(
     tmp_path: Path,
-    popen: Mock,
+    popen: _Popen,
 ) -> None:
     missing = _folder(tmp_path / "a", "no-such-command-knowop")
     script = tmp_path / "script"
@@ -165,7 +177,7 @@ def test_a_command_that_cannot_start_is_failed_with_why(
 
 def test_a_job_past_its_limit_is_stopped_with_its_whole_group(
     tmp_path: Path,
-    popen: Mock,
+    popen: _Popen,
     signal_group: Mock,
 ) -> None:
     pid = tmp_path / "pid"
@@ -195,7 +207,7 @@ def test_a_job_past_its_limit_is_stopped_with_its_whole_group(
 
 def test_a_job_that_ignores_sigterm_is_killed_and_reaped_once_the_grace_is_up(
     tmp_path: Path,
-    popen: Mock,
+    popen: _Popen,
     signal_group: Mock,
 ) -> None:
     pid, shell = tmp_path / "pid", tmp_path / "shell"
@@ -226,7 +238,7 @@ def test_a_job_that_ignores_sigterm_is_killed_and_reaped_once_the_grace_is_up(
 
 def test_a_process_the_kernel_killed_at_the_cap_names_the_cap(
     tmp_path: Path,
-    popen: Mock,
+    popen: _Popen,
 ) -> None:
     folder = _folder(tmp_path, *_python("raise SystemExit(137)"))
     popen.return_value.wait.return_value = 137
@@ -283,7 +295,7 @@ def test_main_runs_the_folders_job_niced_under_its_own_scope_and_records_its_end
         asked.append(cgroup)
 
     # The real ``os.nice`` would lower this test worker for every later test.
-    monkeypatch.setattr(job_runner.os, "nice", nice)
+    monkeypatch.setattr(os, "nice", nice)
     monkeypatch.setattr(job_runner, "_memory_events", no_events)
 
     code = job_runner.main([str(folder.path)])
@@ -296,7 +308,7 @@ def test_main_runs_the_folders_job_niced_under_its_own_scope_and_records_its_end
 def test_the_runner_records_the_jobs_end_as_a_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    popen: Mock,
+    popen: _Popen,
 ) -> None:
     folder = _folder(tmp_path, *_python("print('module-job')"), minutes=1)
     popen.side_effect = partial(_spawn_output, popen.return_value, b"module-job\n")

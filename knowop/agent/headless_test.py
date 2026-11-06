@@ -815,8 +815,8 @@ class TestAHungDriver:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(headless, "_CALL_SEC", 0.05)
-        future = Mock(spec=futures.Future)
-        future.result.side_effect = TimeoutError
+        result = Mock(side_effect=TimeoutError)
+        future = Mock(spec=futures.Future, result=result)
         submitted = Mock(return_value=future)
         monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submitted)
         with asyncio.Runner() as runner:
@@ -828,7 +828,7 @@ class TestAHungDriver:
             finally:
                 cast("Coroutine[None, None, None]", submitted.call_args.args[0]).close()
             assert submitted.call_args.args[1] is run._loop
-        future.result.assert_called_once_with(0.05)
+        result.assert_called_once_with(0.05)
 
     def test_a_call_in_flight_when_the_run_ends_says_the_run_ended(self) -> None:
         caught: list[Exception] = []
@@ -1030,15 +1030,19 @@ class TestSignals:
         number: signal.Signals,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        installed, removed = Mock(), Mock(return_value=True)
+        handlers: dict[int, tuple[Callable[[int], None], int]] = {}
+
+        def install(signum: int, callback: Callable[[int], None], status: int) -> None:
+            handlers[signum] = callback, status
+
+        installed = Mock(side_effect=install)
+        removed = Mock(return_value=True)
         monkeypatch.setattr(asyncio.SelectorEventLoop, "add_signal_handler", installed)
         monkeypatch.setattr(asyncio.SelectorEventLoop, "remove_signal_handler", removed)
 
         def received() -> None:
-            handler = next(
-                each for each in installed.call_args_list if each.args[0] == number
-            )
-            cast("Callable[[int], None]", handler.args[1])(handler.args[2])
+            callback, status = handlers[number]
+            callback(status)
 
         rig = _Rig()
         status = rig.run.run(on_started=received)

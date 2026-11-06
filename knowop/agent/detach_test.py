@@ -589,7 +589,7 @@ class TestCommands:
 
         assert [host.name for host in detach.live_hosts()] == ["beta", "delta"]
 
-    @pytest.mark.parametrize(("failed", "status"), [(set(), 0), ({"beta"}, 1)])
+    @pytest.mark.parametrize(("failed", "status"), [(set[str](), 0), ({"beta"}, 1)])
     def test_stop_all_stops_each_live_host_and_fails_when_one_did_not_stop(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -753,7 +753,7 @@ class TestCommands:
             address = host.enter_context(hosts.listen(root / "s"))
             detach._write_record(root, _record(root, name="zeta", address=address))
             monkeypatch.setattr(
-                detach.time,
+                hosts.clock,
                 "sleep",
                 partial(_write_then_close, scrollback, host),
             )

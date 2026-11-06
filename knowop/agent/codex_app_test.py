@@ -13,8 +13,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from functools import partial
 from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
-from unittest.mock import AsyncMock, Mock, patch
+from typing import TYPE_CHECKING, Final, TypedDict, cast
+from unittest.mock import AsyncMock, patch
 
 import asyncio
 import logging
@@ -48,6 +48,8 @@ _CWD: Final = _THIS.parent
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
 
+    from knowop.shell.exec_command_test import _Process
+
 
 type _Event = Ask | Resolved | StateChanged
 _Tree = dict[str, PlainTree]
@@ -73,7 +75,7 @@ _ASK_ID: Final = re.compile(r"[0-9a-f]{8}-\d+")
 @pytest.fixture(autouse=True)
 def app_process(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     """Run the existing fake on each input frame, behind the real pipe and child APIs."""
-    processes: dict[int, Mock] = {}
+    processes: dict[int, _Process] = {}
     start = AsyncMock(side_effect=partial(_spawn_app, processes))
     monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
     monkeypatch.setattr(os, "killpg", partial(_signal_app, processes))
@@ -81,7 +83,7 @@ def app_process(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 
 async def _spawn_app(
-    processes: dict[int, Mock],
+    processes: dict[int, _Process],
     *argv: str,
     cwd: Path | None = None,
     **options: object,
@@ -98,7 +100,7 @@ async def _spawn_app(
     return cast(Process, process)
 
 
-def _answer_app(process: Mock, script: Path, cwd: Path, data: bytes) -> None:
+def _answer_app(process: _Process, script: Path, cwd: Path, data: bytes) -> None:
     if process.returncode is not None:
         raise BrokenPipeError
     output, error_bytes = StringIO(), BytesIO()
@@ -123,7 +125,7 @@ def _answer_app(process: Mock, script: Path, cwd: Path, data: bytes) -> None:
         process.stderr.feed_eof()
 
 
-def _signal_app(processes: dict[int, Mock], pgid: int, signum: int) -> None:
+def _signal_app(processes: dict[int, _Process], pgid: int, signum: int) -> None:
     process = processes[pgid]
     if process.returncode is not None:
         raise ProcessLookupError
@@ -275,6 +277,14 @@ def _resolved(request_id: int) -> _Tree:
     }
 
 
+class _Call(TypedDict):
+    """A request sent by the driver to the app-server."""
+
+    id: int
+    method: str
+    params: _Tree
+
+
 class _Rig:
     """A driver wired to a scripted fake app-server, and the log of what it sent."""
 
@@ -324,9 +334,13 @@ class _Rig:
             for line in self.log.read_text().splitlines()
         ]
 
-    def called(self, method: str) -> list[_Tree]:
+    def called(self, method: str) -> list[_Call]:
         """Return the requests of ``method`` the driver sent, as whole frames."""
-        return [each for each in self.frames() if each.get("method") == method]
+        return [
+            from_plain(each, _Call)
+            for each in self.frames()
+            if each.get("method") == method
+        ]
 
     def params(self, method: str) -> _Tree:
         """Return the params of the first request of ``method`` the driver sent."""

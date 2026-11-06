@@ -47,6 +47,7 @@ from knowop.shell.terminal_host import (
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
+    from trackinizer.mock_test_support import AsyncMockProtocol, MockProtocol
     from websockets.asyncio.client import ClientConnection
 
     from knowop.shell.terminal_direct import PeerFactory
@@ -318,12 +319,22 @@ async def test_stop_and_a_closed_socket_each_terminate_and_reap_the_terminal(
         assert leg.sent[-1] == encode_frame(Frame.EXIT, (143).to_bytes(4))
 
 
+class _TerminalMock(MagicMock):
+    __aenter__: AsyncMockProtocol[Self]
+    __aexit__: AsyncMockProtocol[bool]
+    wait: AsyncMockProtocol[int]
+    terminate: AsyncMockProtocol[object]
+    write: AsyncMockProtocol[object]
+    set_winsize: MockProtocol[object]
+    output: MockProtocol[AsyncIterator[bytes]]
+
+
 def _terminal(
     monkeypatch: pytest.MonkeyPatch,
     *chunks: bytes,
     status: int = 0,
-) -> tuple[MagicMock, Mock]:
-    terminal = MagicMock(spec=Terminal)
+) -> tuple[_TerminalMock, Mock]:
+    terminal = _TerminalMock(spec=Terminal)
     terminal.__aenter__.return_value = terminal
     terminal.wait.return_value = status
     terminal.output.return_value = _Output(*chunks).output()
@@ -724,11 +735,11 @@ async def test_a_refusal_to_a_leg_already_closed_is_not_an_error() -> None:
 
 async def _five_opens(
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[TerminalHost, _Client, list[_FakeSocket], list[MagicMock]]:
+) -> tuple[TerminalHost, _Client, list[_FakeSocket], list[_TerminalMock]]:
     """Open five independent fake legs and terminals through the real host threads."""
     legs = [_FakeSocket() for _ in range(5)]
     _ = _connector(monkeypatch, *legs)
-    terminals: list[MagicMock] = []
+    terminals: list[_TerminalMock] = []
     for _ in range(5):
         finished, drained = asyncio.Event(), asyncio.Event()
         terminal, _ = _terminal(monkeypatch, status=143)

@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import partial
 from http.client import HTTPResponse
 from io import BytesIO
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NotRequired, TypedDict
 from unittest.mock import Mock
 from urllib.parse import urlsplit
 
@@ -17,7 +17,7 @@ import json
 import socket
 import threading
 
-from treekle import json_loads
+from treekle import PlainTree, json_loads
 
 import pytest
 
@@ -32,6 +32,22 @@ from knowop.agent.tool_server import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
+
+
+class _Error(TypedDict):
+    """A JSON-RPC failure with its diagnostic."""
+
+    code: int
+    message: str
+
+
+class _Response(TypedDict):
+    """The JSON-RPC envelope returned by the tool server."""
+
+    jsonrpc: str
+    id: int | str | None
+    result: NotRequired[dict[str, PlainTree]]
+    error: NotRequired[_Error]
 
 
 def _echo(arguments: Mapping[str, object]) -> str:
@@ -77,7 +93,7 @@ def _post(
     *,
     path: str = "/mcp",
     headers: Mapping[str, str] | None = None,
-) -> tuple[int, dict[str, object] | None]:
+) -> tuple[int, _Response | None]:
     """Post ``body`` as a CLI does; return the status and the JSON answer, if any."""
     status, data, _ = _send(
         server,
@@ -90,7 +106,7 @@ def _post(
             **(headers or {}),
         },
     )
-    return status, json_loads(data, dict[str, object]) if data else None
+    return status, json_loads(data, _Response) if data else None
 
 
 def _send(
@@ -112,8 +128,10 @@ def _send(
         + "".join(f"{key}: {value}\r\n" for key, value in fields.items())
         + "\r\n"
     ).encode("latin-1") + body
-    peer = Mock(spec=socket.socket)
-    peer.makefile.return_value = BytesIO(_exchange(server, raw))
+    peer = Mock(
+        spec=socket.socket,
+        makefile=Mock(return_value=BytesIO(_exchange(server, raw))),
+    )
     with HTTPResponse(peer) as response:
         response.begin()
         return response.status, response.read(), response.getheader("Allow")
@@ -122,9 +140,13 @@ def _send(
 def _exchange(server: ToolServer, raw: bytes, *, headers_only: bool = False) -> bytes:
     """Run one handler against a socket's input and collect exactly its output."""
     sent = bytearray()
-    peer = Mock(spec=socket.socket)
-    peer.makefile.return_value = BytesIO(raw)
-    peer.sendall.side_effect = partial(_write_response, sent, headers_only=headers_only)
+    peer = Mock(
+        spec=socket.socket,
+        makefile=Mock(return_value=BytesIO(raw)),
+        sendall=Mock(
+            side_effect=partial(_write_response, sent, headers_only=headers_only),
+        ),
+    )
     server._http.finish_request(peer, ("127.0.0.1", 1))
     return bytes(sent)
 
@@ -135,7 +157,7 @@ def _write_response(sent: bytearray, data: bytes, *, headers_only: bool) -> None
     sent.extend(data)
 
 
-def _rpc(server: ToolServer, method: str, params: object = None) -> dict[str, object]:
+def _rpc(server: ToolServer, method: str, params: object = None) -> _Response:
     status, answer = _post(
         server,
         {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}},
@@ -149,21 +171,23 @@ def test_initialize_offers_tools_at_the_version_the_client_asked(
     server: ToolServer,
 ) -> None:
     answer = _rpc(server, "initialize", {"protocolVersion": "2025-03-26"})
+    assert "result" in answer
     assert answer["result"] == {
         "protocolVersion": "2025-03-26",
         "capabilities": {"tools": {}},
         "serverInfo": {"name": "knowop", "version": "1"},
     }
-    unnamed = _rpc(server, "initialize")["result"]
-    assert isinstance(unnamed, dict)
-    assert unnamed["protocolVersion"] == PROTOCOL
+    unnamed = _rpc(server, "initialize")
+    assert "result" in unnamed
+    assert unnamed["result"]["protocolVersion"] == PROTOCOL
     initialized = {"jsonrpc": "2.0", "method": "notifications/initialized"}
     assert _post(server, initialized) == (202, None)
 
 
 def test_the_tools_are_listed_with_their_schemas(server: ToolServer) -> None:
-    listed = _rpc(server, "tools/list")["result"]
-    assert listed == {
+    listed = _rpc(server, "tools/list")
+    assert "result" in listed
+    assert listed["result"] == {
         "tools": [
             {"name": "echo", "description": "Say it.", "inputSchema": _SCHEMA},
             {"name": "refuse", "description": "No.", "inputSchema": _SCHEMA},
@@ -187,6 +211,7 @@ def test_a_call_answers_its_text_and_a_failure_is_a_result(
     failed: bool,
 ) -> None:
     answer = _rpc(server, "tools/call", {"name": name, "arguments": {"text": "hi"}})
+    assert "result" in answer
     assert answer["result"] == {
         "content": [{"type": "text", "text": text}],
         "isError": failed,
@@ -208,14 +233,15 @@ def test_an_unknown_tool_or_method_is_a_json_rpc_error(
     code: int,
 ) -> None:
     answer = _rpc(server, method, params)
-    error = answer["error"]
-    assert isinstance(error, dict)
-    assert error["code"] == code
+    assert "error" in answer
+    assert answer["error"]["code"] == code
     assert answer["id"] == 1
 
 
 def test_ping_and_bad_json(server: ToolServer) -> None:
-    assert _rpc(server, "ping")["result"] == {}
+    answer = _rpc(server, "ping")
+    assert "result" in answer
+    assert answer["result"] == {}
     assert _post(server, b"{not json") == (
         400,
         {
@@ -249,10 +275,8 @@ def test_a_message_with_the_wrong_shape_is_a_parse_error(
     status, answer = _post(server, body)
     assert status == 400
     assert answer is not None
-    error = answer["error"]
-    assert isinstance(error, dict)
-    message = error["message"]
-    assert isinstance(message, str)
+    assert "error" in answer
+    message = answer["error"]["message"]
     assert message not in ("", "None")
     assert answer == {
         "jsonrpc": "2.0",
@@ -264,7 +288,7 @@ def test_a_message_with_the_wrong_shape_is_a_parse_error(
 def test_a_request_without_content_length_reads_no_body(server: ToolServer) -> None:
     status, body, _ = _send(server, "POST", body=b" ", content_length=False)
     assert status == 400
-    assert json_loads(body, dict[str, object]) == {
+    assert json_loads(body, _Response) == {
         "jsonrpc": "2.0",
         "id": None,
         "error": {
@@ -337,10 +361,11 @@ def test_a_server_never_started_closes() -> None:
 
 def test_close_stops_the_server_thread(monkeypatch: pytest.MonkeyPatch) -> None:
     server = ToolServer([])
-    worker = Mock(spec=threading.Thread)
+    start = Mock()
+    worker = Mock(spec=threading.Thread, start=start)
     spawn = Mock(return_value=worker)
     shutdown = Mock()
-    monkeypatch.setattr(tool_server.threading, "Thread", spawn)
+    monkeypatch.setattr(threading, "Thread", spawn)
     monkeypatch.setattr(server._http, "shutdown", shutdown)
 
     server.start()
@@ -350,7 +375,7 @@ def test_close_stops_the_server_thread(monkeypatch: pytest.MonkeyPatch) -> None:
         kwargs={"poll_interval": 0.01},
         daemon=True,
     )
-    worker.start.assert_called_once_with()
+    start.assert_called_once_with()
     assert server._serving is worker
 
     server.close()

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Final
+from unittest.mock import Mock
 
 import os
 import runpy
@@ -17,8 +18,7 @@ import sys
 
 import pytest
 
-from knowop.agent import codex
-from knowop.agent.cli import codex_main
+from knowop.agent import cli
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -53,8 +53,21 @@ def test_each_entry_point_is_a_polyglot_executable_holding_no_logic(cli: str) ->
     assert os.access(_CWD / name, os.X_OK)
 
 
-def test_importing_the_codex_entry_runs_nothing_and_names_the_runners_main() -> None:
-    assert codex.codex_main is codex_main
+def test_codex_dispatches_to_the_runner_only_when_executed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _CWD / "codex.py"
+    main = Mock(return_value=7)
+    monkeypatch.setattr(cli, "codex_main", main)
+
+    _ = runpy.run_path(str(entry), run_name="imported_codex")
+    main.assert_not_called()
+
+    with pytest.raises(SystemExit) as exited:
+        _ = runpy.run_path(str(entry), run_name="__main__")
+
+    assert exited.value.code == 7
+    main.assert_called_once_with()
 
 
 @pytest.mark.cli_python_subprocess

@@ -17,7 +17,7 @@ from functools import partial
 from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Self, cast
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 import asyncio
 import json
@@ -50,6 +50,8 @@ from knowop.shell.exec_command_test import _process
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator, Mapping
+
+    from knowop.shell.exec_command_test import _Process
 
 
 type _Frame = dict[str, PlainTree]
@@ -857,7 +859,7 @@ to print back, with ``$request_id`` filled in from the frame it matched."""
 @pytest.fixture(autouse=True)
 def stream_process() -> Iterator[AsyncMock]:
     """Run the same scripted fake without launching an interpreter or signalling a PID."""
-    processes: dict[int, Mock] = {}
+    processes: dict[int, _Process] = {}
     with ExitStack() as cleanup, pytest.MonkeyPatch.context() as boundary:
         start = AsyncMock(side_effect=partial(_spawn_stream, cleanup, processes))
         boundary.setattr(asyncio, "create_subprocess_exec", start)
@@ -867,7 +869,7 @@ def stream_process() -> Iterator[AsyncMock]:
 
 async def _spawn_stream(
     cleanup: ExitStack,
-    processes: dict[int, Mock],
+    processes: dict[int, _Process],
     *argv: str,
     cwd: Path,
     env: Mapping[str, str],
@@ -889,7 +891,11 @@ async def _spawn_stream(
     return cast(Process, process)
 
 
-def _answer_stream(process: Mock, answer: Callable[[str], None], data: bytes) -> None:
+def _answer_stream(
+    process: _Process,
+    answer: Callable[[str], None],
+    data: bytes,
+) -> None:
     if process.returncode is not None:
         raise BrokenPipeError
     output, error_bytes = StringIO(), BytesIO()

@@ -70,7 +70,10 @@ def _shipped() -> list[Path]:
     )
 
 
-@pytest.mark.parametrize("path", _shipped(), ids=lambda path: path.name)
+@pytest.mark.parametrize(
+    "path",
+    [pytest.param(path, id=path.name) for path in _shipped()],
+)
 def test_a_shipped_module_imports_only_the_client_trackinizer_and_the_stdlib(
     path: Path,
 ) -> None:

@@ -551,6 +551,8 @@ def _described(pull_request: PullRequest, *, autofix: bool, fixing: bool) -> str
                 f"{name} is closed; the run reads it every {minutes} minutes, and "
                 "watches it again once it is reopened."
             )
+        case _:
+            pass
     checks = [f"{pull_request.passed} of {pull_request.total} checks passed"]
     if pull_request.failed:
         checks.append(f"{len(pull_request.failed)} failed")

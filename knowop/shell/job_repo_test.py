@@ -222,13 +222,13 @@ def _capture_run(
 
     monkeypatch.setattr(job_repo, "require_tool", require_tool)
     monkeypatch.setattr(job_repo, "scope_argv", _unscoped)
-    monkeypatch.setattr(job_repo.subprocess, "Popen", popen)
+    monkeypatch.setattr(subprocess, "Popen", popen)
     monkeypatch.setattr(job_repo, "run", kill_scope)
     if remote_config is not None:
         monkeypatch.setenv("GIT_CONFIG_GLOBAL", remote_config)
     done = Repos(tmp_path / "repos")._run(None, "version")
     argv, kwargs = spawned[0]
-    assert (done.args, done.returncode, done.stdout, done.stderr) == (
+    assert (cast(list[str], done.args), done.returncode, done.stdout, done.stderr) == (
         argv,
         0,
         "version\ufffd\n",
@@ -568,10 +568,14 @@ def _pipe_reply(
     return child
 
 
+class _GitProcess(Mock):
+    return_value: _PipedChild
+
+
 @pytest.fixture
-def git_process(monkeypatch: pytest.MonkeyPatch) -> Mock:
+def git_process(monkeypatch: pytest.MonkeyPatch) -> _GitProcess:
     """Replace only Git's OS process and scope signals, keeping pipe supervision real."""
-    started = Mock(return_value=_pipe_reply(["git"]))
+    started = _GitProcess(return_value=_pipe_reply(["git"]))
     monkeypatch.setattr(subprocess, "Popen", started)
     monkeypatch.setattr(job_repo, "require_tool", Mock(return_value="/usr/bin/git"))
     monkeypatch.setattr(job_repo, "run", Mock(return_value=(0, "")))
@@ -672,7 +676,7 @@ def test_git_uses_the_users_configured_credential_helper(
 def test_git_that_runs_out_of_time_is_said_plainly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    git_process: Mock,
+    git_process: _GitProcess,
 ) -> None:
     del git_process
 
@@ -695,7 +699,7 @@ def test_git_that_runs_out_of_time_is_said_plainly(
 def test_git_still_running_at_its_deadline_is_killed_and_said_plainly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    git_process: Mock,
+    git_process: _GitProcess,
 ) -> None:
     child = git_process.return_value
     child.returncode = None
@@ -774,7 +778,7 @@ class _SetOnceHeld(threading.Event):
 
 def test_a_preparation_cancelled_while_git_runs_stops_it(
     tmp_path: Path,
-    git_process: Mock,
+    git_process: _GitProcess,
 ) -> None:
     del git_process
     cancel = _SetOnceHeld()
