@@ -21,11 +21,13 @@ one is read every :data:`CLOSED_PASSES` passes instead, as Claude Code's app rea
 one, and watched again once it reopens; a merged one is read no more.
 
 With Auto-fix on, the failures :func:`due_failures` names become one line from
-``knowop-autofix``, which the inbound loop takes (:meth:`PullRequestWatch.take`) and
-types as it types a Chat line: the server cannot put a line into a chat's run, and
-this run already sits in the agent's checkout, under the agent's own credentials.
-Several sessions may watch one pull request, and only one is woken for it: the first
-to watch it, its ``fixer``, until it lets the pull request go.
+``knowop-autofix``, and a merge conflict another, once per head. A merge the watch saw
+happen becomes a line too, Auto-fix on or off, since it asks for no fix. The inbound
+loop takes them (:meth:`PullRequestWatch.take`) and types them as it types a Chat
+line: the server cannot put a line into a chat's run, and this run already sits in the
+agent's checkout, under the agent's own credentials. Several sessions may watch one
+pull request, and only one is woken for it: the first to watch it, its ``fixer``,
+until it lets the pull request go.
 """
 
 from __future__ import annotations
@@ -49,9 +51,12 @@ from knowop.agent.pull_request_notes import RecordNotes
 from knowop.agent.pull_request_rows import PullRequestRows
 from knowop.agent.pull_requests import (
     AUTOFIX_SOURCE,
+    CONFLICT,
     GhError,
+    conflict_text,
     due_failures,
     links,
+    merged_text,
     read_pull_request,
     run_gh,
     wake_text,
@@ -106,7 +111,8 @@ _LINK_SCHEMA: Final = {
 _WATCH_TOOL: Final = (
     "Watch a GitHub pull request in this chat. Chat shows it over the session, and "
     "while its Auto-fix is on the run sends you a line from knowop-autofix when its "
-    "checks fail. The run already watches a pull request this session opens with gh pr "
+    "checks fail or it has a merge conflict, and one when it merges. The run already "
+    "watches a pull request this session opens with gh pr "
     "create, or one open on a branch it pushes: call this for any other the person "
     "asks you to watch, or to bring back one that was let go. Answers what the run now "
     "sees of it."
@@ -410,7 +416,7 @@ class PullRequestWatch:
             return f"{url} has no row any more; there is nothing left to watch."
         if pull_request is None:
             return f"gh could not read {url}: {error}. The run tries again each minute."
-        pr, due = written
+        pr, wakes = written
         status = _STATUS.get(pull_request.state, "active")
         self._rows.move(stored, status=status)
         match status:
@@ -420,9 +426,8 @@ class PullRequestWatch:
                 self._close(url)
             case _:
                 self._unwatch(url)
-        if due:
-            with self._lock:
-                self._wakes.append(wake_text(pull_request, due))
+        with self._lock:
+            self._wakes.extend(wakes)
         switch = from_plain(pr.get("autofix"), bool, default=None)
         return _described(
             pull_request,
@@ -441,29 +446,48 @@ class PullRequestWatch:
         session: UUID,
         default: bool,
     ) -> tuple[dict[str, object], tuple[str, ...]]:
-        """Return the row's ``app.knowop.pr`` as this read leaves it, and the failures to wake for."""
+        """Return the row's ``app.knowop.pr`` as this read leaves it, and the lines to wake with."""
         new = dict(kept)
-        due: tuple[str, ...] = ()
+        wakes: list[str] = []
         if pull_request is None:
             new["error"] = error
         else:
             new |= pull_request.app() | {"error": None}
             switch = from_plain(kept.get("autofix"), bool, default=None)
-            failing = (default if switch is None else switch) and bool(
-                pull_request.failed,
+            autofix = default if switch is None else switch
+            failing = autofix and bool(pull_request.failed)
+            conflicted = (
+                autofix
+                and pull_request.state == "OPEN"
+                and pull_request.mergeable == "CONFLICTING"
             )
-            fixer = self._fixer(kept, row=row, session=session, failing=failing)
+            # Only a merge this watch saw happen: reading one merged long ago is no news.
+            merged = pull_request.state == "MERGED" and kept.get("state") == "OPEN"
+            fixer = self._fixer(
+                kept,
+                row=row,
+                session=session,
+                failing=failing or conflicted or merged,
+            )
             new["fixer"] = fixer
             if fixer == str(session):
                 told = from_plain(kept.get("told"), list[str], default=[])
                 due = self._due(pull_request, told=told) if failing else ()
                 head = f"{pull_request.head_sha}:"
+                resolve = conflicted and f"{head}{CONFLICT}" not in told
                 new["told"] = [each for each in told if each.startswith(head)] + [
-                    f"{head}{name}" for name in due
+                    f"{head}{name}"
+                    for name in (*due, *((CONFLICT,) if resolve else ()))
                 ]
+                if due:
+                    wakes.append(wake_text(pull_request, due))
+                if resolve:
+                    wakes.append(conflict_text(pull_request))
+                if merged:
+                    wakes.append(merged_text(pull_request))
         if new != kept:
             new["read_at"] = datetime.now(UTC).isoformat()
-        return new, due
+        return new, tuple(wakes)
 
     # The first session to watch it fixes it: the one its row names, until that one
     # lets it go. Whether it did is read only when a failure would wake it.
