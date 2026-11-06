@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal
 
 import re
 import threading
@@ -108,13 +108,13 @@ def _act(command: str) -> _Act | None:
 def _strings(tree: Mapping[str, PlainTree]) -> list[str]:
     """Return every string in a tool call's arguments: its command, however spelled."""
     found: list[str] = []
-    stack: list[object] = [tree]
+    stack: list[PlainTree] = [tree]
     while stack:
         node = stack.pop()
         if isinstance(node, str):
             found.append(node)
         elif isinstance(node, Mapping):
-            stack.extend(cast("Mapping[str, object]", node).values())
+            stack.extend(node.values())
         elif isinstance(node, Sequence):
-            stack.extend(cast("Sequence[object]", node))
+            stack.extend(node)
     return found

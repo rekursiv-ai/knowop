@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import contextlib
 import shutil
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 @pytest.fixture(params=["rg", "python"])
 def engine(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
     """Search with ripgrep, or with it hidden from ``PATH``."""
-    name = str(request.param)
+    name = cast(str, request.param)
     if name == "rg" and shutil.which("rg") is None:
         pytest.skip("ripgrep is not installed")
     if name == "python":

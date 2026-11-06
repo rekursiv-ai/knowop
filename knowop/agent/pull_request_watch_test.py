@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import json
@@ -464,9 +465,10 @@ def test_a_new_run_of_the_session_keeps_watching_and_does_not_wake_twice() -> No
     _opened(first)
     first._sweep()
     assert len(first.take()) == 1
+    reads = len(gh.refs)
     again = _watch(server, gh)
     again._sweep()
-    assert gh.refs[-1] == _URL
+    assert gh.refs[reads:] == [_URL]
     assert again.take() == []
 
 
@@ -522,6 +524,21 @@ def test_a_merged_pull_request_completes_its_row_and_is_read_no_more() -> None:
     reads = len(gh.refs)
     watch._sweep()
     assert len(gh.refs) == reads
+
+
+def test_a_resumed_session_never_reads_its_merged_pull_request() -> None:
+    server, gh = _Server(), _Gh(state="MERGED")
+    first = _watch(server, gh)
+    _opened(first)
+    first._sweep()
+    reads = len(gh.refs)
+
+    again = _watch(server, gh)
+    for _ in range(3):
+        again._sweep()
+
+    assert len(gh.refs) == reads
+    assert again.take() == []
 
 
 def test_a_closed_one_is_read_now_and_then_and_watched_again_once_reopened() -> None:
@@ -600,6 +617,23 @@ def test_only_the_first_session_watching_is_woken_until_it_lets_go() -> None:
     assert len(other.take()) == 1
     assert server.pr()["fixer"] == str(_OTHER)
     assert server.pr()["told"] == [f"{'c' * 40}:CI / unit"]
+
+
+def test_the_current_fixer_needs_no_ownership_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _Server()
+    read = Mock(wraps=server.get)
+    monkeypatch.setattr(_Server, "get", read)
+    watch = _watch(server, _Gh())
+
+    assert watch._fixer(
+        {"fixer": str(_SESSION)},
+        row=uuid4(),
+        session=_SESSION,
+        failing=True,
+    ) == str(_SESSION)
+    read.assert_not_called()
 
 
 def test_two_sessions_reading_one_failure_at_once_wake_only_the_one_that_wrote_first() -> (

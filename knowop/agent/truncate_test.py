@@ -29,7 +29,7 @@ from trackinizer.sagent.session.types import (
 from trackinizer.types.session_records import SessionRecordRow, search_text
 from trackinizer.types.streams import Stderr, Stdin, Stdout
 from trackinizer.wire.wire_session_ir import RecordBody
-from treekle import immutable, json_dumps
+from treekle import immutable, json_dumps, json_loads
 
 import httpx2
 import pytest
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
     from trackinizer.sagent.session.types import SessionRecord
     from trackinizer.types.streams import TraxRecord
-    from treekle import PlainTree
+    from treekle import MutablePlainTree, PlainTree
 
 
 # One cut string: what it kept, how much it says went, and what it kept after.
@@ -135,7 +135,7 @@ def _image_read(image: dict[str, PlainTree]) -> str:
     return "".join(f"{json.dumps(line)}\n" for line in lines)
 
 
-def _base64_sources(tree: object) -> Iterator[str]:
+def _base64_sources(tree: MutablePlainTree) -> Iterator[str]:
     """Yield the data of every base64 media source in a JSON tree."""
     if isinstance(tree, list):
         for item in tree:
@@ -299,7 +299,7 @@ class TestAnImageIsKeptWholeOrNamed:
         claude.denormalize(captured, resumed)
 
         for line in resumed.getvalue().splitlines():
-            for data in _base64_sources(json.loads(line)):
+            for data in _base64_sources(json_loads(line)):
                 base64.b64decode(data, validate=True)
         assert "Trackinizer capture omitted this image" in resumed.getvalue()
 

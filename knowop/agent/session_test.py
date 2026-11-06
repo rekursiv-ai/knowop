@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, TextIO, cast, override
+from typing import TYPE_CHECKING, Final, Literal, TextIO, TypedDict, cast, override
 from unittest.mock import Mock, call, patch
 from uuid import UUID
 
@@ -163,6 +163,8 @@ _THIS: Final = Path(__file__).resolve()
 
 
 if TYPE_CHECKING:
+    from threading import Thread
+
     from trackinizer.runs.adapters.custom_types import Adapter
     from trackinizer.runs.asks import Driver
     from trackinizer.types.inquiries import Inquiry
@@ -1620,6 +1622,7 @@ class _WhereClient:
         self._stop = stop
         self._drains = drains
         self.said: list[dict[str, str | bool | None]] = []
+        self.waits: list[float] = []
 
     def drain_inbound(
         self,
@@ -1628,7 +1631,8 @@ class _WhereClient:
         wait_sec: float = 0.0,
         **where: str | bool | None,
     ) -> list[InboundDrainItem]:
-        del session_id, wait_sec
+        del session_id
+        self.waits.append(wait_sec)
         self.said.append(where)
         if len(self.said) >= self._drains:
             self._stop.set()
@@ -5730,13 +5734,21 @@ class TestSpawnWiring:
     ) -> None:
         monkeypatch.setattr(session, "_JOIN_DEADLINE_SEC", 0.05)
         monkeypatch.setattr(time, "monotonic", lambda: 0.0)
-        drain = Mock(spec=threading.Thread)
+        drain_join = Mock()
+        poll_join = Mock()
+        drain = Mock(
+            spec=threading.Thread,
+            join=drain_join,
+            is_alive=Mock(return_value=True),
+        )
         drain.name = "drain"
-        drain.is_alive.return_value = True
-        poll = Mock(spec=threading.Thread)
+        poll = Mock(
+            spec=threading.Thread,
+            join=poll_join,
+            is_alive=Mock(return_value=True),
+        )
         poll.name = "inbound poll"
         poll.ident = 7
-        poll.is_alive.return_value = True
 
         session._wind_down(
             RunConfig(cli_name="claude", quiesce_seconds=0.0),
@@ -5746,8 +5758,8 @@ class TestSpawnWiring:
             _RecordingSink(),
         )
 
-        drain.join.assert_called_once_with(timeout=0.05)
-        poll.join.assert_called_once_with(timeout=0.05)
+        drain_join.assert_called_once_with(timeout=0.05)
+        poll_join.assert_called_once_with(timeout=0.05)
         err = capsys.readouterr().err
         assert (
             "[knowop run] drain thread did not stop before the teardown deadline" in err
@@ -6235,16 +6247,14 @@ class TestInboundIsWaitDriven:
 
     def test_asks_the_server_to_hold_the_request(self) -> None:
         """Every drain must carry a non-zero hold, or it is still a poll."""
-        client = Mock()
-        client.drain_inbound.return_value = list[InboundDrainItem]()
-        stop = Mock(spec=threading.Event)
-        stop.is_set.side_effect = [False, True]
+        stop = _RecordingStop()
+        client = _WhereClient(stop)
 
         _inbound_poll_loop(client, _SessionSink(), _RecordingRelay(), stop)
 
-        client.drain_inbound.assert_called_once()
-        assert client.drain_inbound.call_args.kwargs["wait_sec"] > 0
-        stop.wait.assert_not_called()
+        [wait_sec] = client.waits
+        assert wait_sec > 0
+        assert stop.timeouts == []
 
     def test_does_not_sleep_between_successful_waits(
         self,
@@ -6255,20 +6265,16 @@ class TestInboundIsWaitDriven:
         A sleep after a successful hold adds latency on top of a mechanism
         whose whole purpose is to remove it.
         """
-        client = Mock()
-        client.drain_inbound.return_value = list[InboundDrainItem]()
-        stop = Mock(spec=threading.Event)
-        stop.is_set.side_effect = [False, False, False, True]
+        stop = _RecordingStop()
+        client = _WhereClient(stop, drains=3)
         slept = Mock()
         monkeypatch.setattr(time, "sleep", slept)
 
         _inbound_poll_loop(client, _SessionSink(), _RecordingRelay(), stop)
 
-        assert client.drain_inbound.call_count == 3, (
-            "did not re-arm after a successful wait"
-        )
+        assert len(client.waits) == 3, "did not re-arm after a successful wait"
         slept.assert_not_called()
-        stop.wait.assert_not_called()
+        assert stop.timeouts == []
 
     def test_a_failure_backs_off_before_re_arming(self) -> None:
         """A persistent outage must not become a hot retry loop.
@@ -6338,7 +6344,8 @@ class TestAClickedCommandInTheInboundLoop:
             env={"PATH": "/usr/bin:/bin"},
             shell_path="/bin/sh",
         )
-        bridge = Mock(spec=PromptBridge)
+        answer = Mock()
+        bridge = Mock(spec=PromptBridge, answer=answer)
         refused: list[SystemMessage] = []
 
         def said(message: SystemMessage) -> None:
@@ -6358,7 +6365,7 @@ class TestAClickedCommandInTheInboundLoop:
         assert not ran.exists()
         assert not runs.running()
         assert relay.submitted == []
-        bridge.answer.assert_not_called()
+        answer.assert_not_called()
         [message] = refused
         assert message.subtype == "delivery_failed"
 
@@ -6634,13 +6641,16 @@ class TestInboundAfterALateOpen:
             Event(record=UserMessage(content="hi"), path=tmp_path / "s.jsonl"),
         )
         relay = _RecordingRelay()
-        stop = Mock(spec=threading.Event)
-        stop.is_set.side_effect = [False, False, True]
-        stop.wait.side_effect = partial(_recover_server_on_wait, client, sink, now)
+        wait = Mock(side_effect=partial(_recover_server_on_wait, client, sink, now))
+        stop = Mock(
+            spec=threading.Event,
+            is_set=Mock(side_effect=[False, False, True]),
+            wait=wait,
+        )
 
         _inbound_poll_loop(client, sink, relay, stop, poll_interval=0.01)
 
-        stop.wait.assert_called_once_with(0.01)
+        wait.assert_called_once_with(0.01)
         assert relay.submitted == ["now you hear me"]
         assert client.drained_for == {client.session}
 
@@ -10561,12 +10571,19 @@ class TestAHeadlessRunsWiring:
 
         sleeping = Mock(side_effect=sleep)
         monkeypatch.setattr(time, "sleep", sleeping)
+        real_join = threading.Thread.join
+        joined: list[str] = []
+
+        def join(thread: Thread, timeout: float | None = None) -> None:
+            joined.append(thread.name)
+            real_join(thread, timeout)
+
         with patch.object(
             threading.Thread,
             "join",
             autospec=True,
-            side_effect=threading.Thread.join,
-        ) as joined:
+            side_effect=join,
+        ):
             _ = _wire_headless(
                 monkeypatch,
                 tmp_path,
@@ -10576,7 +10593,7 @@ class TestAHeadlessRunsWiring:
             )
 
         sleeping.assert_any_call(0.05)
-        assert any(args[0].name == "inbound poll" for args, _ in joined.call_args_list)
+        assert "inbound poll" in joined
         assert wiring.poll_done.is_set()
 
     def test_a_loaded_history_past_the_fit_is_compacted_first(
@@ -10694,13 +10711,23 @@ def _past_token(made: Mapping[str, object]) -> dict[str, str]:
     return env
 
 
+class _McpServer(TypedDict):
+    type: str
+    url: str
+    headers: dict[str, str]
+
+
+class _McpConfig(TypedDict):
+    mcpServers: dict[str, _McpServer]
+
+
 def _past_tools(argv: Sequence[str]) -> list[str]:
     """Return a CLI's ``argv`` past the skill and the run's tools, which lead it."""
     if argv[0] == "claude":
         assert argv[1:3] == ["--append-system-prompt", using_knowop()]
         flag, config = argv[3].split("=", 1)
         assert flag == "--mcp-config"
-        assert set(json.loads(config)["mcpServers"]) == {"knowop"}
+        assert set(json_loads(config, _McpConfig)["mcpServers"]) == {"knowop"}
         assert argv[4] == "--allowedTools=mcp__knowop"
         return [argv[0], *argv[5:]]
     assert argv[1:3] == ["-c", argv[2]]

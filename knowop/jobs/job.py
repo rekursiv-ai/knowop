@@ -331,16 +331,17 @@ class Job(Command):
                     cls.run_machine_logs(client, job, follow=flags.follow)
                 else:
                     cls.run_logs(_rig(client_factory), job, follow=flags.follow)
-            case _ if isinstance(job, int):
-                client = client_factory()
-                if (view := job_records.machine_view(client, job)) is not None:
-                    machine_job.run_results(
-                        client,
-                        view,
-                        results=results_dir(client.base_url, job, flags.to),
-                    )
-                else:
-                    cls.run_results(_rig(client_factory), job, to=flags.to)
+            case _:
+                if isinstance(job, int):
+                    client = client_factory()
+                    if (view := job_records.machine_view(client, job)) is not None:
+                        machine_job.run_results(
+                            client,
+                            view,
+                            results=results_dir(client.base_url, job, flags.to),
+                        )
+                    else:
+                        cls.run_results(_rig(client_factory), job, to=flags.to)
 
     @classmethod
     def run_machine_submit(

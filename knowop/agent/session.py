@@ -49,7 +49,6 @@ from typing import (
     Literal,
     Protocol,
     cast,
-    runtime_checkable,
 )
 from uuid import UUID
 
@@ -1602,16 +1601,14 @@ def _open_trackinizer_sink(
         child.set_cli_session_id(subagent.child)
         return child
 
-    # A client that cannot write edges still records each sub-agent, unlinked.
     def link(child: UUID, parent: UUID, note: str) -> None:
-        if isinstance(client, _EdgeClient):
-            client.add_edge(
-                child,
-                parent,
-                "produced_by",
-                actor=config.actor or adapter.name,
-                note=note,
-            )
+        client.add_edge(
+            child,
+            parent,
+            "produced_by",
+            actor=config.actor or adapter.name,
+            note=note,
+        )
 
     return SubagentSinks(root, open_child=open_child, link=link)
 
@@ -4496,20 +4493,3 @@ class _Flags(Protocol):
     detach: bool
     name: str | None
     attach: UUID | None
-
-
-@runtime_checkable
-class _EdgeClient(Protocol):
-    """A client that links a sub-agent's session to its parent's: ``Client``."""
-
-    def add_edge(
-        self,
-        from_id: UUID,
-        to_id: UUID,
-        edge_kind: str,
-        *,
-        actor: str,
-        note: str = "",
-    ) -> object:
-        """Add the edge ``from_id -> to_id``; a repeat is a no-op."""
-        ...

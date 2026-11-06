@@ -1428,18 +1428,20 @@ def test_a_stubborn_job_of_a_revoked_machine_is_killed_after_the_grace(
     server.stop_answer = ClientError("revoked", status_code=410)
     rig = _host(tmp_path, server=server, launcher=launcher)
     rig.host.start(_MACHINE, _INSTANCE)
-    clock = SimpleNamespace(
-        monotonic=Mock(side_effect=[10.0, 10.049, 10.051]),
-        sleep=Mock(),
+    monotonic = Mock(side_effect=[10.0, 10.049, 10.051])
+    sleep = Mock()
+    monkeypatch.setattr(
+        job_host,
+        "time",
+        SimpleNamespace(monotonic=monotonic, sleep=sleep),
     )
-    monkeypatch.setattr(job_host, "time", clock)
 
     rig.host.stop()
 
     assert launcher.signals == [(unit, signal.SIGTERM), (unit, signal.SIGKILL)]
     assert alive.reported_at() is not None
-    clock.sleep.assert_called_once_with(0.2)
-    assert clock.monotonic.call_count == 3
+    sleep.assert_called_once_with(0.2)
+    assert monotonic.call_count == 3
 
 
 def test_stopping_the_host_leaves_running_jobs_running(rig: _Rig) -> None:
@@ -1574,7 +1576,7 @@ def test_the_systemd_launcher_starts_the_runner_in_a_capped_scope_of_its_own(
         seen.update(kwargs, argv=argv)
         return _Child(None)
 
-    monkeypatch.setattr(job_host.subprocess, "Popen", popen)
+    monkeypatch.setattr(subprocess, "Popen", popen)
     folder = JobFolder.create(tmp_path / "7", _spec())
     launcher = SystemdLauncher(run=_no_systemctl)
 
@@ -1630,7 +1632,7 @@ def test_the_systemd_launcher_asks_its_own_systemd_whether_to_keep_a_dollar(
         asked.append(list(argv))
         return 0, "systemd 255 (255.4-1ubuntu8.6)\n"
 
-    monkeypatch.setattr(job_host.subprocess, "Popen", popen)
+    monkeypatch.setattr(subprocess, "Popen", popen)
     folder = JobFolder.create(tmp_path / "$HOME", _spec())
 
     SystemdLauncher(run=systemd).start(folder, unit="u", memory_mb=512, env={})
@@ -1656,7 +1658,7 @@ def test_the_systemd_launcher_asks_systemd_about_a_scope_it_did_not_start(
         del args, kwargs
         return _Child(0)
 
-    monkeypatch.setattr(job_host.subprocess, "Popen", popen)
+    monkeypatch.setattr(subprocess, "Popen", popen)
     launcher = SystemdLauncher(run=run)
     folder = JobFolder.create(tmp_path / "9", _spec(9))
     launcher.start(folder, unit="knowop-job-ab-9", memory_mb=512, env={})

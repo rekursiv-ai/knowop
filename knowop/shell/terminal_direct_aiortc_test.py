@@ -10,6 +10,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import sys
 
+from aiortc import RTCPeerConnection
+from trackinizer.mock_test_support import AsyncMockProtocol
+
 import pytest
 
 from knowop.shell import terminal_direct_aiortc
@@ -47,11 +50,11 @@ _LIBRARY.__dict__.update(
 class _Made:
     """The one connection the stand-in makes, and what a test reads off it."""
 
-    connection: MagicMock
+    connection: RTCPeerConnection
     handlers: dict[str, Callable[..., None]]
-    set_remote: AsyncMock
-    set_local: AsyncMock
-    close: AsyncMock
+    set_remote: AsyncMockProtocol[object]
+    set_local: AsyncMockProtocol[object]
+    close: AsyncMockProtocol[object]
 
 
 def _recording(handlers: dict[str, Callable[..., None]]) -> MagicMock:
@@ -155,13 +158,14 @@ async def test_the_channel_the_browser_opens_carries_binary_messages_and_its_clo
 async def test_a_failed_or_closed_connection_reports_the_close_once_it_changes(
     stand_in: _Made,
     state: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, _, closed = await _accepted(stand_in)
 
-    stand_in.connection.connectionState = "connecting"
+    monkeypatch.setattr(stand_in.connection, "connectionState", "connecting")
     stand_in.handlers["connectionstatechange"]()
     assert closed == []
-    stand_in.connection.connectionState = state
+    monkeypatch.setattr(stand_in.connection, "connectionState", state)
     stand_in.handlers["connectionstatechange"]()
 
     assert closed == ["closed"]

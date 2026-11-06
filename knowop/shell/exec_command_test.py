@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from asyncio.subprocess import Process
 from functools import partial
-from typing import TYPE_CHECKING, TypedDict, Unpack, cast
+from typing import TYPE_CHECKING, Protocol, Unpack, cast
+from typing_extensions import TypedDict
 from unittest.mock import AsyncMock, Mock
 
 import asyncio
@@ -32,8 +33,10 @@ from knowop.shell.exec_stream import Cut
 
 if TYPE_CHECKING:
     from asyncio import Future
-    from collections.abc import Awaitable, Callable, Iterable
+    from collections.abc import Awaitable, Iterable
     from pathlib import Path
+
+    from trackinizer.mock_test_support import AsyncMockProtocol, MockProtocol
 
 
 @pytest.fixture(autouse=True)
@@ -74,8 +77,8 @@ def test_the_shells_exit_ends_the_wait_where_waiting_waits_for_the_pipes(
     process.wait.assert_not_called()
     process.stdin.write.assert_not_called()
     process.stdin.close.assert_called_once_with()
-    _, options = start.call_args
-    (report_fd,) = options["pass_fds"]
+    assert start.call_args is not None
+    (report_fd,) = cast(tuple[int, ...], start.call_args.kwargs["pass_fds"])
     start.assert_awaited_once_with(
         "bash",
         "-lc",
@@ -211,7 +214,7 @@ async def test_a_run_cancelled_while_its_shell_starts_kills_what_it_started(
 
 
 async def _hand_over(
-    process: Mock,
+    process: _Process,
     starting: asyncio.Event,
     handed: asyncio.Event,
     *argv: str,
@@ -223,14 +226,35 @@ async def _hand_over(
     return cast(Process, process)
 
 
-def _process(*, stdout: bytes = b"", stderr: bytes = b"", code: int | None = 0) -> Mock:
+class _Stdin(Protocol):
+    write: MockProtocol[object]
+    close: MockProtocol[object]
+    drain: AsyncMockProtocol[object]
+
+
+class _Process(Mock):
+    pid: int
+    returncode: int | None
+    stdin: _Stdin
+    stdout: asyncio.StreamReader
+    stderr: asyncio.StreamReader
+    wait: AsyncMockProtocol[object]
+    send_signal: MockProtocol[None]
+
+
+def _process(
+    *,
+    stdout: bytes = b"",
+    stderr: bytes = b"",
+    code: int | None = 0,
+) -> _Process:
     out, err = asyncio.StreamReader(), asyncio.StreamReader()
     out.feed_data(stdout)
     err.feed_data(stderr)
     if code is not None:
         out.feed_eof()
         err.feed_eof()
-    process = Mock(
+    process = _Process(
         spec=Process,
         pid=7,
         returncode=code,
@@ -243,29 +267,39 @@ def _process(*, stdout: bytes = b"", stderr: bytes = b"", code: int | None = 0) 
     return process
 
 
-def _signal_process(process: Mock, signum: int) -> None:
+def _signal_process(process: _Process, signum: int) -> None:
     process.returncode = -signum
     process.stdout.feed_eof()
     process.stderr.feed_eof()
 
 
-def _kill_group(process: Mock, pgid: int, signum: int) -> None:
+def _kill_group(process: _Process, pgid: int, signum: int) -> None:
     assert pgid == process.pid
     _signal_process(process, signum)
 
 
-class _WaitOptions(TypedDict, total=False):
+class _WaitOptions(TypedDict, total=False, closed=True):
     timeout: float | None
     return_when: str
 
 
-async def _expire(
-    wait: Callable[..., Awaitable[tuple[set[Future[object]], set[Future[object]]]]],
-    futures: Iterable[Future[object]],
+class _Wait(Protocol):
+    def __call__[T](
+        self,
+        fs: Iterable[Future[T]],
+        *,
+        timeout: float | None = None,
+        return_when: str = asyncio.ALL_COMPLETED,
+    ) -> Awaitable[tuple[set[Future[T]], set[Future[T]]]]: ...
+
+
+async def _expire[T](
+    wait: _Wait,
+    futures: Iterable[Future[T]],
     **options: Unpack[_WaitOptions],
-) -> tuple[set[Future[object]], set[Future[object]]]:
+) -> tuple[set[Future[T]], set[Future[T]]]:
     if options.get("return_when") == asyncio.FIRST_COMPLETED:
-        assert options["timeout"] == 0.2
+        assert options.get("timeout") == 0.2
         await asyncio.sleep(0)
         return set(), set(futures)
     return await wait(futures, **options)
@@ -279,7 +313,7 @@ async def _run_reply(
     stderr: bytes = b"",
     code: int | None = 0,
     expired: bool = False,
-) -> tuple[ExecResult, Mock, AsyncMock]:
+) -> tuple[ExecResult, _Process, AsyncMock]:
     process = _process(stdout=stdout, stderr=stderr, code=code)
     start = AsyncMock(return_value=cast(Process, process))
     monkeypatch.setattr(asyncio, "create_subprocess_exec", start)

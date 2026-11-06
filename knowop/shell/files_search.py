@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, BinaryIO, Final, Literal, cast
 
 import re
 import shutil
@@ -150,7 +150,7 @@ class Search:
                 daemon=True,
             ).start()
             try:
-                for line in process.stdout or ():
+                for line in cast(BinaryIO | None, process.stdout) or ():
                     if count >= MAX_HITS or self._stopped.is_set():
                         truncated = True
                         break

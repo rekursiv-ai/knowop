@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import partial
 from importlib import metadata
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, override
+from typing import TYPE_CHECKING, Final, Literal, cast, override
 
 import os
 import plistlib
@@ -107,7 +107,10 @@ def _definition_environment(
     """Return the environment written to a launchd plist or systemd unit."""
     if manager == "launchd":
         return from_plain(
-            plistlib.loads(path.read_bytes())["EnvironmentVariables"],
+            cast(
+                dict[str, str],
+                plistlib.loads(path.read_bytes())["EnvironmentVariables"],
+            ),
             dict[str, str],
         )
     return dict(
@@ -245,7 +248,7 @@ def test_a_shell_without_a_folder_variable_gives_the_service_none(
     Services(manager="launchd", folder=tmp_path / "agents", run=_Manager()).start(_ADA)
 
     path = tmp_path / "agents" / f"{_LABEL}.plist"
-    env = plistlib.loads(path.read_bytes())["EnvironmentVariables"]
+    env = _definition_environment(path, "launchd")
     assert {k: v for k, v in _env(tmp_path).items() if k in env} == env
     assert {"XDG_CONFIG_HOME", "XDG_CACHE_HOME"} & set(env) == set()
 

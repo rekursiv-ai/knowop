@@ -194,6 +194,25 @@ def test_a_dangerous_member_is_refused_and_nothing_is_merged(
     assert not (_results(tmp_path) / "out.partial").exists()
 
 
+def test_a_regular_member_without_file_data_is_refused_and_nothing_is_merged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def missing(tar: tarfile.TarFile, member: tarfile.TarInfo | str) -> None:
+        del tar, member
+
+    monkeypatch.setattr(tarfile.TarFile, "extractfile", missing)
+    source = _Source(_tar(("a.txt", b"alpha")))
+    with pytest.raises(
+        IntegrityError,
+        match=r"^'a\.txt' in the download has no readable file$",
+    ):
+        fetch(source, [_entry("a.txt", b"alpha")], results=_results(tmp_path))
+
+    assert not (_results(tmp_path) / "out").exists()
+    assert not (_results(tmp_path) / "out.partial").exists()
+
+
 class _Endless(_Source):
     """Keeps writing small pieces until the reader goes away."""
 

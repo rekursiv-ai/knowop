@@ -27,7 +27,7 @@ import pytest
 
 from knowop.shell import exec_host
 from knowop.shell.exec_command import run_command
-from knowop.shell.exec_command_test import _kill_group, _process
+from knowop.shell.exec_command_test import _kill_group, _Process, _process
 from knowop.shell.exec_host import ExecHost
 
 
@@ -64,7 +64,7 @@ class _Shell:
 
     def __init__(self) -> None:
         self.replies: dict[str, tuple[bytes, int | None]] = {}
-        self.processes: list[Mock] = []
+        self.processes: list[_Process] = []
         self.ready = threading.Event()
         self.start = AsyncMock(side_effect=self._spawn)
         self.kill = Mock(side_effect=self._signal)
@@ -253,8 +253,8 @@ def test_a_command_is_run_and_its_result_posted_under_the_commands_id(
     assert server.keys == [_CREDENTIAL, _CREDENTIAL]
     # The listener closes its client as it leaves, which may follow ``stop``.
     _wait_until(lambda: server.closed >= 2)
-    _, options = shell.start.call_args
-    (report_fd,) = options["pass_fds"]
+    assert shell.start.call_args is not None
+    (report_fd,) = cast(tuple[int, ...], shell.start.call_args.kwargs["pass_fds"])
     shell.start.assert_awaited_once_with(
         "bash",
         "-lc",
@@ -527,7 +527,7 @@ def test_a_new_log_is_private_from_its_creation_and_named_as_the_layout_says(
     macOS opens the log under any casing of its path, so only the names a listing
     returns tell a misspelled directory apart.
     """
-    monkeypatch.setattr(exec_host.os, "fchmod", _keep_mode)
+    monkeypatch.setattr(os, "fchmod", _keep_mode)
     server = _Server()
 
     _serve_one(server, _host(server), _command("true", cwd=tmp_path))

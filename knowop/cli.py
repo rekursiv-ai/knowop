@@ -901,15 +901,12 @@ def _connect_service(
                 join_only=True,
             )
             services.start(unit)
-            started = _await(
-                http,
-                name,
-                # Not this process: the join here heartbeats once, and reads online.
-                lambda d: (
-                    d.status == "online" and _pid(d) not in {None, pid, os.getpid()}
-                ),
-                sleep=sleep,
-            )
+
+            # Not this process: the join here heartbeats once, and reads online.
+            def started_elsewhere(d: MachineDetail) -> bool:
+                return d.status == "online" and _pid(d) not in {None, pid, os.getpid()}
+
+            started = _await(http, name, started_elsewhere, sleep=sleep)
             if started is None:
                 raise ClientError(
                     f"machine {name} did not come online in 30 s; see knowop logs"
@@ -1136,9 +1133,10 @@ def _hand_off(
             return agent_cli.main([*leading, *args[1:]])
         case ["sagent"]:
             return agent_cli.sagent_main([*leading, *args[1:]])
-    # A bare ``knowop run`` runs sagent, and ``attach``, ``ls``, ``log``, ``send``,
-    # ``stop``, ``resume`` and the runner's own flags are the sagent runner's words.
-    return agent_cli.sagent_main([*leading, *args])
+        case _:
+            # A bare ``knowop run`` runs sagent, and ``attach``, ``ls``, ``log``, ``send``,
+            # ``stop``, ``resume`` and the runner's own flags are the sagent runner's words.
+            return agent_cli.sagent_main([*leading, *args])
 
 
 def _starts_an_agent(args: Sequence[str]) -> bool:

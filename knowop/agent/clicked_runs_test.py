@@ -165,13 +165,15 @@ class TestOutputWhileACommandRuns:
         shown: list[tuple[str, str]] = []
         command = "printf a; sleep 0.03; printf b >&2; sleep 0.03"
         directory = state_dir() / "rekursiv-ai" / "knowop" / "runs" / ("2" * 32)
-        child = Mock(spec=subprocess.Popen)
-        child.wait.side_effect = partial(
-            _publish_step,
-            command=command,
-            directory=directory,
-            steps=iter(((b"a", b""), (b"", b""), (b"", b"b"), (b"", b""), 0)),
+        wait = Mock(
+            side_effect=partial(
+                _publish_step,
+                command=command,
+                directory=directory,
+                steps=iter(((b"a", b""), (b"", b""), (b"", b"b"), (b"", b""), 0)),
+            ),
         )
+        child = Mock(spec=subprocess.Popen, wait=wait)
         popen = Mock(return_value=child)
         monkeypatch.setattr(subprocess, "Popen", popen)
         runs = _runs(tmp_path, [], publish=lambda run, text: shown.append((run, text)))
@@ -196,7 +198,7 @@ class TestOutputWhileACommandRuns:
         assert stderr.name == str(directory / "stderr")
         assert stdout.closed
         assert stderr.closed
-        assert child.wait.call_count == 5
+        assert wait.call_count == 5
 
     def test_a_show_that_fails_costs_the_command_nothing(self, tmp_path: Path) -> None:
         records: list[SystemMessage] = []

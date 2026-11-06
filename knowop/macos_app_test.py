@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import plistlib
 import shutil
@@ -42,7 +42,10 @@ def app(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 def test_macos_verifies_the_app_and_knows_it_as_knowop(app: Path) -> None:
     code, out = _codesign(["codesign", "--verify", "--strict", str(app)])
-    info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+    info = cast(
+        dict[str, str | bool],
+        plistlib.loads((app / "Contents" / "Info.plist").read_bytes()),
+    )
 
     assert (code, out) == (0, "")
     assert (info["CFBundleName"], info["CFBundleIdentifier"]) == (

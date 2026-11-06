@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import Mock, call
 
 import os
+import subprocess
 
 from trackinizer.sagent.session.types import (
     AssistantMessage,
@@ -456,7 +457,7 @@ class TestRunGit:
     ) -> None:
         """Output is kept to ``max_bytes`` and the cut is reported."""
         execute = Mock(return_value=CompletedProcess(["printf", "hello"], 0, b"hello"))
-        monkeypatch.setattr(worktree_diff.subprocess, "run", execute)
+        monkeypatch.setattr(subprocess, "run", execute)
 
         done = run_git(["printf", "hello"], 100)
         assert done.returncode == 0
@@ -475,7 +476,7 @@ class TestRunGit:
                         "GIT_OPTIONAL_LOCKS": "0",
                         "GIT_TERMINAL_PROMPT": "0",
                     },
-                    stdin=worktree_diff.subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
                     capture_output=True,
                     timeout=20.0,
                     check=False,
@@ -490,7 +491,7 @@ class TestRunGit:
     ) -> None:
         """A git that cannot start ends as ``-1``, not a crash."""
         execute = Mock(side_effect=FileNotFoundError("trax-run-no-such-binary-xyz"))
-        monkeypatch.setattr(worktree_diff.subprocess, "run", execute)
+        monkeypatch.setattr(subprocess, "run", execute)
 
         done = run_git(["trax-run-no-such-binary-xyz"], 100)
         assert done.returncode == -1
@@ -504,7 +505,7 @@ class TestRunGit:
         monkeypatch.setattr(worktree_diff, "GIT_SEC", 0.02)
         argv = ["sh", "-c", "printf partial; exec sleep 30"]
         execute = Mock(side_effect=TimeoutExpired(argv, 0.02, output=b"partial"))
-        monkeypatch.setattr(worktree_diff.subprocess, "run", execute)
+        monkeypatch.setattr(subprocess, "run", execute)
 
         done = run_git(argv, 4)
 
@@ -512,7 +513,7 @@ class TestRunGit:
         execute.assert_called_once_with(
             argv,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
-            stdin=worktree_diff.subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=0.02,
             check=False,

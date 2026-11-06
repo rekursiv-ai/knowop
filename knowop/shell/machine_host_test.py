@@ -70,7 +70,7 @@ class _Host:
     ) -> None:
         self.beats = list(beats)
         self.join_error = join_error
-        self.calls: list[tuple[object, ...]] = []
+        self.calls: list[tuple[str | uuid.UUID | Facts | None, ...]] = []
         self.keys: list[str] = []
         self.closed = 0
 
@@ -244,7 +244,7 @@ def test_a_first_connect_joins_with_the_stdin_token_and_saves_the_credential(
     assert join[5] == host_facts()
     # The join stored the facts, so no heartbeat repeats them.
     assert [beat[4] for beat in beats] == [None, None, None]
-    assert {beat[2] for beat in beats} == {join[3]}
+    assert [beat[2] for beat in beats] == [join[3]] * 3
     assert host.keys == ["", _CREDENTIAL]
     assert host.closed == 2
     assert slept == [HEARTBEAT_SEC, HEARTBEAT_SEC]
@@ -851,7 +851,7 @@ class _Terminals:
 
     def __init__(
         self,
-        calls: list[tuple[object, ...]],
+        calls: list[tuple[str | uuid.UUID | Facts | None, ...]],
         label: str = "terminals",
         *,
         start_error: Exception | None = None,

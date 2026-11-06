@@ -226,7 +226,7 @@ def gpus(run: Run = run) -> list[Gpu]:
     )
     if code:
         return []
-    found = []
+    found: list[Gpu] = []
     for line in out.splitlines():
         index, uuid, name, used = (part.strip() for part in line.split(","))
         found.append(

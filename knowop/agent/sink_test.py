@@ -6,7 +6,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, TypeGuard, override
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
 
 import asyncio
@@ -2278,8 +2278,7 @@ class TestLockedSink:
         position out from under it, and the two turns would be stored out of
         order.
         """
-        inner = Mock(spec=Sink)
-        inner.feed.return_value = ["Stdout"]
+        inner = Mock(spec=Sink, feed=Mock(return_value=["Stdout"]))
         sink = LockedSink(inner)
         adapter = IOStreamAdapter()
         calls = Mock()
@@ -2289,17 +2288,13 @@ class TestLockedSink:
             assert sink.feed(adapter, _PART, b"x\n") == ["Stdout"]
 
         assert calls.mock_calls == [
-            call.lock.__enter__(),
-            call.inner.feed(
-                adapter,
-                _PART,
-                b"x\n",
-                restart=False,
-                on_record=None,
-                upload=True,
-                annotate=None,
+            ("lock.__enter__", (), {}),
+            (
+                "inner.feed",
+                (adapter, _PART, b"x\n"),
+                {"restart": False, "on_record": None, "upload": True, "annotate": None},
             ),
-            call.lock.__exit__(None, None, None),
+            ("lock.__exit__", (None, None, None), {}),
         ]
 
     def test_delegates_session_id_and_emit(self) -> None:

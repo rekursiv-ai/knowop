@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from trackinizer.mock_test_support import MockProtocol
+
     from knowop.shell.terminal_host import TerminalHost
 
 
@@ -774,12 +776,17 @@ def test_a_closed_stdin_holds_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
     assert serve.piped_token() == ""
 
 
+class _Poller(Mock):
+    poll: MockProtocol[list[tuple[int, int]]]
+    register: MockProtocol[None]
+
+
 def test_a_pipe_nobody_writes_to_is_not_waited_on_for_a_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An agent shell or a CI step leaves an open pipe; the login must still start."""
     monkeypatch.setattr(serve, "_STDIN_WAIT_SEC", 0.05)
-    poller = Mock(wraps=select.poll())
+    poller = _Poller(wraps=select.poll())
     poller.poll.return_value = list[tuple[int, int]]()
     monkeypatch.setattr(select, "poll", lambda: poller)
     read_end, write_end = os.pipe()
@@ -798,7 +805,7 @@ def test_a_pipe_nobody_writes_to_is_not_waited_on_for_a_token(
 
 
 def test_a_token_written_to_a_pipe_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
-    poller = Mock(wraps=select.poll())
+    poller = _Poller(wraps=select.poll())
     monkeypatch.setattr(select, "poll", lambda: poller)
     read_end, write_end = os.pipe()
     _ = os.write(write_end, f"{_ENROLLMENT}\n".encode())

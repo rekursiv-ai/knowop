@@ -504,6 +504,8 @@ class CodexAppDriver:
                 _ = self._diffs.pop(_text(_tree(params, "item"), "id"), None)
             case "serverRequest/resolved":
                 self._on_resolved(self._ask_id(params.get("requestId")))
+            case _:
+                pass
 
     def _on_resolved(self, ask_id: str) -> None:
         """End an ask nobody here answered: our interrupt cleared it, or a client did."""
