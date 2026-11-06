@@ -31,6 +31,7 @@ from knowop.agent.pull_request_watch import (
 )
 from knowop.agent.pull_requests import (
     AUTOFIX_SOURCE,
+    CONFLICT,
     HOLD_SEC,
     GhOutput,
 )
@@ -218,6 +219,7 @@ class _Gh:
     head_sha: str = _SHA
     author: str = "me-on-github"
     login: str = "me-on-github"
+    mergeable: str = "MERGEABLE"
     checks: list[dict[str, object]] = field(default_factory=list)
     fails: str = ""
     none_for: set[str] = field(default_factory=set)
@@ -248,7 +250,7 @@ class _Gh:
             "base": "main",
             "additions": 1,
             "deletions": 0,
-            "mergeable": "MERGEABLE",
+            "mergeable": self.mergeable,
             "review": "",
             "checks": self.checks,
         }
@@ -510,6 +512,85 @@ def test_a_failure_waits_while_its_workflow_runs_another_check() -> None:
     clock.now += HOLD_SEC
     watch._sweep()
     assert len(watch.take()) == 1
+
+
+def test_a_merge_conflict_wakes_the_agent_once_per_head() -> None:
+    server, gh = _Server(), _Gh(mergeable="CONFLICTING")
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    (wake,) = watch.take()
+    assert wake.source == AUTOFIX_SOURCE
+    assert 'knowop-conflict pr="' in wake.text
+    assert "main" in wake.text
+    assert server.pr()["told"] == [f"{_SHA}:{CONFLICT}"]
+    watch._sweep()
+    assert watch.take() == []
+    gh.head_sha = "b" * 40
+    watch._sweep()
+    assert len(watch.take()) == 1
+
+
+def test_a_failure_and_a_conflict_on_one_head_wake_once_each() -> None:
+    server = _Server()
+    gh = _Gh(mergeable="CONFLICTING", checks=[_check("unit", conclusion="FAILURE")])
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    texts = [line.text for line in watch.take()]
+    assert ["knowop-autofix" in text for text in texts] == [True, False]
+    assert ["knowop-conflict" in text for text in texts] == [False, True]
+
+
+@pytest.mark.parametrize("mergeable", ["MERGEABLE", "UNKNOWN"])
+def test_only_a_known_conflict_wakes_the_agent(mergeable: str) -> None:
+    server, gh = _Server(), _Gh(mergeable=mergeable)
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    assert watch.take() == []
+
+
+def test_a_conflict_wakes_nobody_with_auto_fix_off() -> None:
+    server, gh = _Server(autofix=False), _Gh(mergeable="CONFLICTING")
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    assert watch.take() == []
+
+
+def test_a_merge_tells_the_agent_once() -> None:
+    server, gh = _Server(), _Gh()
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    assert watch.take() == []
+    gh.state = "MERGED"
+    watch._sweep()
+    (told,) = watch.take()
+    assert told.source == AUTOFIX_SOURCE
+    assert 'knowop-merged pr="' in told.text
+    assert "main" in told.text
+    watch._sweep()
+    assert watch.take() == []
+
+
+def test_a_merge_tells_the_agent_with_auto_fix_off() -> None:
+    server, gh = _Server(autofix=False), _Gh()
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    gh.state = "MERGED"
+    watch._sweep()
+    assert len(watch.take()) == 1
+
+
+def test_one_merged_before_the_watch_read_it_tells_nobody() -> None:
+    server, gh = _Server(), _Gh(state="MERGED")
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    assert watch.take() == []
 
 
 def test_a_merged_pull_request_completes_its_row_and_is_read_no_more() -> None:

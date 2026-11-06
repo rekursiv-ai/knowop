@@ -29,13 +29,16 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AUTOFIX_SOURCE",
+    "CONFLICT",
     "HOLD_SEC",
     "GhError",
     "GhOutput",
     "GhRunner",
     "PullRequest",
+    "conflict_text",
     "due_failures",
     "links",
+    "merged_text",
     "read_login",
     "read_pull_request",
     "run_gh",
@@ -45,6 +48,9 @@ __all__ = [
 
 AUTOFIX_SOURCE: Final = "knowop-autofix"
 """The sender of an Auto-fix line, which Chat draws as Auto-fix's and no person's."""
+
+CONFLICT: Final = "merge-conflict"
+"""What a row's ``told`` names a head's merge conflict by, beside its failed checks."""
 
 HOLD_SEC: Final = 300.0
 """The longest a failure waits for its workflow's running checks before it wakes the
@@ -361,6 +367,60 @@ def due_failures(
         name
         for name in pull_request.failed
         if f"{pull_request.head_sha}:{name}" not in named and name not in held
+    )
+
+
+def conflict_text(pull_request: PullRequest) -> str:
+    """Return the line that wakes the agent to resolve a merge conflict.
+
+    Args:
+      pull_request: The pull request that no longer merges into its base.
+
+    Returns:
+      text: The line.
+
+    """
+    head = pull_request.head_sha[:10]
+    task = (
+        f"{pull_request.repo}#{pull_request.number} has merge conflicts with "
+        f"{pull_request.base} at head {head}. Auto-fix is on for this pull request: "
+        f"bring {pull_request.base} into {pull_request.head}, resolve the conflicts, "
+        f"and push to that branch without asking first. If your HEAD is past {head}, "
+        "check whether a later push already resolved them. Read both sides of each "
+        "conflict before you choose, and say so if a conflict needs the person's call."
+    )
+    return "\n".join(
+        (
+            f'<knowop-conflict pr="{pull_request.url}" head="{head}">',
+            task,
+            "</knowop-conflict>",
+        ),
+    )
+
+
+def merged_text(pull_request: PullRequest) -> str:
+    """Return the line that tells the agent its pull request merged.
+
+    Args:
+      pull_request: The pull request, as read once merged.
+
+    Returns:
+      text: The line.
+
+    """
+    head = pull_request.head_sha[:10]
+    task = (
+        f"{pull_request.repo}#{pull_request.number} was merged into "
+        f"{pull_request.base} at head {head}. The run watches it no more, and pushes "
+        f"to {pull_request.head} will not reach {pull_request.base}. Tell the person, "
+        "and pick up anything that was waiting on this merge."
+    )
+    return "\n".join(
+        (
+            f'<knowop-merged pr="{pull_request.url}" head="{head}">',
+            task,
+            "</knowop-merged>",
+        ),
     )
 
 
