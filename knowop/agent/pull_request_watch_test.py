@@ -12,11 +12,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, override
 from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import json
+import threading
 import time
 
 from trackinizer.client.errors import ClientError
@@ -661,6 +662,31 @@ def test_a_new_run_reads_a_closed_row_of_its_session_at_its_second_pass() -> Non
     (row,) = server.rows.values()
     assert row["status"] == "active"
     assert len(gh.refs) == reads + 1
+
+
+class _ClosingPoke(threading.Event):
+    """A wait that the run's close ends: the close lands as the wait returns."""
+
+    def __init__(self, close: Callable[[], None]) -> None:
+        super().__init__()
+        self._close = close
+
+    @override
+    def wait(self, timeout: float | None = None) -> bool:
+        del timeout
+        self._close()
+        return True
+
+
+def test_a_close_during_the_wait_ends_the_run_before_its_pass() -> None:
+    server, gh = _Server(), _Gh()
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._poke = _ClosingPoke(watch.close)
+
+    watch.run()
+
+    assert gh.refs == []
 
 
 def test_the_watch_tool_watches_one_reopened_since_its_row_was_closed() -> None:

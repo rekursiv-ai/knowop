@@ -593,6 +593,15 @@ class TestTrackinizerSink:
         sink = FileSink(io.StringIO())
         sink.set_cli_session_id("x")  # Must not raise.
 
+    def test_fail_tells_no_one_on_a_file_sink(self) -> None:
+        """A local FileSink has no server session to end saying why."""
+        buf = io.StringIO()
+        sink = FileSink(buf)
+        sink.fail("exited 1: claude not found")
+        assert buf.getvalue() == ""
+        sink.close()
+        assert buf.closed
+
     def test_flush_holds_until_interval_then_sends(self) -> None:
         """A partial buffer streams once it ages past ``flush_interval_sec``.
 

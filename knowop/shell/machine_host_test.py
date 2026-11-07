@@ -25,6 +25,7 @@ from trackinizer.wire.wire_machine_host import (
 
 import pytest
 
+from knowop.shell import machine_host
 from knowop.shell.machine_host import (
     HOST_CLIS,
     connect,
@@ -409,7 +410,8 @@ def test_lost_contact_is_retried_sooner_at_first_and_never_ends_the_host(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _save()
-    down = ClientError("-> 503", status_code=503)
+    # 500 is the first status past the answers a retry cannot change.
+    down = ClientError("-> 500", status_code=500)
     host = _Host(
         beats=[_REFUSED, down, _REFUSED, _REFUSED, _REFUSED, None, _REFUSED, _REVOKED],
     )
@@ -473,7 +475,7 @@ def test_hours_offline_never_overflow_the_backoff() -> None:
 
 # A 401 before any heartbeat landed is a saved credential the server forgot, which
 # the connect replaces (see the tests of joining again); once serving, it ends the host.
-@pytest.mark.parametrize("status", [401, 404, 422])
+@pytest.mark.parametrize("status", [400, 401, 404, 422, 499])
 def test_an_answer_a_retry_cannot_change_ends_the_host(status: int) -> None:
     _save()
     host = _Host(beats=[None, ClientError(f"-> {status}", status_code=status)])
@@ -799,6 +801,8 @@ def test_host_facts_report_what_the_host_says_about_itself(
 
 
 def test_every_report_of_one_host_names_the_same_start_in_utc() -> None:
+    """Read afresh: another test's report may have cached the start already."""
+    machine_host._started_at.cache_clear()
     started_at = host_facts()["started_at"]
 
     assert isinstance(started_at, str)

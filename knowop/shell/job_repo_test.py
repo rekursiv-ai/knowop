@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Self, cast
 from unittest.mock import Mock
 
+import fcntl
 import hashlib
 import os
 import signal
@@ -494,6 +495,33 @@ def test_removing_a_worktree_deletes_it_and_the_mirrors_record(
 
     assert not (tmp_path / "a").exists()
     assert fake_git.worktrees(mirror) == []
+
+
+def test_a_removal_waits_while_another_host_holds_the_mirrors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other host lets go during the first wait; the removal then goes ahead."""
+    root = tmp_path / "repos"
+    root.mkdir(mode=0o700)
+    held = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    waits: list[float] = []
+
+    def let_go(seconds: float) -> None:
+        waits.append(seconds)
+        os.close(held)
+
+    monkeypatch.setattr(time, "sleep", let_go)
+    (tmp_path / "a").mkdir()
+
+    Repos(root, protocols=_FILE).remove(
+        remote="https://github.com/never/fetched.git",
+        dest=tmp_path / "a",
+    )
+
+    assert waits == [0.05]
+    assert not (tmp_path / "a").exists()
 
 
 def test_git_uses_the_memory_and_time_scope(

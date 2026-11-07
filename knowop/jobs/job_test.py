@@ -301,6 +301,17 @@ def test_a_verb_that_reaches_only_the_server_needs_no_ssh(
     assert world.server.calls == calls
 
 
+def test_secrets_lists_the_names_the_server_holds(
+    world: _Rig,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world.server.names = ["HF_TOKEN", "WANDB_API_KEY"]
+
+    Job.dispatch(JOB_WORD, ["secrets"], world.factory)
+
+    assert capsys.readouterr().out == "HF_TOKEN\nWANDB_API_KEY\n"
+
+
 # -- submit.
 
 
