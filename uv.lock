@@ -2528,7 +2528,7 @@ wheels = [
 [[package]]
 name = "trackinizer"
 version = "0.1.13"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#02bce942116e5beb86aa73c5459b91d4b258dc9a" }
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#fbe43e21a286a366c8c1ab4c58a8c5dbcad494ef" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
