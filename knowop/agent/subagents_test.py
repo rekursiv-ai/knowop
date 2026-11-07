@@ -2,35 +2,36 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, override
 from uuid import UUID, uuid4
 
 from trackinizer.runs.adapters.custom_types import Subagent
+from trackinizer.sagent.session.types import BashResult
+from trackinizer.wire.wire_session_ir import RecordBody
 
 import pytest
 
+from knowop.agent.custom_types import Event
 from knowop.agent.sink import Sink
+from knowop.agent.slash import SlashCommand
 from knowop.agent.subagents import SubagentSinks
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
-    from datetime import datetime
 
     from trackinizer.lib.agent.sessions.tail import Tail
     from trackinizer.runs.adapters.custom_types import Adapter
     from trackinizer.sagent.session.types import EditResult
     from trackinizer.types.streams import TraxRecord
-    from trackinizer.wire.wire_session_ir import RecordBody
-
-    from knowop.agent.custom_types import Event
-    from knowop.agent.slash import SlashCommand
 
 
 _RUN: Path = Path("/projects/-w/s1.jsonl")
 _KID: Path = Path("/projects/-w/s1/subagents/agent-a1.jsonl")
 _GRANDKID: Path = Path("/projects/-w/s1/subagents/agent-a2.jsonl")
+_BODY: RecordBody = RecordBody(idx=0, kind="BashResult", text="")
 
 
 class _Recorded(Sink):
@@ -43,6 +44,11 @@ class _Recorded(Sink):
         log: list[str] | None = None,
     ) -> None:
         self.opened = opened
+        self.opens = True
+        """Whether a flush opens the session; a sink with nothing sent yet has none."""
+        self.emitted: list[Path] = []
+        self.diffs = 0
+        self.run_records = 0
         self.fed: list[tuple[Path, bytes, bool, bool]] = []
         self.observed: list[bool] = []
         self.cli_ids: list[str] = []
@@ -62,7 +68,7 @@ class _Recorded(Sink):
 
     @override
     def open(self) -> str | None:
-        return None
+        return f"opened {self.cli_ids[0]}"
 
     @override
     def set_cli_session_id(self, cli_session_id: str) -> None:
@@ -70,7 +76,13 @@ class _Recorded(Sink):
 
     @override
     def emit(self, adapter_name: str, event: Event) -> None:
-        del adapter_name, event
+        del adapter_name
+        self.emitted.append(event.path)
+
+    @override
+    def emit_run_record(self, event: Event) -> None:
+        del event
+        self.run_records += 1
 
     @override
     def restart(self, path: Path) -> None:
@@ -88,6 +100,7 @@ class _Recorded(Sink):
     @override
     def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
         del records
+        self.diffs += 1
 
     @override
     def feed(
@@ -109,12 +122,16 @@ class _Recorded(Sink):
     @override
     def flush(self) -> None:
         self.flushed += 1
-        if self.opened is None:
+        if self.opened is None and self.opens:
             self.opened = uuid4()
 
     @override
     def pending(self) -> list[tuple[Path, RecordBody]]:
-        return []
+        return [(path, _BODY) for path in self.emitted]
+
+    @override
+    def positions(self) -> dict[Path, int]:
+        return dict.fromkeys(self.emitted, 1)
 
     @override
     def keep_session_open(self) -> None:
@@ -350,6 +367,54 @@ def test_why_the_run_failed_is_said_by_its_own_session_alone() -> None:
         ["exited with status 1"],
         [],
     )
+
+
+def test_each_record_reaches_the_sink_of_the_file_it_came_from() -> None:
+    tree = _Tree()
+    _ = tree.sinks.feed(_agents(), _KID, b"one\n")
+    _ = tree.sinks.feed(_agents(), _RUN, b"hi\n")
+
+    tree.sinks.emit("fake", Event(record=BashResult(call_id="k"), path=_KID))
+    tree.sinks.emit("fake", Event(record=BashResult(call_id="r"), path=_RUN))
+
+    assert tree.children["a1"].emitted == [_KID]
+    assert tree.run.emitted == [_RUN]
+
+
+def test_the_runs_diff_records_and_buffer_are_its_own_sessions() -> None:
+    tree = _Tree()
+    _ = tree.sinks.feed(_agents(), _KID, b"one\n")
+    tree.sinks.emit("fake", Event(record=BashResult(call_id="r"), path=_RUN))
+    tree.sinks.emit("fake", Event(record=BashResult(call_id="k"), path=_KID))
+
+    tree.sinks.emit_worktree_diff(())
+    tree.sinks.emit_run_record(Event(record=BashResult(call_id="x"), path=_RUN))
+    tree.sinks.emit_slash_command(
+        SlashCommand(command="compact"),
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    kid = tree.children["a1"]
+    assert tree.sinks.open() == "opened s1"
+    assert (tree.run.diffs, tree.run.run_records, tree.run.commands) == (1, 1, 1)
+    assert (kid.diffs, kid.run_records, kid.commands) == (0, 0, 0)
+    assert tree.sinks.pending() == [(_RUN, _BODY)]
+    assert tree.sinks.positions() == {_RUN: 1}
+
+
+def test_a_child_whose_session_is_not_open_yet_waits_to_be_linked() -> None:
+    tree = _Tree()
+    _ = tree.sinks.feed(_agents(), _KID, b"one\n")
+    kid = tree.children["a1"]
+    kid.opens = False
+
+    tree.sinks.flush()
+    assert tree.links == []
+    kid.opens = True
+    tree.sinks.flush()
+
+    assert kid.session_id is not None
+    assert tree.links == [(kid.session_id, tree.run.session_id, "Explore: read it")]
 
 
 @pytest.mark.parametrize("seen", [None, "a1"], ids=["first", "child"])

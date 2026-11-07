@@ -20,7 +20,15 @@ import pytest
 
 from knowop.jobs import (
     job as job_commands,
-    job_test,
+)
+from knowop.jobs.conftest import (
+    _COMMIT,
+    _PUBLIC,
+    _TOOLS,
+    _fake_source,
+    _grant,
+    _job,
+    _Rig,
 )
 
 
@@ -31,8 +39,8 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture
-def world() -> job_test._Rig:
-    return job_test._Rig()
+def world() -> _Rig:
+    return _Rig()
 
 
 def test_a_box_credential_sends_only_the_job_control_body() -> None:
@@ -44,7 +52,7 @@ def test_a_box_credential_sends_only_the_job_control_body() -> None:
         request_sizes.append(len(request.content))
         return httpx2.Response(
             201,
-            json=job_test._job().model_dump(mode="json"),
+            json=_job().model_dump(mode="json"),
         )
 
     client = Client("https://jobs.test", api_key=bearer)
@@ -57,12 +65,12 @@ def test_a_box_credential_sends_only_the_job_control_body() -> None:
     with client:
         job = client.job_submit(
             SubmitBody(
-                public_key=job_test._PUBLIC,
+                public_key=_PUBLIC,
                 gpus=1,
                 minutes=10,
                 label="box",
                 argv=["python", "run.py"],
-                commit=job_test._COMMIT,
+                commit=_COMMIT,
             ),
         )
 
@@ -77,21 +85,21 @@ def test_a_box_credential_sends_only_the_job_control_body() -> None:
     ids=["person", "box"],
 )
 def test_large_bundle_and_results_never_enter_server_request_bodies(
-    world: job_test._Rig,
+    world: _Rig,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     api_key: str,
 ) -> None:
-    _ = job_test._fake_source(monkeypatch, tmp_path, size=100_000)
+    _ = _fake_source(monkeypatch, tmp_path, size=100_000)
     target = tmp_path / "results"
     responses: list[BaseModel] = [
-        job_test._job("requested"),
-        GrantStatus(state="ready", grant=job_test._grant()),
-        job_test._job("starting"),
-        job_test._job("queued"),
-        job_test._job("queued"),
+        _job("requested"),
+        GrantStatus(state="ready", grant=_grant()),
+        _job("starting"),
+        _job("queued"),
+        _job("queued"),
         GrantTicket(serial=9),
-        GrantStatus(state="ready", grant=job_test._grant("ro")),
+        GrantStatus(state="ready", grant=_grant("ro")),
     ]
     requests: list[httpx2.Request] = []
     response_sizes: list[int] = []
@@ -118,7 +126,7 @@ def test_large_bundle_and_results_never_enter_server_request_bodies(
         rig = job_commands.Rig(
             client=client,
             runner=world.node,
-            tools=job_test._TOOLS,
+            tools=_TOOLS,
             sleep=world.time.sleep,
             clock=world.time.clock,
         )
@@ -141,14 +149,9 @@ def test_large_bundle_and_results_never_enter_server_request_bodies(
     assert responses == []
     assert max(len(request.content) for request in requests) < 65_536
     assert max(response_sizes) < 65_536
-    assert (
-        SubmitBody.model_validate_json(requests[0].content).commit == job_test._COMMIT
-    )
+    assert SubmitBody.model_validate_json(requests[0].content).commit == _COMMIT
     assert StartBody.model_validate_json(requests[2].content).bundle_bytes == 100_000
-    assert (
-        ReadGrantBody.model_validate_json(requests[5].content).public_key
-        == job_test._PUBLIC
-    )
+    assert ReadGrantBody.model_validate_json(requests[5].content).public_key == _PUBLIC
 
 
 if __name__ == "__main__":

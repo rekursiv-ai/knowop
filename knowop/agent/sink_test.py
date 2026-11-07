@@ -15,7 +15,6 @@ import io
 import json
 import threading
 
-from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix.follow import follow_tree
 from trackinizer.runs.adapters.claude import ClaudeAdapter
@@ -50,7 +49,7 @@ from trackinizer.sagent.session.types import (
     WriteResult,
 )
 from trackinizer.types.line_capture import LineCapture
-from trackinizer.types.session_records import _BY_KIND, SessionRecordRow
+from trackinizer.types.session_records import _BY_KIND
 from trackinizer.types.streams import Stderr, Stdin, Stdout
 from trackinizer.wire.wire_session_ir import (
     AppendRecordsRequest,
@@ -67,10 +66,17 @@ from trackinizer.wire.wire_sessions import (
 )
 from treekle import from_plain, immutable, json_loads
 
-import httpx2
 import pytest
 
 from knowop.agent import truncate
+from knowop.agent.conftest import (
+    _PART,
+    _SMALL_PROXY_LIMIT,
+    _WORKER_LOG,
+    _BlockingSink,
+    _Server,
+    _uncut,
+)
 from knowop.agent.custom_types import Event
 from knowop.agent.sink import (
     FileSink,
@@ -94,23 +100,9 @@ if TYPE_CHECKING:
     from trackinizer.types.streams import TraxRecord
 
 
-_PART = Path("/sessions/a.jsonl")
 _OTHER = Path("/sessions/b.jsonl")
 _AT = datetime(2026, 6, 1, tzinfo=UTC)
 
-_PROXY_LIMIT: Final = 8_000_000
-"""The live proxy's request-body cap: Caddy's ``8MB`` counts decimal megabytes."""
-
-_SMALL_PROXY_LIMIT: Final = 32_000
-"""A scaled proxy bound for fast tests of oversized-record truncation."""
-
-_WORKER_LOG: Final = (
-    '\x1b[2K\r\x1b[36m[w3]\x1b[0m \x1b[2m22:45:01\x1b[0m\t{"step":120,"loss":0.25}'
-    " \x1b[32m━━━━\x1b[0m\x1b[1A" + "\x00" * 28 + "\n"
-)
-"""One line of the worker logs a scientist read in bulk: a progress bar, then the
-NUL padding of a preallocated log. Each control character takes six bytes on the
-wire, which is how ~1 MB of output became an 11.39 MB record."""
 
 _OVER_THE_LIMIT: Final = '\x00\x1b[0m"' * 5_000
 """Text oversized against the scaled proxy bound used in truncation tests."""
@@ -2113,75 +2105,6 @@ class TestAttachedRun:
         assert client.started[0].attach is None
 
 
-class _BlockingSink(Sink):
-    """A sink whose ``flush`` blocks until released, logging call spans.
-
-    Records ``("op", "enter"/"exit")`` for each call so a test can prove the
-    lock serializes overlapping calls from different threads: a serialized run
-    never interleaves a second call's ``enter`` between the first call's
-    ``enter`` and ``exit``.
-    """
-
-    def __init__(self, release: threading.Event) -> None:
-        self._release = release
-        self.entered = threading.Event()
-        self.log: list[tuple[str, str]] = []
-        self._lock = threading.Lock()
-
-    @property
-    @override
-    def session_id(self) -> UUID | None:
-        return None
-
-    @override
-    def open(self) -> str | None:
-        return None
-
-    @override
-    def set_cli_session_id(self, cli_session_id: str) -> None:
-        del cli_session_id
-
-    def _record(self, op: str, phase: str) -> None:
-        with self._lock:
-            self.log.append((op, phase))
-
-    @override
-    def restart(self, path: Path) -> None:
-        del path
-        self._record("restart", "enter")
-        self._record("restart", "exit")
-
-    @override
-    def emit(self, adapter_name: str, event: Event) -> None:
-        del adapter_name, event
-        self._record("emit", "enter")
-        self._record("emit", "exit")
-
-    @override
-    def emit_slash_command(self, command: SlashCommand, at: datetime) -> None:
-        del command, at
-
-    @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
-        del records
-
-    @override
-    def flush(self) -> None:
-        self._record("flush", "enter")
-        self.entered.set()
-        self._release.wait(5.0)
-        self._record("flush", "exit")
-
-    @override
-    def pending(self) -> list[tuple[Path, RecordBody]]:
-        return []
-
-    @override
-    def close(self) -> None:
-        self._record("close", "enter")
-        self._record("close", "exit")
-
-
 class TestWrappedSinksSendEachFilesEncoding:
     """A synced run tells the server how each file spells its bytes.
 
@@ -2912,63 +2835,6 @@ def _stored_by(client: _FakeClient) -> str:
     bodies = [body for _, _, batch, _ in client.appended for body in batch]
     return "".join(body.model_dump_json() for body in bodies) + "".join(
         body.model_dump_json() for body in client.slash
-    )
-
-
-class _Server:
-    """Answers as Trackinizer does, behind a proxy with a byte limit."""
-
-    def __init__(self, *, proxy_limit: int = _PROXY_LIMIT) -> None:
-        self.session_id = uuid4()
-        self.proxy_limit = proxy_limit
-        self.uploads: list[bytes] = []
-        self.down = False
-        self.ended = False
-        self.uploaded = threading.Event()
-
-    def client(self) -> Client:
-        """Return a real client whose requests reach this server and nothing else."""
-        client = Client("http://server")
-        client._http.close()
-        client._http = httpx2.Client(
-            base_url=client.base_url,
-            transport=httpx2.MockTransport(self._answer),
-        )
-        return client
-
-    def records(self) -> list[RecordBody]:
-        """Return every record body uploaded, in order."""
-        return [
-            body
-            for upload in self.uploads
-            for body in AppendRecordsRequest.model_validate_json(upload).records
-        ]
-
-    def read_back(self) -> list[TraxRecord]:
-        """Return every uploaded record as a server reader decodes it."""
-        return [body.row(self.session_id, 0).record() for body in self.records()]
-
-    def _answer(self, request: httpx2.Request) -> httpx2.Response:
-        if self.down:
-            return httpx2.Response(502, text="Bad Gateway")
-        if len(request.content) > self.proxy_limit:
-            return httpx2.Response(413, text="Request Entity Too Large")
-        path = request.url.path
-        if path.endswith("/records"):
-            self.uploads.append(request.content)
-            self.uploaded.set()
-            return httpx2.Response(200, json={"written": 0, "skipped": 0})
-        if path.endswith("/start"):
-            return httpx2.Response(200, json={"id": str(self.session_id), "seq": 0})
-        if path.endswith("/end"):
-            self.ended = True
-        return httpx2.Response(200, json={"id": str(self.session_id)})
-
-
-def _uncut(record: TraxRecord) -> RecordBody:
-    """Return the wire body ``record`` had before capture bounded records."""
-    return RecordBody.of(
-        SessionRecordRow.of(session_id=uuid4(), part=0, idx=0, record=record),
     )
 
 

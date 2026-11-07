@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, cast, override
+from typing import TYPE_CHECKING, Self, cast
 from unittest.mock import Mock
 
 import hashlib
@@ -17,6 +17,7 @@ import time
 import pytest
 
 from knowop.shell import job_repo
+from knowop.shell.conftest import _SetOnceHeld, _unscoped
 from knowop.shell.job_repo import FetchError, Repos
 
 
@@ -243,19 +244,6 @@ def _capture_run(
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert env["SSH_ASKPASS_REQUIRE"] == "never"
     return argv, env
-
-
-def _unscoped(
-    *,
-    unit: str,
-    memory_mb: int,
-    argv: Sequence[str],
-    runtime_sec: float | None = None,
-) -> list[str]:
-    assert unit.startswith("knowop-prepare-")
-    assert memory_mb == 256
-    assert runtime_sec is not None
-    return list(argv)
 
 
 @pytest.fixture(autouse=True)
@@ -761,19 +749,6 @@ def test_a_preparation_cancelled_before_it_holds_the_mirrors_runs_no_git(
             dest=tmp_path / "s",
             cancel=cancel,
         )
-
-
-class _SetOnceHeld(threading.Event):
-    """A cancel that is clear when the mirrors' lock is taken, and set from then on."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.asked = 0
-
-    @override
-    def is_set(self) -> bool:
-        self.asked += 1
-        return self.asked > 1
 
 
 def test_a_preparation_cancelled_while_git_runs_stops_it(

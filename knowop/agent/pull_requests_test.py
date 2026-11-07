@@ -13,6 +13,7 @@ import json
 
 import pytest
 
+from knowop.agent import pull_requests
 from knowop.agent.pull_requests import (
     HOLD_SEC,
     GhError,
@@ -180,6 +181,42 @@ def test_run_gh_says_so_when_gh_cannot_start(
     out = run_gh(["pr", "view"], tmp_path)
     assert out.returncode == -1
     assert out.stderr.startswith("gh did not start")
+
+
+def test_run_gh_runs_the_gh_on_the_path_without_a_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _gh_script(tmp_path, 'echo "$PWD $* $GH_PROMPT_DISABLED"; echo no >&2; exit 3')
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+
+    out = run_gh(["pr", "view"], tmp_path)
+
+    assert out == GhOutput(
+        returncode=3,
+        stdout=f"{tmp_path.resolve()} pr view 1\n",
+        stderr="no\n",
+    )
+
+
+def test_run_gh_gives_up_on_a_gh_that_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _gh_script(tmp_path, "exec sleep 30")
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+    monkeypatch.setattr(pull_requests, "GH_SEC", 0.05)
+
+    out = run_gh(["pr", "view"], tmp_path)
+
+    assert out == GhOutput(returncode=-1, stdout="", stderr="gh took over 0s")
+
+
+def _gh_script(folder: Path, body: str) -> None:
+    """Put a ``gh`` that runs ``body`` in ``folder``."""
+    gh = folder / "gh"
+    gh.write_text(f"#!/bin/sh\n{body}\n")
+    gh.chmod(0o755)
 
 
 def test_a_failure_is_named_once_per_head() -> None:

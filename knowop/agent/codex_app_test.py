@@ -13,7 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from functools import partial
 from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, TypedDict, cast
+from typing import TYPE_CHECKING, Final, cast
 from unittest.mock import AsyncMock, patch
 
 import asyncio
@@ -30,7 +30,7 @@ from trackinizer.runs.asks import (
     Resolved,
     StateChanged,
 )
-from treekle import PlainTree, from_plain, json_dumps, json_loads
+from treekle import PlainTree, from_plain
 
 import pytest
 
@@ -39,32 +39,32 @@ from knowop.agent.codex_app import (
     CodexAppError,
 )
 from knowop.agent.codex_app_fake import serve
-from knowop.shell.exec_command_test import _process, _signal_process
+from knowop.agent.conftest import (
+    _FAKE,
+    _THIS,
+    _THREAD,
+    _TURN,
+    _ask,
+    _asked,
+    _collect,
+    _command,
+    _Event,
+    _Frame,
+    _next,
+    _Rig,
+    _signal_app,
+    _Tree,
+)
+from knowop.shell.conftest import _process
 
 
-_THIS: Final = Path(__file__).resolve()
 _CWD: Final = _THIS.parent
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Coroutine, Mapping, Sequence
+    from collections.abc import Sequence
 
-    from knowop.shell.exec_command_test import _Process
+    from knowop.shell.conftest import _Process
 
-
-type _Event = Ask | Resolved | StateChanged
-_Tree = dict[str, PlainTree]
-type _Frame = _Tree | str
-type _Frames = Mapping[str, Sequence[_Frame]]
-
-_FAKE: Final = _THIS.with_name("codex_app_fake.py")
-_THREAD: Final = "thr_1"
-_TURN: Final = "turn_1"
-
-_REPLIES: Final[dict[str, _Tree]] = {
-    "thread/start": {"thread": {"id": _THREAD}},
-    "thread/resume": {"thread": {"id": _THREAD}},
-    "turn/start": {"turn": {"id": _TURN}},
-}
 
 _AMEND: Final[PlainTree] = {
     "acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["touch"]},
@@ -125,19 +125,6 @@ def _answer_app(process: _Process, script: Path, cwd: Path, data: bytes) -> None
         process.stderr.feed_eof()
 
 
-def _signal_app(processes: dict[int, _Process], pgid: int, signum: int) -> None:
-    process = processes[pgid]
-    if process.returncode is not None:
-        raise ProcessLookupError
-    if signum:
-        _signal_process(process, signum)
-
-
-def _amend() -> PlainTree:
-    """Return a fresh amendment decision: ``to_plain`` writes a shared one as a ref."""
-    return {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": ["touch"]}}
-
-
 def _status(*flags: str, kind: str = "active") -> _Tree:
     """Return a ``thread/status/changed`` frame; only an active status has flags."""
     status: _Tree = {"type": kind}
@@ -152,25 +139,6 @@ def _status(*flags: str, kind: str = "active") -> _Tree:
 def _turn(method: str, turn: str) -> _Tree:
     """Return a ``turn/started`` or ``turn/completed`` frame."""
     return {"method": method, "params": {"threadId": _THREAD, "turn": {"id": turn}}}
-
-
-def _command(request_id: int = 0, **extra: PlainTree) -> _Tree:
-    return {
-        "method": "item/commandExecution/requestApproval",
-        "id": request_id,
-        "params": {
-            "kind": "command",
-            "threadId": _THREAD,
-            "turnId": _TURN,
-            "itemId": "item_1",
-            "startedAtMs": 1,
-            "reason": "Outside the workspace",
-            "command": "touch /x",
-            "cwd": "/w",
-            "availableDecisions": ["accept", _amend(), "cancel"],
-            **extra,
-        },
-    }
 
 
 def _item_started(kind: str, changes: Sequence[_Tree] | None = ()) -> _Tree:
@@ -277,147 +245,11 @@ def _resolved(request_id: int) -> _Tree:
     }
 
 
-class _Call(TypedDict):
-    """A request sent by the driver to the app-server."""
-
-    id: int
-    method: str
-    params: _Tree
-
-
-class _Rig:
-    """A driver wired to a scripted fake app-server, and the log of what it sent."""
-
-    def __init__(
-        self,
-        tmp_path: Path,
-        *,
-        replies: Mapping[str, PlainTree] | None = None,
-        after: _Frames | None = None,
-        on_response: _Frames | None = None,
-        argv: tuple[str, ...] | None = None,
-    ) -> None:
-        self.log = tmp_path / "frames.jsonl"
-        self.log.touch()
-        script = tmp_path / "script.json"
-        script.write_text(
-            json_dumps(
-                {
-                    "log": str(self.log),
-                    "replies": {**_REPLIES, **(replies or {})},
-                    "after": after or {},
-                    "on_response": on_response or {},
-                },
-            ),
-        )
-        self.cwd = tmp_path
-        self.argv = argv or (sys.executable, str(_FAKE), str(script))
-        self.driver = CodexAppDriver(argv=self.argv)
-
-    async def start(
-        self,
-        *,
-        resume: str = "",
-        model: str = "",
-        effort: str = "",
-    ) -> str:
-        return await self.driver.start(
-            cwd=self.cwd,
-            resume=resume,
-            model=model,
-            effort=effort,
-        )
-
-    def frames(self) -> list[_Tree]:
-        return [
-            from_plain(json_loads(line), _Tree)
-            for line in self.log.read_text().splitlines()
-        ]
-
-    def called(self, method: str) -> list[_Call]:
-        """Return the requests of ``method`` the driver sent, as whole frames."""
-        return [
-            from_plain(each, _Call)
-            for each in self.frames()
-            if each.get("method") == method
-        ]
-
-    def params(self, method: str) -> _Tree:
-        """Return the params of the first request of ``method`` the driver sent."""
-        return from_plain(self.called(method)[0]["params"], _Tree)
-
-    def methods(self) -> list[str]:
-        return [
-            from_plain(each.get("method"), str, default="") for each in self.frames()
-        ]
-
-    def response(self, request_id: int) -> PlainTree:
-        """Return the result the driver sent to the server request ``request_id``."""
-        frame = next(
-            each
-            for each in self.frames()
-            if each.get("id") == request_id and "method" not in each
-        )
-        return frame.get("result", frame.get("error"))
-
-    def run[T](self, scenario: Coroutine[object, object, T]) -> T:
-        """Run ``scenario`` to its end and reap the app-server, whatever it did."""
-
-        async def bounded() -> T:
-            try:
-                return await asyncio.wait_for(scenario, 10)
-            finally:
-                await self.driver.stop()
-
-        return asyncio.run(bounded())
-
-    async def sent(self, frames: int) -> None:
-        """Wait until the fake has logged ``frames`` frames."""
-        while len(self.log.read_text().splitlines()) < frames:  # noqa: ASYNC110 -- The fake is another process; only its log file says what it got.
-            await asyncio.sleep(0.002)
-
-
-async def _next(events: AsyncIterator[_Event]) -> _Event:
-    return await asyncio.wait_for(anext(events), 5)
-
-
-async def _ask(events: AsyncIterator[_Event]) -> Ask:
-    """Return the next ask, skipping the state changes before it."""
-    while True:
-        event = await _next(events)
-        if isinstance(event, Ask):
-            return event
-
-
 def _seen_kind[T: Ask | Resolved | StateChanged](
     seen: list[_Event],
     kind: type[T],
 ) -> list[T]:
     return [each for each in seen if isinstance(each, kind)]
-
-
-async def _collect(events: AsyncIterator[_Event]) -> list[_Event]:
-    return [each async for each in events]
-
-
-async def _asked(
-    rig: _Rig,
-    *,
-    option: str,
-    updated_input: dict[str, PlainTree] | None = None,
-    stop_after: int = 5,
-) -> tuple[Ask, list[_Event]]:
-    """Run a turn that asks, answer its first ask, and return it with the events after."""
-    await rig.start()
-    events = rig.driver.events()
-    await rig.driver.send_line("go")
-    ask = await _ask(events)
-    await rig.driver.answer(
-        Answer(ask_id=ask.id, option=option, updated_input=updated_input, who="jp"),
-    )
-    await rig.sent(stop_after)
-    await rig.driver.stop()
-    return ask, await _collect(events)
 
 
 async def _stopped(rig: _Rig) -> None:
@@ -1091,6 +923,17 @@ _HI: Final = _change("/x/a.txt", "add", "hi\n")
         ([], ""),
         ([_item_started("commandExecution", [_HI])], ""),
         ([_item_started("fileChange", [_HI]), _item_completed()], ""),
+        # A notification the driver does not follow changes nothing it tracks.
+        (
+            [
+                _item_started("fileChange", [_HI]),
+                {
+                    "method": "account/rateLimits/updated",
+                    "params": dict[str, PlainTree](),
+                },
+            ],
+            "/x/a.txt (add)\nhi\n",
+        ),
     ],
 )
 def test_a_file_change_ask_carries_the_diff_its_item_started_with(

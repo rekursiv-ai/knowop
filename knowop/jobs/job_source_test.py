@@ -17,6 +17,7 @@ from trackinizer.client.errors import ClientError
 import pytest
 
 from knowop.jobs import job_source
+from knowop.jobs.conftest import _done
 from knowop.jobs.job_source import Git, Snapshot
 
 
@@ -1035,15 +1036,6 @@ def test_missing_git_is_a_plain_tool_error(
     with pytest.raises(ClientError, match="git was not found on PATH"):
         Git(cwd=repo, env={})("status")
     git.assert_not_called()
-
-
-def _done(
-    stdout: bytes = b"",
-    *,
-    code: int = 0,
-    stderr: bytes = b"",
-) -> CompletedProcess[bytes]:
-    return CompletedProcess([], code, stdout, stderr)
 
 
 if __name__ == "__main__":

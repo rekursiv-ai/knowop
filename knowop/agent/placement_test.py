@@ -14,6 +14,7 @@ from trackinizer.wire.wire_sessions import SessionPlacement
 import pytest
 
 from knowop.agent import placement
+from knowop.agent.conftest import _CANVAS, _SESSION, _Client
 from knowop.agent.placement import (
     chat_placement,
     git_ref,
@@ -30,21 +31,7 @@ if TYPE_CHECKING:
     from treekle import PlainTree
 
 
-_CANVAS = UUID(int=5)
-_SESSION = UUID(int=1)
 _WORKSPACE = UUID(int=2)
-
-
-class _Client:
-    def __init__(self, *, fail: bool = False) -> None:
-        self.asked: list[tuple[str, object]] = []
-        self._fail = fail
-
-    def post(self, path: str, *, body: object = None) -> dict[str, str]:
-        self.asked.append((path, body))
-        if self._fail:
-            raise ClientError("404 Not Found")
-        return {"workspace_id": str(UUID(int=2))}
 
 
 class _Lister:

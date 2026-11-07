@@ -10,7 +10,6 @@ import subprocess
 import time
 
 from trackinizer.lib.userdirs import state_dir
-from trackinizer.wire.wire_sessions import InboundDrainItem
 
 from knowop.agent.clicked_runs import (
     MOST_RUNNING,
@@ -20,18 +19,17 @@ from knowop.agent.clicked_runs import (
     Ended,
     wake_text,
 )
+from knowop.agent.conftest import ME, _click, _lines, _runs
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Iterator, Mapping
     from pathlib import Path
 
     from trackinizer.sagent.session.types import SystemMessage
+    from trackinizer.wire.wire_sessions import InboundDrainItem
 
     import pytest
-
-
-ME = "dan@x"
 
 
 class TestAClickedCommand:
@@ -95,6 +93,31 @@ class TestAClickedCommand:
         [line] = _lines(runs)
 
         assert 'signal="TERM"' in line.text
+        assert 'stopped-by="ann@x"' in line.text
+        assert _run(records[-1])["stopped_by"] == "ann@x"
+
+    def test_a_stop_for_a_command_not_running_changes_nothing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        records: list[SystemMessage] = []
+        runs = _runs(tmp_path, records)
+
+        runs.handle(_click("7" * 32, "stop", stop=True, by="ann@x"))
+
+        assert records == []
+        assert runs.take() == []
+        assert not runs.running()
+
+    def test_a_second_stop_keeps_who_stopped_it_first(self, tmp_path: Path) -> None:
+        records: list[SystemMessage] = []
+        runs = _runs(tmp_path, records)
+        runs.handle(_click("8" * 32, "sleep 30"))
+
+        runs.handle(_click("8" * 32, "stop", stop=True, by="ann@x"))
+        runs.handle(_click("8" * 32, "stop", stop=True, by="bob@x"))
+        [line] = _lines(runs)
+
         assert 'stopped-by="ann@x"' in line.text
         assert _run(records[-1])["stopped_by"] == "ann@x"
 
@@ -244,6 +267,24 @@ class TestWakeText:
             f"</{RUN_SOURCE}>",
         ]
 
+    def test_a_signal_with_no_name_is_given_by_its_number(self) -> None:
+        """A real-time signal past ``SIGRTMIN`` has no name of its own."""
+        text = wake_text(
+            Ended(
+                run_id="9" * 32,
+                command="true",
+                by=ME,
+                seconds=1.0,
+                code=-40,
+                stdout="",
+                stderr="",
+            ),
+        )
+
+        assert text.splitlines()[0] == (
+            f'<{RUN_SOURCE} id="{"9" * 32}" signal="40" seconds="1.0" by="{ME}">'
+        )
+
 
 def _publish_step(
     *,
@@ -266,55 +307,10 @@ def _publish_step(
     raise subprocess.TimeoutExpired(["/bin/sh", "-c", command], timeout)
 
 
-def _runs(
-    cwd: Path,
-    records: list[SystemMessage],
-    *,
-    env: Mapping[str, str] | None = None,
-    shell_path: str = "/bin/sh",
-    publish: Callable[[str, str], None] | None = None,
-) -> ClickedRuns:
-    """Return runs whose records go to ``records``, looking at output every 5 ms."""
-    return ClickedRuns(
-        record=records.append,
-        cwd=cwd,
-        env={"PATH": "/usr/bin:/bin", **(env or {})},
-        shell_path=shell_path,
-        publish=publish,
-        publish_sec=0.005,
-    )
-
-
 def _refuse(run_id: str, text: str) -> None:
     """Fail to show output, as a server that is down does."""
     del run_id, text
     raise ConnectionError("server down")
-
-
-def _click(
-    run_id: str,
-    command: str,
-    *,
-    stop: bool = False,
-    by: str = ME,
-) -> InboundDrainItem:
-    """Return the ``run`` message a click on ``command`` drains as."""
-    return InboundDrainItem(
-        text=command,
-        kind="run",
-        payload={"run_id": run_id, "block": "line-1:0", "stop": stop},
-        source=by,
-    )
-
-
-def _lines(runs: ClickedRuns) -> list[InboundDrainItem]:
-    """Return the next lines due, waiting for them while a command runs."""
-    deadline = time.monotonic() + 5.0
-    while not (lines := runs.take()) and runs.running():
-        if time.monotonic() > deadline:
-            raise AssertionError("A clicked command did not end within 5 s.")
-        time.sleep(0.001)
-    return lines
 
 
 # A test that returns with a command still running leaves its wait thread to read the

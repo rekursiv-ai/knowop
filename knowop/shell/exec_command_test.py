@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from asyncio.subprocess import Process
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, Unpack, cast
 from typing_extensions import TypedDict
 from unittest.mock import AsyncMock, Mock
@@ -23,6 +24,7 @@ from trackinizer.wire.wire_exec import (
 
 import pytest
 
+from knowop.shell.conftest import _kill_group, _Process, _process
 from knowop.shell.exec_command import (
     _supervise,
     run_command,
@@ -34,9 +36,6 @@ from knowop.shell.exec_stream import Cut
 if TYPE_CHECKING:
     from asyncio import Future
     from collections.abc import Awaitable, Iterable
-    from pathlib import Path
-
-    from trackinizer.mock_test_support import AsyncMockProtocol, MockProtocol
 
 
 @pytest.fixture(autouse=True)
@@ -154,6 +153,94 @@ def test_a_home_folder_of_a_user_this_machine_lacks_runs_nothing(
     start.assert_not_called()
 
 
+def test_a_folder_that_does_not_exist_runs_nothing(tmp_path: Path) -> None:
+    missing = tmp_path / "nowhere"
+
+    result = asyncio.run(run_command(_request(f"touch {tmp_path}/ran", cwd=missing)))
+
+    assert result.exit_code == 1
+    assert _err(result) == f"{missing} is not a folder on this machine\n".encode()
+    assert result.cwd == str(missing)
+    assert not (tmp_path / "ran").exists()
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (PermissionError(13, "Permission denied"), 126),
+        (FileNotFoundError(2, "No such file or directory"), 127),
+        (OSError(12, "Cannot allocate memory"), 126),
+    ],
+)
+def test_a_command_that_cannot_spawn_reports_why_and_leaks_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: OSError,
+    code: int,
+) -> None:
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(side_effect=error))
+    before = _open_descriptors()
+
+    result = asyncio.run(run_command(_request("true", cwd=tmp_path)))
+
+    assert result.exit_code == code
+    assert b"cannot start the command" in _err(result)
+    assert error.strerror is not None
+    assert error.strerror.encode() in _err(result)
+    assert result.cwd == str(tmp_path)
+    assert _open_descriptors() == before
+
+
+def test_the_requests_standard_input_is_written_then_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result, process, _ = asyncio.run(
+        _run_reply(
+            _request("cat", cwd=tmp_path, stdin=b"fed\n"),
+            monkeypatch=monkeypatch,
+            stdout=b"fed\n",
+        ),
+    )
+
+    assert (result.exit_code, _out(result)) == (0, b"fed\n")
+    process.stdin.write.assert_called_once_with(b"fed\n")
+    process.stdin.drain.assert_awaited_once_with()
+    process.stdin.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize("error", [BrokenPipeError, ConnectionResetError])
+def test_a_command_that_stops_reading_its_input_still_reports(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: type[OSError],
+) -> None:
+    """``head -c 1`` exits after one byte; the rest of the input has nowhere to go."""
+    result, process = asyncio.run(
+        _run_refusing_input(
+            _request("head -c 1", cwd=tmp_path, stdin=b"fed\n"),
+            monkeypatch=monkeypatch,
+            error=error,
+        ),
+    )
+
+    assert (result.exit_code, _out(result)) == (0, b"f")
+    process.stdin.close.assert_called_once_with()
+
+
+async def _run_refusing_input(
+    request: ExecRequest,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    error: type[OSError],
+) -> tuple[ExecResult, _Process]:
+    process = _process(stdout=b"f")
+    process.stdin.drain.side_effect = error
+    start = AsyncMock(return_value=cast(Process, process))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start)
+    return await run_command(request), process
+
+
 def test_a_command_started_without_its_pipes_is_refused(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="started without its pipes"):
         asyncio.run(_supervise_without_pipes(tmp_path))
@@ -226,58 +313,6 @@ async def _hand_over(
     return cast(Process, process)
 
 
-class _Stdin(Protocol):
-    write: MockProtocol[object]
-    close: MockProtocol[object]
-    drain: AsyncMockProtocol[object]
-
-
-class _Process(Mock):
-    pid: int
-    returncode: int | None
-    stdin: _Stdin
-    stdout: asyncio.StreamReader
-    stderr: asyncio.StreamReader
-    wait: AsyncMockProtocol[object]
-    send_signal: MockProtocol[None]
-
-
-def _process(
-    *,
-    stdout: bytes = b"",
-    stderr: bytes = b"",
-    code: int | None = 0,
-) -> _Process:
-    out, err = asyncio.StreamReader(), asyncio.StreamReader()
-    out.feed_data(stdout)
-    err.feed_data(stderr)
-    if code is not None:
-        out.feed_eof()
-        err.feed_eof()
-    process = _Process(
-        spec=Process,
-        pid=7,
-        returncode=code,
-        stdin=Mock(spec=asyncio.StreamWriter, drain=AsyncMock()),
-        stdout=out,
-        stderr=err,
-        wait=AsyncMock(side_effect=AssertionError("The pipe-bound wait was used.")),
-    )
-    process.send_signal.side_effect = partial(_signal_process, process)
-    return process
-
-
-def _signal_process(process: _Process, signum: int) -> None:
-    process.returncode = -signum
-    process.stdout.feed_eof()
-    process.stderr.feed_eof()
-
-
-def _kill_group(process: _Process, pgid: int, signum: int) -> None:
-    assert pgid == process.pid
-    _signal_process(process, signum)
-
-
 class _WaitOptions(TypedDict, total=False, closed=True):
     timeout: float | None
     return_when: str
@@ -339,14 +374,26 @@ async def _supervise_without_pipes(cwd: Path) -> None:
         )
 
 
-def _request(command: str, *, cwd: Path | str, timeout_sec: float = 10) -> ExecRequest:
+def _request(
+    command: str,
+    *,
+    cwd: Path | str,
+    timeout_sec: float = 10,
+    stdin: bytes | None = None,
+) -> ExecRequest:
     return ExecRequest.model_construct(
         command=command,
         cwd=str(cwd),
         timeout_sec=timeout_sec,
-        stdin_b64=None,
+        stdin_b64=None if stdin is None else base64.b64encode(stdin).decode(),
         env=None,
     )
+
+
+# ``/dev/fd`` lists this process's descriptors on Linux and macOS alike; ``/proc``
+# exists on Linux alone.
+def _open_descriptors() -> int:
+    return len(list(Path("/dev/fd").iterdir()))
 
 
 def _out(result: ExecResult) -> bytes:
