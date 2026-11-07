@@ -135,19 +135,20 @@ def test_read_sorts_checks_into_passed_failed_and_pending() -> None:
             _check("slow", status="IN_PROGRESS", conclusion=""),
             _status("ci/circleci", "ERROR"),
             _status("deploy", "PENDING"),
+            _status("docs", "SUCCESS"),
         ],
     )
     assert pull_request.failed == ("CI / unit", "e2e", "ci/circleci")
     assert pull_request.pending == ("CI / slow", "deploy")
     # A cancelled run is a newer push's doing, not a failure of this head.
-    assert pull_request.passed == 3
-    assert pull_request.total == 9
+    assert pull_request.passed == 4
+    assert pull_request.total == 10
     assert pull_request.repo == "acme/app"
     assert pull_request.app()["checks"] == {
-        "passed": 3,
+        "passed": 4,
         "failed": ["CI / unit", "e2e", "ci/circleci"],
         "pending": ["CI / slow", "deploy"],
-        "total": 9,
+        "total": 10,
     }
 
 
@@ -173,6 +174,47 @@ def test_read_sorts_checks_into_passed_failed_and_pending() -> None:
 def test_read_says_why_it_found_no_pull_request(out: GhOutput, said: str) -> None:
     with pytest.raises(GhError, match=said):
         _ = read_pull_request(_Gh(out), Path("/work"), ref=_URL)
+
+
+def test_read_keeps_what_github_says_of_the_pull_request() -> None:
+    assert _pull_request(
+        title="Fix it",
+        draft=True,
+        additions=12,
+        deletions=4,
+        mergeable="CONFLICTING",
+        review="APPROVED",
+    ).app() == {
+        "url": _URL,
+        "repo": "acme/app",
+        "number": 7,
+        "title": "Fix it",
+        "state": "OPEN",
+        "draft": True,
+        "head": "agent/fix",
+        "head_sha": _SHA,
+        "base": "main",
+        "additions": 12,
+        "deletions": 4,
+        "mergeable": "CONFLICTING",
+        "review": "APPROVED",
+        "checks": {"passed": 0, "failed": [], "pending": [], "total": 0},
+    }
+
+
+def test_read_says_why_in_a_few_hundred_characters_at_most() -> None:
+    """A field of the wrong type is no pull request; why is cut, not dropped."""
+    misread = _Gh(GhOutput(returncode=0, stdout=_view(number="x" * 500), stderr=""))
+    with pytest.raises(GhError) as printed:
+        _ = read_pull_request(misread, Path("/work"))
+    assert str(printed.value).startswith("gh printed no pull request: ")
+    assert len(str(printed.value)) == 300
+
+    url = f"https://x.test/{'p' * 300}"
+    foreign = _Gh(GhOutput(returncode=0, stdout=_view(url=url), stderr=""))
+    with pytest.raises(GhError) as named:
+        _ = read_pull_request(foreign, Path("/work"))
+    assert str(named.value) == f"gh named no GitHub pull request: {url[:200]}"
 
 
 def test_run_gh_says_so_when_gh_cannot_start(

@@ -307,7 +307,7 @@ def read_pull_request(run: GhRunner, cwd: Path, *, ref: str = "") -> PullRequest
         deletions=view["deletions"],
         mergeable=view["mergeable"],
         review=view["review"],
-        passed=len(verdicts) - len(failed) - len(pending),
+        passed=sum(verdict == "passed" for verdict, _ in verdicts),
         failed=_names(failed),
         pending=_names(pending),
         waiting=_names(check for check in failed if check["workflow"] in running),
