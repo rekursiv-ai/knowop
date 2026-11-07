@@ -126,6 +126,17 @@ def test_a_pull_request_of_another_head_keeps_the_branch_looked_for() -> None:
     assert said == []
 
 
+def test_the_default_branch_is_never_looked_for() -> None:
+    gh, git = _Gh(), _Git(branch="main")
+    lookup = _lookup(gh, git, list[str]())
+    lookup.note(anyone=True)
+    git.branch = "b1"
+    lookup.note(anyone=True)
+    (found,) = lookup.found()
+    assert found.startswith("https://github.com/acme/app/pull/")
+    assert gh.asked == ["b1"]
+
+
 def test_a_failure_other_than_no_pull_request_is_said() -> None:
     gh, git, said = _Gh(error="HTTP 502\n"), _Git(), list[str]()
     lookup = _lookup(gh, git, said)

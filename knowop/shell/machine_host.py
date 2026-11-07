@@ -437,7 +437,8 @@ def _retry_delay(err: ClientError, *, failures: int) -> float:
     if err.status_code is not None and 400 <= err.status_code < 500:
         raise err
     echo(f"knowop: retrying after failure {failures}: {err}", err=True)
-    return min(2.0 ** min(failures, 4), float(HEARTBEAT_SEC))
+    cap = 4  # pragma: no mutate -- any cap past log2(HEARTBEAT_SEC) waits the same.
+    return min(2.0 ** min(failures, cap), float(HEARTBEAT_SEC))
 
 
 def _join(

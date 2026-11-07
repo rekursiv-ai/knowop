@@ -478,6 +478,23 @@ class TestTrustGate:
         assert not gate.answer({"prompt_id": None, "decision": "allow"})
         assert records == []
 
+    def test_a_card_is_stamped_now_in_utc_by_default(self) -> None:
+        records: list[SystemMessage] = []
+        gate = TrustGate(
+            emit=records.append,
+            pending=threading.Event(),
+            ready=lambda: False,
+            rearm=lambda: None,
+        )
+        before = datetime.now(UTC)
+        gate.open("claude", "/work", machine=None, remembered=True)
+
+        (record,) = records
+        assert record.timestamp is not None
+        stamped = datetime.fromisoformat(record.timestamp)
+        assert stamped.tzinfo == UTC
+        assert before <= stamped <= datetime.now(UTC)
+
     def test_a_decision_that_is_neither_types_nothing(self) -> None:
         card = _Card()
 

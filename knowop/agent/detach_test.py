@@ -401,6 +401,60 @@ def test_a_failed_spawn_closes_both_ends_of_the_ready_pipe(
             _ = os.fstat(fd)
 
 
+def test_run_host_reads_the_payload_closes_it_and_runs_its_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The child rebuilds its start from the request's run, and hosts with it."""
+    request = HostRequest(
+        paths=str(tmp_path),
+        address=str(tmp_path / "host.sock"),
+        control=str(tmp_path / "control.sock"),
+        resume="sess-1",
+        command="sh",
+        ready=9,
+        run=_run_request("host"),
+    )
+    read_fd, write_fd = os.pipe()
+    _ = os.write(write_fd, json.dumps(to_plain(request)).encode())
+    os.close(write_fd)
+    hosted: list[tuple[Path, dict[str, object]]] = []
+    monkeypatch.setattr(detach, "_detach", partial(_detach_noted, hosted))
+    rebuilt: list[RunRequest] = []
+
+    def rebuild(run: RunRequest) -> Callable[[HostSpec | None], int]:
+        rebuilt.append(run)
+        return _start
+
+    assert detach.run_host(read_fd, rebuild=rebuild) == 7
+    assert rebuilt == [request["run"]]
+    [(paths, kwargs)] = hosted
+    assert paths == tmp_path
+    assert kwargs == {
+        "address": tmp_path / "host.sock",
+        "control": tmp_path / "control.sock",
+        "resume": "sess-1",
+        "command": "sh",
+        "ready": 9,
+        "start": _start,
+    }
+    with pytest.raises(OSError, match="Bad file descriptor"):
+        _ = os.fstat(read_fd)
+
+
+def _start(spec: HostSpec | None) -> int:
+    raise AssertionError(spec)
+
+
+def _detach_noted(
+    hosted: list[tuple[Path, dict[str, object]]],
+    paths: Path,
+    **kwargs: object,
+) -> int:
+    hosted.append((paths, kwargs))
+    return 7
+
+
 def launch(name: str, *, command: str, start: Callable[[HostSpec], int]) -> int:
     """Exercise host bookkeeping with an in-process runner at the spawn boundary."""
     with pytest.MonkeyPatch.context() as patch:

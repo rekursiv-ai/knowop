@@ -9,6 +9,7 @@ import errno
 import hashlib
 import os
 import threading
+import uuid
 
 from trackinizer.wire.wire_machine_job import (
     MAX_CHUNK_BYTES,
@@ -20,7 +21,12 @@ from trackinizer.wire.wire_machine_job import (
 
 import pytest
 
-from knowop.shell.job_folder import Ended, JobFolder, Launch
+from knowop.shell.job_folder import (
+    Ended,
+    JobBinding,
+    JobFolder,
+    Launch,
+)
 
 
 if TYPE_CHECKING:
@@ -66,6 +72,20 @@ def test_a_new_folder_keeps_the_spec_and_only_its_user_reads_it(tmp_path: Path) 
     )
     with pytest.raises(FileExistsError):
         _ = JobFolder.create(folder.path, _SPEC)
+
+
+def test_the_binding_is_kept_and_a_legacy_folder_has_none(tmp_path: Path) -> None:
+    folder = _folder(tmp_path)
+    binding = JobBinding(
+        server="https://trax.example",
+        account="jan@example.com",
+        machine_id=uuid.UUID(int=7),
+    )
+    assert folder.binding() is None
+
+    folder.bind(binding)
+
+    assert JobFolder(folder.path).binding() == binding
 
 
 def test_the_launch_and_the_end_are_recorded_whole_and_read_back(

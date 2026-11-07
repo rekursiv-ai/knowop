@@ -403,7 +403,6 @@ class FileSink(Sink):
     def __init__(self, handle: IO[str], *, redactor: Redactor | None = None) -> None:
         self._handle = handle
         self._redactor = redactor
-        self._closed = False
         # Positions per FILE, not per run: a session spans several files and
         # each is stored as its own part, numbered from zero.
         self._next_idx: dict[Path, int] = {}
@@ -529,14 +528,12 @@ class FileSink(Sink):
     def flush(self) -> None:
         # The handle is opened line-buffered, so each event already reaches
         # disk on its newline; a flush is a cheap no-op kept for the Protocol.
-        if not self._closed:
+        if not self._handle.closed:
             self._handle.flush()
 
     @override
     def close(self) -> None:
-        if not self._closed:
-            self._handle.close()
-            self._closed = True
+        self._handle.close()
 
 
 class PrivateNotHeldError(RuntimeError):
@@ -1325,7 +1322,10 @@ class ResilientSink(Sink):
         if self._fallback is None:
             path = self._fallback_path
             path.parent.mkdir(parents=True, exist_ok=True)
-            handle = path.open("a", encoding="utf-8")
+            handle = path.open(
+                "a",
+                encoding="utf-8",
+            )  # pragma: no mutate -- json.dumps writes ASCII only.
             # Line by line, so a run killed before ``close`` keeps what it wrote.
             handle.reconfigure(line_buffering=True)
             self._fallback = FileSink(handle, redactor=self._redactor)
