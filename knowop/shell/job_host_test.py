@@ -22,6 +22,7 @@ import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.wire_machine_job import (
+    WAIT_MAX_SEC,
     CancelWork,
     Chunk,
     JobRecovery,
@@ -89,6 +90,8 @@ class _Server:
         self.reply_errors: list[ClientError] = []
         self.stop_answer: WorkOffer | ClientError = WorkOffer()
         self.idle = threading.Event()
+        # Each wait's ``wait_sec``, and when it was asked, in monotonic seconds.
+        self.waits: list[tuple[float, float]] = []
 
     def wait_machine_work(
         self,
@@ -98,6 +101,7 @@ class _Server:
         wait_sec: float,
     ) -> WorkOffer:
         assert (machine_id, instance) == (self.machine_id, _INSTANCE)
+        self.waits.append((wait_sec, time.monotonic()))
         if wait_sec == 0:
             return _answer(self.stop_answer)
         if self.offers:
@@ -1325,7 +1329,11 @@ def test_an_answer_that_never_lands_is_given_up_after_three_tries(
     assert rig.server.replies == []
 
 
-def test_the_listener_hands_each_offer_to_the_host(tmp_path: Path) -> None:
+def test_the_listener_hands_each_offer_to_the_host(
+    tmp_path: Path,
+    started_threads: list[threading.Thread],
+) -> None:
+    """The listener and the scheduler are daemons: stopping leaves a wait held."""
     server = _Server()
     server.offers = [WorkOffer(work=StartWork(job=_spec()))]
     rig = _host(tmp_path, server=server)
@@ -1335,19 +1343,62 @@ def test_the_listener_hands_each_offer_to_the_host(tmp_path: Path) -> None:
     finally:
         rig.host.stop()
 
+    assert [(t.name, t.daemon) for t in started_threads[:2]] == [
+        ("jobs-listener", True),
+        ("jobs", True),
+    ]
+    assert server.waits[0][0] == WAIT_MAX_SEC
 
-def test_a_failed_wait_is_tried_again(tmp_path: Path) -> None:
+
+def test_a_failed_wait_is_said_and_tried_again_after_the_retry(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     server = _Server()
     server.offers = [
         ClientError("down", status_code=502),
         WorkOffer(work=StartWork(job=_spec())),
     ]
-    rig = _host(tmp_path, server=server)
+    rig = _host(tmp_path, server=server, retry_sec=0.05)
     rig.host.start(_MACHINE, _INSTANCE)
     try:
         _until(lambda: rig.server.states() == [(7, "queued")])
     finally:
         rig.host.stop()
+
+    (_, failed_at), (_, retried_at) = server.waits[:2]
+    assert retried_at - failed_at >= 0.05
+    assert "knowop: job wait failed: down" in capsys.readouterr().err
+
+
+def test_work_that_comes_as_the_host_stops_is_left_to_its_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    started_threads: list[threading.Thread],
+) -> None:
+    server = _Server()
+    rig = _host(tmp_path, server=server)
+    wait = server.wait_machine_work
+
+    def stopped_while_held(
+        machine_id: uuid.UUID,
+        *,
+        instance: uuid.UUID,
+        wait_sec: float,
+    ) -> WorkOffer:
+        if wait_sec == 0:
+            return wait(machine_id, instance=instance, wait_sec=wait_sec)
+        rig.host._stop.set()
+        return WorkOffer(work=StartWork(job=_spec()))
+
+    monkeypatch.setattr(server, "wait_machine_work", stopped_while_held)
+    rig.host.start(_MACHINE, _INSTANCE)
+    started_threads[0].join(timeout=5)
+    rig.host.stop()
+
+    assert not started_threads[0].is_alive()
+    assert server.reports == []
+    assert not (rig.root / "7").exists()
 
 
 def test_a_revoked_machine_stops_every_job_and_keeps_none(tmp_path: Path) -> None:

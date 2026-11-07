@@ -571,6 +571,8 @@ class TestTheHost:
         assert record.pid == os.getpid()
         assert record.cwd == str(Path.cwd())
         assert record.ended is not None
+        # The next launch of the name measures its resume window from this end.
+        assert detach._recent(record, now=datetime.now(UTC))
         assert logged in capsys.readouterr().err + caplog.text
 
     def test_listening_records_the_host_running_and_releases_the_launcher(
