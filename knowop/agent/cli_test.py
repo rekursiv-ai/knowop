@@ -98,6 +98,32 @@ def test_rai_codex_runs_codex(entered: _Entered) -> None:
     assert entered.kwargs["default_cli"] == "codex"
 
 
+@pytest.mark.parametrize("argv", [None, ["--no-sync", "--", "explicit"]])
+def test_sagent_runs_with_explicit_arguments_or_the_process_arguments(
+    argv: list[str] | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = Mock(return_value=7)
+    monkeypatch.setattr(session, "main", runner)
+    monkeypatch.setattr(sys, "argv", ["knowop", "--no-sync", "--", "process"])
+
+    assert cli.sagent_main(argv) == 7
+    assert runner.call_args.args == (
+        ["--no-sync", "--", "process"] if argv is None else argv,
+    )
+    assert runner.call_args.kwargs["default_cli"] == "sagent"
+
+
+def test_sagent_reports_client_errors_with_status_2(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(session, "main", Mock(side_effect=ClientError("unreachable")))
+
+    assert cli.sagent_main([]) == 2
+    assert capsys.readouterr().err == "knowop run sagent: unreachable\n"
+
+
 def test_detach_has_no_pickle_import() -> None:
     tree = ast.parse(Path(detach.__file__).read_text())
     imports = [
