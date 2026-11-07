@@ -14,12 +14,11 @@ import subprocess
 import sys
 import time
 
-from trackinizer.wire.wire_machine_job import MachineJobSpec
-
 import pytest
 
 from knowop.shell import job_runner
-from knowop.shell.job_folder import Ended, JobFolder
+from knowop.shell.conftest import _folder, _python
+from knowop.shell.job_folder import Ended
 from knowop.shell.job_runner import run_job
 
 
@@ -55,30 +54,6 @@ def signal_group(monkeypatch: pytest.MonkeyPatch) -> Mock:
     sent = Mock()
     monkeypatch.setattr(os, "killpg", sent)
     return sent
-
-
-def _folder(tmp_path: Path, *argv: str, minutes: int = 5) -> JobFolder:
-    folder = JobFolder.create(
-        tmp_path / "7",
-        MachineJobSpec(
-            id=7,
-            owner="jan@example.com",
-            argv=list(argv),
-            remote="https://github.com/o/r.git",
-            ref="refs/heads/main",
-            commit="a" * 40,
-            gpus=0,
-            memory_mb=1_024,
-            minutes=minutes,
-            label="",
-        ),
-    )
-    folder.src.mkdir()
-    return folder
-
-
-def _python(code: str) -> list[str]:
-    return [sys.executable, "-c", code]
 
 
 def _spawn_output(

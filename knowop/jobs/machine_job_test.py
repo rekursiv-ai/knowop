@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, call
 
-import base64
 import hashlib
 import io
 import os
@@ -17,8 +14,6 @@ import subprocess
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.wire_machine_job import (
     Chunk,
-    MachineJobSpec,
-    MachineJobSubmit,
     MachineJobView,
     ReadRefused,
     ReadReply,
@@ -28,16 +23,21 @@ from trackinizer.wire.wire_machine_job import (
 import pytest
 
 from knowop.jobs import machine_job
+from knowop.jobs.conftest import (
+    _REMOTE,
+    _Clock,
+    _done,
+    _Machine,
+    _submit,
+    _view,
+)
 from knowop.jobs.job_fetch import IntegrityError
-from knowop.jobs.job_source_test import _done
 from knowop.jobs.machine_job import (
     Pushed,
     pushed,
     run_logs,
     run_results,
-    run_submit,
 )
-from knowop.shell.job_folder import Ended, JobFolder
 
 
 if TYPE_CHECKING:
@@ -45,7 +45,6 @@ if TYPE_CHECKING:
     from subprocess import CompletedProcess
 
 
-_REMOTE = "https://example.invalid/o/r.git"
 _HEAD = "a" * 40
 
 
@@ -60,13 +59,6 @@ def git(monkeypatch: pytest.MonkeyPatch) -> Mock:
         {"PATH": "/tools", "KEEP": "value", "GIT_DIR": "/callers/repository"},
     )
     return run
-
-
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    work = tmp_path / "work"
-    work.mkdir()
-    return work
 
 
 @pytest.fixture(autouse=True)
@@ -302,143 +294,6 @@ def test_a_folder_outside_any_repository_is_refused(tmp_path: Path, git: Mock) -
         _ = pushed(tmp_path / "plain")
 
     assert git.call_count == 1
-
-
-def _view(state: str, **fields: object) -> MachineJobView:
-    return MachineJobView.model_validate(
-        {
-            "id": 9,
-            "machine": "gx10",
-            "state": state,
-            "gpus": 0,
-            "memory_mb": 2_048,
-            "minutes": 5,
-            "label": "",
-            "argv": ["python", "train.py"],
-            "remote": _REMOTE,
-            "ref": "refs/heads/main",
-            "commit": "a" * 40,
-            "exit_code": None,
-            "reason": "",
-            "created_at": datetime(2026, 10, 23, 12, tzinfo=UTC),
-            "queued_at": None,
-            "started_at": None,
-            "ended_at": None,
-            **fields,
-        },
-    )
-
-
-@dataclass(slots=True, kw_only=True)
-class _Machine:
-    """The server's machine-job calls, answered from a job folder as the host would."""
-
-    folder: JobFolder
-    views: list[MachineJobView] = field(default_factory=list)
-    submitted: list[MachineJobSubmit] = field(default_factory=list)
-    reads: list[tuple[str, int]] = field(default_factory=list)
-    results_max: int = 1_000
-    grow: list[bytes] = field(default_factory=list)
-    """Bytes the job writes to its log after each read, the last of which ends it."""
-
-    corrupt: str = ""
-    """A result file whose bytes the relay changes."""
-
-    log_reply: ReadReply | None = None
-    """What every log read answers, in place of the folder's log."""
-
-    listing: ReadReply | None = None
-    """What the manifest answers, in place of the folder's."""
-
-    def machine_job_submit(self, body: MachineJobSubmit) -> MachineJobView:
-        self.submitted.append(body)
-        return _view("requested")
-
-    def machine_job_view(self, job_id: int) -> MachineJobView:
-        assert job_id == 9
-        return self.views.pop(0) if len(self.views) > 1 else self.views[0]
-
-    def machine_job_log(self, job_id: int, *, offset: int, wait: float) -> ReadReply:
-        assert job_id == 9
-        del wait
-        self.reads.append(("log", offset))
-        if self.log_reply is not None:
-            return self.log_reply
-        reply = self.folder.read_log(offset)
-        if self.grow:
-            self.folder.note(self.grow.pop(0).decode())
-            if not self.grow:
-                self.folder.write_ended(
-                    Ended(state="completed", exit_code=0, reason=""),
-                )
-        return ReadReply(reply=reply)
-
-    def machine_job_manifest(self, job_id: int) -> ReadReply:
-        assert job_id == 9
-        if self.listing is not None:
-            return self.listing
-        return ReadReply(
-            reply=self.folder.manifest(results_max=self.results_max, where="gx10"),
-        )
-
-    def machine_job_file(self, job_id: int, path: str, *, offset: int) -> ReadReply:
-        assert job_id == 9
-        self.reads.append((path, offset))
-        reply = self.folder.read_file(
-            path,
-            offset,
-            results_max=self.results_max,
-            where="gx10",
-        )
-        if path == self.corrupt and isinstance(reply, Chunk):
-            data = base64.b64decode(reply.data_b64).upper()
-            reply = reply.model_copy(
-                update={"data_b64": base64.b64encode(data).decode()},
-            )
-        return ReadReply(reply=reply)
-
-
-@pytest.fixture
-def machine(tmp_path: Path) -> _Machine:
-    spec = MachineJobSpec(
-        id=9,
-        owner="jan@example.com",
-        argv=["python", "train.py"],
-        remote=_REMOTE,
-        ref="refs/heads/main",
-        commit="a" * 40,
-        gpus=0,
-        memory_mb=2_048,
-        minutes=5,
-        label="",
-    )
-    return _Machine(folder=JobFolder.create(tmp_path / "machine" / "9", spec))
-
-
-class _Clock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.now += seconds
-
-
-def _submit(machine: _Machine, repo: Path, clock: _Clock, *, gpus: int = 0) -> int:
-    return run_submit(
-        machine,
-        repo=repo,
-        machine="gx10",
-        command=("python", "train.py"),
-        gpus=gpus,
-        memory_mb=2_048,
-        minutes=5,
-        label="smoke",
-        sleep=clock.sleep,
-        clock=clock,
-    )
 
 
 def test_submit_names_the_pushed_commit_and_waits_until_the_machine_takes_it(

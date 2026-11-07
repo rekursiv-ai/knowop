@@ -42,6 +42,22 @@ def test_a_stream_past_the_limit_keeps_both_ends_and_says_how_much_went() -> Non
     assert b"bytes cut" in stream
 
 
+def test_a_stream_arriving_in_many_chunks_keeps_only_its_last_ones() -> None:
+    """Chunks the tail no longer needs are dropped as they pass, not held to the end."""
+    chunks = [bytes([n % 251]) * 4096 for n in range(3 * MAX_STREAM_BYTES // 4096)]
+
+    stream, cut = _kept(chunks)
+
+    whole = b"".join(chunks)
+    assert cut
+    assert len(stream) <= MAX_STREAM_BYTES
+    head, _, rest = stream.partition(b"\n[... ")
+    _, _, tail = rest.partition(b" bytes cut ...]\n")
+    assert whole.startswith(head)
+    assert whole.endswith(tail)
+    assert len(head) == len(tail)
+
+
 def test_a_stream_one_byte_past_the_limit_is_cut_and_still_fits() -> None:
     stream, cut = _kept([b"x" * (MAX_STREAM_BYTES + 1)])
 

@@ -19,11 +19,11 @@ from collections.abc import (
     Sized,
 )
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, TextIO, TypedDict, cast, override
+from typing import TYPE_CHECKING, Final, TextIO, TypedDict, cast, override
 from unittest.mock import Mock, call, patch
 from uuid import UUID
 
@@ -59,7 +59,7 @@ from trackinizer.runs.adapters.custom_types import Subagent
 from trackinizer.runs.adapters.gemini import GeminiAdapter
 from trackinizer.runs.adapters.iostream import IOStreamAdapter
 from trackinizer.runs.adapters.sagent import SagentAdapter
-from trackinizer.runs.asks import Answer, Ask, Resolved, StateChanged
+from trackinizer.runs.asks import Answer, Ask
 from trackinizer.sagent.session.jsonl import record_line
 from trackinizer.sagent.session.projects import project_dir
 from trackinizer.sagent.session.types import (
@@ -67,7 +67,6 @@ from trackinizer.sagent.session.types import (
     ContextCompaction,
     ContextState,
     EditResult,
-    IncompleteRecord,
     SessionRecord,
     SystemMessage,
     UncategorizedRecord,
@@ -94,6 +93,7 @@ from trackinizer.wire.wire_sessions import (
     SessionPlacement,
     SessionStart,
     SessionStartResponse,
+    session_run_output_path,
 )
 from treekle import PlainTree, from_plain, json_dumps, json_loads
 
@@ -110,6 +110,37 @@ from knowop.agent.claude_stream import ClaudeStreamDriver
 from knowop.agent.clicked_runs import ClickedRuns
 from knowop.agent.codex_app import CodexAppDriver
 from knowop.agent.commands import command_record
+from knowop.agent.conftest import (
+    _PLACED_SESSION,
+    _always_found,
+    _BatchClient,
+    _drain_once,
+    _FakeAdapter,
+    _headless_config,
+    _HeadlessWiring,
+    _line_records,
+    _NoServer,
+    _PlacedSink,
+    _PlacingClient,
+    _RecordingRelay,
+    _RecordingSink,
+    _RefusingClient,
+    _ScriptedDriver,
+    _Server,
+    _ServerComesBackClient,
+    _SessionSink,
+    _spec,
+    _texts,
+    _TuiRelay,
+    _UploadOutageClient,
+    _wait_for_events,
+    _WholeFileAdapter,
+    _wire,
+    _wire_headless,
+    _Wiring,
+    _wiring_drain,
+    _WiringRelay,
+)
 from knowop.agent.custom_types import Event, RunRequest
 from knowop.agent.detach import HeadlessSpec
 from knowop.agent.headless import (
@@ -150,7 +181,6 @@ from knowop.agent.sink import (
     Sink,
     TrackinizerSink,
 )
-from knowop.agent.sink_test import _Server
 from knowop.agent.slash import SlashCommand
 from knowop.agent.tool_server import BEARER_ENV, ToolServer
 from knowop.agent.trust import TrustGate
@@ -169,7 +199,6 @@ if TYPE_CHECKING:
     from trackinizer.runs.asks import Driver
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.types.streams import TraxRecord
-    from trackinizer.wire.filters import Filter
 
 
 @pytest.fixture(autouse=True)
@@ -211,106 +240,6 @@ def trusted_claude(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLAUDE_CODE_SANDBOXED", "1")
 
 
-class _RecordingSink(Sink):
-    """Collects emitted records for assertions.
-
-    SUBCLASSES ``Sink`` rather than matching it structurally -- which is the
-    Protocol's own rule, and load-bearing here: ``feed`` is concrete on the
-    Protocol and reaches ``_readers``, so a structural stand-in gets the
-    method without the state it needs.
-
-    Positions are per-FILE, exactly as the real sinks derive them, so a test
-    can assert each part numbers its records from 0.
-    """
-
-    def __init__(self) -> None:
-        self.events: list[tuple[int, str, Event]] = []
-        self.slash: list[tuple[SlashCommand, datetime]] = []
-        self.diffs: list[list[EditResult]] = []
-        self.closed = False
-        self.flushes = 0
-        self.cli_session_ids: list[str] = []
-        self._next_idx: dict[Path, int] = {}
-
-    @property
-    @override
-    def session_id(self) -> UUID | None:
-        return None
-
-    @override
-    def open(self) -> str | None:
-        return None
-
-    @override
-    def set_cli_session_id(self, cli_session_id: str) -> None:
-        self.cli_session_ids.append(cli_session_id)
-
-    @override
-    def restart(self, path: Path) -> None:
-        self._next_idx[path] = 0
-
-    @override
-    def pass_over(self, path: Path) -> None:
-        self._next_idx[path] = self._next_idx.get(path, 0) + 1
-
-    @override
-    def emit(self, adapter_name: str, event: Event) -> None:
-        idx = self._next_idx.get(event.path, 0)
-        self._next_idx[event.path] = idx + 1
-        self.events.append((idx, adapter_name, event))
-
-    @override
-    def emit_slash_command(self, command: SlashCommand, at: datetime) -> None:
-        self.slash.append((command, at))
-
-    @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
-        self.diffs.append(list(records))
-
-    @override
-    def flush(self) -> None:
-        self.flushes += 1
-
-    @override
-    def pending(self) -> list[tuple[Path, RecordBody]]:
-        return []
-
-    @override
-    def close(self) -> None:
-        self.closed = True
-
-
-# Reads the record's own field rather than a projection, so a test failure names the
-# turn that went missing rather than a search string.
-#
-# Records with no prose are SKIPPED, not asserted against: one native line legitimately
-# produces several records -- a claude user line also emits the ``TurnContext`` that
-# applies to it -- and the drain tests are about which turns were captured and in what
-# order, not how many records a dialect spends saying so.
-def _texts(sink: _RecordingSink) -> list[str]:
-    """Return the prose of each captured record that carries any, in emit order."""
-    out: list[str] = []
-    for _idx, _name, event in sink.events:
-        match event.record:
-            case IncompleteRecord() as record:
-                out.append(record.text)
-            case UserMessage() | AssistantMessage() as record:
-                out.append(record.content or "")
-            case _:
-                continue
-    return out
-
-
-# The fake dialect the file-drain tests use: it makes "which turns were captured, in
-# what order" the only thing under test, with no provider grammar in the way -- so it
-# states no opening ``TurnContext`` either, which a real dialect does and which would
-# show up in every count here.
-def _line_records(stream: TextIO) -> Iterator[SessionRecord]:
-    """One record per line, carrying the line's own text."""
-    for line in stream:
-        yield UserMessage(content=line.rstrip("\n"))
-
-
 # STREAMING, like the real dialects: the reader runs on the ``Tail``'s own thread, and a
 # generator that raises is finished -- so the tail rebuilds it and the raise is handed
 # back to whoever fed the poison line. That is what keeps one bad line costing one line
@@ -322,74 +251,6 @@ def _poison_records(stream: TextIO) -> Iterator[SessionRecord]:
         if text == "boom":
             raise ValueError("reader blew up")
         yield UserMessage(content=text)
-
-
-# Mirrors gemini, which rewrites ONE JSON object in place: the runner re-feeds the whole
-# body on each change and marks the chunk a restart, so each record lands back on the
-# position it already held rather than the reader having to remember what it emitted.
-def _document_records(stream: TextIO) -> Iterator[SessionRecord]:
-    """Every message a whole document holds, re-read from its start."""
-    obj = json_loads(stream.read(), dict[str, object])
-    for text in from_plain(obj.get("messages"), list[str], default=[]):
-        yield UserMessage(content=text)
-
-
-class _FakeAdapter:
-    """Treats every ``*.jsonl`` line as one ``UserMessage`` record."""
-
-    name: str = "fake"
-    cli_binary: str = "fake"
-    whole_file: bool = False
-    parent_session_env: frozenset[str] = frozenset[str]()
-    session_switch_commands: frozenset[str] = frozenset({"clear"})
-
-    def __init__(self, root: Path) -> None:
-        self._root = root
-        self.subagents: dict[Path, Subagent] = {}
-
-    def session_dirs(self) -> Iterable[Path]:
-        return (self._root,)
-
-    def matches_session_file(self, path: Path) -> bool:
-        return path.suffix == ".jsonl"
-
-    def session_scope(self) -> Path | None:
-        return None
-
-    def session_id_from_path(self, path: Path) -> str | None:
-        del path
-        return None
-
-    def resumed_session(self, cli_args: tuple[str, ...]) -> str | None:
-        del cli_args
-        return None
-
-    def subagent(self, path: Path) -> Subagent | None:
-        """Return the sub-agent ``path`` names, as the run's CLI declares one."""
-        return self.subagents.get(path)
-
-    def reader(self) -> Tail[TraxRecord]:
-        return Tail(_line_records)
-
-
-class _WholeFileAdapter(_FakeAdapter):
-    """A whole-file adapter: the runner must feed it the entire file body.
-
-    Mirrors gemini, which rewrites one JSON object in place rather than
-    appending lines.
-    """
-
-    name: str = "wholefile"
-    cli_binary: str = "wholefile"
-    whole_file: bool = True
-
-    @override
-    def matches_session_file(self, path: Path) -> bool:
-        return path.suffix == ".json"
-
-    @override
-    def reader(self) -> Tail[TraxRecord]:
-        return Tail(_document_records, whole_file=True)
 
 
 # Each line is the absolute path of a file the session edited, so the diff
@@ -435,16 +296,6 @@ class _PoisonAdapter(_FakeAdapter):
         return Tail(_poison_records)
 
 
-def _always_found(
-    cmd: str,
-    mode: int = os.F_OK | os.X_OK,
-    path: str | None = None,
-) -> str:
-    """Return a ``shutil.which`` that resolves anything: the binary is never exec'd."""
-    del mode, path
-    return f"/bin/{cmd}"
-
-
 def _write(path: Path, lines: int) -> None:
     path.write_text("".join(json.dumps({"n": i}) + "\n" for i in range(lines)))
 
@@ -481,61 +332,6 @@ def _append(path: Path, text: str, argv: Sequence[str]) -> None:
 def _ignore(argv: Sequence[str]) -> None:
     """Act as a CLI that writes nothing."""
     del argv
-
-
-# Delivery is the handshake between a test's writes: a second write issued once the
-# first's turn has been EMITTED cannot be folded into the same wake, which no fixed
-# pause can promise. Returns rather than asserts on timeout so the caller's own
-# assertion names what is missing.
-def _wait_for_events(sink: _RecordingSink, count: int) -> None:
-    """Block until ``sink`` holds ``count`` events, or give up after 3s."""
-    deadline = time.monotonic() + 3.0
-    while len(sink.events) < count and time.monotonic() < deadline:
-        time.sleep(0.005)
-
-
-# The drain is wake-driven, so a test cannot call one scan and inspect the result: it
-# starts the loop, writes, and waits for delivery. A ``write`` that handshakes on
-# delivery mid-way passes the ``sink`` it will watch.
-def _drain_once(
-    adapter: Adapter,
-    write: Callable[[], object],
-    *,
-    baseline: frozenset[Path] = frozenset(),
-    expected: int = 1,
-    sink: _RecordingSink | None = None,
-    owner: session._SessionOwner | None = None,
-) -> tuple[_Stats, _RecordingSink]:
-    """Run the real drain, perform ``write``, and collect what it captured."""
-    sink = sink or _RecordingSink()
-    stats = _Stats()
-    stop = threading.Event()
-    armed = threading.Event()
-
-    def _run() -> None:
-        _drain_filesystem_loop(
-            adapter,
-            sink,
-            stats,
-            RunConfig(cli_name=adapter.name),
-            stop,
-            baseline=baseline,
-            slash_queue=deque(),
-            armed=armed,
-            owner=owner,
-        )
-
-    worker = threading.Thread(target=_run, daemon=True)
-    worker.start()
-    try:
-        assert armed.wait(5.0), "session-log watch did not arm"
-        write()
-        _wait_for_events(sink, expected)
-    finally:
-        stop.set()
-        worker.join(timeout=5.0)
-        assert not worker.is_alive(), "session drain did not stop"
-    return stats, sink
 
 
 class _RecordingStop(threading.Event):
@@ -1637,35 +1433,6 @@ class _WhereClient:
         if len(self.said) >= self._drains:
             self._stop.set()
         return []
-
-
-class _RefusingClient:
-    """A client whose every drain fails with ``error``, as the server refuses it."""
-
-    def __init__(
-        self,
-        error: ClientError,
-        *,
-        stop_after: int = 0,
-        stop: threading.Event | None = None,
-    ) -> None:
-        self._error = error
-        self._stop_after = stop_after
-        self._stop = stop
-        self.drains = 0
-
-    def drain_inbound(
-        self,
-        session_id: UUID,
-        *,
-        wait_sec: float = 0.0,
-        **where: str | bool | None,
-    ) -> list[InboundDrainItem]:
-        del session_id, wait_sec, where
-        self.drains += 1
-        if self._stop is not None and self.drains >= self._stop_after:
-            self._stop.set()
-        raise self._error
 
 
 def _start_host(
@@ -3392,132 +3159,6 @@ class TestDryRunDrain:
         assert rc == 0
 
 
-class _NoServer:
-    """A server the test keeps offline: every request the run makes fails it."""
-
-    base_url = "http://no-server.test"
-
-    def session_start(self, body: SessionStart) -> SessionStartResponse:
-        del body
-        raise AssertionError("session_start reached the offline server.")
-
-    def append_records(
-        self,
-        session_id: UUID,
-        *,
-        name: str = "",
-        manifest: ManifestBody | None = None,
-        records: Sequence[RecordBody] = (),
-        restart: bool = False,
-        slash_commands: Sequence[SlashCommandBody] = (),
-    ) -> AppendRecordsResponse:
-        del session_id, name, manifest, records, restart, slash_commands
-        raise AssertionError("append_records reached the offline server.")
-
-    def session_end(
-        self,
-        session_id: UUID,
-        body: SessionEnd | None = None,
-    ) -> SessionEndResponse:
-        del session_id, body
-        raise AssertionError("session_end reached the offline server.")
-
-    def post(self, path: str, *, body: object = None) -> PlainTree:
-        del path, body
-        raise AssertionError("post reached the offline server.")
-
-    def get(
-        self,
-        path: str,
-        *,
-        params: Mapping[str, object] | None = None,
-    ) -> PlainTree:
-        del path, params
-        raise AssertionError("get reached the offline server.")
-
-    def drain_inbound(
-        self,
-        session_id: UUID,
-        *,
-        wait_sec: float = 0.0,
-        **where: str | bool | None,
-    ) -> list[InboundDrainItem]:
-        del session_id, wait_sec, where
-        raise AssertionError("drain_inbound reached the offline server.")
-
-    def read_session_parts(self, session_id: UUID) -> list[PartBody]:
-        del session_id
-        raise AssertionError("read_session_parts reached the offline server.")
-
-    def read_session_records(
-        self,
-        session_id: UUID,
-        *,
-        part: int = 0,
-        plaintext_only: bool = False,
-    ) -> list[RecordBody]:
-        del session_id, part, plaintext_only
-        raise AssertionError("read_session_records reached the offline server.")
-
-    def get_inquiry(
-        self,
-        ref: object,
-    ) -> tuple[Inquiry.InquiryKind, UUID, dict[str, PlainTree]]:
-        del ref
-        raise AssertionError("get_inquiry reached the offline server.")
-
-    def list_kind(
-        self,
-        kind: Inquiry.InquiryKind,
-        *,
-        filters: Sequence[Filter] = (),
-    ) -> list[dict[str, PlainTree]]:
-        del kind, filters
-        raise AssertionError("list_kind reached the offline server.")
-
-    def submit(self, kind: Inquiry.InquiryKind, body: Mapping[str, object]) -> UUID:
-        del kind, body
-        raise AssertionError("submit reached the offline server.")
-
-    def add_edge(
-        self,
-        from_id: UUID,
-        to_id: UUID,
-        edge_kind: str,
-        *,
-        actor: str,
-        note: str = "",
-    ) -> object:
-        del from_id, to_id, edge_kind, actor, note
-        raise AssertionError("add_edge reached the offline server.")
-
-    def transition_app(
-        self,
-        target_id: UUID,
-        *,
-        expected_from: dict[str, object] | None,
-        to: dict[str, object] | None,
-        actor: str,
-    ) -> None:
-        del target_id, expected_from, to, actor
-        raise AssertionError("transition_app reached the offline server.")
-
-    def transition_status(
-        self,
-        target_id: UUID,
-        *,
-        expected_from: str,
-        to: str,
-        actor: str,
-    ) -> None:
-        del target_id, expected_from, to, actor
-        raise AssertionError("transition_status reached the offline server.")
-
-    def patch(self, path: str, *, body: object = None) -> PlainTree:
-        del path, body
-        raise AssertionError("patch reached the offline server.")
-
-
 class _BorrowedClient(_NoServer):
     """A shared client whose lifetime is owned outside one ``knowop run``."""
 
@@ -4990,102 +4631,6 @@ class TestWrappedCliIsATopLevelSession:
         assert "launcher-room" not in out.read_text()
 
 
-@dataclass(slots=True, kw_only=True)
-class _Wiring:
-    """What ``_spawn_and_drain`` handed each collaborator."""
-
-    argv: list[str] = field(default_factory=list[str])
-    relay: dict[str, object] = field(default_factory=dict[str, object])
-    relay_instance: object = None
-    drain: dict[str, object] = field(default_factory=dict[str, object])
-    inbound: list[object] = field(default_factory=list[object])
-    daemons: list[bool] = field(default_factory=list[bool])
-    thread_names: list[str] = field(default_factory=list[str])
-
-
-class _WiringRelay:
-    """A relay that records how it was built, plays ``output``, and exits ``rc``."""
-
-    def __init__(
-        self,
-        argv: list[str],
-        *,
-        wiring: _Wiring,
-        rc: int,
-        output: bytes,
-        **kwargs: object,
-    ) -> None:
-        wiring.argv = list(argv)
-        wiring.relay = kwargs
-        wiring.relay_instance = self
-        self._rc = rc
-        self._output = output
-        self._on_output = kwargs["on_output"]
-
-    def run(self) -> int:
-        if callable(self._on_output) and self._output:
-            _ = self._on_output(self._output)
-        return self._rc
-
-
-def _wiring_drain(
-    wiring: _Wiring,
-    *args: object,
-    armed: threading.Event,
-    **kwargs: object,
-) -> None:
-    """Record the drain's inputs, and that it runs as a daemon; release the spawn."""
-    wiring.drain = {"args": args, **kwargs}
-    wiring.daemons.append(threading.current_thread().daemon)
-    wiring.thread_names.append(threading.current_thread().name)
-    armed.set()
-
-
-def _wiring_inbound(wiring: _Wiring, *args: object, **kwargs: object) -> None:
-    """Record inbound delivery's inputs, and that it runs as a daemon."""
-    wiring.inbound = [*args, kwargs]
-    wiring.daemons.append(threading.current_thread().daemon)
-    wiring.thread_names.append(threading.current_thread().name)
-
-
-def _wire(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    config: RunConfig,
-    adapter: Adapter,
-    *,
-    sink: Sink | None = None,
-    stats: _Stats | None = None,
-    rc: int = 0,
-    output: bytes = b"",
-    relay: type[_WiringRelay] = _WiringRelay,
-    wiring: _Wiring | None = None,
-) -> tuple[_Wiring, int]:
-    """Run ``_spawn_and_drain`` against recording collaborators."""
-    wiring = wiring or _Wiring()
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-    monkeypatch.setattr(
-        session,
-        "ThreadedRelay",
-        partial(relay, wiring=wiring, rc=rc, output=output),
-    )
-    monkeypatch.setattr(
-        session,
-        "_drain_filesystem_loop",
-        partial(_wiring_drain, wiring),
-    )
-    monkeypatch.setattr(session, "_inbound_poll_loop", partial(_wiring_inbound, wiring))
-    monkeypatch.setattr(shutil, "which", _always_found)
-    status = session._spawn_and_drain(
-        replace(config, quiesce_seconds=0.0),
-        adapter,
-        sink or _RecordingSink(),
-        stats or _Stats(),
-    )
-    return wiring, status
-
-
 class _RecordingOpener:
     """Stand in for ``open_worktree_diff``: record each cwd, return a fixed value."""
 
@@ -5289,7 +4834,7 @@ class TestSpawnWiring:
         assert wiring.argv[1:3] == ["--append-system-prompt", using_knowop()]
         assert client.asked == [
             (
-                f"/api/sessions/{_SESSION}/place",
+                f"/api/sessions/{_PLACED_SESSION}/place",
                 {
                     "canvas": str(UUID(int=5)),
                     "git": {
@@ -5352,51 +4897,58 @@ class TestSpawnWiring:
         tmp_path: Path,
     ) -> None:
         """The server places no chat's session; its session list names the canvas."""
-        server = _ChatServer(_SESSION)
+        server = _ChatServer(_PLACED_SESSION)
         wiring, _ = _wire(
             monkeypatch,
             tmp_path,
-            RunConfig(cli_name="claude", client=server, attach=_SESSION),
+            RunConfig(cli_name="claude", client=server, attach=_PLACED_SESSION),
             ClaudeAdapter(),
             sink=_PlacedSink(),
         )
         env = cast(dict[str, str], wiring.relay["env"])
         assert (env["TRAX_WORKSPACE"], env["TRAX_CANVAS"]) == (_WORKSPACE, _CANVAS)
         assert wiring.argv[1:3] == ["--append-system-prompt", using_knowop()]
-        assert server.posted == [f"/api/sessions/{_SESSION}/place"]
+        assert server.posted == [f"/api/sessions/{_PLACED_SESSION}/place"]
         assert server.listed == [{"days": 1}]
 
     def test_a_chats_canvas_arms_no_box_hook_but_a_placed_canvas_does(self) -> None:
         """A chat's lines carry its canvas's boxes; a box hook would repeat them."""
-        chat = RunConfig(cli_name="claude", client=_ChatServer(_SESSION))
+        chat = RunConfig(cli_name="claude", client=_ChatServer(_PLACED_SESSION))
         placed = {"TRAX_WORKSPACE": _WORKSPACE, "TRAX_CANVAS": _CANVAS}
 
-        assert _place(replace(chat, attach=_SESSION), session_id=_SESSION) == (
+        assert _place(
+            replace(chat, attach=_PLACED_SESSION),
+            session_id=_PLACED_SESSION,
+        ) == (
             placed,
             {},
         )
         assert _place(
-            replace(chat, client=_ChatServer(_SESSION, places=True)),
-            session_id=_SESSION,
+            replace(chat, client=_ChatServer(_PLACED_SESSION, places=True)),
+            session_id=_PLACED_SESSION,
         ) == (placed, placed)
 
     def test_only_an_attached_run_the_server_left_unplaced_reads_the_list(
         self,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        fresh = _ChatServer(_SESSION)
-        placed = _ChatServer(_SESSION, places=True)
+        fresh = _ChatServer(_PLACED_SESSION)
+        placed = _ChatServer(_PLACED_SESSION, places=True)
         # Its ``get`` raises: a read of the session list would fail the test.
         refused = _PlacingClient(refuse=True)
-        unopened = _ChatServer(_SESSION)
+        unopened = _ChatServer(_PLACED_SESSION)
 
-        for client, attach in ((fresh, None), (placed, _SESSION), (refused, _SESSION)):
+        for client, attach in (
+            (fresh, None),
+            (placed, _PLACED_SESSION),
+            (refused, _PLACED_SESSION),
+        ):
             config = RunConfig(cli_name="claude", client=client)
-            _ = _place(replace(config, attach=attach), session_id=_SESSION)
-        clientless = RunConfig(cli_name="claude", attach=_SESSION)
+            _ = _place(replace(config, attach=attach), session_id=_PLACED_SESSION)
+        clientless = RunConfig(cli_name="claude", attach=_PLACED_SESSION)
         unopened_run = replace(clientless, client=unopened)
 
-        assert _place(clientless, session_id=_SESSION) == ({}, {})
+        assert _place(clientless, session_id=_PLACED_SESSION) == ({}, {})
         assert _place(unopened_run, session_id=None) == ({}, {})
         assert (fresh.listed, placed.listed, unopened.listed) == ([], [], [])
         assert unopened.posted == []
@@ -5785,36 +5337,6 @@ class _GrantingSink(_RecordingSink):
     def open(self) -> str:
         self.calls.append("open")
         return self._granted
-
-
-class _PlacedSink(_RecordingSink):
-    """A sink whose server opened session ``_SESSION``."""
-
-    @property
-    @override
-    def session_id(self) -> UUID:
-        return _SESSION
-
-
-_SESSION = UUID("00000000-0000-0000-0000-0000000000a1")
-
-
-class _PlacingClient(_NoServer):
-    """A client whose server places a session, or refuses to; records what it was asked."""
-
-    def __init__(self, *, refuse: bool = False) -> None:
-        self.asked: list[tuple[str, object]] = []
-        self._refuse = refuse
-
-    @override
-    def post(self, path: str, *, body: object = None) -> dict[str, str]:
-        self.asked.append((path, body))
-        if self._refuse:
-            raise ClientError("404 Not Found")
-        return {
-            "workspace_id": str(UUID(int=7)),
-            "canvas_id": str(UUID(int=8)),
-        }
 
 
 class _ChatServer(_NoServer):
@@ -6655,94 +6177,6 @@ class TestInboundAfterALateOpen:
         assert client.drained_for == {client.session}
 
 
-class _BatchClient:
-    """Returns one batch of messages, then nothing (the queue is drained)."""
-
-    def __init__(self, texts: list[str]) -> None:
-        self._texts = texts
-        self.drains = 0
-
-    def drain_inbound(
-        self,
-        session_id: UUID,
-        *,
-        wait_sec: float = 0.0,
-        **where: str | bool | None,
-    ) -> list[InboundDrainItem]:
-        del where
-        del session_id, wait_sec
-        self.drains += 1
-        if self.drains > 1:
-            _real_pause(0.02)
-            return []
-        return [InboundDrainItem(text=text) for text in self._texts]
-
-
-class _UploadOutageClient(_BatchClient):
-    """Opens a session and serves its inbound queue, but every upload fails."""
-
-    def __init__(self, texts: list[str]) -> None:
-        super().__init__(texts)
-        self.session = uuid.uuid4()
-        self.drained_for: set[UUID] = set()
-
-    def session_start(self, body: SessionStart) -> SessionStartResponse:
-        return SessionStartResponse(id=self.session, seq=0, actor=body.actor)
-
-    def append_records(
-        self,
-        session_id: UUID,
-        **fields: object,
-    ) -> AppendRecordsResponse:
-        del session_id, fields
-        raise RuntimeError("upload failed")
-
-    def session_end(
-        self,
-        session_id: UUID,
-        body: SessionEnd | None = None,
-    ) -> SessionEndResponse:
-        del body
-        return SessionEndResponse(id=session_id)
-
-    @override
-    def drain_inbound(
-        self,
-        session_id: UUID,
-        *,
-        wait_sec: float = 0.0,
-        **where: str | bool | None,
-    ) -> list[InboundDrainItem]:
-        del where
-        self.drained_for.add(session_id)
-        return super().drain_inbound(session_id, wait_sec=wait_sec)
-
-
-class _ServerComesBackClient(_UploadOutageClient):
-    """A server that refuses everything until ``up``, then accepts uploads too."""
-
-    def __init__(self, texts: list[str]) -> None:
-        super().__init__(texts)
-        self.up = False
-
-    @override
-    def session_start(self, body: SessionStart) -> SessionStartResponse:
-        if not self.up:
-            raise RuntimeError("server down")
-        return super().session_start(body)
-
-    @override
-    def append_records(
-        self,
-        session_id: UUID,
-        **fields: object,
-    ) -> AppendRecordsResponse:
-        if not self.up:
-            raise RuntimeError("server down")
-        del fields
-        return AppendRecordsResponse(part=0, written=1, skipped=0)
-
-
 def _recover_server_on_wait(
     client: _ServerComesBackClient,
     sink: ResilientSink,
@@ -6755,37 +6189,6 @@ def _recover_server_on_wait(
     now[0] = 30.0
     sink.flush()
     return False
-
-
-class _SessionSink:
-    """A sink whose session is already open, so inbound has an id to use."""
-
-    session_id = UUID("11111111-2222-3333-4444-555555555555")
-
-    def __init__(self, *, account: str | None = None) -> None:
-        self.kept_open = False
-        self.account = account
-
-    def keep_session_open(self) -> None:
-        self.kept_open = True
-
-
-class _RecordingRelay:
-    """Records what would have been typed into the CLI."""
-
-    def __init__(self) -> None:
-        self.submitted: list[str] = []
-        self.written: list[bytes] = []
-        self.terminated = 0
-
-    def submit(self, text: str) -> None:
-        self.submitted.append(text)
-
-    def write(self, data: bytes) -> None:
-        self.written.append(data)
-
-    def terminate(self) -> None:
-        self.terminated += 1
 
 
 class _TerminateSeesKeptOpen(_RecordingRelay):
@@ -6828,11 +6231,6 @@ class _PickyRelay(_RecordingRelay):
         if text == self._reject:
             raise RuntimeError("pty write failed")
         super().submit(text)
-
-
-def _real_pause(seconds: float) -> None:
-    """Block without ``time.sleep``, so a sleep assertion stays meaningful."""
-    threading.Event().wait(seconds)
 
 
 class _FailingClient:
@@ -8715,15 +8113,6 @@ class TestAChatRunIsHeadless:
         assert not config.headless
 
 
-def _spec(tmp_path: Path) -> HeadlessSpec:
-    """Return the spec a ``--detach`` host is given, in ``tmp_path``."""
-    return HeadlessSpec(
-        address=socket_address(tmp_path / "host.sock"),
-        scrollback=tmp_path / "scrollback.log",
-        control=socket_address(tmp_path / "control.sock"),
-    )
-
-
 class TestWhatDrivesAChatRun:
     """The mode and policy a headless run gives its CLI, and the argv that starts it."""
 
@@ -9356,6 +8745,28 @@ class TestDeliveringToAHeadlessRun:
 
         assert run.told == [("interrupt", None)]
 
+    def test_a_click_reaching_a_run_with_no_clicked_runs_is_recorded_undelivered(
+        self,
+    ) -> None:
+        run = _FakeRun()
+        records: list[SystemMessage] = []
+
+        _deliver(
+            InboundDrainItem(text="ls", kind="run", source="ann@x"),
+            run,
+            records=records,
+        )
+
+        assert run.told == []
+        [record] = records
+        assert record.extra["$delivery"] == {
+            "text": "ls",
+            "kind": "run",
+            "source": "ann@x",
+            "refused": False,
+            "reason": "this run runs no clicked commands",
+        }
+
     def test_settings_change_the_model_and_effort(self) -> None:
         run = _FakeRun()
 
@@ -9781,143 +9192,6 @@ def _no_tui(session_id: str, listening: Callable[[], None]) -> Tui:
     raise AssertionError("a run that never ran has no terminal")
 
 
-class _ScriptedDriver:
-    """A driver that starts as told, reports what it was scripted to, and notes the rest."""
-
-    def __init__(
-        self,
-        *,
-        session: str = "s1",
-        events: Sequence[Ask | Resolved | StateChanged] = (),
-        fail: Exception | None = None,
-    ) -> None:
-        self.session = session
-        self.script = events
-        self.fail = fail
-        self.started: tuple[Path, str, str, str] | None = None
-        self.stopped = False
-        self._ended: asyncio.Event | None = None
-
-    async def start(self, *, cwd: Path, resume: str, model: str, effort: str) -> str:
-        if self.fail is not None:
-            raise self.fail
-        self._ended = asyncio.Event()
-        self.started = (cwd, resume, model, effort)
-        return self.session
-
-    async def send_line(self, text: str) -> None:
-        del text
-
-    async def command(self, verb: str, args: str) -> str:
-        del verb, args
-        return ""
-
-    async def answer(self, answer: Answer) -> None:
-        del answer
-
-    async def interrupt(self) -> None:
-        return
-
-    async def settings(self, *, model: str, effort: str) -> None:
-        del model, effort
-
-    async def stop(self) -> None:
-        self.stopped = True
-        assert self._ended is not None
-        self._ended.set()
-
-    async def events(self) -> AsyncIterator[Ask | Resolved | StateChanged]:
-        for event in self.script:
-            yield event
-        assert self._ended is not None
-        _ = await self._ended.wait()
-
-
-class _TuiRelay:
-    """A takeover terminal: it listens at once and runs until it is ended."""
-
-    def __init__(
-        self,
-        argv: list[str],
-        *,
-        wiring: _HeadlessWiring,
-        **kwargs: object,
-    ) -> None:
-        self.argv = list(argv)
-        self.kwargs = kwargs
-        self.ended = threading.Event()
-        self.over = False
-        wiring.relays.append(self)
-
-    def run(self) -> int:
-        host = self.kwargs["host"]
-        assert isinstance(host, HostSpec)
-        assert host.on_listening is not None
-        host.on_listening()
-        _ = self.ended.wait(5.0)
-        self.over = True
-        return 0
-
-    def terminate(self) -> None:
-        self.ended.set()
-
-    def submit(self, text: str) -> None:
-        del text
-
-
-@dataclass(slots=True, kw_only=True)
-class _HeadlessWiring(_Wiring):
-    """What a headless run handed each collaborator."""
-
-    drivers: list[_ScriptedDriver] = field(default_factory=list[_ScriptedDriver])
-    made: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
-    poll: list[object] = field(default_factory=list[object])
-    relays: list[_TuiRelay] = field(default_factory=list[_TuiRelay])
-    script: Callable[[HeadlessRun], None] | None = None
-    polled: threading.Event = field(default_factory=threading.Event)
-    stats: _Stats = field(default_factory=_Stats)
-    taken: list[str] = field(default_factory=list[str])
-    poll_thread: str = ""
-    up: threading.Event = field(default_factory=threading.Event)
-    after_ending: float = 0.0
-    poll_done: threading.Event = field(default_factory=threading.Event)
-
-
-def _hw_make_driver(
-    wiring: _HeadlessWiring,
-    config: RunConfig,
-    adapter: Adapter,
-    **kwargs: object,
-) -> Driver:
-    """Hand out the next scripted driver, noting what it was built from."""
-    argv = cast(list[str], kwargs["argv"])
-    # Read now: the run takes the file away when it ends.
-    settings = (
-        Path(argv[argv.index("--settings") + 1]).read_text()
-        if "--settings" in argv
-        else ""
-    )
-    wiring.made.append(
-        {"config": config, "adapter": adapter, "settings": settings, **kwargs},
-    )
-    return cast("Driver", wiring.drivers[len(wiring.made) - 1])
-
-
-def _hw_poll(wiring: _HeadlessWiring, *args: object, **kwargs: object) -> None:
-    """Note the poll loop's inputs, run the test's script against the run, end it."""
-    wiring.poll = [*args, kwargs]
-    wiring.daemons.append(threading.current_thread().daemon)
-    wiring.poll_thread = threading.current_thread().name
-    run = args[2]
-    assert isinstance(run, HeadlessRun)
-    wiring.polled.set()
-    if wiring.script is not None:
-        wiring.script(run)
-    run.terminate()
-    time.sleep(wiring.after_ending)
-    wiring.poll_done.set()
-
-
 def _wait_until(check: Callable[[], bool]) -> None:
     pause = threading.Event()
     for _ in range(1_000):
@@ -9925,81 +9199,6 @@ def _wait_until(check: Callable[[], bool]) -> None:
             return
         _ = pause.wait(0.005)
     raise AssertionError("the run never got there")
-
-
-# ``host`` says what hosts the run: a ``--detach`` host with a control socket, one with
-# a terminal alone, or none. A ``clientless`` run has no server, so it is ended through
-# its control socket.
-def _wire_headless(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    config: RunConfig,
-    adapter: Adapter,
-    drivers: Sequence[_ScriptedDriver] = (),
-    *,
-    wiring: _HeadlessWiring | None = None,
-    script: Callable[[HeadlessRun], None] | None = None,
-    sink: Sink | None = None,
-    sandboxed: bool = False,
-    client: RunClient | None = None,
-    host: Literal["terminal", "plain", "none"] = "terminal",
-    clientless: bool = False,
-) -> tuple[_HeadlessWiring, int]:
-    """Run ``_spawn_and_drain`` as a chat's headless run against scripted drivers."""
-    wiring = wiring or _HeadlessWiring(drivers=list(drivers), script=script)
-    spec = replace(
-        _spec(tmp_path),
-        on_takeover=wiring.taken.append,
-        on_listening=(
-            partial(_stop_soon, _spec(tmp_path).control)
-            if clientless
-            else wiring.up.set
-        ),
-    )
-    hosts: dict[str, HostSpec | None] = {
-        "terminal": spec,
-        "plain": HostSpec(
-            address=spec.address,
-            scrollback=spec.scrollback,
-            on_listening=wiring.up.set,
-        ),
-        "none": None,
-    }
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
-    monkeypatch.setattr(session, "_make_driver", partial(_hw_make_driver, wiring))
-    monkeypatch.setattr(
-        session,
-        "_drain_filesystem_loop",
-        partial(_wiring_drain, wiring),
-    )
-    monkeypatch.setattr(session, "_inbound_poll_loop", partial(_hw_poll, wiring))
-    monkeypatch.setattr(session, "ThreadedRelay", partial(_TuiRelay, wiring=wiring))
-    machine_host.set_sandbox(on=sandboxed)
-    status = session._spawn_and_drain(
-        replace(
-            config,
-            headless=True,
-            client=None if clientless else client or _NoServer(),
-            host=hosts[host],
-            run_name="chat-1",
-            quiesce_seconds=0.0,
-        ),
-        adapter,
-        sink or _RecordingSink(),
-        wiring.stats,
-    )
-    return wiring, status
-
-
-def _stop_soon(control: Path) -> None:
-    """Take the run over a moment after it is up, then end it as ``knowop run stop``."""
-    threading.Timer(0.02, _take_over_then_stop, args=(control,)).start()
-
-
-def _take_over_then_stop(control: Path) -> None:
-    _ = headless.request(control, "takeover")
-    _ = headless.request(control, "stop")
 
 
 def _spy_on_placing(
@@ -10014,28 +9213,6 @@ def _spy_on_placing(
     """Note what the run asks the server to place, and place it."""
     placed.append((client, session_id, cwd))
     return place(client, session_id=session_id, environ=environ, cwd=cwd)
-
-
-def _headless_config(
-    cli: str = "claude",
-    *,
-    actor: str | None = None,
-    rooms: tuple[str, ...] = (),
-    private: bool = False,
-    cli_session_id: str | None = None,
-    cli_args: tuple[str, ...] = (),
-    compact_after_load: bool = False,
-) -> RunConfig:
-    """Return a chat run's config with the few fields these tests vary."""
-    return RunConfig(
-        cli_name=cli,
-        actor=actor,
-        rooms=rooms,
-        private=private,
-        cli_session_id=cli_session_id,
-        cli_args=cli_args,
-        compact_after_load=compact_after_load,
-    )
 
 
 class TestAHeadlessRunsWiring:
@@ -11661,6 +10838,74 @@ def test_every_observer_given_sees_each_chunk_in_order(count: int) -> None:
 
 def _saw(seen: list[tuple[int, bytes]], who: int, raw: bytes) -> None:
     seen.append((who, raw))
+
+
+def test_a_clicked_commands_output_is_shown_on_its_sessions_run() -> None:
+    client = _PostRecorder()
+
+    session._put_run_output(
+        cast(RunClient, client),
+        _SessionOnlySink(),
+        "1" * 32,
+        "a" * 32,
+        "hi",
+    )
+
+    assert client.posted == [
+        (
+            session_run_output_path(_CHAT, "a" * 32),
+            {"instance": "1" * 32, "text": "hi"},
+        ),
+    ]
+
+
+def test_a_clicked_commands_output_waits_for_its_session_to_open() -> None:
+    client = _PostRecorder()
+
+    session._put_run_output(
+        cast(RunClient, client),
+        _RecordingSink(),
+        "1" * 32,
+        "a" * 32,
+        "hi",
+    )
+
+    assert client.posted == []
+
+
+def test_a_click_that_cannot_be_read_as_a_run_is_recorded_undelivered(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    records: list[SystemMessage] = []
+    runs = ClickedRuns(
+        record=records.append,
+        cwd=tmp_path,
+        env={"PATH": "/usr/bin:/bin"},
+        shell_path="/bin/sh",
+    )
+    item = InboundDrainItem(text="ls", kind="run", source="ann@x", payload={})
+
+    session._start_clicked(runs, item, record=records.append)
+
+    [record] = records
+    delivery = from_plain(record.extra["$delivery"], dict[str, object])
+    assert (delivery["kind"], delivery["refused"]) == ("run", False)
+    assert str(delivery["reason"]).startswith("1 validation error for ChatRun")
+    assert not runs.running()
+    assert [each.getMessage() for each in caplog.records] == [
+        "knowop run: could not run a clicked command",
+    ]
+
+
+def test_each_record_is_shown_to_the_pull_request_watch() -> None:
+    noted: list[TraxRecord] = []
+    watch = Mock(spec=PullRequestWatch, note=Mock(side_effect=noted.append))
+    record = UserMessage(content="gh pr create")
+
+    session._note_record(None, watch, record)
+
+    assert noted == [record]
 
 
 if __name__ == "__main__":

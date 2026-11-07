@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from trackinizer.client.errors import ClientError
 from treekle import PlainTree
@@ -46,6 +46,13 @@ class _Client:
     refusals: list[int] = field(default_factory=list)
     """The status each ``transition_*`` call is refused with, in turn; then none."""
 
+    made: UUID | None = None
+    """The row ``submit`` makes; ``None`` for a test that must make none."""
+
+    submitted: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+
+    profile: dict[str, PlainTree] = field(default_factory=dict)
+
     def get(
         self,
         path: str,
@@ -54,6 +61,8 @@ class _Client:
     ) -> PlainTree:
         del params
         self.calls.append(("get", path))
+        if path == "/api/me/profile":
+            return self.profile
         return {
             "backlinks": {"produced_by": self.peers},
             "edges": {"produced_by": self.peers},
@@ -75,8 +84,9 @@ class _Client:
         return [self.rows[one.value]] if one.value in self.rows else []
 
     def submit(self, kind: str, body: Mapping[str, object]) -> UUID:
-        del kind, body
-        raise AssertionError
+        assert self.made is not None, "a row was made where one was stored"
+        self.submitted.append((kind, dict(body)))
+        return self.made
 
     def add_edge(
         self,
@@ -162,6 +172,13 @@ def test_the_sessions_rows_read_each_link_once_and_only_a_pull_requests() -> Non
     assert rows.linked(_URL) == _ROW
 
 
+def test_a_labelled_edge_whose_row_is_gone_names_no_pull_request() -> None:
+    client = _Client(peers=[{"id": str(_ROW), "status": "active", "labels": [LABEL]}])
+    rows = PullRequestRows(client=client, actor="Agent")
+    assert rows.session_rows(_SESSION) == []
+    assert rows.linked(_URL) is None
+
+
 def test_a_row_is_linked_to_the_session_once_with_the_pull_request_label() -> None:
     client = _Client(rows={_URL: _row(_ROW, url=_URL, labels=[LABEL])})
     rows = PullRequestRows(client=client, actor="Agent")
@@ -172,6 +189,36 @@ def test_a_row_is_linked_to_the_session_once_with_the_pull_request_label() -> No
         ("edge", (_ROW, _SESSION, "produced_by")),
         (path, {"op": "add", "value": LABEL, "actor": "Agent"}),
     ]
+
+
+def test_a_pull_request_with_no_row_yet_gets_one_keyed_to_the_person_and_link() -> None:
+    client = _Client(made=_ROW)
+    rows = PullRequestRows(client=client, actor="Agent")
+
+    stored = rows.row(_URL, session=_SESSION, me="me@acme.test", pull_request=None)
+
+    assert stored == Stored(row=_ROW, app={}, status="active")
+    [(kind, body)] = client.submitted
+    assert (kind, body["title"], body["url"], body["labels"]) == (
+        "WebResult",
+        _URL,
+        _URL,
+        [LABEL],
+    )
+    assert body["idempotency_key"] == str(
+        uuid5(NAMESPACE_URL, f"me@acme.test\n{_URL}"),
+    )
+    assert ("edge", (_ROW, _SESSION, "produced_by")) in client.calls
+    assert rows.linked(_URL) == _ROW
+
+
+def test_the_profile_is_the_persons_as_the_server_says() -> None:
+    profile: dict[str, PlainTree] = {
+        "email": "me@acme.test",
+        "preferences": {"autofix": False},
+    }
+    rows = PullRequestRows(client=_Client(profile=profile), actor="Agent")
+    assert rows.profile() == profile
 
 
 def _bump(pr: dict[str, object]) -> tuple[dict[str, object], int]:
@@ -236,6 +283,13 @@ def test_a_row_moves_from_the_status_it_was_read_with() -> None:
         ("status", ("active", "abandoned")),
         ("status", ("abandoned", "active")),
     ]
+
+
+def test_a_move_the_server_refuses_for_another_reason_fails_the_pass() -> None:
+    client = _Client(refusals=[500])
+    rows = PullRequestRows(client=client, actor="Agent")
+    with pytest.raises(ClientError, match="refused"):
+        rows.move(Stored(row=_ROW, app={}, status="active"), status="complete")
 
 
 @pytest.mark.parametrize(

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import IO, TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, cast, override
 
 import hashlib
 import io
@@ -13,348 +11,57 @@ import json
 import re
 import shutil
 import subprocess
-import tarfile
 import time
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import data_dir
 from trackinizer.trax.context import CWD
 from trackinizer.wire.wire_job import (
-    Grant,
     GrantStatus,
-    GrantTicket,
-    JobList,
-    JobView,
-    ReadGrantBody,
-    SecretNames,
     StartBody,
     SubmitBody,
 )
-from trackinizer.wire.wire_machine_job import MachineJobList
 
 import pytest
 
-from knowop.jobs import job_records, job_source, machine_job
+from knowop.jobs import job_records, machine_job
+from knowop.jobs.conftest import (
+    _COMMIT,
+    _PUBLIC,
+    _fake_source,
+    _grant,
+    _job,
+    _Rig,
+    _Server,
+    _Time,
+    allowed,
+    outs,
+    snapshotted,
+)
 from knowop.jobs.job import JOB_WORD, Job, Rig, results_dir
-from knowop.jobs.job_source import BundleInfo, Snapshot
 from knowop.jobs.job_ssh import SubprocessRunner, Tools
 
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Sequence
+    from collections.abc import Generator
+    from pathlib import Path
 
     import argparse
 
     from trackinizer.client.client import Client
 
 
-_BLOB = "AAAAC3NzaC1lZDI1NTE5AAAAIPtWmP3ce7m3hrwpxvm9x5s3WnCClGsA5R5nJ9J25ir1"
-_PUBLIC = f"ssh-ed25519 {_BLOB}"
-_CERT = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAx"
-_COMMIT = "a" * 40
 _BASE = "b" * 40
 _HEAD = "c" * 40
-_URL = "https://trax.example"
-_TOOLS = Tools(ssh="ssh", ssh_keygen="ssh-keygen")
 
 
 def _no_client() -> Client:
     raise AssertionError("the command must not reach the server")
 
 
-def _grant(role: str = "rw") -> Grant:
-    return Grant.model_validate(
-        {
-            "job_id": 7,
-            "serial": 3,
-            "role": role,
-            "node": {
-                "name": "gpu-node-b",
-                "host": "203.0.113.7",
-                "port": 22,
-                "user": "rai-ext-job-7",
-                "host_key": _PUBLIC,
-            },
-            "certificate": _CERT,
-            "valid_before": "2026-10-21T12:00:00Z",
-            "max_bundle_bytes": 100_000,
-        },
-    )
-
-
-def _job(state: str = "queued", **fields: object) -> JobView:
-    return JobView.model_validate(
-        {
-            "id": 7,
-            "state": state,
-            "node": "gpu-node-b",
-            "gpus": 1,
-            "minutes": 5,
-            "label": "try",
-            "argv": ["python", "x.py"],
-            "commit": _COMMIT,
-            "bundle_sha256": None,
-            "created_at": datetime(2026, 10, 21, 12, tzinfo=UTC),
-            "started_at": None,
-            "ended_at": None,
-            "gpu_seconds": None,
-            "usd": None,
-            "reason": "",
-            "upload_serial": 3,
-            **fields,
-        },
-    )
-
-
-class _Time:
-    """A clock that only moves when something waits."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-        self.slept: list[float] = []
-
-    def clock(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.slept.append(seconds)
-        self.now += seconds
-
-
-class _Server:
-    """The server's ``job_*`` methods, scripted, recording every call."""
-
-    base_url = _URL
-
-    def __init__(self, time: _Time) -> None:
-        self.time = time
-        self.calls: list[tuple[str, object]] = []
-        self.grants = [GrantStatus(state="ready", grant=_grant())]
-        self.read_grants = [GrantStatus(state="ready", grant=_grant("ro"))]
-        self.views = [_job("queued")]
-        self.names: list[str] = []
-
-    def _next[T](self, queue: list[T]) -> T:
-        return queue.pop(0) if len(queue) > 1 else queue[0]
-
-    def job_submit(self, body: SubmitBody) -> JobView:
-        self.calls.append(("submit", body))
-        return _job("requested")
-
-    def job_grant(self, job_id: int, *, wait: float) -> GrantStatus:
-        self.calls.append(("grant", (job_id, wait)))
-        status = self._next(self.grants)
-        if status.state == "pending":
-            self.time.now += wait
-        return status
-
-    def job_read_grant(self, job_id: int, body: ReadGrantBody) -> GrantTicket:
-        self.calls.append(("read_grant", (job_id, body.public_key)))
-        return GrantTicket(serial=9)
-
-    def job_grant_serial(self, job_id: int, serial: int, *, wait: float) -> GrantStatus:
-        self.calls.append(("grant_serial", (job_id, serial, wait)))
-        return self._next(self.read_grants)
-
-    def job_start(self, job_id: int, body: StartBody) -> JobView:
-        self.calls.append(("start", (job_id, body)))
-        return _job("starting")
-
-    def job_view(self, job_id: int) -> JobView:
-        self.calls.append(("job", job_id))
-        return self._next(self.views)
-
-    def job_list(self) -> JobList:
-        self.calls.append(("jobs", None))
-        return JobList(jobs=[_job("running"), _job("completed", id=6, node=None)])
-
-    def job_cancel(self, job_id: int) -> JobView:
-        self.calls.append(("cancel", job_id))
-        return _job("cancelled")
-
-    # Every job here is a GPU job: the server holds no machine job of the caller's.
-    def machine_job_view(self, job_id: int) -> JobView:
-        self.calls.append(("machine_job", job_id))
-        raise ClientError("-> 404", status_code=404)
-
-    def machine_job_cancel(self, job_id: int) -> JobView:
-        self.calls.append(("machine_cancel", job_id))
-        raise ClientError("-> 404", status_code=404)
-
-    def machine_job_list(self) -> MachineJobList:
-        self.calls.append(("machine_jobs", None))
-        return MachineJobList(jobs=[])
-
-    def job_secret_names(self) -> SecretNames:
-        return SecretNames(names=self.names)
-
-    def job_put_secret(self, name: str, value: str) -> None:
-        self.calls.append(("put_secret", (name, value)))
-
-    def job_delete_secret(self, name: str) -> None:
-        self.calls.append(("delete_secret", name))
-
-
-class _Node:
-    """Plays ssh-keygen and the node's gate for every verb."""
-
-    def __init__(self) -> None:
-        self.words: list[list[str]] = []
-        self.keygen_dirs: list[Path] = []
-        self.bases: list[str] = []
-        self.upload_codes = [0]
-        self.uploaded: list[bytes] = []
-        self.reply_commit: str | None = None
-        self.files: dict[str, bytes] = {"a.txt": b"alpha", "d/b.bin": b"beta"}
-        self.interrupt = False
-        self.log_chunks = ["é".encode()[:1], "é".encode()[1:] + b" line\n"]
-
-    def run(
-        self,
-        argv: Sequence[str],
-        *,
-        stdin: bytes | IO[bytes] | None = None,
-        stdout: IO[bytes] | None = None,
-    ) -> int:
-        if argv[0] == "ssh-keygen":
-            key = Path(argv[argv.index("-f") + 1])
-            self.keygen_dirs.append(key.parent)
-            key.write_text("PRIVATE\n")
-            key.with_suffix(".pub").write_text(f"{_PUBLIC} knowop-job\n")
-            return 0
-        assert stdout is not None
-        words = list(argv[argv.index("--") + 1 :])
-        self.words.append(words)
-        match words[0]:
-            case "bases":
-                _ = stdout.write("".join(f"{each}\n" for each in self.bases).encode())
-            case "upload":
-                assert stdin is not None
-                assert not isinstance(stdin, bytes)
-                data = stdin.read()
-                self.uploaded.append(data)
-                if code := self.upload_codes.pop(0):
-                    return code
-                reply = {
-                    "commit": self.reply_commit or words[3],
-                    "bundle_sha256": words[2],
-                    "bytes": len(data),
-                    "files": 2,
-                }
-                _ = stdout.write(json.dumps(reply).encode() + b"\n")
-            case "logs":
-                if self.interrupt:
-                    raise KeyboardInterrupt
-                for chunk in self.log_chunks:
-                    _ = stdout.write(chunk)
-            case "manifest":
-                for path, data in self.files.items():
-                    entry = {
-                        "path": path,
-                        "size": len(data),
-                        "sha256": hashlib.sha256(data).hexdigest(),
-                    }
-                    _ = stdout.write(json.dumps(entry).encode() + b"\n")
-            case "download":
-                assert isinstance(stdin, bytes)
-                wanted = stdin.decode().split()
-                with tarfile.open(fileobj=stdout, mode="w|") as tar:
-                    for path in wanted:
-                        info = tarfile.TarInfo(path)
-                        info.size = len(self.files[path])
-                        tar.addfile(info, io.BytesIO(self.files[path]))
-            case _:
-                raise AssertionError(words)
-        return 0
-
-
-class _Rig:
-    def __init__(self) -> None:
-        self.time = _Time()
-        self.server = _Server(self.time)
-        self.node = _Node()
-
-    def factory(self) -> Client:
-        return cast("Client", self.server)
-
-    @property
-    def rig(self) -> Rig:
-        return Rig(
-            client=cast("Client", self.server),
-            runner=self.node,
-            tools=_TOOLS,
-            sleep=self.time.sleep,
-            clock=self.time.clock,
-        )
-
-
 @pytest.fixture
 def world() -> _Rig:
     return _Rig()
-
-
-outs: list[str] = []
-"""The file names the fake bundler was asked to write."""
-
-snapshotted: list[Path] = []
-"""The directories the fake snapshotter was asked to snapshot."""
-
-allowed: list[bool] = []
-"""Whether each fake snapshot was told to send secret-named untracked files."""
-
-
-def _fake_source(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    *,
-    size: int = 12,
-    base: str | None = None,
-    untracked: tuple[str, ...] = (),
-    head: str = "",
-    shallow: bool = False,
-) -> list[list[str]]:
-    """Replace git: the snapshot is a commit, the bundle a 12-byte file."""
-    bundled: list[list[str]] = []
-    outs.clear()
-    snapshotted.clear()
-    allowed.clear()
-    private = tmp_path / "private"
-    private.mkdir(exist_ok=True)
-
-    def snapshot(
-        repo: Path,
-        tmp: Path,
-        *,
-        allow_secret_names: bool = False,
-    ) -> Snapshot:
-        del tmp
-        snapshotted.append(repo)
-        allowed.append(allow_secret_names)
-        return Snapshot(
-            commit=_COMMIT,
-            private_git_dir=private,
-            files=5,
-            untracked=untracked,
-            head=head,
-            shallow=shallow,
-        )
-
-    def bundle(snap: Snapshot, bases: Sequence[str], out: Path) -> BundleInfo:
-        assert snap.commit == _COMMIT
-        outs.append(out.name)
-        bundled.append(list(bases))
-        data = b"b" * size
-        out.write_bytes(data)
-        return BundleInfo(
-            path=out,
-            bytes=size,
-            sha256=hashlib.sha256(data).hexdigest(),
-            base=base if bases else None,
-        )
-
-    monkeypatch.setattr(job_source, "snapshot", snapshot)
-    monkeypatch.setattr(job_source, "bundle", bundle)
-    return bundled
 
 
 def _submit(

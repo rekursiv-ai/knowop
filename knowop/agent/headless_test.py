@@ -7,10 +7,9 @@ real one in a temp folder.
 from __future__ import annotations
 
 from concurrent import futures
-from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, Self, cast
+from typing import TYPE_CHECKING, Final, cast
 from unittest.mock import ANY, Mock, call, patch
 
 import asyncio
@@ -29,14 +28,13 @@ from trackinizer.runs.asks import (
     RunState,
     StateChanged,
 )
-from trackinizer.sagent.session.types import SystemMessage
 from treekle import PlainTree, from_plain, json_loads
 
 import pytest
 
 from knowop.agent import headless
+from knowop.agent.conftest import _WAIT, _FakeDriver, _HeadlessRig
 from knowop.agent.headless import (
-    HeadlessRun,
     HostState,
     Reply,
     RunEndedError,
@@ -48,12 +46,8 @@ from knowop.agent.headless import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Coroutine
+    from collections.abc import Callable, Coroutine
 
-    from trackinizer.runs.asks import Driver
-
-
-_WAIT: Final = 5.0
 
 _ASK: Final = Ask(
     id="a1",
@@ -66,206 +60,6 @@ _ASK: Final = Ask(
         Option(id="decline", label="No", kind="deny"),
     ),
 )
-
-
-class _FakeDriver:
-    """A scripted driver: it reports what it is pushed, and remembers what it is told."""
-
-    def __init__(self, *, session: str = "s1", fail: Exception | None = None) -> None:
-        self.session = session
-        self.fail = fail
-        self.started: tuple[Path, str, str, str] | None = None
-        self.told: list[tuple[str, object]] = []
-        self.stopped = False
-        self.refuse: Exception | None = None
-        self.hold_start: threading.Event | None = None
-        self.starting = threading.Event()
-        self.hang = False
-        self.hanging = threading.Event()
-        self.printed = ""
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._queue = asyncio.Queue[Ask | Resolved | StateChanged | None]()
-
-    def push(self, event: Ask | Resolved | StateChanged | None) -> None:
-        """Report ``event`` from any thread; ``None`` ends the driver by itself."""
-        loop = self._loop
-        assert loop is not None
-        loop.call_soon_threadsafe(self._queue.put_nowait, event)
-
-    async def start(self, *, cwd: Path, resume: str, model: str, effort: str) -> str:
-        self._loop = asyncio.get_running_loop()
-        self.starting.set()
-        if self.hold_start is not None:
-            _ = await asyncio.to_thread(self.hold_start.wait, _WAIT)
-        if self.fail is not None:
-            raise self.fail
-        self.started = (cwd, resume, model, effort)
-        return self.session
-
-    async def send_line(self, text: str) -> None:
-        await self._tell("line", text)
-
-    async def command(self, verb: str, args: str) -> str:
-        await self._tell("command", (verb, args))
-        return self.printed
-
-    async def answer(self, answer: Answer) -> None:
-        await self._tell("answer", answer)
-
-    async def interrupt(self) -> None:
-        await self._tell("interrupt", None)
-
-    async def settings(self, *, model: str, effort: str) -> None:
-        await self._tell("settings", (model, effort))
-
-    async def stop(self) -> None:
-        self.stopped = True
-        await self._queue.put(None)
-
-    async def events(self) -> AsyncIterator[Ask | Resolved | StateChanged]:
-        while (event := await self._queue.get()) is not None:
-            yield event
-
-    async def _tell(self, what: str, detail: object) -> None:
-        if self.refuse is not None:
-            raise self.refuse
-        if self.hang:
-            self.hanging.set()
-            _ = await asyncio.Event().wait()
-        self.told.append((what, detail))
-
-
-type _TuiMode = Literal["listens", "late", "silent", "crashes", "fails"]
-
-
-class _FakeTui:
-    """A takeover terminal: it listens, then runs until it is ended.
-
-    ``late`` listens a moment after it starts, ``silent`` never listens, ``crashes``
-    fails after it listens, and ``fails`` fails before it listens.
-    """
-
-    def __init__(
-        self,
-        *,
-        listening: Callable[[], None],
-        exits_with: int | None,
-        mode: _TuiMode,
-    ) -> None:
-        self._listening = listening
-        self._exits_with = exits_with
-        self._mode = mode
-        self.lines: list[str] = []
-        self.ended = threading.Event()
-        self.over = threading.Event()
-
-    def run(self) -> int:
-        if self._exits_with is not None:
-            return self._exits_with
-        if self._mode == "fails":
-            raise OSError("out of ptys")
-        if self._mode == "late":
-            _ = self.ended.wait(0.03)
-        if self._mode != "silent":
-            self._listening()
-        if self._mode == "crashes":
-            raise RuntimeError("pty died")
-        _ = self.ended.wait(_WAIT)
-        self.over.set()
-        return 0
-
-    def terminate(self) -> None:
-        self.ended.set()
-
-    def submit(self, text: str) -> None:
-        self.lines.append(text)
-
-    def finish(self) -> None:
-        """Quit the way a person does: the terminal ends by itself."""
-        self.ended.set()
-
-
-@dataclass(slots=True, kw_only=True)
-class _Rig:
-    """A headless run in a thread, with its fake drivers and terminal."""
-
-    drivers: list[_FakeDriver] = field(default_factory=lambda: [_FakeDriver()])
-    tui_exits: tuple[int | None, ...] = ()
-    tui_mode: _TuiMode = "listens"
-    no_tui: Exception | None = None
-    resume: str = ""
-    control: Path | None = None
-    notify_takeover: bool = True
-    records: list[SystemMessage] = field(default_factory=list[SystemMessage])
-    sessions: list[str] = field(default_factory=list[str])
-    states: list[HostState] = field(default_factory=list[HostState])
-    taken: list[str] = field(default_factory=list[str])
-    tuis: list[_FakeTui] = field(default_factory=list[_FakeTui])
-    tui_for: list[str] = field(default_factory=list[str])
-    status: list[int] = field(default_factory=list[int])
-    started: threading.Event = field(default_factory=threading.Event)
-    listening: threading.Event = field(default_factory=threading.Event)
-    run: HeadlessRun = field(init=False)
-    _thread: threading.Thread = field(init=False)
-    _made: int = field(default=0, init=False)
-
-    def __post_init__(self) -> None:
-        self.run = HeadlessRun(
-            cli="codex",
-            cwd=Path("/work"),
-            resume=self.resume,
-            model="m1",
-            effort="high",
-            make_driver=self._make_driver,
-            make_tui=self._make_tui,
-            record=self.records.append,
-            on_session=self.sessions.append,
-            on_listening=self.listening.set,
-            on_state=self.states.append,
-            on_takeover=self.taken.append if self.notify_takeover else None,
-            control=self.control,
-        )
-        self._thread = threading.Thread(
-            target=lambda: self.status.append(
-                self.run.run(on_started=self.started.set),
-            ),
-            daemon=True,
-        )
-
-    def __enter__(self) -> Self:
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.run.terminate()
-        self._thread.join(_WAIT)
-        assert not self._thread.is_alive(), "the run did not end"
-
-    def wait_started(self) -> None:
-        assert self.started.wait(_WAIT), "the run did not start"
-
-    def join(self) -> int:
-        self._thread.join(_WAIT)
-        assert not self._thread.is_alive(), "the run did not end"
-        return self.status[0]
-
-    def _make_driver(self) -> Driver:
-        driver = self.drivers[self._made]
-        self._made += 1
-        return cast("Driver", driver)
-
-    def _make_tui(self, *, session_id: str, listening: Callable[[], None]) -> _FakeTui:
-        if self.no_tui is not None:
-            raise self.no_tui
-        self.tui_for.append(session_id)
-        nth = len(self.tuis)
-        tui = _FakeTui(
-            listening=listening,
-            exits_with=self.tui_exits[nth] if nth < len(self.tui_exits) else None,
-            mode=self.tui_mode,
-        )
-        self.tuis.append(tui)
-        return tui
 
 
 def _wait_for(check: Callable[[], bool]) -> None:
@@ -281,14 +75,14 @@ class TestStart:
     """The run starts its driver where the chat's run was told to."""
 
     def test_the_driver_starts_in_the_folder_with_the_model(self) -> None:
-        with _Rig(resume="old") as rig:
+        with _HeadlessRig(resume="old") as rig:
             rig.wait_started()
             assert rig.drivers[0].started == (Path("/work"), "old", "m1", "high")
             assert rig.run.session_id == "s1"
             assert rig.sessions == ["s1"]
 
     def test_the_launcher_hears_the_run_is_up_after_the_driver_is(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             assert rig.listening.is_set()
 
@@ -297,7 +91,7 @@ class TestStart:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         driver = _FakeDriver(fail=FileNotFoundError("claude"))
-        with _Rig(drivers=[driver]) as rig:
+        with _HeadlessRig(drivers=[driver]) as rig:
             assert rig.join() == 1
             assert not rig.started.is_set()
             assert not rig.listening.is_set()
@@ -306,7 +100,7 @@ class TestStart:
         assert "could not start codex headless: claude" in capsys.readouterr().err
 
     def test_a_run_that_started_has_no_failure_to_say(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             assert rig.run.failure == ""
 
@@ -315,7 +109,7 @@ class TestEvents:
     """What the driver reports becomes the records of the chat's session."""
 
     def test_an_ask_is_a_card_and_its_end_closes_it(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             rig.drivers[0].push(_ASK)
             rig.drivers[0].push(
@@ -341,7 +135,7 @@ class TestEvents:
             )
 
     def test_an_ask_names_when_it_was_asked(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             rig.drivers[0].push(_ASK)
             _wait_for(lambda: len(rig.records) == 1)
@@ -350,7 +144,7 @@ class TestEvents:
             assert abs((datetime.now(UTC) - datetime.fromisoformat(stamp)).seconds) < 5
 
     def test_each_change_of_state_is_reported(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             turn: tuple[RunState, ...] = (
                 "running",
@@ -365,7 +159,7 @@ class TestEvents:
             assert rig.run.state == "idle"
 
     def test_a_state_that_did_not_change_is_not_reported_again(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             quiet: tuple[RunState, ...] = ("idle", "running", "running")
             for state in quiet:
@@ -375,13 +169,13 @@ class TestEvents:
             assert rig.states == ["running"]
 
     def test_a_driver_that_ends_by_itself_ends_the_run(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             rig.drivers[0].push(None)
             assert rig.join() == 1
 
     def test_the_run_stop_ends_the_driver_and_is_not_a_failure(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             rig.run.terminate()
             assert rig.join() == 0
@@ -393,7 +187,7 @@ class TestWhatThePersonSends:
 
     def test_a_line_a_command_an_answer_an_interrupt_and_settings(self) -> None:
         answer = Answer(ask_id="a1", option="accept", who="jp")
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             rig.run.send_line("hello")
             rig.run.command("compact", "")
@@ -409,28 +203,28 @@ class TestWhatThePersonSends:
             ]
 
     def test_a_command_answers_with_what_the_driver_printed(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             assert rig.run.command("compact", "") == ""
             rig.drivers[0].printed = "Remote Control is active"
             assert rig.run.command("rc", "") == "Remote Control is active"
 
     def test_what_the_driver_refuses_comes_back_to_the_sender(self) -> None:
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             rig.drivers[0].refuse = ValueError("no such option")
             with pytest.raises(ValueError, match="no such option"):
                 rig.run.answer(Answer(ask_id="a1", option="x"))
 
     def test_a_call_after_the_run_ended_says_so(self) -> None:
-        rig = _Rig()
+        rig = _HeadlessRig()
         with rig:
             rig.wait_started()
         with pytest.raises(RunEndedError):
             rig.run.send_line("late")
 
     def test_a_call_before_the_run_started_says_so(self) -> None:
-        rig = _Rig()
+        rig = _HeadlessRig()
         with pytest.raises(RunEndedError):
             rig.run.interrupt()
 
@@ -449,7 +243,7 @@ class TestTakeover:
         notify_takeover: bool,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control, notify_takeover=notify_takeover) as rig:
+        with _HeadlessRig(control=control, notify_takeover=notify_takeover) as rig:
             rig.wait_started()
             reply = request(control, "takeover")
             assert reply.ok
@@ -462,7 +256,7 @@ class TestTakeover:
 
     def test_a_line_is_refused_while_it_is_taken_over(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             assert request(control, "takeover").ok
             for call in (lambda: rig.run.send_line("hello"), rig.run.interrupt):
@@ -477,7 +271,7 @@ class TestTakeover:
         tmp_path: Path,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             rig.drivers[0].push(_ASK)
             _wait_for(lambda: len(rig.records) == 1)
@@ -499,7 +293,7 @@ class TestTakeover:
         tmp_path: Path,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             assert request(control, "takeover").ok
             assert request(control, "takeover").ok
@@ -512,7 +306,7 @@ class TestTakeover:
         tmp_path: Path,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             assert request(control, "takeover").ok
             rig.tuis[0].finish()
@@ -530,7 +324,7 @@ class TestTakeover:
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
         drivers = [_FakeDriver(), _FakeDriver()]
-        with _Rig(control=control, drivers=drivers, tui_exits=(3,)) as rig:
+        with _HeadlessRig(control=control, drivers=drivers, tui_exits=(3,)) as rig:
             rig.wait_started()
             reply = request(control, "takeover")
             assert not reply.ok
@@ -548,7 +342,7 @@ class TestTakeover:
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
         drivers = [_FakeDriver(), _FakeDriver(session="s2")]
-        with _Rig(control=control, drivers=drivers, tui_exits=(3,)) as rig:
+        with _HeadlessRig(control=control, drivers=drivers, tui_exits=(3,)) as rig:
             rig.wait_started()
             assert not request(control, "takeover").ok
             assert rig.sessions == ["s1", "s2"]
@@ -560,7 +354,7 @@ class TestTakeover:
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
         drivers = [_FakeDriver(), _FakeDriver(fail=ConnectionError("gone"))]
-        with _Rig(control=control, drivers=drivers, tui_exits=(3,)) as rig:
+        with _HeadlessRig(control=control, drivers=drivers, tui_exits=(3,)) as rig:
             rig.wait_started()
             reply = request(control, "takeover")
             assert not reply.ok
@@ -575,7 +369,7 @@ class TestTakeover:
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
         drivers = [_FakeDriver(), _FakeDriver()]
-        with _Rig(control=control, drivers=drivers, tui_mode="fails") as rig:
+        with _HeadlessRig(control=control, drivers=drivers, tui_mode="fails") as rig:
             rig.wait_started()
             reply = request(control, "takeover")
             assert not reply.ok
@@ -590,7 +384,7 @@ class TestTakeover:
         control = socket_address(tmp_path / "c.sock")
         drivers = [_FakeDriver(), _FakeDriver()]
         no_tui = RuntimeError("codex has no turn in this chat yet")
-        with _Rig(control=control, drivers=drivers, no_tui=no_tui) as rig:
+        with _HeadlessRig(control=control, drivers=drivers, no_tui=no_tui) as rig:
             rig.wait_started()
             reply = request(control, "takeover")
             assert not reply.ok
@@ -603,7 +397,7 @@ class TestTakeover:
         tmp_path: Path,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             assert request(control, "takeover").ok
             assert say(control, "hi").ok
@@ -615,7 +409,7 @@ class TestControl:
 
     def test_state_names_the_run(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             reply = request(control, "state")
             assert (reply.ok, reply.state, reply.cli, reply.session) == (
@@ -627,14 +421,14 @@ class TestControl:
 
     def test_send_types_a_line_for_the_driver(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             assert say(control, "hi").ok
             assert rig.drivers[0].told == [("line", "hi")]
 
     def test_a_line_the_driver_refuses_is_reported(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             rig.drivers[0].refuse = ConnectionError("claude ended")
             reply = say(control, "hi")
@@ -643,7 +437,7 @@ class TestControl:
 
     def test_the_reattach_that_was_never_added_is_refused(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             raw = asyncio.run(_raw(control, b'{"op": "reattach"}\n'))
             assert b"unreadable request" in raw
@@ -654,7 +448,7 @@ class TestControl:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             rig.drivers[0].refuse = RuntimeError("boom")
             reply = say(control, "hi")
@@ -672,14 +466,14 @@ class TestControl:
         tmp_path: Path,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             rig.drivers[0].refuse = RuntimeError()
             assert say(control, "hi").reason == "RuntimeError"
 
     def test_stop_ends_the_run(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             assert request(control, "stop").ok
             assert rig.join() == 0
@@ -691,7 +485,7 @@ class TestControl:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             assert request(control, "takeover").ok
             assert request(control, "stop").ok
@@ -703,7 +497,7 @@ class TestControl:
 
     def test_the_socket_goes_with_the_run(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             assert control.exists()
         assert not control.exists()
@@ -714,7 +508,7 @@ class TestControl:
 
     def test_a_request_that_is_not_one_is_refused(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             raw = asyncio.run(_raw(control, b'{"op": "dance"}\n'))
             assert b'"ok": false' in raw
@@ -820,7 +614,7 @@ class TestAHungDriver:
         submitted = Mock(return_value=future)
         monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", submitted)
         with asyncio.Runner() as runner:
-            run = _Rig().run
+            run = _HeadlessRig().run
             run._loop = runner.get_loop()
             try:
                 with pytest.raises(TimeoutError):
@@ -833,13 +627,13 @@ class TestAHungDriver:
     def test_a_call_in_flight_when_the_run_ends_says_the_run_ended(self) -> None:
         caught: list[Exception] = []
 
-        def call(rig: _Rig) -> None:
+        def call(rig: _HeadlessRig) -> None:
             try:
                 rig.run.send_line("hello")
             except RunEndedError as error:
                 caught.append(error)
 
-        with _Rig() as rig:
+        with _HeadlessRig() as rig:
             rig.wait_started()
             rig.drivers[0].hang = True
             caller = threading.Thread(target=call, args=(rig,), daemon=True)
@@ -856,7 +650,7 @@ class TestARunThatIsStarting:
     def test_it_is_told_so_and_not_that_the_chat_was_taken_over(self) -> None:
         driver = _FakeDriver()
         driver.hold_start = threading.Event()
-        with _Rig(drivers=[driver]) as rig:
+        with _HeadlessRig(drivers=[driver]) as rig:
             assert driver.starting.wait(_WAIT)
             with pytest.raises(RunEndedError) as refused:
                 rig.run.send_line("hello")
@@ -869,7 +663,7 @@ class TestAFreshRun:
     """What a run says before it has started."""
 
     def test_it_is_idle_with_no_session_and_nothing_to_end(self) -> None:
-        run = _Rig().run
+        run = _HeadlessRig().run
 
         run.terminate()
 
@@ -877,7 +671,7 @@ class TestAFreshRun:
 
     def test_a_call_before_the_run_started_says_it_is_not_running(self) -> None:
         with pytest.raises(RunEndedError) as raised:
-            _Rig().run.interrupt()
+            _HeadlessRig().run.interrupt()
         assert str(raised.value) == "the codex run is not running"
 
 
@@ -904,7 +698,7 @@ class TestTheTerminalsEdges:
                 autospec=True,
                 side_effect=wait,
             ) as waited,
-            _Rig(control=control, drivers=drivers, tui_mode="silent") as rig,
+            _HeadlessRig(control=control, drivers=drivers, tui_mode="silent") as rig,
         ):
             rig.wait_started()
             reply = request(control, "takeover")
@@ -921,7 +715,7 @@ class TestTheTerminalsEdges:
         tmp_path: Path,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control, tui_mode="late") as rig:
+        with _HeadlessRig(control=control, tui_mode="late") as rig:
             rig.wait_started()
             reply = request(control, "takeover")
             assert (reply.ok, reply.state) == (True, "taken_over")
@@ -938,7 +732,7 @@ class TestTheTerminalsEdges:
             seen.append(capsys.readouterr().err)
             return "[knowop run] the codex terminal failed: pty died\n" in "".join(seen)
 
-        with _Rig(control=control, tui_mode="crashes") as rig:
+        with _HeadlessRig(control=control, tui_mode="crashes") as rig:
             rig.wait_started()
             assert request(control, "takeover").ok
             _wait_for(said)
@@ -947,7 +741,7 @@ class TestTheTerminalsEdges:
     def test_a_chat_handed_back_can_be_taken_over_again(self, tmp_path: Path) -> None:
         control = socket_address(tmp_path / "c.sock")
         drivers = [_FakeDriver(), _FakeDriver()]
-        with _Rig(control=control, drivers=drivers, tui_exits=(3, None)) as rig:
+        with _HeadlessRig(control=control, drivers=drivers, tui_exits=(3, None)) as rig:
             rig.wait_started()
             assert not request(control, "takeover").ok
             reply = request(control, "takeover")
@@ -966,7 +760,7 @@ class TestTheControlSocketsEdges:
         tmp_path: Path,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             raw = asyncio.run(_raw(control, b"not json\n"))
         assert json_loads(raw.decode(), Reply) == Reply(
@@ -979,7 +773,7 @@ class TestTheControlSocketsEdges:
         tmp_path: Path,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             raw = asyncio.run(_raw(control, b"x" * 100_000 + b"\n"))
             assert b"unreadable request" in raw
@@ -991,7 +785,7 @@ class TestTheControlSocketsEdges:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         control = socket_address(tmp_path / "c.sock")
-        with _Rig(control=control) as rig:
+        with _HeadlessRig(control=control) as rig:
             rig.wait_started()
             for _ in range(3):
                 probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1044,7 +838,7 @@ class TestSignals:
             callback, status = handlers[number]
             callback(status)
 
-        rig = _Rig()
+        rig = _HeadlessRig()
         status = rig.run.run(on_started=received)
         numbers = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
         installed.assert_has_calls(

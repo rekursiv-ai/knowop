@@ -16,7 +16,7 @@ from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from functools import partial
 from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Self, cast
+from typing import TYPE_CHECKING, Final, cast
 from unittest.mock import AsyncMock, patch
 
 import asyncio
@@ -35,7 +35,7 @@ from trackinizer.runs.asks import (
     Resolved,
     StateChanged,
 )
-from treekle import PlainTree, from_plain, json_loads
+from treekle import PlainTree, from_plain
 
 import pytest
 
@@ -44,17 +44,33 @@ from knowop.agent.claude_stream import (
     ClaudeWire,
     Reading,
 )
-from knowop.agent.codex_app_test import _signal_app
-from knowop.shell.exec_command_test import _process
+from knowop.agent.conftest import (
+    _ANY_REQUEST,
+    _ASK_STEPS,
+    _BASH_INPUT,
+    _INIT,
+    _ack,
+    _can_use_tool,
+    _claude_asked,
+    _claude_next,
+    _ClaudeEvent,
+    _ClaudeFrame,
+    _response,
+    _rest,
+    _Run,
+    _says,
+    _signal_app,
+    _state,
+    _step,
+)
+from knowop.shell.conftest import _process
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator, Mapping
+    from collections.abc import Iterator, Mapping
 
-    from knowop.shell.exec_command_test import _Process
+    from knowop.shell.conftest import _Process
 
-
-type _Frame = dict[str, PlainTree]
 
 _CWD: Final = Path("/work")
 
@@ -76,10 +92,6 @@ _MODE: Final[PlainTree] = {
 }
 _SUGGESTIONS: Final[PlainTree] = [_RULE, _FOLDER, _MODE]
 
-_BASH_INPUT: Final[PlainTree] = {
-    "command": "touch ok.txt",
-    "description": "Create empty file ok.txt",
-}
 
 _QUESTIONS: Final[PlainTree] = [
     {
@@ -94,28 +106,7 @@ _QUESTIONS: Final[PlainTree] = [
 ]
 
 
-def _can_use_tool(
-    tool: str = "Bash",
-    *,
-    input: PlainTree = _BASH_INPUT,
-    request_id: str = "r1",
-    **fields: PlainTree,
-) -> _Frame:
-    return {
-        "type": "control_request",
-        "request_id": request_id,
-        "request": {
-            "subtype": "can_use_tool",
-            "tool_name": tool,
-            "display_name": tool,
-            "input": input,
-            "tool_use_id": "toolu_1",
-            **fields,
-        },
-    }
-
-
-def _request(subtype: str, **fields: PlainTree) -> _Frame:
+def _request(subtype: str, **fields: PlainTree) -> _ClaudeFrame:
     return {
         "type": "control_request",
         "request_id": "r2",
@@ -144,13 +135,6 @@ def _bash(
 
 def _kinds(ask: Ask) -> list[tuple[str, str]]:
     return [(each.id, each.kind) for each in ask.options]
-
-
-def _response(request_id: str, **body: PlainTree) -> _Frame:
-    return {
-        "type": "control_response",
-        "response": {"subtype": "success", "request_id": request_id, "response": body},
-    }
 
 
 def test_a_bash_ask_becomes_a_permission_ask() -> None:
@@ -341,12 +325,13 @@ def test_the_session_id_and_state_follow_the_cli() -> None:
         {"type": "result", "subtype": "success"},
         {"type": "system", "subtype": "session_state_changed", "state": "asleep"},
         {"type": "system", "subtype": "init"},
+        {"type": "system", "subtype": "compact_boundary"},
         {"type": "control_cancel_request", "request_id": "nobody"},
         {"type": "control_request", "request": {"subtype": "can_use_tool"}},
         {"type": "mystery"},
     ],
 )
-def test_frames_that_open_nothing_are_ignored(frame: _Frame) -> None:
+def test_frames_that_open_nothing_are_ignored(frame: _ClaudeFrame) -> None:
     assert ClaudeWire(cwd=_CWD).read(frame) == Reading()
 
 
@@ -694,7 +679,7 @@ def test_a_dialog_nobody_declared_is_cancelled_at_once() -> None:
     assert reading.replies == (_response("r2", behavior="cancelled"),)
 
 
-def _failure(request_id: str, error: str) -> _Frame:
+def _failure(request_id: str, error: str) -> _ClaudeFrame:
     return {
         "type": "control_response",
         "response": {"subtype": "error", "request_id": request_id, "error": error},
@@ -789,7 +774,9 @@ def test_suggestions_are_worded_for_every_rule_and_folder() -> None:
         {"destination": "session"},
     ],
 )
-def test_a_suggestion_that_is_not_a_plain_allow_is_not_offered(update: _Frame) -> None:
+def test_a_suggestion_that_is_not_a_plain_allow_is_not_offered(
+    update: _ClaudeFrame,
+) -> None:
     ask = _bash(ClaudeWire(cwd=_CWD), permission_suggestions=[update])
     assert _kinds(ask) == [
         ("allow_once", "allow_once"),
@@ -807,53 +794,6 @@ def test_a_diff_needs_an_edit_and_both_strings() -> None:
     assert _bash(wire, tool="Edit", input=only_new, request_id="b").diff == ""
     assert _bash(wire, tool="Write", input=both, request_id="c").diff == ""
     assert _bash(wire, tool="Edit", input=both, request_id="d").diff != ""
-
-
-_FAKE: Final = """
-import json, os, sys
-
-script = json.load(open(os.environ["FAKE_SCRIPT"]))
-log = open(os.environ["FAKE_LOG"], "a")
-log.write(json.dumps({"argv": sys.argv[1:],
-                      "env": os.environ.get("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS"),
-                      "cwd": os.getcwd()}) + "\\n")
-log.flush()
-
-
-def matches(want, got):
-    if isinstance(want, dict):
-        return isinstance(got, dict) and all(
-            key in got and matches(value, got[key]) for key, value in want.items()
-        )
-    return want == got
-
-
-def answer(line):
-    frame = json.loads(line)
-    log.write(line)
-    log.flush()
-    for step in script:
-        if matches(step["when"], frame):
-            sys.stderr.write(step.get("stderr", ""))
-            sys.stderr.flush()
-            sys.stderr.buffer.write(bytes.fromhex(step.get("stderr_hex", "")))
-            sys.stderr.flush()
-            for emit in step["emit"]:
-                text = emit if isinstance(emit, str) else json.dumps(emit)
-                sys.stdout.write(text.replace("$request_id", frame.get("request_id", "")) + "\\n")
-                sys.stdout.flush()
-            sys.stdout.write(step.get("tail", ""))
-            sys.stdout.flush()
-            if "exit" in step:
-                sys.exit(step["exit"])
-            break
-
-
-for line in sys.stdin:
-    answer(line)
-"""
-"""A claude that answers from a script: each step names a frame to match and the frames
-to print back, with ``$request_id`` filled in from the frame it matched."""
 
 
 @pytest.fixture(autouse=True)
@@ -924,125 +864,6 @@ def _expired(
     return timeout(0)
 
 
-def _ack(**body: PlainTree) -> _Frame:
-    return _response("$request_id", **body)
-
-
-def _step(when: _Frame, *emit: _Frame | str, **more: PlainTree) -> _Frame:
-    return {"when": when, "emit": list(emit), **more}
-
-
-_USER: Final = "user"
-
-_INIT: Final = _step(
-    {"request": {"subtype": "initialize"}},
-    _ack(commands=[], session_state="idle"),
-)
-_ANY_REQUEST: Final = _step({"type": "control_request"}, _ack())
-
-
-def _state(state: str) -> _Frame:
-    return {"type": "system", "subtype": "session_state_changed", "state": state}
-
-
-def _says(text: str) -> _Frame:
-    return {"type": _USER, "message": {"role": "user", "content": text}}
-
-
-class _Run:
-    """One driver over the scripted fake, and what the fake saw.
-
-    Leaving the block stops the driver, so a test that fails half way leaves no fake
-    claude behind.
-    """
-
-    def __init__(
-        self,
-        tmp_path: Path,
-        *steps: _Frame,
-        permission_mode: str | None = None,
-        request_timeout_sec: float = 2.0,
-    ) -> None:
-        self.tmp_path = tmp_path
-        (tmp_path / "fake.py").write_text(_FAKE)
-        (tmp_path / "script.json").write_text(json.dumps(list(steps)))
-        self.log = tmp_path / "log.jsonl"
-        argv = (sys.executable, "-I", "-S", str(tmp_path / "fake.py"))
-        env = {
-            "FAKE_SCRIPT": str(tmp_path / "script.json"),
-            "FAKE_LOG": str(self.log),
-        }
-        # A request nobody answers fails the test in seconds, not at the harness limit.
-        self.driver = (
-            ClaudeStreamDriver(
-                argv=argv,
-                env=env,
-                request_timeout_sec=request_timeout_sec,
-            )
-            if permission_mode is None
-            else ClaudeStreamDriver(
-                argv=argv,
-                env=env,
-                permission_mode=permission_mode,
-                request_timeout_sec=request_timeout_sec,
-            )
-        )
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        del exc
-        await self.driver.stop()
-
-    async def start(
-        self,
-        *,
-        resume: str = "",
-        model: str = "",
-        effort: str = "",
-    ) -> str:
-        return await self.driver.start(
-            cwd=self.tmp_path,
-            resume=resume,
-            model=model,
-            effort=effort,
-        )
-
-    def seen(self) -> list[_Frame]:
-        return [
-            json_loads(line, dict[str, PlainTree])
-            for line in self.log.read_text().splitlines()
-        ]
-
-    def sent(self) -> list[_Frame]:
-        """Return the frames the driver wrote, after the fake's own first line."""
-        return self.seen()[1:]
-
-
-type _Event = Ask | Resolved | StateChanged
-
-
-async def _next(events: AsyncIterator[_Event]) -> _Event:
-    return await asyncio.wait_for(anext(events), 1)
-
-
-async def _rest(driver: Driver) -> list[_Event]:
-    async def drain() -> list[_Event]:
-        return [each async for each in driver.events()]
-
-    return await asyncio.wait_for(drain(), 2)
-
-
-async def _asked(run: _Run) -> AsyncIterator[_Event]:
-    """Start the run, send "ask", and return its events with the ask taken."""
-    _ = await run.start()
-    events = run.driver.events()
-    await run.driver.send_line("ask")
-    _ = [await _next(events), await _next(events)]
-    return events
-
-
 def test_start_launches_claude_headless_over_stream_json(tmp_path: Path) -> None:
     async def go() -> tuple[_Run, str]:
         async with _Run(tmp_path, _INIT) as run:
@@ -1091,13 +912,13 @@ def test_a_resumed_session_keeps_its_id(tmp_path: Path) -> None:
 
 
 def test_a_turn_reports_its_states(tmp_path: Path) -> None:
-    async def go() -> list[_Event]:
+    async def go() -> list[_ClaudeEvent]:
         steps = (_INIT, _step(_says("hi"), _state("running"), _state("idle")))
         async with _Run(tmp_path, *steps) as run:
             _ = await run.start()
             events = run.driver.events()
             await run.driver.send_line("hi")
-            return [await _next(events), await _next(events)]
+            return [await _claude_next(events), await _claude_next(events)]
 
     assert asyncio.run(go()) == [
         StateChanged(state="running"),
@@ -1105,25 +926,12 @@ def test_a_turn_reports_its_states(tmp_path: Path) -> None:
     ]
 
 
-_ASK_STEPS: Final = (
-    _INIT,
-    _step(_says("ask"), _state("requires_action"), _can_use_tool()),
-    _step({"type": "control_response"}, _state("running"), _state("idle")),
-    _step(
-        {"request": {"subtype": "interrupt"}},
-        {"type": "control_cancel_request", "request_id": "r1"},
-        _ack(still_queued=[]),
-    ),
-    _ANY_REQUEST,
-)
-
-
 def test_an_ask_is_answered_from_chat(tmp_path: Path) -> None:
-    async def go() -> tuple[_Run, list[_Event]]:
+    async def go() -> tuple[_Run, list[_ClaudeEvent]]:
         async with _Run(tmp_path, *_ASK_STEPS) as run:
-            events = await _asked(run)
+            events = await _claude_asked(run)
             await run.driver.answer(Answer(ask_id="r1", option="allow_once", who="jp"))
-            return run, [await _next(events) for _ in range(3)]
+            return run, [await _claude_next(events) for _ in range(3)]
 
     run, seen = asyncio.run(go())
     assert seen == [
@@ -1145,12 +953,12 @@ def test_an_ask_is_answered_from_chat(tmp_path: Path) -> None:
 
 
 def test_the_ask_reaches_the_events_with_its_state(tmp_path: Path) -> None:
-    async def go() -> list[_Event]:
+    async def go() -> list[_ClaudeEvent]:
         async with _Run(tmp_path, *_ASK_STEPS) as run:
             _ = await run.start()
             events = run.driver.events()
             await run.driver.send_line("ask")
-            return [await _next(events), await _next(events)]
+            return [await _claude_next(events), await _claude_next(events)]
 
     state, ask = asyncio.run(go())
     assert state == StateChanged(state="requires_action")
@@ -1160,11 +968,11 @@ def test_the_ask_reaches_the_events_with_its_state(tmp_path: Path) -> None:
 
 
 def test_an_interrupt_releases_the_ask_the_cli_withdraws(tmp_path: Path) -> None:
-    async def go() -> tuple[_Run, _Event]:
+    async def go() -> tuple[_Run, _ClaudeEvent]:
         async with _Run(tmp_path, *_ASK_STEPS) as run:
-            events = await _asked(run)
+            events = await _claude_asked(run)
             await run.driver.interrupt()
-            return run, await _next(events)
+            return run, await _claude_next(events)
 
     run, released = asyncio.run(go())
     assert released == Resolved(
@@ -1189,9 +997,9 @@ def test_a_late_answer_changes_nothing(tmp_path: Path) -> None:
 def test_an_option_the_ask_lacks_is_refused_and_the_ask_stays_open(
     tmp_path: Path,
 ) -> None:
-    async def go() -> list[_Event]:
+    async def go() -> list[_ClaudeEvent]:
         async with _Run(tmp_path, *_ASK_STEPS) as run:
-            _ = await _asked(run)
+            _ = await _claude_asked(run)
             with pytest.raises(ValueError, match="allow_session"):
                 await run.driver.answer(Answer(ask_id="r1", option="allow_session"))
             await run.driver.stop()
@@ -1203,7 +1011,7 @@ def test_an_option_the_ask_lacks_is_refused_and_the_ask_stays_open(
 
 
 def test_a_cli_that_exits_releases_what_it_left_open(tmp_path: Path) -> None:
-    async def go() -> list[_Event]:
+    async def go() -> list[_ClaudeEvent]:
         steps = (_INIT, _step(_says("die"), _can_use_tool(), exit=0))
         async with _Run(tmp_path, *steps) as run:
             _ = await run.start()
@@ -1221,7 +1029,7 @@ def test_a_cli_that_exits_releases_what_it_left_open(tmp_path: Path) -> None:
 
 
 def test_events_end_once_the_cli_is_gone(tmp_path: Path) -> None:
-    async def go() -> tuple[list[_Event], list[_Event]]:
+    async def go() -> tuple[list[_ClaudeEvent], list[_ClaudeEvent]]:
         async with _Run(tmp_path, _INIT) as run:
             _ = await run.start()
             await run.driver.stop()
@@ -1251,14 +1059,14 @@ def test_a_failed_write_releases_the_ask_and_says_so(
         del self, data
         return False
 
-    async def go() -> list[_Event]:
+    async def go() -> list[_ClaudeEvent]:
         async with _Run(tmp_path, *_ASK_STEPS) as run:
-            events = await _asked(run)
+            events = await _claude_asked(run)
             monkeypatch.setattr(Piped, "write", gone)
             with pytest.raises(ConnectionError, match=r"^claude has ended$"):
                 await run.driver.answer(Answer(ask_id="r1", option="allow_once"))
             monkeypatch.undo()
-            return [await _next(events)]
+            return [await _claude_next(events)]
 
     assert asyncio.run(go()) == [
         Resolved(ask_id="r1", option="", by="released", decision="released"),
@@ -1282,18 +1090,18 @@ def test_a_line_that_is_not_a_frame_does_not_end_the_reader(tmp_path: Path) -> N
         stderr="warning\n",
     )
 
-    async def go() -> list[_Event]:
+    async def go() -> list[_ClaudeEvent]:
         async with _Run(tmp_path, _INIT, noise) as run:
             _ = await run.start()
             events = run.driver.events()
             await run.driver.send_line("noise")
-            return [await _next(events)]
+            return [await _claude_next(events)]
 
     assert asyncio.run(go()) == [StateChanged(state="idle")]
 
 
 def test_a_last_frame_without_a_newline_is_still_read(tmp_path: Path) -> None:
-    async def go() -> list[_Event]:
+    async def go() -> list[_ClaudeEvent]:
         bye = _step(_says("bye"), tail=json.dumps(_state("idle")), exit=0)
         async with _Run(tmp_path, _INIT, bye) as run:
             _ = await run.start()
@@ -1369,7 +1177,7 @@ def test_a_request_the_driver_cannot_serve_is_answered_with_an_error(
             _ = await run.start()
             events = run.driver.events()
             await run.driver.send_line("serve")
-            _ = await _next(events)
+            _ = await _claude_next(events)
             return run
 
     run = asyncio.run(go())
@@ -1392,7 +1200,7 @@ def test_a_reply_that_cannot_be_written_does_not_end_the_reader(
     async def refuse_replies(self: Piped, data: bytes) -> bool:
         return False if b"unsupported" in data else await write(self, data)
 
-    async def go() -> list[_Event]:
+    async def go() -> list[_ClaudeEvent]:
         serve = _step(
             _says("serve"),
             {
@@ -1407,7 +1215,7 @@ def test_a_reply_that_cannot_be_written_does_not_end_the_reader(
             events = run.driver.events()
             monkeypatch.setattr(Piped, "write", refuse_replies)
             await run.driver.send_line("serve")
-            return [await _next(events)]
+            return [await _claude_next(events)]
 
     assert asyncio.run(go()) == [StateChanged(state="idle")]
 
@@ -1447,14 +1255,18 @@ def test_a_refusal_without_words_still_says_it_was_refused(tmp_path: Path) -> No
 
 def test_a_slash_command_is_a_line(tmp_path: Path) -> None:
     async def go() -> tuple[_Run, list[str]]:
-        async with _Run(tmp_path, _INIT, _step({"type": _USER}, _state("idle"))) as run:
+        async with _Run(
+            tmp_path,
+            _INIT,
+            _step({"type": "user"}, _state("idle")),
+        ) as run:
             _ = await run.start()
             events = run.driver.events()
             printed = [
                 await run.driver.command("compact", ""),
                 await run.driver.command("/goal", "ship it"),
             ]
-            _ = [await _next(events), await _next(events)]
+            _ = [await _claude_next(events), await _claude_next(events)]
             return run, printed
 
     run, printed = asyncio.run(go())
@@ -1572,7 +1384,7 @@ def test_start_stops_the_cli_when_initialize_is_refused(tmp_path: Path) -> None:
         },
     )
 
-    async def go() -> list[_Event]:
+    async def go() -> list[_ClaudeEvent]:
         async with _Run(tmp_path, refused) as run:
             with pytest.raises(RuntimeError, match="boom"):
                 _ = await run.start()
@@ -1638,7 +1450,7 @@ def test_the_session_id_follows_a_clear(tmp_path: Path) -> None:
             _ = await run.start()
             events = run.driver.events()
             await run.driver.command("clear", "")
-            _ = await _next(events)
+            _ = await _claude_next(events)
             return run.driver.session_id
 
     assert asyncio.run(go()) == "fresh"

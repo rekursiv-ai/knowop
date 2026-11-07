@@ -23,16 +23,31 @@ from trackinizer.lib.posix.host import Frame, decode_frame, encode_frame, encode
 from trackinizer.lib.posix.terminal import Terminal
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.wire import wire_terminals
-from trackinizer.wire.wire_terminals import TerminalWait
-from websockets.datastructures import Headers
-from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.exceptions import ConnectionClosed
 from websockets.frames import Close
-from websockets.http11 import Response
 
 import pytest
 import pytest_asyncio
 
 from knowop.shell import terminal_host
+from knowop.shell.conftest import (
+    _CREDENTIAL,
+    _INSTANCE,
+    _MACHINE,
+    _Client,
+    _connect,
+    _connector,
+    _fail_files,
+    _FakeSocket,
+    _finish_files,
+    _Messages,
+    _opened,
+    _ScriptedPeer,
+    _startup_log,
+    _status,
+    _terminal_host,
+    _terminal_run,
+)
 from knowop.shell.files_channel import FilesChannel, Info
 from knowop.shell.terminal_direct import DirectRouter
 from knowop.shell.terminal_host import (
@@ -45,91 +60,14 @@ from knowop.shell.terminal_host import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+    from collections.abc import AsyncIterator, Callable
 
     from trackinizer.mock_test_support import AsyncMockProtocol, MockProtocol
     from websockets.asyncio.client import ClientConnection
 
-    from knowop.shell.terminal_direct import PeerFactory
-
 pytestmark = pytest.mark.asyncio
 
-_MACHINE = uuid.UUID(int=1)
-_INSTANCE = uuid.UUID(int=2)
-_CREDENTIAL = "trax_machine_" + "0" * 32 + "_" + "c" * 43
 _INPUT = encode_frame(Frame.INPUT, b"typed\n")
-
-
-class _Client:
-    """Hands out scripted waits; once they run out it blocks like a held request."""
-
-    def __init__(self, answers: Sequence[TerminalWait | ClientError]) -> None:
-        self._answers = list(answers)
-        self.idle = threading.Event()
-        self.closed = threading.Event()
-        self.failed = threading.Event()
-        """Set once a scripted error has been raised."""
-
-    def wait_terminals(
-        self,
-        machine_id: uuid.UUID,
-        *,
-        instance: uuid.UUID,
-        wait_sec: float,
-    ) -> TerminalWait | None:
-        assert (machine_id, instance, wait_sec) == (_MACHINE, _INSTANCE, 25)
-        if self._answers:
-            answer = self._answers.pop(0)
-            if isinstance(answer, ClientError):
-                self.failed.set()
-                raise answer
-            return answer
-        self.idle.wait(0.005)
-        return None
-
-    def close(self) -> None:
-        self.closed.set()
-
-
-def _opened(**fields: object) -> TerminalWait:
-    return TerminalWait.model_validate(
-        {
-            "terminal_id": uuid.uuid4(),
-            "opener": "ada@x.y",
-            "rows": 24,
-            "cols": 80,
-            **fields,
-        },
-    )
-
-
-def _host(
-    url: str,
-    *shell: str,
-    client: _Client | None = None,
-    trax_env: dict[str, str] | None = None,
-    drain_sec: float = 0.5,
-    direct: PeerFactory | None = None,
-) -> TerminalHost:
-    return TerminalHost(
-        name="box",
-        server_url=url,
-        credential=_CREDENTIAL,
-        credential_client=lambda _key: client or _Client([]),
-        trax_env=trax_env or {},
-        shell=shell,
-        drain_sec=drain_sec,
-        direct=direct,
-    )
-
-
-async def _run(host: TerminalHost, opened: TerminalWait) -> None:
-    await asyncio.to_thread(
-        host.serve,
-        opened,
-        machine_id=_MACHINE,
-        instance=_INSTANCE,
-    )
 
 
 async def test_a_shells_output_and_exit_status_arrive(
@@ -140,8 +78,8 @@ async def test_a_shells_output_and_exit_status_arrive(
     _, launch = _terminal(monkeypatch, b"ok", status=3)
     opened = _opened()
 
-    await _run(
-        _host("http://box.invalid", "/bin/sh", "-c", "printf ok; exit 3"),
+    await _terminal_run(
+        _terminal_host("http://box.invalid", "/bin/sh", "-c", "printf ok; exit 3"),
         opened,
     )
 
@@ -174,7 +112,10 @@ async def test_startup_retries_handshake_timeouts_and_launches_the_cli_once(
     _, launch = _terminal(monkeypatch, b"ready")
     opened = _opened(command="claude", run_name="chat-retry")
 
-    await asyncio.wait_for(_run(_host("http://box.invalid"), opened), 3)
+    await asyncio.wait_for(
+        _terminal_run(_terminal_host("http://box.invalid"), opened),
+        3,
+    )
 
     path = wire_terminals.MACHINE_TERMINAL_WS_PATH.format(
         machine_id=_MACHINE,
@@ -215,8 +156,8 @@ async def test_a_refused_startup_never_launches_the_cli_and_reports_one_error(
     )
     _, launch = _terminal(monkeypatch)
 
-    await _run(
-        _host("http://box.invalid"),
+    await _terminal_run(
+        _terminal_host("http://box.invalid"),
         _opened(command="claude", run_name="chat-refused"),
     )
 
@@ -232,9 +173,9 @@ async def test_stop_cancels_startup_while_waiting_for_the_server_acknowledgement
     leg = _FakeSocket(hang=True)
     _ = _connector(monkeypatch, leg)
     _, launch = _terminal(monkeypatch)
-    host = _host("http://box.invalid")
+    host = _terminal_host("http://box.invalid")
     running = asyncio.create_task(
-        _run(host, _opened(command="claude", run_name="chat-stopped")),
+        _terminal_run(host, _opened(command="claude", run_name="chat-stopped")),
     )
     try:
         assert await asyncio.wait_for(asyncio.to_thread(leg.received.wait, 2), 2)
@@ -269,8 +210,13 @@ async def test_input_reaches_the_shell_and_a_resize_is_clamped(
     )
     terminal.wait.side_effect = functools.partial(_terminal_status, finished, status=0)
 
-    await _run(
-        _host("http://box.invalid", "/bin/sh", "-c", "read x; stty size; echo got-$x"),
+    await _terminal_run(
+        _terminal_host(
+            "http://box.invalid",
+            "/bin/sh",
+            "-c",
+            "read x; stty size; echo got-$x",
+        ),
         _opened(),
     )
 
@@ -298,7 +244,10 @@ async def test_stop_and_a_closed_socket_each_terminate_and_reap_the_terminal(
         terminal.wait.side_effect = functools.partial(_terminal_status, finished)
         terminal.terminate.side_effect = finished.set
 
-        await _run(_host("http://box.invalid", "/bin/sh", "-c", command), _opened())
+        await _terminal_run(
+            _terminal_host("http://box.invalid", "/bin/sh", "-c", command),
+            _opened(),
+        )
 
         launch.assert_called_once_with(
             ["/bin/sh", "-c", command],
@@ -412,14 +361,14 @@ async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
     launch = _environment(monkeypatch)
     url = "http://box.invalid"
     canvas, workspace = uuid.uuid4(), uuid.uuid4()
-    host = _host(
+    host = _terminal_host(
         url,
         "/bin/sh",
         "-c",
         "env",
         trax_env={"LC_TRAX_SERVER": url, "TRACKINIZER_PROFILE": "hosted"},
     )
-    await _run(host, _opened(canvas=canvas, workspace=workspace))
+    await _terminal_run(host, _opened(canvas=canvas, workspace=workspace))
 
     assert launch.call_args.kwargs["clean_env"] is True
     assert launch.call_args.kwargs["drop_env"] == ()
@@ -446,8 +395,8 @@ async def _run_env(
     leg = _FakeSocket()
     _ = _connector(monkeypatch, leg)
     launch = _environment(monkeypatch)
-    host = _host("http://box.invalid", trax_env=trax_env)
-    await _run(
+    host = _terminal_host("http://box.invalid", trax_env=trax_env)
+    await _terminal_run(
         host,
         _opened(command="claude", run_name="run-1a2b3c4d", canvas=canvas),
     )
@@ -501,7 +450,10 @@ async def test_each_open_and_close_is_logged_once_for_this_user_only(
     _ = _connector(monkeypatch, _FakeSocket())
     _, launch = _terminal(monkeypatch, status=5)
     opened = _opened(requested_by="helper-1")
-    await _run(_host("http://box.invalid", "/bin/sh", "-c", "exit 5"), opened)
+    await _terminal_run(
+        _terminal_host("http://box.invalid", "/bin/sh", "-c", "exit 5"),
+        opened,
+    )
 
     launch.assert_called_once()
     path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box.terminals.log"
@@ -523,7 +475,10 @@ async def test_a_terminal_without_a_folder_starts_in_the_home_directory(
     _ = _connector(monkeypatch, leg)
     _, launch = _terminal(monkeypatch, f"{home}\r\n".encode())
 
-    await _run(_host("http://box.invalid", "/bin/sh", "-c", "pwd -P"), _opened())
+    await _terminal_run(
+        _terminal_host("http://box.invalid", "/bin/sh", "-c", "pwd -P"),
+        _opened(),
+    )
 
     assert _result(leg) == (f"{home}\r\n".encode(), 0)
     assert launch.call_args.kwargs["cwd"] == Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -540,8 +495,8 @@ async def test_a_run_starts_in_the_folder_it_names_and_says_so_on_its_first_line
     _ = _connector(monkeypatch, leg)
     _, launch = _terminal(monkeypatch, f"{physical}\r\n".encode())
 
-    await _run(
-        _host("http://box.invalid"),
+    await _terminal_run(
+        _terminal_host("http://box.invalid"),
         _opened(command="claude", run_name="run-1a2b3c4d", cwd=str(folder)),
     )
 
@@ -565,8 +520,8 @@ async def test_a_tilde_folder_is_resolved_against_the_home_directory(
     _ = _connector(monkeypatch, leg)
     _, launch = _terminal(monkeypatch, f"{physical}\r\n".encode())
 
-    await _run(
-        _host("http://box.invalid"),
+    await _terminal_run(
+        _terminal_host("http://box.invalid"),
         _opened(command="claude", run_name="run-1a2b3c4d", cwd="~/project"),
     )
 
@@ -583,8 +538,8 @@ async def test_a_run_without_a_folder_says_it_starts_in_the_home_directory(
     _ = _connector(monkeypatch, leg)
     _, launch = _terminal(monkeypatch)
 
-    await _run(
-        _host("http://box.invalid"),
+    await _terminal_run(
+        _terminal_host("http://box.invalid"),
         _opened(command="codex", run_name="run-1a2b3c4d"),
     )
 
@@ -607,8 +562,8 @@ async def test_a_folder_that_is_missing_or_a_file_ends_the_terminal_and_runs_not
     for folder in (str(tmp_path / "gone"), str(file), stranger):
         leg = _FakeSocket()
         _ = _connector(monkeypatch, leg)
-        await _run(
-            _host("http://box.invalid", "/bin/sh", "-c", "echo ran"),
+        await _terminal_run(
+            _terminal_host("http://box.invalid", "/bin/sh", "-c", "echo ran"),
             _opened(cwd=folder),
         )
         refusals.append(_result(leg))
@@ -646,8 +601,8 @@ async def test_a_files_open_answers_requests_and_starts_no_shell(
     _ = _connector(monkeypatch, leg)
     _, launch = _terminal(monkeypatch)
 
-    await _run(
-        _host("http://box.invalid", "/bin/sh", "-c", f"touch {marker}"),
+    await _terminal_run(
+        _terminal_host("http://box.invalid", "/bin/sh", "-c", f"touch {marker}"),
         _opened(kind="files"),
     )
 
@@ -663,14 +618,6 @@ async def test_a_files_open_answers_requests_and_starts_no_shell(
     assert '"kind":"files"' in path.read_text().splitlines()[0]
 
 
-async def _finish_files(
-    channel: FilesChannel,
-    send: Callable[[bytes], Awaitable[None]],
-) -> None:
-    del channel
-    await send(b"finished\n")
-
-
 async def test_a_completed_files_service_reports_a_successful_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -678,18 +625,10 @@ async def test_a_completed_files_service_reports_a_successful_exit(
     leg = _FakeSocket()
     _ = _connector(monkeypatch, leg)
 
-    await _run(_host("http://box.invalid"), _opened(kind="files"))
+    await _terminal_run(_terminal_host("http://box.invalid"), _opened(kind="files"))
 
     assert _result(leg) == (b"finished\n", 0)
     assert leg.closed
-
-
-async def _fail_files(
-    channel: FilesChannel,
-    send: Callable[[bytes], Awaitable[None]],
-) -> None:
-    del channel, send
-    raise RuntimeError("file service failed")
 
 
 async def test_a_failed_files_service_propagates_its_error(
@@ -700,7 +639,7 @@ async def test_a_failed_files_service_propagates_its_error(
     _ = _connector(monkeypatch, leg)
 
     with pytest.raises(RuntimeError, match="file service failed"):
-        await _run(_host("http://box.invalid"), _opened(kind="files"))
+        await _terminal_run(_terminal_host("http://box.invalid"), _opened(kind="files"))
     assert leg.closed
 
 
@@ -751,7 +690,13 @@ async def _five_opens(
         terminals.append(terminal)
     monkeypatch.setattr(terminal_host, "Terminal", Mock(side_effect=terminals))
     client = _Client([_opened() for _ in range(5)])
-    host = _host("http://box.invalid", "/bin/sh", "-c", "sleep 30", client=client)
+    host = _terminal_host(
+        "http://box.invalid",
+        "/bin/sh",
+        "-c",
+        "sleep 30",
+        client=client,
+    )
     host.start(_MACHINE, _INSTANCE)
     for _ in range(500):
         await asyncio.sleep(0.002)
@@ -825,7 +770,7 @@ async def test_shutdown_cannot_join_a_bridge_before_its_thread_starts(
         ),
     )
     _ = _connector(monkeypatch, _FakeSocket(hang=True))
-    host = _host("http://127.0.0.1:1")
+    host = _terminal_host("http://127.0.0.1:1")
     opening = asyncio.create_task(
         asyncio.to_thread(
             host._start_bridge,
@@ -849,7 +794,7 @@ async def test_shutdown_cannot_join_a_bridge_before_its_thread_starts(
 async def test_a_closed_loop_in_the_shutdown_snapshot_does_not_skip_other_bridges() -> (
     None
 ):
-    host = _host("http://127.0.0.1:1")
+    host = _terminal_host("http://127.0.0.1:1")
     closed = asyncio.new_event_loop()
     closed.close()
     ended = asyncio.Event()
@@ -868,7 +813,7 @@ async def test_the_exit_is_reported_though_a_job_the_shell_left_still_holds_the_
     terminal, launch = _terminal(monkeypatch, status=4)
     drained = asyncio.Event()
     terminal.output.return_value = _held_output(asyncio.Event(), drained)
-    host = _host(
+    host = _terminal_host(
         "http://box.invalid",
         "/bin/sh",
         "-c",
@@ -876,7 +821,7 @@ async def test_the_exit_is_reported_though_a_job_the_shell_left_still_holds_the_
         drain_sec=0.02,
     )
 
-    await asyncio.wait_for(_run(host, _opened()), 3)
+    await asyncio.wait_for(_terminal_run(host, _opened()), 3)
 
     assert _result(leg)[1] == 4
     assert not drained.is_set()
@@ -888,7 +833,7 @@ async def test_the_exit_is_reported_though_a_job_the_shell_left_still_holds_the_
 
 async def test_a_410_ends_the_listener_and_any_other_failure_is_retried() -> None:
     client = _Client([ClientError("-> 410", status_code=410)])
-    host = _host("http://127.0.0.1:1", client=client)
+    host = _terminal_host("http://127.0.0.1:1", client=client)
 
     host.start(_MACHINE, _INSTANCE)
     await asyncio.to_thread(client.closed.wait, 10)
@@ -900,7 +845,7 @@ async def test_a_wait_that_fails_otherwise_is_said_and_waited_out_until_stopped(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     client = _Client([ClientError("-> 503", status_code=503)])
-    host = _host("http://127.0.0.1:1", client=client)
+    host = _terminal_host("http://127.0.0.1:1", client=client)
 
     host.start(_MACHINE, _INSTANCE)
     assert await asyncio.to_thread(client.failed.wait, 10)
@@ -911,7 +856,7 @@ async def test_a_wait_that_fails_otherwise_is_said_and_waited_out_until_stopped(
 
 
 async def test_an_open_that_arrives_once_the_host_stopped_starts_no_bridge() -> None:
-    host = _host("http://127.0.0.1:1")
+    host = _terminal_host("http://127.0.0.1:1")
     opened = _opened()
     host.stop()
 
@@ -929,8 +874,13 @@ async def test_a_leg_closed_before_the_shell_starts_runs_nothing_and_logs_a_clos
     leg = _ClosingSocket()
     _ = _connector(monkeypatch, leg)
 
-    await _run(
-        _host("http://box.invalid", "/bin/sh", "-c", f"touch {tmp_path / 'ran'}"),
+    await _terminal_run(
+        _terminal_host(
+            "http://box.invalid",
+            "/bin/sh",
+            "-c",
+            f"touch {tmp_path / 'ran'}",
+        ),
         _opened(),
     )
 
@@ -964,37 +914,6 @@ async def test_the_server_leg_is_read_until_it_sends_what_is_no_frame_or_closes(
     assert shell.written == []
 
 
-class _ScriptedPeer:
-    """A peer that, once it has answered, plays the browser: switch the route, type."""
-
-    def __init__(self) -> None:
-        self.sent: list[tuple[Frame, bytes]] = []
-        self.ice_servers: tuple[str, ...] = ()
-        self.is_open = True
-
-    async def accept(
-        self,
-        offer_sdp: str,
-        *,
-        ice_servers: tuple[str, ...],
-        on_message: Callable[[bytes], None],
-        on_close: Callable[[], None],
-    ) -> str:
-        del offer_sdp, on_close
-        self.ice_servers = ice_servers
-        loop = asyncio.get_running_loop()
-        route = wire_terminals.encode_route(wire_terminals.ROUTE_DIRECT, 0)
-        loop.call_soon(on_message, encode_frame(Frame.ROUTE, route))
-        loop.call_soon(on_message, encode_frame(Frame.INPUT, b"go\n"))
-        return "answer-sdp"
-
-    def send(self, data: bytes) -> None:
-        self.sent.append(decode_frame(data))
-
-    async def close(self) -> None:
-        self.is_open = False
-
-
 async def test_an_offer_is_answered_and_the_shells_output_then_goes_direct(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1009,7 +928,7 @@ async def test_an_offer_is_answered_and_the_shells_output_then_goes_direct(
     terminal.write.side_effect = functools.partial(_typed, typed)
     terminal.output.return_value = _output_when(typed, finished, b"got-go\r\n")
     terminal.wait.side_effect = functools.partial(_terminal_status, finished, status=0)
-    host = _host(
+    host = _terminal_host(
         "http://box.invalid",
         "/bin/sh",
         "-c",
@@ -1017,7 +936,7 @@ async def test_an_offer_is_answered_and_the_shells_output_then_goes_direct(
         direct=lambda: peer,
     )
 
-    await _run(host, _opened(ice_servers=["stun:s.test:3478"]))
+    await _terminal_run(host, _opened(ice_servers=["stun:s.test:3478"]))
 
     terminal.write.assert_awaited_once_with(b"go\n")
     relayed = [
@@ -1054,7 +973,7 @@ _KNOWOP = ("-m", "knowop", "run")
 async def test_a_claude_run_starts_detached_and_attaches_its_chat_session() -> None:
     session_id = uuid.UUID("9f1c2e3a-0000-4000-8000-000000000001")
 
-    argv = _host("http://127.0.0.1:1")._argv(
+    argv = _terminal_host("http://127.0.0.1:1")._argv(
         _opened(command="claude", attach=session_id, run_name="chat-9f1c2e3a"),
     )
 
@@ -1071,7 +990,7 @@ async def test_a_claude_run_starts_detached_and_attaches_its_chat_session() -> N
 
 
 async def test_a_codex_run_without_a_session_attaches_nothing() -> None:
-    argv = _host("http://127.0.0.1:1")._argv(
+    argv = _terminal_host("http://127.0.0.1:1")._argv(
         _opened(command="codex", run_name="run-1a2b3c4d"),
     )
 
@@ -1091,7 +1010,7 @@ async def test_a_run_is_started_by_this_install_whatever_path_holds(
     """Another knowop on ``PATH``, or a ``trax`` that forwards, never runs it."""
     monkeypatch.setattr(shutil, "which", _in_opt_bin)
 
-    argv = _host("http://127.0.0.1:1")._argv(
+    argv = _terminal_host("http://127.0.0.1:1")._argv(
         _opened(command="claude", run_name="run-1a2b3c4d"),
     )
 
@@ -1099,107 +1018,11 @@ async def test_a_run_is_started_by_this_install_whatever_path_holds(
 
 
 async def test_a_terminal_without_a_command_runs_the_login_shell() -> None:
-    assert _host("http://127.0.0.1:1")._argv(_opened()) == _login_shell()
-    shell = _host("http://127.0.0.1:1", "/bin/sh", "-c", "true")._argv(_opened())
-    assert shell == ["/bin/sh", "-c", "true"]
-
-
-class _FakeSocket:
-    """A leg that answers the startup handshake as scripted."""
-
-    def __init__(
-        self,
-        *,
-        reply: bytes = encode_frame(Frame.ACK),
-        send_error: ConnectionClosed | None = None,
-        hang: bool = False,
-        messages: tuple[bytes, ...] = (),
-        closes: bool = False,
-        end_after_output: bool = False,
-    ) -> None:
-        self.reply = reply
-        self.send_error = send_error
-        self.hang = hang
-        self.closed = False
-        self.waiting = asyncio.Event()
-        self.received = threading.Event()
-        self.sent: list[bytes] = []
-        self.messages = messages
-        self.closes = closes
-        self.end_after_output = end_after_output
-        self.output_sent = asyncio.Event()
-
-    def __aiter__(self) -> _Messages:
-        return _Messages(
-            *self.messages,
-            closes=self.closes,
-            hold=not self.end_after_output,
-            until=self.output_sent if self.end_after_output else None,
-        )
-
-    async def send(self, data: bytes) -> None:
-        self.sent.append(data)
-        if decode_frame(data)[0] is Frame.OUTPUT:
-            self.output_sent.set()
-        if self.send_error is not None:
-            raise self.send_error
-
-    async def recv(self) -> bytes:
-        self.received.set()
-        if self.hang:
-            self.waiting.set()
-            await asyncio.Event().wait()
-        return self.reply
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-class _Connector:
-    """Stands in for ``connect``: scripted outcomes, the last one repeating."""
-
-    def __init__(self, *outcomes: _FakeSocket | Exception) -> None:
-        self.outcomes = list(outcomes)
-        self.calls: list[dict[str, object]] = []
-        self.urls: list[str] = []
-
-    async def __call__(self, url: str, **kwargs: object) -> _FakeSocket:
-        self.urls.append(url)
-        self.calls.append(kwargs)
-        outcome = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
-
-
-def _connector(
-    monkeypatch: pytest.MonkeyPatch,
-    *outcomes: _FakeSocket | Exception,
-) -> _Connector:
-    connector = _Connector(*outcomes)
-    monkeypatch.setattr(terminal_host, "connect", connector)
-    return connector
-
-
-async def _connect(
-    opened: TerminalWait | None = None,
-    **timing: float,
-) -> object:
-    return await _host("http://box.invalid")._connect(
-        opened or _opened(),
-        machine_id=_MACHINE,
-        instance=_INSTANCE,
-        **timing,
+    assert _terminal_host("http://127.0.0.1:1")._argv(_opened()) == _login_shell()
+    shell = _terminal_host("http://127.0.0.1:1", "/bin/sh", "-c", "true")._argv(
+        _opened(),
     )
-
-
-def _status(code: int) -> InvalidStatus:
-    return InvalidStatus(Response(code, "x", Headers(), b""))
-
-
-def _startup_log() -> str:
-    path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box.terminals.log"
-    return path.read_text()
+    assert shell == ["/bin/sh", "-c", "true"]
 
 
 @dataclass(slots=True, kw_only=True)
@@ -1430,36 +1253,6 @@ class _Output:
     async def output(self) -> AsyncIterator[bytes]:
         for chunk in self._chunks:
             yield chunk
-
-
-class _Messages:
-    """The server's leg as it is read: scripted messages, then its end."""
-
-    def __init__(
-        self,
-        *messages: str | bytes,
-        closes: bool,
-        hold: bool = False,
-        until: asyncio.Event | None = None,
-    ) -> None:
-        self._messages = list(messages)
-        self._closes = closes
-        self._hold = hold
-        self._until = until
-
-    def __aiter__(self) -> Self:
-        return self
-
-    async def __anext__(self) -> str | bytes:
-        if self._messages:
-            return self._messages.pop(0)
-        if self._closes:
-            raise ConnectionClosed(None, None)
-        if self._until is not None:
-            await self._until.wait()
-        if self._hold:
-            await asyncio.Event().wait()
-        raise StopAsyncIteration
 
 
 async def _relay_gone(data: bytes) -> None:

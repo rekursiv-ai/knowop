@@ -4,41 +4,45 @@ from __future__ import annotations
 
 from asyncio.subprocess import Process
 from datetime import datetime
-from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, Mock
 
 import asyncio
-import base64
 import os
-import queue
 import signal
 import stat
 import threading
 import time
-import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.wire.wire_exec import ExecRequest, ExecResult, ExecWait
-from treekle import json_loads
 
 import pytest
 
 from knowop.shell import exec_host
-from knowop.shell.exec_command import run_command
-from knowop.shell.exec_command_test import _kill_group, _Process, _process
-from knowop.shell.exec_host import ExecHost
+from knowop.shell.conftest import (
+    _CREDENTIAL,
+    _INSTANCE,
+    _MACHINE,
+    _REVOKED,
+    _command,
+    _err,
+    _host,
+    _kill_group,
+    _log_lines,
+    _out,
+    _Process,
+    _process,
+    _Server,
+    _wait_until,
+)
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from pathlib import Path
 
-
-_MACHINE: Final = uuid.UUID(int=1)
-_INSTANCE: Final = uuid.UUID(int=2)
-_CREDENTIAL: Final = "trax_machine_" + "0" * 32 + "_" + "c" * 43
-_REVOKED: Final = ClientError("-> 410", status_code=410)
+    from knowop.shell.exec_host import ExecHost
 
 
 @pytest.fixture(autouse=True)
@@ -84,143 +88,6 @@ class _Shell:
             raise ProcessLookupError
         if signum:
             _kill_group(process, pgid, signum)
-
-
-def _request(
-    command: str,
-    *,
-    cwd: Path | str,
-    timeout_sec: float = 10,
-    stdin: bytes | None = None,
-    env: dict[str, str] | None = None,
-) -> ExecRequest:
-    # A fraction of a second, which the wire's whole seconds cannot say, keeps the
-    # timeout tests from waiting out a real one.
-    return ExecRequest.model_construct(
-        command=command,
-        cwd=str(cwd),
-        timeout_sec=timeout_sec,
-        stdin_b64=None if stdin is None else base64.b64encode(stdin).decode(),
-        env=env,
-    )
-
-
-def _run(request: ExecRequest) -> ExecResult:
-    """Run the request; a kill that does not take effect shows as a slow run."""
-    started = time.monotonic()
-    result = asyncio.run(run_command(request))
-    assert time.monotonic() - started < 5
-    return result
-
-
-def _out(result: ExecResult) -> bytes:
-    return base64.b64decode(result.stdout_b64)
-
-
-def _err(result: ExecResult) -> bytes:
-    return base64.b64decode(result.stderr_b64)
-
-
-def _wait_until(done: Callable[[], bool]) -> None:
-    deadline = time.monotonic() + 5
-    while not done():
-        assert time.monotonic() < deadline, "the awaited change never came"
-        time.sleep(0.005)
-
-
-def test_a_folder_that_does_not_exist_runs_nothing(tmp_path: Path) -> None:
-    missing = tmp_path / "nowhere"
-
-    result = _run(_request(f"touch {tmp_path}/ran", cwd=missing))
-
-    assert result.exit_code == 1
-    assert _err(result) == f"{missing} is not a folder on this machine\n".encode()
-    assert result.cwd == str(missing)
-    assert not (tmp_path / "ran").exists()
-
-
-class _Server:
-    """A scripted server: hands out commands, then ends the host as a revoke would."""
-
-    def __init__(self) -> None:
-        self.waits: queue.Queue[ExecWait | ClientError | None] = queue.Queue()
-        self.results: list[tuple[uuid.UUID, ExecResult]] = []
-        self.post_errors: list[ClientError] = []
-        self.posts = 0
-        self.posted = threading.Event()
-        self.keys: list[str] = []
-        self.closed = 0
-
-    def __call__(self, key: str) -> _Server:
-        self.keys.append(key)
-        return self
-
-    def wait_exec(
-        self,
-        machine_id: uuid.UUID,
-        *,
-        instance: uuid.UUID,
-        wait_sec: float,
-    ) -> ExecWait | None:
-        assert (machine_id, instance, wait_sec) == (_MACHINE, _INSTANCE, 25)
-        # A wait with nothing to hand out ends empty, as the server's does. Raising
-        # instead would fail the listener of a test that stopped early, after the test.
-        try:
-            answer = self.waits.get(timeout=5)
-        except queue.Empty:
-            return None
-        if isinstance(answer, ClientError):
-            raise answer
-        return answer
-
-    def post_exec_result(
-        self,
-        machine_id: uuid.UUID,
-        exec_id: uuid.UUID,
-        result: ExecResult,
-    ) -> None:
-        assert machine_id == _MACHINE
-        self.posts += 1
-        if self.post_errors:
-            raise self.post_errors.pop(0)
-        self.results.append((exec_id, result))
-        self.posted.set()
-
-    def close(self) -> None:
-        self.closed += 1
-
-
-def _command(
-    command: str,
-    *,
-    cwd: Path,
-    timeout_sec: int = 10,
-    env: dict[str, str] | None = None,
-) -> ExecWait:
-    return ExecWait(
-        exec_id=uuid.uuid4(),
-        asker="ada@example.com",
-        command=command,
-        cwd=str(cwd),
-        timeout_sec=timeout_sec,
-        env=env,
-    )
-
-
-def _host(server: _Server) -> ExecHost:
-    return ExecHost(
-        name="box-1",
-        credential=_CREDENTIAL,
-        credential_client=server,
-        retry_sec=0,
-    )
-
-
-def _log_lines() -> list[dict[str, object]]:
-    path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box-1.exec.log"
-    return [
-        json_loads(line, dict[str, object]) for line in path.read_text().splitlines()
-    ]
 
 
 def _serve_one(server: _Server, host: ExecHost, command: ExecWait) -> None:
@@ -445,39 +312,6 @@ def test_a_failed_wait_is_reported_and_the_host_goes_on(
     host.stop()
 
     assert "exec wait failed" in capsys.readouterr().err
-
-
-# ``/dev/fd`` lists this process's descriptors on Linux and macOS alike; ``/proc``
-# exists on Linux alone.
-def _open_descriptors() -> int:
-    return len(list(Path("/dev/fd").iterdir()))
-
-
-@pytest.mark.parametrize(
-    ("error", "code"),
-    [
-        (PermissionError(13, "Permission denied"), 126),
-        (FileNotFoundError(2, "No such file or directory"), 127),
-        (OSError(12, "Cannot allocate memory"), 126),
-    ],
-)
-def test_a_command_that_cannot_spawn_reports_why_and_leaks_nothing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    error: OSError,
-    code: int,
-) -> None:
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(side_effect=error))
-    before = _open_descriptors()
-
-    result = _run(_request("true", cwd=tmp_path))
-
-    assert result.exit_code == code
-    assert b"cannot start the command" in _err(result)
-    assert error.strerror is not None
-    assert error.strerror.encode() in _err(result)
-    assert result.cwd == str(tmp_path)
-    assert _open_descriptors() == before
 
 
 def test_a_command_that_cannot_spawn_is_still_logged_and_posted(

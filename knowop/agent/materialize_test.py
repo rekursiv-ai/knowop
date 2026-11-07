@@ -35,6 +35,7 @@ from treekle import PlainTree, from_plain, immutable, json_loads
 
 import pytest
 
+from knowop.agent.conftest import _TESTDATA
 from knowop.agent.errors import (
     CiphertextDroppedError,
     NotResumableError,
@@ -54,9 +55,6 @@ if TYPE_CHECKING:
 pytestmark: Final = pytest.mark.usefixtures("local_session_dirs")
 
 
-# Captured transcripts, kept beside the readers that parse them. trackinizer's wheel
-# leaves them out, so the public export carries copies beside this module instead.
-_TESTDATA: Final = Path(__file__).resolve().parent / "testdata" / "sessions"
 _FIXTURE: Final = _TESTDATA / "claude_sidechain.jsonl"
 
 

@@ -114,7 +114,9 @@ def _strings(tree: Mapping[str, PlainTree]) -> list[str]:
         if isinstance(node, str):
             found.append(node)
         elif isinstance(node, Mapping):
-            stack.extend(node.values())
+            stack.extend(reversed(list(node.values())))
         elif isinstance(node, Sequence):
-            stack.extend(node)
+            # Reversed onto the stack so the words pop in order: ``["git", "push"]``
+            # read backwards is no push.
+            stack.extend(reversed(node))
     return found

@@ -22,10 +22,10 @@ from treekle import PlainTree, json_loads
 import pytest
 
 from knowop.agent import tool_server
+from knowop.agent.conftest import _SCHEMA, _break, _echo, _refuse
 from knowop.agent.tool_server import (
     PROTOCOL,
     AgentTool,
-    ToolError,
     ToolServer,
 )
 
@@ -48,23 +48,6 @@ class _Response(TypedDict):
     id: int | str | None
     result: NotRequired[dict[str, PlainTree]]
     error: NotRequired[_Error]
-
-
-def _echo(arguments: Mapping[str, object]) -> str:
-    return f"said {arguments['text']}"
-
-
-def _refuse(arguments: Mapping[str, object]) -> str:
-    del arguments
-    raise ToolError("not that one")
-
-
-def _break(arguments: Mapping[str, object]) -> str:
-    del arguments
-    raise RuntimeError("boom")
-
-
-_SCHEMA = {"type": "object", "properties": {"text": {"type": "string"}}}
 
 
 @pytest.fixture(autouse=True)

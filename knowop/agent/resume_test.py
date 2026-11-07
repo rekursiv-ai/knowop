@@ -5,9 +5,8 @@ from __future__ import annotations
 from collections import Counter
 from datetime import datetime
 from io import StringIO
-from pathlib import Path
 from typing import TYPE_CHECKING, Final
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import functools
 import json
@@ -18,7 +17,6 @@ from trackinizer.lib.agent.sessions import (
     codex,
     sagent,
 )
-from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.sagent.session.types import (
     AgentToAgentMessage,
     AssistantMessage,
@@ -34,13 +32,15 @@ from trackinizer.sagent.session.types import (
     UserMessage,
     WebSearchResult,
 )
-from trackinizer.types.session_records import SessionRecordRow
-from trackinizer.wire.refs import UuidRef
-from trackinizer.wire.wire_session_ir import PartBody, RecordBody
-from treekle import PlainTree, immutable
+from treekle import immutable
 
 import pytest
 
+from knowop.agent.conftest import (
+    _direct_segments,
+    _FakeClient,
+    _PartsClient,
+)
 from knowop.agent.errors import (
     CiphertextDroppedError,
     LossyConversionError,
@@ -57,151 +57,12 @@ from knowop.agent.truncate import NOTE
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+    from pathlib import Path
 
-    from trackinizer.client.conversation import PartReader
     from trackinizer.sagent.session.types import SessionRecord
-    from trackinizer.types.inquiries import Inquiry
-    from trackinizer.types.streams import TraxRecord
 
 
 pytestmark: Final = pytest.mark.usefixtures("local_session_dirs")
-
-
-# Captured transcripts, kept beside the readers that parse them. trackinizer's wheel
-# leaves them out, so the public export carries copies beside this module instead.
-_TESTDATA: Final = Path(__file__).resolve().parent / "testdata" / "sessions"
-
-
-# Fed a line at a time through :class:`Tail`, which is what capture does: the reader
-# PULLS and the runner PUSHES, so driving the pull side directly would exercise a path
-# the runner never takes.
-def _records(name: str) -> tuple[list[TraxRecord], Mapping[str, PlainTree]]:
-    """Return a corpus fixture's records and how its file spells its bytes."""
-    records, encoding = _read(name)
-    return list(records), encoding
-
-
-@functools.cache
-def _read(name: str) -> tuple[tuple[TraxRecord, ...], Mapping[str, PlainTree]]:
-    """Read a corpus fixture as capture does; see :func:`_records`."""
-    reader = Tail((codex if name.startswith("codex") else claude).normalize)
-    out: list[TraxRecord] = []
-    with (_TESTDATA / name).open(encoding="utf-8") as handle:
-        for line in handle:
-            out.extend(reader.feed(line))
-    out.extend(reader.close())
-    return tuple(out), immutable(reader.encoding)
-
-
-class _FakeClient:
-    """Serves one stored session.
-
-    It has no method that stamps the CLI's id onto the row, so a resume that tried to
-    would fail here: that absence is what the attach tests rely on.
-    """
-
-    def __init__(self, name: str, *, session_format: str) -> None:
-        records, self.encoding = _records(name)
-        self.records: Sequence[TraxRecord] = records
-        self._format = session_format
-
-    def read_session_parts(self, session_id: UUID) -> list[PartBody]:
-        del session_id
-        return [
-            PartBody(
-                part=0,
-                name="s.jsonl",
-                format=self._format,
-                records=len(self.records),
-                metadata=self.encoding,
-                ir_id=uuid4(),
-            ),
-        ]
-
-    def read_session_records(
-        self,
-        session_id: UUID,
-        *,
-        part: int = 0,
-        **_: object,
-    ) -> list[RecordBody]:
-        return [
-            RecordBody.of(
-                SessionRecordRow.of(
-                    session_id=session_id,
-                    part=part,
-                    idx=idx,
-                    record=record,
-                ),
-            )
-            for idx, record in enumerate(self.records)
-        ]
-
-    def get_inquiry(
-        self,
-        ref: object,
-    ) -> tuple[Inquiry.InquiryKind, UUID, dict[str, PlainTree]]:
-        """Return the session's detail view, which names its seq."""
-        assert isinstance(ref, UuidRef)
-        return "AgentSession", ref.uuid, {"self": {"seq": 7}}
-
-
-class _PartsClient:
-    """Serves a session of several parts, each one a file of its own format."""
-
-    def __init__(
-        self,
-        parts: Mapping[int, tuple[str, Sequence[SessionRecord]]],
-    ) -> None:
-        self._parts = parts
-
-    def read_session_parts(self, session_id: UUID) -> list[PartBody]:
-        del session_id
-        return [
-            PartBody(
-                part=number,
-                name=f"{number}.jsonl",
-                format=fmt,
-                records=len(records),
-            )
-            for number, (fmt, records) in self._parts.items()
-        ]
-
-    def read_session_records(
-        self,
-        session_id: UUID,
-        *,
-        part: int = 0,
-        **_: object,
-    ) -> list[RecordBody]:
-        return [
-            RecordBody.of(
-                SessionRecordRow.of(
-                    session_id=session_id,
-                    part=part,
-                    idx=idx,
-                    record=record,
-                ),
-            )
-            for idx, record in enumerate(self._parts[part][1])
-        ]
-
-    def get_inquiry(
-        self,
-        ref: object,
-    ) -> tuple[Inquiry.InquiryKind, UUID, dict[str, PlainTree]]:
-        """Return the session's detail view, which names its seq."""
-        assert isinstance(ref, UuidRef)
-        return "AgentSession", ref.uuid, {"self": {"seq": 7}}
-
-
-def _direct_segments(
-    segments: list[Segment],
-    client: PartReader,
-    session_id: UUID,
-) -> list[Segment]:
-    del client, session_id
-    return segments
 
 
 class TestWhichTargetsResume:

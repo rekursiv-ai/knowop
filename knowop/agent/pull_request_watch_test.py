@@ -17,6 +17,7 @@ from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import json
+import time
 
 from trackinizer.client.errors import ClientError
 from trackinizer.sagent.session.types import BashResult, ToolCall
@@ -24,6 +25,7 @@ from treekle import from_plain
 
 import pytest
 
+from knowop.agent import pull_request_watch
 from knowop.agent.pull_request_rows import DISMISSED, LABEL
 from knowop.agent.pull_request_watch import (
     CLOSED_PASSES,
@@ -839,7 +841,63 @@ def test_a_tool_call_naming_no_pull_request_is_refused() -> None:
         _ = _tool(watch, "watch_pull_request").call({"url": "acme/app#7"})
 
 
-def test_a_tool_call_is_answered_when_its_pass_fails() -> None:
+def test_unwatching_one_let_go_already_changes_nothing() -> None:
+    server, gh = _Server(), _Gh()
+    watch = _watch(server, gh)
+    watch.start()
+    try:
+        for _ in range(2):
+            answer = _tool(watch, "unwatch_pull_request").call({"url": _URL})
+            assert answer.startswith(f"Let go of {_URL}")
+    finally:
+        watch.close()
+    assert len(server.rows) == 1
+    assert server.labels() == [LABEL, DISMISSED]
+
+
+def test_a_tool_call_no_pass_answers_in_time_says_where_the_run_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(pull_request_watch, "ASK_SEC", 0.01)
+    watch = _watch(_Server(), _Gh())
+    with pytest.raises(ToolError, match=f"The run is still at {_URL}"):
+        _ = _tool(watch, "watch_pull_request").call({"url": _URL})
+
+
+def test_a_run_with_no_session_yet_reads_and_stores_nothing() -> None:
+    server, gh = _Server(), _Gh()
+    watch = PullRequestWatch(
+        client=server,
+        session=lambda: None,
+        actor="Agent",
+        cwd=Path("/work"),
+        gh=gh,
+        git=_Git(),
+        clock=_Clock(),
+        poll_sec=3600.0,
+    )
+    _opened(watch)
+    watch._sweep()
+    assert (gh.refs, server.rows, server.edges) == ([], {}, {})
+
+
+def test_a_row_deleted_under_the_watch_is_read_no_more() -> None:
+    server, gh = _Server(), _Gh()
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    server.racing = server.rows.clear
+    gh.checks = [_check("lint")]
+    watch._sweep()
+    reads = len(gh.refs)
+    watch._sweep()
+    assert server.rows == {}
+    assert len(gh.refs) == reads
+
+
+def test_a_tool_call_is_answered_when_its_pass_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     server, gh = _Server(down=True), _Gh()
     watch = _watch(server, gh)
     watch.start()
@@ -848,6 +906,12 @@ def test_a_tool_call_is_answered_when_its_pass_fails() -> None:
     finally:
         watch.close()
     assert answer == "The run could not do that; its log says why."
+    # The call is answered before the failed pass is logged; left unwaited, the
+    # line lands in whichever test's log runs next.
+    deadline = time.monotonic() + 5
+    while "knowop run: pull request watch failed" not in caplog.messages:
+        assert time.monotonic() < deadline, "the failed pass was never logged"
+        time.sleep(0.001)
 
 
 def test_a_read_that_fails_says_why_on_the_row() -> None:
