@@ -237,11 +237,12 @@ wheels = [
 
 [[package]]
 name = "codedoctor"
-version = "0.1.2"
-source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#b204f6518443eb9ec6b8816bf66c99235489753d" }
+version = "0.1.3"
+source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#51155c1cb625d8eb4c2af3c62a437c433213fcd4" }
 dependencies = [
     { name = "pyyaml" },
     { name = "rignore" },
+    { name = "ruamel-yaml" },
     { name = "tomlkit" },
     { name = "treekle" },
     { name = "typing-extensions" },
@@ -2103,8 +2104,8 @@ wheels = [
 
 [[package]]
 name = "rekursiv-ai-typings"
-version = "0.1.15"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#3cfaf352a1a133e6185de471fc6772013925b989" }
+version = "0.1.16"
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#c487f18c9e96a8caa636c56e70175c519070da82" }
 
 [[package]]
 name = "rich"
@@ -2543,7 +2544,7 @@ wheels = [
 [[package]]
 name = "trackinizer"
 version = "0.1.13"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#9e3cf891cc75da99688b44cbb63136fa96ae45ed" }
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#e26aa7d83fb906ba0ac59810f05b31e71da8e078" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
