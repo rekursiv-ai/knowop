@@ -23,6 +23,7 @@ from trackinizer.lib.posix.sockets import socket_address
 from trackinizer.runs.asks import (
     Answer,
     Ask,
+    Compaction,
     Option,
     Resolved,
     RunState,
@@ -133,6 +134,19 @@ class TestEvents:
                 ]
                 == "allow"
             )
+
+    def test_each_end_of_a_compaction_is_a_record_and_no_state(self) -> None:
+        with _HeadlessRig() as rig:
+            rig.wait_started()
+            rig.drivers[0].push(StateChanged(state="running"))
+            rig.drivers[0].push(Compaction(state="started", trigger="auto"))
+            rig.drivers[0].push(Compaction(state="ended", trigger="auto"))
+            _wait_for(lambda: len(rig.records) == 2)
+            assert [
+                from_plain(each.extra["$compaction"], dict[str, PlainTree])["state"]
+                for each in rig.records
+            ] == ["started", "ended"]
+            assert rig.states == ["running"]
 
     def test_an_ask_names_when_it_was_asked(self) -> None:
         with _HeadlessRig() as rig:

@@ -52,8 +52,7 @@ from trackinizer.runs.asks import (
     Answer,
     Ask,
     Driver,
-    Resolved,
-    StateChanged,
+    DriverEvent,
 )
 from trackinizer.sagent.session.types import (
     AssistantMessage,
@@ -387,7 +386,7 @@ def _uncut(record: TraxRecord) -> RecordBody:
 _THIS: Final = Path(__file__).resolve()
 
 
-type _Event = Ask | Resolved | StateChanged
+type _Event = DriverEvent
 _Tree = dict[str, PlainTree]
 type _Frame = _Tree | str
 type _Frames = Mapping[str, Sequence[_Frame]]
@@ -760,7 +759,7 @@ class _Run:
         return self.seen()[1:]
 
 
-type _ClaudeEvent = Ask | Resolved | StateChanged
+type _ClaudeEvent = DriverEvent
 
 
 async def _claude_next(events: AsyncIterator[_ClaudeEvent]) -> _ClaudeEvent:
@@ -815,9 +814,9 @@ class _FakeDriver:
         self.hanging = threading.Event()
         self.printed = ""
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._queue = asyncio.Queue[Ask | Resolved | StateChanged | None]()
+        self._queue = asyncio.Queue[DriverEvent | None]()
 
-    def push(self, event: Ask | Resolved | StateChanged | None) -> None:
+    def push(self, event: DriverEvent | None) -> None:
         """Report ``event`` from any thread; ``None`` ends the driver by itself."""
         loop = self._loop
         if loop is None:
@@ -854,7 +853,7 @@ class _FakeDriver:
         self.stopped = True
         await self._queue.put(None)
 
-    async def events(self) -> AsyncIterator[Ask | Resolved | StateChanged]:
+    async def events(self) -> AsyncIterator[DriverEvent]:
         while (event := await self._queue.get()) is not None:
             yield event
 
@@ -1878,7 +1877,7 @@ class _ScriptedDriver:
         self,
         *,
         session: str = "s1",
-        events: Sequence[Ask | Resolved | StateChanged] = (),
+        events: Sequence[DriverEvent] = (),
         fail: Exception | None = None,
     ) -> None:
         self.session = session
@@ -1917,7 +1916,7 @@ class _ScriptedDriver:
             raise ValueError("Expected self._ended is not None.")
         self._ended.set()
 
-    async def events(self) -> AsyncIterator[Ask | Resolved | StateChanged]:
+    async def events(self) -> AsyncIterator[DriverEvent]:
         for event in self.script:
             yield event
         if self._ended is None:

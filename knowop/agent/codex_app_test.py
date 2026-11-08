@@ -26,6 +26,7 @@ import sys
 from trackinizer.runs.asks import (
     Answer,
     Ask,
+    Compaction,
     Option,
     Resolved,
     StateChanged,
@@ -245,7 +246,7 @@ def _resolved(request_id: int) -> _Tree:
     }
 
 
-def _seen_kind[T: Ask | Resolved | StateChanged](
+def _seen_kind[T: _Event](
     seen: list[_Event],
     kind: type[T],
 ) -> list[T]:
@@ -1425,6 +1426,84 @@ def test_a_turn_named_twice_is_one_turn(tmp_path: Path) -> None:
 
     rig.run(scenario())
     assert rig.methods()[-2:] == ["turn/start", "turn/start"]
+
+
+# 0.163.0's schema: a ``contextCompaction`` item is ``{id, type}`` and nothing else.
+def _compacting() -> _Tree:
+    return _item_started("contextCompaction", changes=None)
+
+
+def _compacted() -> _Tree:
+    return _item_completed("contextCompaction")
+
+
+def _compactions(rig: _Rig, verb: str) -> list[Compaction]:
+    """Return the compactions the driver reports for a line, or for ``/compact``."""
+
+    async def scenario() -> list[_Event]:
+        await rig.start()
+        if verb:
+            _ = await rig.driver.command(verb, "")
+        else:
+            await rig.driver.send_line("go")
+        await asyncio.sleep(0.05)
+        await rig.driver.stop()
+        return await _collect(rig.driver.events())
+
+    return _seen_kind(rig.run(scenario()), Compaction)
+
+
+def test_a_compact_command_is_a_manual_compaction_from_its_item_start_to_its_end(
+    tmp_path: Path,
+) -> None:
+    after = [_compacting(), _compacted(), _compacting(), _compacted()]
+    rig = _Rig(tmp_path, after={"thread/compact/start": after})
+    # Only the compaction ``/compact`` asked for is manual; codex's next is its own.
+    assert _compactions(rig, "compact") == [
+        Compaction(state="started", trigger="manual"),
+        Compaction(state="ended", trigger="manual"),
+        Compaction(state="started", trigger="auto"),
+        Compaction(state="ended", trigger="auto"),
+    ]
+    assert rig.params("thread/compact/start") == {"threadId": _THREAD}
+
+
+def test_a_compaction_codex_starts_itself_is_automatic_and_ends_with_its_turn(
+    tmp_path: Path,
+) -> None:
+    failed: _Tree = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": _THREAD,
+            "turn": {"id": _TURN, "status": "failed", "error": {"message": "boom"}},
+        },
+    }
+    after = [_turn("turn/started", _TURN), _compacting(), failed, _compacted()]
+    rig = _Rig(tmp_path, after={"turn/start": after})
+    assert _compactions(rig, "") == [
+        Compaction(state="started", trigger="auto"),
+        Compaction(state="ended", trigger="auto", error="boom"),
+    ]
+
+
+def test_a_turn_that_completes_ends_no_compaction_that_is_not_open(
+    tmp_path: Path,
+) -> None:
+    def interrupted() -> _Tree:
+        turn: _Tree = {"id": _TURN, "status": "interrupted"}
+        return {
+            "method": "turn/completed",
+            "params": {"threadId": _THREAD, "turn": turn},
+        }
+
+    after = [_compacting(), _compacted(), interrupted(), _compacting(), interrupted()]
+    rig = _Rig(tmp_path, after={"turn/start": after})
+    assert _compactions(rig, "") == [
+        Compaction(state="started", trigger="auto"),
+        Compaction(state="ended", trigger="auto"),
+        Compaction(state="started", trigger="auto"),
+        Compaction(state="ended", trigger="auto", error="interrupted"),
+    ]
 
 
 def test_stop_ends_the_events_and_may_be_called_again(tmp_path: Path) -> None:

@@ -20,6 +20,10 @@ The wire, as measured on codex 0.163.0:
   interrupt, ``by="terminal"`` otherwise.
 - ``thread/status/changed`` carries ``waitingOnApproval`` and ``waitingOnUserInput``,
   which are the ``requires_action`` state.
+- A compaction, automatic or ``thread/compact/start``, is an item of type
+  ``contextCompaction`` (``{id, type}`` and nothing else, per 0.163.0's
+  ``generate-json-schema``): ``item/started`` begins it and ``item/completed`` ends it.
+  The rollout writes its ``compacted`` line only at the end.
 - ``thread/name/set`` names the thread before its first turn as after it, answers
   ``{}`` and announces ``thread/name/updated``. An empty name is refused with "thread
   name must not be empty". No method turns remote control on.
@@ -44,9 +48,10 @@ from trackinizer.lib.posix.pipes import Piped
 from trackinizer.runs.asks import (
     Answer,
     Ask,
+    Compaction,
+    DriverEvent,
     Option,
     OptionKind,
-    Resolved,
     Resolver,
     RunState,
     StateChanged,
@@ -77,7 +82,6 @@ type SandboxMode = Literal["read-only", "workspace-write", "danger-full-access"]
 type Reviewer = Literal["user", "auto_review"]
 """Who decides an approval: the person, or codex's own reviewer agent."""
 
-type _Event = Ask | Resolved | StateChanged
 _Tree = dict[str, PlainTree]
 
 _QUIET: Final = (
@@ -163,7 +167,7 @@ class CodexAppDriver:
         }
         self._piped: Piped | None = None
         self._stack = contextlib.AsyncExitStack()
-        self._events = asyncio.Queue[_Event | None]()
+        self._events = asyncio.Queue[DriverEvent | None]()
         self._waiters: dict[int, _Pending] = {}
         self._open: dict[str, _Open] = {}
         self._diffs: dict[str, str] = {}
@@ -256,6 +260,7 @@ class CodexAppDriver:
         thread: _Tree = {"threadId": self._run.thread_id}
         match verb.removeprefix("/"):
             case "compact":
+                self._run.next_trigger = "manual"
                 _ = await self._call("thread/compact/start", thread)
             case "goal":
                 await self._goal(thread, args.strip())
@@ -323,7 +328,7 @@ class CodexAppDriver:
         """End the app-server; the events end once its output is read. Safe to repeat."""
         await self._stack.aclose()
 
-    async def events(self) -> AsyncIterator[_Event]:
+    async def events(self) -> AsyncIterator[DriverEvent]:
         """Stream the asks, their ends and the state until the app-server ends.
 
         Yields:
@@ -493,19 +498,42 @@ class CodexAppDriver:
             case "turn/started":
                 self._run.begin(_text(_tree(params, "turn"), "id"))
             case "turn/completed":
-                turn = _text(_tree(params, "turn"), "id")
-                if turn in self._run.turns:
-                    self._run.turns.remove(turn)
+                turn = _tree(params, "turn")
+                if _text(turn, "id") in self._run.turns:
+                    self._run.turns.remove(_text(turn, "id"))
+                self._compacted(error=_turn_error(turn))
             case "item/started":
                 item = _tree(params, "item")
                 if _text(item, "type") == "fileChange":
                     self._diffs[_text(item, "id")] = _diff(item)
+                if _text(item, "type") == "contextCompaction":
+                    self._compacting(_text(item, "id"))
             case "item/completed":
-                _ = self._diffs.pop(_text(_tree(params, "item"), "id"), None)
+                item = _tree(params, "item")
+                _ = self._diffs.pop(_text(item, "id"), None)
+                if _text(item, "type") == "contextCompaction":
+                    self._compacted(_text(item, "id"))
             case "serverRequest/resolved":
                 self._on_resolved(self._ask_id(params.get("requestId")))
             case _:
                 pass
+
+    def _compacting(self, item: str) -> None:
+        """Begin the compaction ``item`` is: ``manual`` when ``/compact`` asked for it."""
+        trigger, self._run.next_trigger = self._run.next_trigger, "auto"
+        self._run.compactions[item] = trigger
+        self._events.put_nowait(Compaction(state="started", trigger=trigger))
+
+    # A compaction whose turn ended before its item did failed or was interrupted: it
+    # ends with the turn, so Chat does not say it is compacting for the rest of the run.
+    def _compacted(self, item: str = "", *, error: str = "") -> None:
+        """End the compaction ``item`` is, or every one still open when ``item`` is empty."""
+        for each in [item] if item else list(self._run.compactions):
+            trigger = self._run.compactions.pop(each, None)
+            if trigger is not None:
+                self._events.put_nowait(
+                    Compaction(state="ended", trigger=trigger, error=error),
+                )
 
     def _on_resolved(self, ask_id: str) -> None:
         """End an ask nobody here answered: our interrupt cleared it, or a client did."""
@@ -791,6 +819,14 @@ def _diff(item: _Tree) -> str:
     return "\n".join(blocks)
 
 
+def _turn_error(turn: _Tree) -> str:
+    """Return why a turn did not complete: its error's message, else its status."""
+    status = _text(turn, "status")
+    if status in {"", "completed"}:
+        return ""
+    return _text(_tree(turn, "error"), "message") or status
+
+
 def _text(tree: Mapping[str, PlainTree], key: str) -> str:
     return from_plain(tree.get(key), str, default="")
 
@@ -819,6 +855,14 @@ class _Run:
     """The turn our last interrupt stopped: an ask of that turn that ends was cleared."""
 
     calls: int = 0
+    next_trigger: Literal["auto", "manual"] = "auto"
+    """What begins the next compaction: ``manual`` once ``/compact`` is sent."""
+
+    compactions: dict[str, Literal["auto", "manual"]] = field(
+        default_factory=dict[str, Literal["auto", "manual"]],
+    )
+    """The compactions in progress, by item id, and what started each."""
+
     state: RunState = "idle"
     active: bool = False
     waiting: bool = False
