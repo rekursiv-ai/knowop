@@ -2,7 +2,8 @@
 
 The watch learns of a pull request four ways, as Claude Code's app binds one:
 
-- ``gh pr create`` printed its link (:class:`RecordNotes` reads the session's records);
+- ``gh pr create`` printed its link (:class:`RecordNotes` reads the records of the
+  session and of each sub-agent it spawned, whatever worktree that one works in);
 - the branch the run started on has an open pull request the person opened;
 - a branch the session pushed has an open one, whoever opened it
   (:class:`BranchLookup`);
@@ -22,12 +23,20 @@ one, and watched again once it reopens; a merged one is read no more.
 
 With Auto-fix on, the failures :func:`due_failures` names become one line from
 ``knowop-autofix``, and a merge conflict another, once per head. A merge the watch saw
-happen becomes a line too, Auto-fix on or off, since it asks for no fix. The inbound
-loop takes them (:meth:`PullRequestWatch.take`) and types them as it types a Chat
-line: the server cannot put a line into a chat's run, and this run already sits in the
-agent's checkout, under the agent's own credentials. Several sessions may watch one
-pull request, and only one is woken for it: the first to watch it, its ``fixer``,
-until it lets the pull request go.
+happen becomes a line too, Auto-fix on or off, since it asks for no fix, and so does a
+draft whose head's checks all passed, once per head: a reminder to mark it ready once
+its work is done, which the run never does itself. The inbound loop takes them
+(:meth:`PullRequestWatch.take`) and types them as it types a Chat line: the server
+cannot put a line into a chat's run, and this run already sits in the agent's
+checkout, under the agent's own credentials. Several sessions may watch one pull
+request, and only one is woken for it: the first to watch it, its ``fixer``, until it
+lets the pull request go.
+
+Auto-merge is GitHub's own: a row's box, in Chat or on the Pull requests page, or
+the person's ``automerge`` preference for one never asked about, turns it on
+(``gh pr merge --auto --squash``) or off once per ask, as that person in ``gh``, and
+the row says why GitHub refused. GitHub then merges once the required checks pass and
+the reviews allow; a draft's ask waits until it is marked ready.
 """
 
 from __future__ import annotations
@@ -36,7 +45,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, TypedDict
 from uuid import UUID
 
 import logging
@@ -52,13 +61,16 @@ from knowop.agent.pull_request_rows import PullRequestRows
 from knowop.agent.pull_requests import (
     AUTOFIX_SOURCE,
     CONFLICT,
+    READY,
     GhError,
     conflict_text,
     due_failures,
     links,
     merged_text,
     read_pull_request,
+    ready_text,
     run_gh,
+    set_auto_merge,
     wake_text,
 )
 from knowop.agent.tool_server import AgentTool, ToolError
@@ -112,10 +124,10 @@ _WATCH_TOOL: Final = (
     "Watch a GitHub pull request in this chat. Chat shows it over the session, and "
     "while its Auto-fix is on the run sends you a line from knowop-autofix when its "
     "checks fail or it has a merge conflict, and one when it merges. The run already "
-    "watches a pull request this session opens with gh pr "
-    "create, or one open on a branch it pushes: call this for any other the person "
-    "asks you to watch, or to bring back one that was let go. Answers what the run now "
-    "sees of it."
+    "watches a pull request this session or any of its sub-agents opens with gh pr "
+    "create, in any worktree, or one open on a branch it pushes: call this for any "
+    "other the person asks you to watch, or to bring back one that was let go. Answers "
+    "what the run now sees of it."
 )
 
 _UNWATCH_TOOL: Final = (
@@ -304,6 +316,7 @@ class PullRequestWatch:
             else:
                 self._dismiss(each.url, session=session, me=profile["email"])
         default = profile["preferences"].get("autofix", True)
+        automerge = profile["preferences"].get("automerge") is True
         read = [
             *self._watched,
             *(url for url in reopening if url in self._closed_links),
@@ -314,6 +327,7 @@ class PullRequestWatch:
                 session=session,
                 me=profile["email"],
                 default=default,
+                automerge=automerge,
             )
             for url in read
         }
@@ -387,7 +401,15 @@ class PullRequestWatch:
 
     # The row's status follows GitHub, a closed pull request's back to ``active`` once
     # it is reopened.
-    def _refresh(self, url: str, *, session: UUID, me: str, default: bool) -> str:
+    def _refresh(
+        self,
+        url: str,
+        *,
+        session: UUID,
+        me: str,
+        default: bool,
+        automerge: bool,
+    ) -> str:
         """Read one pull request, store what changed, and queue a wake when one is due."""
         try:
             pull_request: PullRequest | None = read_pull_request(
@@ -400,6 +422,11 @@ class PullRequestWatch:
             pull_request, error = None, str(failed)
             self._say(f"could not read {url}: {error}")
         stored = self._rows.row(url, session=session, me=me, pull_request=pull_request)
+        enacted = (
+            {}
+            if pull_request is None
+            else self._auto_merge(pull_request, kept=stored.pr, default=automerge)
+        )
         written = self._rows.write_pr(
             stored,
             partial(
@@ -410,6 +437,7 @@ class PullRequestWatch:
                 error=error,
                 session=session,
                 default=default,
+                enacted=enacted,
             ),
         )
         if written is None:
@@ -447,6 +475,7 @@ class PullRequestWatch:
         error: str | None,
         session: UUID,
         default: bool,
+        enacted: dict[str, object],
     ) -> tuple[dict[str, object], tuple[str, ...]]:
         """Return the row's ``app.knowop.pr`` as this read leaves it, and the lines to wake with."""
         new = dict(kept)
@@ -454,7 +483,7 @@ class PullRequestWatch:
         if pull_request is None:
             new["error"] = error
         else:
-            new |= pull_request.app() | {"error": None}
+            new |= pull_request.app() | {"error": None} | enacted
             # ``gh`` reads with the person's own login, so a pull request whose author
             # is that login is theirs: the Pull requests page lists it under theirs.
             if login:
@@ -469,11 +498,17 @@ class PullRequestWatch:
             )
             # Only a merge this watch saw happen: reading one merged long ago is no news.
             merged = pull_request.state == "MERGED" and kept.get("state") == "OPEN"
+            # A reminder, Auto-fix on or off, as a merge is news: it asks for no fix.
+            ready = (
+                pull_request.state == "OPEN"
+                and pull_request.draft
+                and pull_request.passing
+            )
             fixer = self._fixer(
                 kept,
                 row=row,
                 session=session,
-                failing=failing or conflicted or merged,
+                failing=failing or conflicted or merged or ready,
             )
             new["fixer"] = fixer
             if fixer == str(session):
@@ -481,9 +516,14 @@ class PullRequestWatch:
                 due = self._due(pull_request, told=told) if failing else ()
                 head = f"{pull_request.head_sha}:"
                 resolve = conflicted and f"{head}{CONFLICT}" not in told
+                remind = ready and f"{head}{READY}" not in told
                 new["told"] = [each for each in told if each.startswith(head)] + [
                     f"{head}{name}"
-                    for name in (*due, *((CONFLICT,) if resolve else ()))
+                    for name in (
+                        *due,
+                        *((CONFLICT,) if resolve else ()),
+                        *((READY,) if remind else ()),
+                    )
                 ]
                 if due:
                     wakes.append(wake_text(pull_request, due))
@@ -491,6 +531,8 @@ class PullRequestWatch:
                     wakes.append(conflict_text(pull_request))
                 if merged:
                     wakes.append(merged_text(pull_request))
+                if remind:
+                    wakes.append(ready_text(pull_request))
         if new != kept:
             new["read_at"] = datetime.now(UTC).isoformat()
         return new, tuple(wakes)
@@ -506,7 +548,7 @@ class PullRequestWatch:
         failing: bool,
     ) -> str:
         """Return the session that fixes a pull request, this one if none does."""
-        fixer = from_plain(kept.get("fixer"), str, default="")
+        fixer = from_plain(kept.get("fixer", ""), str)
         if not fixer or (
             failing
             and fixer != str(session)
@@ -528,6 +570,37 @@ class PullRequestWatch:
         if pull_request.failed:
             self._first_failed[pull_request.url] = (pull_request.head_sha, first)
         return due_failures(pull_request, told=told, first_seen=first, now=now)
+
+    # Run before the row is written, and not in ``_changed``, which a lost write runs
+    # again: ``gh`` is called once a read. An ask is done once, so GitHub's own state
+    # rules after it, a change on github.com too; a draft's ask waits, as GitHub turns
+    # no draft's auto-merge on.
+    def _auto_merge(
+        self,
+        pull_request: PullRequest,
+        *,
+        kept: Mapping[str, object],
+        default: bool,
+    ) -> dict[str, object]:
+        """Do the Auto-merge ask due on a pull request; return what the row keeps of it."""
+        done = from_plain(kept.get("automerge_done"), str, default="")
+        ask = from_plain(kept.get("automerge_ask"), _MergeAsk, default=None)
+        stamp, on = (ask["at"], ask["on"]) if ask else ("default", default)
+        if (
+            stamp == done
+            or not (ask or (default and not done))
+            or pull_request.state != "OPEN"
+            or (on and pull_request.draft)
+        ):
+            return {}
+        if on == pull_request.auto_merge:
+            return {"automerge_done": stamp, "automerge_error": None}
+        error = set_auto_merge(self._gh, self._cwd, url=pull_request.url, on=on)
+        return {
+            "automerge_done": stamp,
+            "automerge_error": error,
+            "auto_merge": on if error is None else pull_request.auto_merge,
+        }
 
     def _watch(self, url: str) -> None:
         """Read ``url`` at every pass."""
@@ -551,6 +624,13 @@ class PullRequestWatch:
         if message not in self._said:
             self._said.add(message)
             _logger.warning("knowop run: %s", message)
+
+
+class _MergeAsk(TypedDict):
+    """What a row's Auto-merge box writes: on or off, and when, which names the ask."""
+
+    on: bool
+    at: str
 
 
 @dataclass(slots=True, kw_only=True)

@@ -1,7 +1,8 @@
 # Agent instructions
 
 `using-knowop/SKILL.md` is what an agent running inside knowop is told it can do: Chat's
-lines, the person's canvas, its pull requests and Auto-fix, and filing results to trax.
+lines, the person's canvas, its pull requests, Auto-fix and Auto-merge, and filing
+results to trax.
 `knowop run` gives its body to every claude and codex it starts as their standing
 instructions (`--append-system-prompt`, codex's `developer_instructions`), and types it
 again after a compaction, or on the first line to a CLI with no such flag. Those words

@@ -272,6 +272,11 @@ def test_an_unchanged_pr_is_not_written() -> None:
     assert client.calls == []
 
 
+def test_a_stored_rows_pull_request_is_its_app_knowop_pr_or_none() -> None:
+    assert Stored(row=_ROW, app=dict(_pr(reads=1)), status="active").pr == {"reads": 1}
+    assert Stored(row=_ROW, app={"other": 1}, status="active").pr == {}
+
+
 def test_a_row_moves_from_the_status_it_was_read_with() -> None:
     client = _Client(refusals=[409])
     rows = PullRequestRows(client=client, actor="Agent")

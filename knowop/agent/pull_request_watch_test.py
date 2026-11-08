@@ -32,11 +32,13 @@ from knowop.agent.pull_request_rows import DISMISSED, LABEL
 from knowop.agent.pull_request_watch import (
     CLOSED_PASSES,
     PullRequestWatch,
+    _Asked,
 )
 from knowop.agent.pull_requests import (
     AUTOFIX_SOURCE,
     CONFLICT,
     HOLD_SEC,
+    READY,
     GhOutput,
 )
 from knowop.agent.tool_server import AgentTool, ToolError
@@ -72,6 +74,7 @@ class _Server:
     rows: dict[UUID, dict[str, object]] = field(default_factory=dict)
     edges: dict[_Edge, list[str]] = field(default_factory=dict)
     autofix: bool | None = None
+    automerge: bool | None = None
     down: bool = False
     racing: Callable[[], None] | None = None
     """What another writer does between the watch's read and its write, which is then
@@ -87,7 +90,14 @@ class _Server:
         if path == "/api/me/profile":
             if self.down:
                 raise ClientError("down", status_code=503)
-            preferences = {} if self.autofix is None else {"autofix": self.autofix}
+            preferences = {
+                key: value
+                for key, value in (
+                    ("autofix", self.autofix),
+                    ("automerge", self.automerge),
+                )
+                if value is not None
+            }
             return {"email": _ME, "preferences": preferences}
         target = UUID(path.removeprefix("/api/web/get/"))
         # A row's view names the sessions it was produced by; a session's, its rows.
@@ -214,6 +224,13 @@ class _Server:
         )
         return labels
 
+    def ask(self, *, on: bool, at: str) -> None:
+        """Write what a row's Auto-merge box writes on the one row."""
+        (row,) = self.rows.values()
+        app = from_plain(row["app"], dict[str, dict[str, dict[str, object]]])
+        app["knowop"]["pr"]["automerge_ask"] = {"on": on, "at": at}
+        row["app"] = app
+
 
 @dataclass(slots=True, kw_only=True)
 class _Gh:
@@ -224,17 +241,29 @@ class _Gh:
     author: str = "me-on-github"
     login: str = "me-on-github"
     mergeable: str = "MERGEABLE"
+    draft: bool = False
+    auto_merge: bool = False
     checks: list[dict[str, object]] = field(default_factory=list)
     fails: str = ""
+    refuses: str = ""
+    """What GitHub says when it refuses a ``gh pr merge``; empty for none."""
+
     none_for: set[str] = field(default_factory=set)
     """Branches with no pull request yet."""
 
     refs: list[str] = field(default_factory=list)
+    merges: list[list[str]] = field(default_factory=list)
 
     def __call__(self, args: Sequence[str], cwd: Path) -> GhOutput:
         del cwd
         if args[0] == "api":
             return GhOutput(returncode=0, stdout=f"{self.login}\n", stderr="")
+        if args[1] == "merge":
+            self.merges.append(list(args[2:]))
+            if self.refuses:
+                return GhOutput(returncode=1, stdout="", stderr=self.refuses)
+            self.auto_merge = "--auto" in args
+            return GhOutput(returncode=0, stdout="", stderr="")
         ref = "" if args[2] == "--json" else args[2]
         self.refs.append(ref)
         if ref in self.none_for:
@@ -248,7 +277,7 @@ class _Gh:
             "title": "Fix it",
             "state": self.state,
             "author": self.author,
-            "draft": False,
+            "draft": self.draft,
             "head": _BRANCH,
             "head_sha": self.head_sha,
             "base": "main",
@@ -257,6 +286,7 @@ class _Gh:
             "mergeable": self.mergeable,
             "review": "",
             "updated": "2026-11-08T10:00:00Z",
+            "auto_merge": self.auto_merge,
             "checks": self.checks,
         }
         return GhOutput(returncode=0, stdout=json.dumps(view), stderr="")
@@ -469,6 +499,135 @@ def test_nothing_noted_reads_nothing() -> None:
     watch._sweep()
     assert gh.refs == []
     assert server.rows == {}
+
+
+def test_a_pull_request_a_subagent_opened_in_its_own_worktree_is_watched() -> None:
+    """``claude -p`` keeps a sub-agent's output only as the text its model read."""
+    server, gh = _Server(), _Gh()
+    watch = _watch(server, gh, git=_Git(branch=_BRANCH))
+    command = "cd /opt/scratch/runs/other && gh pr create --draft 2>&1 | tail -2"
+    watch.note(ToolCall(call_id="k", name="Bash", arguments={"command": command}))
+    watch.note(BashResult(call_id="k", shown=f"{_URL}\n"))
+    watch._sweep()
+    assert [row["url"] for row in server.rows.values()] == [_URL]
+
+
+def test_a_link_a_subagent_only_read_is_not_watched() -> None:
+    server, gh = _Server(), _Gh(author="someone-else")
+    watch = _watch(server, gh)
+    command = 'grep -rn "gh pr create" /w/agent-a1.jsonl'
+    watch.note(ToolCall(call_id="g", name="Bash", arguments={"command": command}))
+    watch.note(BashResult(call_id="g", shown=f"{_URL}\n"))
+    watch._sweep()
+    assert gh.refs == []
+    assert server.rows == {}
+
+
+def test_a_passing_draft_reminds_the_agent_to_mark_it_ready_once_per_head() -> None:
+    server, gh = _Server(autofix=False), _Gh(draft=True, checks=[_check("unit")])
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    (told,) = watch.take()
+    assert told.source == AUTOFIX_SOURCE
+    assert told.text.startswith(f'<knowop-ready pr="{_URL}"')
+    assert server.pr()["told"] == [f"{_SHA}:{READY}"]
+    watch._sweep()
+    assert watch.take() == []
+    gh.head_sha = "b" * 40
+    watch._sweep()
+    assert len(watch.take()) == 1
+
+
+@pytest.mark.parametrize(
+    ("draft", "checks"),
+    [
+        (False, [_check("unit")]),
+        (True, []),
+        (True, [_check("unit"), _check("lint", status="IN_PROGRESS")]),
+    ],
+    ids=["ready", "no-checks", "running"],
+)
+def test_no_reminder_comes_until_a_drafts_checks_all_pass(
+    *,
+    draft: bool,
+    checks: list[dict[str, object]],
+) -> None:
+    server, gh = _Server(), _Gh(draft=draft, checks=checks)
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    assert watch.take() == []
+
+
+def test_auto_merge_turns_on_and_off_as_chat_asks_once_each() -> None:
+    server, gh = _Server(), _Gh()
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    assert gh.merges == []
+    server.ask(on=True, at="t1")
+    watch._sweep()
+    watch._sweep()
+    assert gh.merges == [[_URL, "--auto", "--squash"]]
+    assert server.pr()["auto_merge"] is True
+    assert server.pr()["automerge_done"] == "t1"
+    server.ask(on=False, at="t2")
+    watch._sweep()
+    assert gh.merges[1:] == [[_URL, "--disable-auto"]]
+    assert server.pr()["auto_merge"] is False
+
+
+def test_auto_merge_waits_for_a_draft_to_be_marked_ready() -> None:
+    server, gh = _Server(), _Gh(draft=True)
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    server.ask(on=True, at="t1")
+    watch._sweep()
+    assert gh.merges == []
+    assert "automerge_done" not in server.pr()
+    gh.draft = False
+    watch._sweep()
+    assert gh.merges == [[_URL, "--auto", "--squash"]]
+
+
+def test_auto_merge_github_refused_says_why_and_is_not_asked_again() -> None:
+    said = "GraphQL: Protected branch rules not configured for this branch (enable)"
+    server, gh = _Server(), _Gh(refuses=f"{said}\n")
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    server.ask(on=True, at="t1")
+    watch._sweep()
+    watch._sweep()
+    assert len(gh.merges) == 1
+    assert server.pr()["automerge_error"] == said
+    assert server.pr()["auto_merge"] is False
+
+
+def test_the_persons_auto_merge_default_turns_it_on_once() -> None:
+    """Once on, GitHub's own state holds: one turned off on github.com stays off."""
+    server, gh = _Server(automerge=True), _Gh()
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    assert gh.merges == [[_URL, "--auto", "--squash"]]
+    gh.auto_merge = False
+    watch._sweep()
+    assert len(gh.merges) == 1
+    assert server.pr()["auto_merge"] is False
+
+
+def test_one_already_merging_on_its_own_needs_no_call() -> None:
+    server, gh = _Server(), _Gh(auto_merge=True)
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    server.ask(on=True, at="t1")
+    watch._sweep()
+    assert gh.merges == []
+    assert server.pr()["automerge_done"] == "t1"
 
 
 def test_a_failed_check_wakes_the_agent_once_per_head() -> None:
@@ -768,6 +927,36 @@ def test_a_merge_the_fixer_let_go_of_tells_the_next_session_to_read_it() -> None
     assert server.pr()["fixer"] == str(_OTHER)
 
 
+@pytest.mark.parametrize(
+    ("conflicted", "told"),
+    [(True, CONFLICT), (False, READY)],
+    ids=["conflict", "ready"],
+)
+def test_a_line_due_alone_passes_a_let_go_pull_request_to_the_next_session(
+    *,
+    conflicted: bool,
+    told: str,
+) -> None:
+    """A conflict, or a passing draft, wakes whoever watches it once the first lets go."""
+    server = _Server()
+    gh = (
+        _Gh(mergeable="CONFLICTING")
+        if conflicted
+        else _Gh(draft=True, checks=[_check("unit")])
+    )
+    first, other = _watch(server, gh), _watch(server, gh, session=_OTHER)
+    _opened(first)
+    first._sweep()
+    _ = first.take()
+    server.labels(_SESSION).append(DISMISSED)
+    _opened(other)
+    gh.head_sha = "c" * 40
+    other._sweep()
+    assert len(other.take()) == 1
+    assert server.pr()["fixer"] == str(_OTHER)
+    assert server.pr()["told"] == [f"{'c' * 40}:{told}"]
+
+
 def test_a_read_that_changed_the_row_stamps_when_and_one_that_did_not_leaves_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -776,7 +965,7 @@ def test_a_read_that_changed_the_row_stamps_when_and_one_that_did_not_leaves_it(
     _opened(watch)
     watch._sweep()
     stamped = datetime.fromisoformat(from_plain(server.pr()["read_at"], str))
-    assert stamped.tzinfo is not None
+    assert stamped.utcoffset() == timedelta(0)
     assert abs(datetime.now(UTC) - stamped) < timedelta(minutes=1)
     later = datetime(2030, 1, 1, tzinfo=UTC)
     monkeypatch.setattr(
@@ -909,6 +1098,16 @@ def test_the_watch_tool_answers_failures_runs_and_a_switch_off(
         watch.close()
 
 
+def test_a_watch_and_an_unwatch_in_one_pass_answer_that_the_run_let_it_go() -> None:
+    server, gh = _Server(), _Gh()
+    watch = _watch(server, gh)
+    asked = [_Asked(ask="watch", url=_URL), _Asked(ask="unwatch", url=_URL)]
+    watch._asked.extend(asked)
+    watch._sweep()
+    assert asked[0].answer == f"The run let {_URL} go."
+    assert gh.refs == []
+
+
 def test_the_unwatch_tool_lets_go_of_one_never_watched_and_keeps_it_gone() -> None:
     server, gh = _Server(), _Gh()
     watch = _watch(server, gh)
@@ -917,7 +1116,10 @@ def test_the_unwatch_tool_lets_go_of_one_never_watched_and_keeps_it_gone() -> No
         answer = _tool(watch, "unwatch_pull_request").call({"url": _URL})
     finally:
         watch.close()
-    assert answer.startswith(f"Let go of {_URL}: Chat no longer shows it")
+    assert answer == (
+        f"Let go of {_URL}: Chat no longer shows it, and no Auto-fix line comes for "
+        "it. watch_pull_request brings it back."
+    )
     assert server.labels() == [LABEL, DISMISSED]
     _opened(watch)
     watch._sweep()

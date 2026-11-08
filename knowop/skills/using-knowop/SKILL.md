@@ -1,6 +1,6 @@
 ---
 name: using-knowop
-description: "ALWAYS invoke this skill when running under knowop run: Chat lines, the person's canvas, handing them a command to Run, pull requests and Auto-fix, filing to trax. Do not guess what a KnowOp line or tool means -- read this first."
+description: "ALWAYS invoke this skill when running under knowop run: Chat lines, the person's canvas, handing them a command to Run, pull requests, Auto-fix and Auto-merge, filing to trax. Do not guess what a KnowOp line or tool means -- read this first."
 ---
 
 # Using KnowOp
@@ -76,8 +76,10 @@ the result means; don't rerun it unless asked.
 
 ## Pull requests
 
-The run watches this session's pull requests (yours, and the person's on the starting
-branch) and Chat shows them. Its `knowop` MCP server adds:
+The run watches this session's pull requests and Chat shows them, changed last
+first: each one `gh pr create` opens, yours or a sub-agent's, in any worktree; one
+open on a branch you push; and the person's own on the starting branch. Its `knowop`
+MCP server adds:
 
 - `watch_pull_request` with its `url`: watch one, or bring one back.
 - `unwatch_pull_request` with its `url`: let one go.
@@ -88,6 +90,16 @@ instructions. Do not poll CI. Default on or off: knowop canvas autofix to true (
 false). A merge conflict arrives the same way as `<knowop-conflict pr="LINK"
 head="SHA">`: resolve it and push. `<knowop-merged pr="LINK" head="SHA">` says one
 merged, with Auto-fix on or off: tell the person, and pick up what waited on it.
+
+A pull request you open as a draft is yours to mark ready: once its work is done and
+its checks pass, run `gh pr ready LINK`. `<knowop-ready pr="LINK" head="SHA">` says a
+draft's checks all passed; mark it ready then if its work is done, else leave it.
+
+Auto-merge, beside Auto-fix in Chat, is GitHub's own: the run turns it on (`gh pr
+merge --auto --squash`) or off as the person asks, and GitHub merges once the required
+checks pass and the reviews allow. A draft's waits until it is marked ready. Default
+on or off: knowop canvas automerge to true (or false). Leave it to the person: do not
+turn it on yourself.
 
 ## Filing results
 

@@ -8,7 +8,11 @@ status what GitHub says: ``active`` while open, ``complete`` once merged and
 their login is known), the person's switch (``autofix``: true, false, or absent for
 their ``autofix`` preference), the session that Auto-fixes it (``fixer``) and the
 failures that session's wakes already named (``told``), so a run that starts again
-does not wake twice.
+does not wake twice. Auto-merge is GitHub's own (``auto_merge``, as last read): the
+row's box, in Chat and on the Pull requests page, asks for it on or off
+(``automerge_ask``, ``on`` and the ``at`` that names the ask), the run does it once
+(``automerge_done``, the ``at`` it did, or ``default`` for the person's ``automerge``
+preference), and says why GitHub refused (``automerge_error``).
 
 The edge from the row to each session is labelled :data:`LABEL` too, so a session's
 pull requests are found among what it produced without reading every row. A session
@@ -126,6 +130,7 @@ class Preferences(TypedDict):
     """The preferences the watch reads."""
 
     autofix: NotRequired[bool]
+    automerge: NotRequired[bool]
 
 
 class Profile(TypedDict):
@@ -165,6 +170,12 @@ class Stored:
     row: UUID
     app: dict[str, object]
     status: str
+
+    @property
+    def pr(self) -> dict[str, object]:
+        """The row's ``app.knowop.pr``, empty for none."""
+        knowop = from_plain(self.app.get("knowop"), dict[str, object], default={})
+        return from_plain(knowop.get("pr"), dict[str, object], default={})
 
 
 class PullRequestRows:

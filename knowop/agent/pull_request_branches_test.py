@@ -64,6 +64,7 @@ class _Gh:
             "mergeable": "MERGEABLE",
             "review": "",
             "updated": "2026-11-08T10:00:00Z",
+            "auto_merge": False,
             "checks": list[object](),
         }
         return GhOutput(returncode=0, stdout=json.dumps(view), stderr="")

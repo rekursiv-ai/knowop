@@ -1,10 +1,12 @@
 """Note what a session's shell calls did to pull requests, from the records it emits.
 
-The run's drain thread shows each record to :meth:`RecordNotes.note`. A call that ran
-``gh pr create`` names its pull request in what it printed, and one that ran ``git
-push`` sends the watch to look for the pull request of the branch. claude records a
-shell result without its command, so the command is read from the call and its result
-found by the call's id. A call that failed did neither.
+The run's drain thread shows each record of the run's agents, its sub-agents' too, to
+:meth:`RecordNotes.note`. A call that ran ``gh pr create`` names its pull request in
+what it printed, and one that ran ``git push`` sends the watch to look for the pull
+request of the branch. claude records a shell result without its command, so the
+command is read from the call and its result found by the call's id. A call that
+failed did neither, and one that only names a command (``grep "gh pr create"``) ran
+neither: each counts where a shell runs a command, first or after a separator.
 """
 
 from __future__ import annotations
@@ -32,8 +34,11 @@ __all__ = ["Noted", "RecordNotes"]
 type _Act = Literal["create", "push"]
 """What a shell call did: opened a pull request, or pushed a branch."""
 
-_CREATE: Final = re.compile(r"\bgh\s+pr\s+create\b")
-_PUSH: Final = re.compile(r"\bgit\b[^\n;&|]*\bpush\b")
+# Where a shell runs a command: first, or after a separator, a ``then`` or a ``do``,
+# behind any variable assignments.
+_RUN: Final = r"(?:^|[\n;&|(]|\bthen|\bdo)\s*(?:\w+=\S*\s+)*"
+_CREATE: Final = re.compile(rf"{_RUN}gh\s+pr\s+create\b")
+_PUSH: Final = re.compile(rf"{_RUN}git\b[^\n;&|]*\bpush\b")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -72,20 +77,18 @@ class RecordNotes:
 
         """
         if isinstance(record, ToolCall):
-            act = _act(" ".join(_strings(record.arguments)))
+            act = _act(_strings(record.arguments))
             if act is not None:
                 self._calls[record.call_id] = act
             return False
         if not isinstance(record, BashResult):
             return False
-        act = self._calls.pop(record.call_id, None) or _act(
-            " ".join(record.command or ()),
-        )
+        act = self._calls.pop(record.call_id, None) or _act(record.command or ())
         if act is None or record.is_error is True or record.exit_code not in {None, 0}:
             return False
         with self._lock:
             if act == "create":
-                self._opened.extend(links(record.stdout))
+                self._opened.extend(links(record.text()))
             else:
                 self._pushed = True
         return True
@@ -98,11 +101,15 @@ class RecordNotes:
         return noted
 
 
-def _act(command: str) -> _Act | None:
+# Each word alone, and all of them as one line: an argv (``["git", "push"]``) is one
+# command only joined, and the script of ``["bash", "-lc", "git push"]`` starts its
+# own word.
+def _act(words: Sequence[str]) -> _Act | None:
     """Say whether a shell command opened a pull request or pushed a branch."""
-    if _CREATE.search(command):
+    lines = (*words, " ".join(words))
+    if any(_CREATE.search(line) for line in lines):
         return "create"
-    return "push" if _PUSH.search(command) else None
+    return "push" if any(_PUSH.search(line) for line in lines) else None
 
 
 def _strings(tree: Mapping[str, PlainTree]) -> list[str]:
