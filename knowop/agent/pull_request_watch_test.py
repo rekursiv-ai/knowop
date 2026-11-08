@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, override
 from unittest.mock import Mock
@@ -255,6 +256,7 @@ class _Gh:
             "deletions": 0,
             "mergeable": self.mergeable,
             "review": "",
+            "updated": "2026-11-08T10:00:00Z",
             "checks": self.checks,
         }
         return GhOutput(returncode=0, stdout=json.dumps(view), stderr="")
@@ -363,6 +365,29 @@ def test_a_pull_request_the_session_opened_gets_a_row_produced_by_the_session() 
     assert pr["state"] == "OPEN"
     assert pr["checks"] == {"passed": 1, "failed": [], "pending": [], "total": 1}
     assert pr["error"] is None
+
+
+@pytest.mark.parametrize(
+    ("author", "authored"),
+    [("me-on-github", True), ("someone-else", False)],
+)
+def test_the_row_says_whether_the_person_opened_it(author: str, authored: bool) -> None:
+    """The person's own are the bottom section of the Pull requests page."""
+    server, gh = _Server(), _Gh(author=author)
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    pr = server.pr()
+    assert (pr["author"], pr["authored"]) == (author, authored)
+
+
+def test_a_login_gh_cannot_read_says_nothing_of_who_opened_it() -> None:
+    server, gh = _Server(), _Gh(login="")
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    assert server.pr()["author"] == "me-on-github"
+    assert "authored" not in server.pr()
 
 
 def test_a_codex_result_names_its_own_command_and_a_failed_one_counts_for_nothing() -> (
@@ -726,6 +751,44 @@ def test_only_the_first_session_watching_is_woken_until_it_lets_go() -> None:
     assert len(other.take()) == 1
     assert server.pr()["fixer"] == str(_OTHER)
     assert server.pr()["told"] == [f"{'c' * 40}:CI / unit"]
+
+
+def test_a_merge_the_fixer_let_go_of_tells_the_next_session_to_read_it() -> None:
+    server, gh = _Server(), _Gh()
+    first, other = _watch(server, gh), _watch(server, gh, session=_OTHER)
+    _opened(first)
+    first._sweep()
+    _opened(other)
+    other._sweep()
+    server.labels(_SESSION).append(DISMISSED)
+    gh.state = "MERGED"
+    other._sweep()
+    (told,) = other.take()
+    assert 'knowop-merged pr="' in told.text
+    assert server.pr()["fixer"] == str(_OTHER)
+
+
+def test_a_read_that_changed_the_row_stamps_when_and_one_that_did_not_leaves_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server, gh = _Server(), _Gh()
+    watch = _watch(server, gh)
+    _opened(watch)
+    watch._sweep()
+    stamped = datetime.fromisoformat(from_plain(server.pr()["read_at"], str))
+    assert stamped.tzinfo is not None
+    assert abs(datetime.now(UTC) - stamped) < timedelta(minutes=1)
+    later = datetime(2030, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr(
+        pull_request_watch,
+        "datetime",
+        Mock(now=Mock(return_value=later)),
+    )
+    watch._sweep()
+    assert server.pr()["read_at"] == stamped.isoformat()
+    gh.checks = [_check("lint")]
+    watch._sweep()
+    assert server.pr()["read_at"] == later.isoformat()
 
 
 def test_the_current_fixer_needs_no_ownership_read(

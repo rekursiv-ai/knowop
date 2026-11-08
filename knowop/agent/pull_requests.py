@@ -75,13 +75,14 @@ _FIELDS: Final = ",".join(
         "mergeable",
         "reviewDecision",
         "statusCheckRollup",
+        "updatedAt",
     ),
 )
 
 # gh's own camelCase names, renamed in gh's jq to the names :class:`_View` reads.
 _JQ: Final = (
     '{number, url, title, state, author: (.author.login // ""), draft: .isDraft, '
-    "head: .headRefName, "
+    'head: .headRefName, updated: (.updatedAt // ""), '
     "head_sha: .headRefOid, base: .baseRefName, additions, deletions, mergeable, "
     'review: (.reviewDecision // ""), checks: [(.statusCheckRollup // [])[] | '
     '{name: (.name // .context // ""), workflow: (.workflowName // ""), '
@@ -186,6 +187,7 @@ class PullRequest:
       deletions: Lines it removes.
       mergeable: ``MERGEABLE``, ``CONFLICTING`` or ``UNKNOWN``.
       review: Its review decision; empty for none.
+      updated: When it last changed, as GitHub stamps it (ISO 8601); empty for none.
       passed: Checks of the head that passed or need nothing.
       failed: Names of the head's checks that failed.
       pending: Names of the head's checks still running.
@@ -208,6 +210,7 @@ class PullRequest:
     deletions: int
     mergeable: str
     review: str
+    updated: str
     passed: int
     failed: tuple[str, ...]
     pending: tuple[str, ...]
@@ -236,6 +239,8 @@ class PullRequest:
             "deletions": self.deletions,
             "mergeable": self.mergeable,
             "review": self.review,
+            "author": self.author,
+            "updated": self.updated,
             "checks": {
                 "passed": self.passed,
                 "failed": list(self.failed),
@@ -307,6 +312,7 @@ def read_pull_request(run: GhRunner, cwd: Path, *, ref: str = "") -> PullRequest
         deletions=view["deletions"],
         mergeable=view["mergeable"],
         review=view["review"],
+        updated=view["updated"],
         passed=sum(verdict == "passed" for verdict, _ in verdicts),
         failed=_names(failed),
         pending=_names(pending),
@@ -493,6 +499,7 @@ class _View(TypedDict):
     deletions: int
     mergeable: str
     review: str
+    updated: str
     checks: list[_Check]
 
 

@@ -96,12 +96,28 @@ class BranchLookup:
                 continue
             if pull_request.state != "OPEN" or pull_request.head != branch:
                 continue
-            if not (anyone or self._github_login()):
+            if not (anyone or self.login()):
                 continue
             del self._branches[branch]
             if anyone or pull_request.author == self._login:
                 links.append(pull_request.url)
         return links
+
+    def login(self) -> str:
+        """Return the login ``gh`` reads with, read once it can be.
+
+        A failed read is logged once, and tried again at the next call.
+
+        Returns:
+          login: The person's GitHub login; empty until ``gh api user`` names it.
+
+        """
+        if not self._login:
+            try:
+                self._login = read_login(self._gh, self._cwd)
+            except GhError as error:
+                self._say(f"could not read your GitHub login: {error}")
+        return self._login
 
     def _default_branch(self) -> str:
         """Return the branch ``origin`` names as its default, read once; empty for none."""
@@ -116,12 +132,3 @@ class BranchLookup:
             named = out.stdout.decode(errors="replace").strip()
             self._default = named.removeprefix("origin/") if out.returncode == 0 else ""
         return self._default
-
-    def _github_login(self) -> str:
-        """Return the login ``gh`` reads with, read once it can be; empty until then."""
-        if not self._login:
-            try:
-                self._login = read_login(self._gh, self._cwd)
-            except GhError as error:
-                self._say(f"could not read your GitHub login: {error}")
-        return self._login
