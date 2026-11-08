@@ -4,15 +4,18 @@ Each pull request is one WebResult per account: ``url`` its link, labelled
 :data:`LABEL`, produced by each session that opened, pushed or watched it, and its
 status what GitHub says: ``active`` while open, ``complete`` once merged and
 ``abandoned`` while closed. ``app.knowop.pr`` holds what GitHub last said (with
-``error`` when the last read failed), the person's switch (``autofix``: true, false,
-or absent for their ``autofix`` preference), the session that Auto-fixes it
-(``fixer``) and the failures that session's wakes already named (``told``), so a run
-that starts again does not wake twice.
+``error`` when the last read failed), whether the person opened it (``authored``, once
+their login is known), the person's switch (``autofix``: true, false, or absent for
+their ``autofix`` preference), the session that Auto-fixes it (``fixer``) and the
+failures that session's wakes already named (``told``), so a run that starts again
+does not wake twice.
 
 The edge from the row to each session is labelled :data:`LABEL` too, so a session's
 pull requests are found among what it produced without reading every row. A session
 lets one go with :data:`DISMISSED` on that edge, which Chat's × writes too. Chat
-draws the pill over a session's transcript from these rows.
+draws the pill over a session's transcript from these rows, and the Pull requests
+page lists them by the workspaces those sessions sit in (the server's
+``private/pull_requests.py``, which keeps these two labels too).
 """
 
 from __future__ import annotations

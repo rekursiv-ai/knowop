@@ -81,6 +81,7 @@ def _view(**fields: object) -> str:
         "deletions": 1,
         "mergeable": "MERGEABLE",
         "review": "",
+        "updated": "2026-11-08T10:00:00Z",
         "checks": [],
     }
     return json.dumps(view | fields)
@@ -184,6 +185,7 @@ def test_read_keeps_what_github_says_of_the_pull_request() -> None:
         deletions=4,
         mergeable="CONFLICTING",
         review="APPROVED",
+        updated="2026-11-08T11:30:00Z",
     ).app() == {
         "url": _URL,
         "repo": "acme/app",
@@ -198,6 +200,8 @@ def test_read_keeps_what_github_says_of_the_pull_request() -> None:
         "deletions": 4,
         "mergeable": "CONFLICTING",
         "review": "APPROVED",
+        "author": "octo",
+        "updated": "2026-11-08T11:30:00Z",
         "checks": {"passed": 0, "failed": [], "pending": [], "total": 0},
     }
 

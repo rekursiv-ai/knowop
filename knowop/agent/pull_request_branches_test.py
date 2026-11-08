@@ -9,8 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
 import json
+
+import pytest
 
 from knowop.agent.pull_request_branches import BRANCHES, BranchLookup
 from knowop.agent.pull_requests import GhOutput
@@ -60,6 +63,7 @@ class _Gh:
             "deletions": 0,
             "mergeable": "MERGEABLE",
             "review": "",
+            "updated": "2026-11-08T10:00:00Z",
             "checks": list[object](),
         }
         return GhOutput(returncode=0, stdout=json.dumps(view), stderr="")
@@ -68,15 +72,19 @@ class _Gh:
 @dataclass(slots=True, kw_only=True)
 class _Git:
     branch: str = "b0"
+    default: str = "origin/main"
+    """What ``origin/HEAD`` names; empty for a remote that names none."""
+
+    asked: list[tuple[list[str], int]] = field(default_factory=list)
 
     def __call__(self, argv: Sequence[str], max_bytes: int) -> Output:
-        del max_bytes
+        self.asked.append((list(argv), max_bytes))
         said = {
             "HEAD": self.branch,
-            "refs/remotes/origin/HEAD": "origin/main",
+            "refs/remotes/origin/HEAD": self.default,
             "remote.origin.url": "u",
         }[argv[-1]]
-        return Output(returncode=0, stdout=said.encode(), cut=False)
+        return Output(returncode=0 if said else 1, stdout=said.encode(), cut=False)
 
 
 def _lookup(gh: _Gh, git: _Git, said: list[str]) -> BranchLookup:
@@ -135,6 +143,44 @@ def test_the_default_branch_is_never_looked_for() -> None:
     (found,) = lookup.found()
     assert found.startswith("https://github.com/acme/app/pull/")
     assert gh.asked == ["b1"]
+    # Read once, as ``git symbolic-ref`` names it, in the checkout.
+    default = (
+        [
+            "git",
+            "-C",
+            "/work",
+            "symbolic-ref",
+            "--short",
+            "-q",
+            "refs/remotes/origin/HEAD",
+        ],
+        4096,
+    )
+    assert [each for each in git.asked if each[0][-1].startswith("refs/")] == [default]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "said", "default"),
+    [(0, b"origin/ma\xffin\n", "ma�in"), (1, b"origin/main\n", "")],
+)
+def test_the_default_branch_is_what_git_names_and_none_when_git_fails(
+    returncode: int,
+    said: bytes,
+    default: str,
+) -> None:
+    """A name that is not UTF-8 is still read; a failed read names none."""
+    git = Mock(return_value=Output(returncode=returncode, stdout=said, cut=False))
+    lookup = BranchLookup(cwd=Path("/work"), gh=_Gh(), git=git, say=list[str]().append)
+    assert lookup._default_branch() == default
+
+
+def test_a_remote_that_names_no_default_branch_has_every_branch_looked_for() -> None:
+    gh, git = _Gh(), _Git(branch="main", default="")
+    lookup = _lookup(gh, git, list[str]())
+    lookup.note(anyone=True)
+    (found,) = lookup.found()
+    assert found.startswith("https://github.com/acme/app/pull/")
+    assert gh.asked == ["main"]
 
 
 def test_a_failure_other_than_no_pull_request_is_said() -> None:

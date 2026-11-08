@@ -406,6 +406,7 @@ class PullRequestWatch:
                 self._changed,
                 row=stored.row,
                 pull_request=pull_request,
+                login="" if pull_request is None else self._branches.login(),
                 error=error,
                 session=session,
                 default=default,
@@ -442,6 +443,7 @@ class PullRequestWatch:
         *,
         row: UUID,
         pull_request: PullRequest | None,
+        login: str,
         error: str | None,
         session: UUID,
         default: bool,
@@ -453,6 +455,10 @@ class PullRequestWatch:
             new["error"] = error
         else:
             new |= pull_request.app() | {"error": None}
+            # ``gh`` reads with the person's own login, so a pull request whose author
+            # is that login is theirs: the Pull requests page lists it under theirs.
+            if login:
+                new["authored"] = pull_request.author == login
             switch = from_plain(kept.get("autofix"), bool, default=None)
             autofix = default if switch is None else switch
             failing = autofix and bool(pull_request.failed)
