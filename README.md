@@ -54,9 +54,11 @@ restrictions you need.
 `knowop connect` prints a code; approve it in your browser, on any device. That one
 approval logs you in, enrolls this computer and confirms it. The computer's terminal
 then opens in the web app, its files can be browsed there (read-only, as you), and
-it runs the commands the server's assistant sends; `--no-exec` serves the terminal
-and files only. `knowop connect acme` does the same on `https://acme.knowop.ai`. A
-computer with no browser, such as a box, pipes an
+it serves sagent's tools (the shell and your files, as you) to the server's
+assistant; `--no-exec` serves the terminal and files only. A published install
+has no tools to serve until sagent's host code ships in its wheel: `knowop
+connect` then says so and reports none. `knowop connect acme` does the same on
+`https://acme.knowop.ai`. A computer with no browser, such as a box, pipes an
 enrollment token to `knowop connect` instead, and joins with no login.
 
 At a terminal, `knowop connect` joins in the foreground, so a refusal shows there,
@@ -221,7 +223,7 @@ computer. Terminals use the server relay when a direct link is unavailable.
 |---|---|
 | `cli.py` | The `knowop` command. |
 | `service.py` | The user service `knowop connect` installs: launchd's or systemd's. |
-| `shell/` | The machine host `knowop connect` runs: terminals, the assistant's commands, and with `--jobs` your jobs (`job_host.py`). |
+| `shell/` | The machine host `knowop connect` runs: terminals, sagent's tools for the assistant, and with `--jobs` your jobs (`job_host.py`). |
 | `agent/` | The agent runner `knowop run` hands to. Its `__main__.py` and `codex.py` run it by module, on trax's connection, for unattended plumbing. |
 | `jobs/` | The job runner `knowop job` hands to. |
 | `machines.py` | The machine registry `knowop machine` reads and writes. |

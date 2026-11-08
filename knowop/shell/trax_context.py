@@ -1,8 +1,8 @@
 """The trax context a host keeps out of what it starts for the server.
 
 A ``knowop connect`` started where trax is configured inherits a server, a credential and a
-profile. A terminal run or a command the server sends must never carry them: the
-credential would reach the server's own assistant in the command's output.
+profile. A terminal run or a tool call the server relays must never carry them: the
+credential would reach the server's own assistant in the output.
 """
 
 from __future__ import annotations

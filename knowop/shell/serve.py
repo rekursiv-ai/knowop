@@ -10,8 +10,8 @@ only by the account it was saved for, which then asks for no token. A piped toke
 an admin's for the machine and names no person, so its credential is the machine's
 own.
 
-Once joined the host serves terminals (``terminal_host.py``) and commands
-(``exec_host.py``), in the foreground, until the machine is revoked, a newer connect
+Once joined the host serves terminals (``terminal_host.py``) and sagent's tools
+(``tool_host.py``), in the foreground, until the machine is revoked, a newer connect
 of it takes over, or Ctrl-C releases it.
 
 With ``jobs`` it also runs the jobs its account submits with ``knowop job submit
@@ -50,22 +50,21 @@ if TYPE_CHECKING:
     from trackinizer.wire.wire_machines import Facts
 
     from knowop.shell import (
-        exec_host,
         job_host,
         job_limits,
         job_repo,
         machine_host,
         terminal_direct_aiortc,
         terminal_host,
+        tool_host,
     )
     from knowop.shell.terminal_direct import PeerFactory
     from knowop.shell.terminal_host import TerminalHost
 else:
     from wrapt import lazy_import
 
-    # The host loop, the terminal and exec servers and the login poll bring pydantic,
+    # The host loop, the terminal and tool servers and the login poll bring pydantic,
     # websockets and the wire models; ``knowop status`` needs none of them.
-    exec_host = lazy_import("knowop.shell.exec_host")
     job_host = lazy_import("knowop.shell.job_host")
     job_limits = lazy_import("knowop.shell.job_limits")
     job_repo = lazy_import("knowop.shell.job_repo")
@@ -74,6 +73,7 @@ else:
         "knowop.shell.terminal_direct_aiortc",
     )
     terminal_host = lazy_import("knowop.shell.terminal_host")
+    tool_host = lazy_import("knowop.shell.tool_host")
     login = lazy_import("trackinizer.trax.login")
     wire_machine_job = lazy_import("trackinizer.wire.wire_machine_job")
 
@@ -93,7 +93,7 @@ def connect_machine(
     server: str,
     signed_in: Callable[[], Client] | None,
     sandbox: bool,
-    exec_commands: bool,
+    serve_tools: bool,
     sleep: Callable[[float], None] = time.sleep,
     token: str = "",
     jobs: bool = False,
@@ -111,7 +111,8 @@ def connect_machine(
       signed_in: Returns a client that holds a key for ``server``, or ``None`` when
         no saved profile does.
       sandbox: Whether this connect declares the computer a disposable sandbox.
-      exec_commands: Whether the host runs the commands the assistant sends.
+      serve_tools: Whether the host serves sagent's tools to the assistant, which an
+        install without them cannot, and says so.
       sleep: Waits the given seconds between polls and heartbeats.
       token: A one-use enrollment token for ``name`` the caller already holds, as a
         login that enrolled the machine returns; used before any other.
@@ -128,12 +129,13 @@ def connect_machine(
 
     """
     offer = _job_offer() if jobs else None
+    tools = serve_tools and tool_host.can_serve()
     direct = None
     if not join_only:
         direct = _direct_link()
         echo(
             f"serving: machine {name} at {server} "
-            f"({_what_is_served(exec_commands, jobs=jobs)})",
+            f"({_what_is_served(tools, jobs=jobs)})",
         )
     account, read_token = _token_source(
         name,
@@ -169,9 +171,7 @@ def connect_machine(
             joined,
             direct=direct,
         ),
-        exec_for=(
-            (lambda joined: _exec_host(name, server, joined)) if exec_commands else None
-        ),
+        tools_for=(lambda joined: _tool_host(name, server, joined)) if tools else None,
         jobs_for=jobs_for,
         job_facts=None if offer is None else offer.facts,
         sandbox=sandbox,
@@ -235,12 +235,14 @@ def _terminal_host(
     )
 
 
-def _exec_host(name: str, url: str, joined: JoinResponse) -> exec_host.ExecHost:
-    """Make the command server for a joined machine."""
-    return exec_host.ExecHost(
-        name=name,
+def _tool_host(name: str, url: str, joined: JoinResponse) -> tool_host.ToolHost:
+    """Make the tool server for a joined machine."""
+    return tool_host.ToolHost(
+        url,
         credential=joined.credential,
-        credential_client=lambda key: Client(url, api_key=key),
+        name=name,
+        client_for=lambda key: Client(url, api_key=key),
+        dirs=tool_host.tool_dirs(name, server=url),
     )
 
 
@@ -260,11 +262,11 @@ def _direct_link() -> PeerFactory | None:
     return factory
 
 
-def _what_is_served(exec_commands: bool, *, jobs: bool) -> str:
+def _what_is_served(tools: bool, *, jobs: bool) -> str:
     """Return the words that say what this host serves."""
     served = [
         "terminals",
-        *(["commands"] if exec_commands else []),
+        *(["tools"] if tools else []),
         *(["jobs"] if jobs else []),
     ]
     if len(served) == 1:

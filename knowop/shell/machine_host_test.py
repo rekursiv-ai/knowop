@@ -792,11 +792,11 @@ def test_host_facts_report_what_the_host_says_about_itself(
     }
     assert host_facts(terminal=True)["terminal"] is True
     assert host_facts(terminal=True)["files"] is True
-    assert host_facts(exec_commands=True)["exec"] is True
-    assert set(host_facts(terminal=True, exec_commands=True)) - set(host_facts()) == {
+    assert host_facts(tools=True)["tools"] is True
+    assert set(host_facts(terminal=True, tools=True)) - set(host_facts()) == {
         "terminal",
         "files",
-        "exec",
+        "tools",
     }
 
 
@@ -914,7 +914,7 @@ def test_no_server_starts_before_a_heartbeat_has_taken_the_machine() -> None:
         read_token=_no_token,
         sleep=lambda _: None,
         joined_terminals=lambda _joined: _Terminals(host.calls),
-        exec_for=lambda _joined: _Terminals(host.calls, "exec"),
+        tools_for=lambda _joined: _Terminals(host.calls, "tools"),
         jobs_for=lambda _joined: _Terminals(host.calls, "jobs"),
     )
 
@@ -922,11 +922,11 @@ def test_no_server_starts_before_a_heartbeat_has_taken_the_machine() -> None:
         "beat",
         "beat",
         "terminals-start",
-        "exec-start",
+        "tools-start",
         "jobs-start",
         "beat",
         "jobs-stop",
-        "exec-stop",
+        "tools-stop",
         "terminals-stop",
     ]
     assert [call[5] for call in host.calls if call[0] == "beat"] == [
@@ -936,7 +936,9 @@ def test_no_server_starts_before_a_heartbeat_has_taken_the_machine() -> None:
     ]
 
 
-def test_a_host_that_serves_exec_reports_it_and_stops_it_before_the_terminals() -> None:
+def test_a_host_that_serves_tools_reports_it_and_stops_it_before_the_terminals() -> (
+    None
+):
     _save()
     host = _Host(beats=[None, _REVOKED])
 
@@ -947,23 +949,23 @@ def test_a_host_that_serves_exec_reports_it_and_stops_it_before_the_terminals() 
         read_token=_no_token,
         sleep=lambda _: None,
         joined_terminals=lambda _joined: _Terminals(host.calls),
-        exec_for=lambda _joined: _Terminals(host.calls, "exec"),
+        tools_for=lambda _joined: _Terminals(host.calls, "tools"),
     )
 
     kinds = [call[0] for call in host.calls]
     assert kinds == [
         "beat",
         "terminals-start",
-        "exec-start",
+        "tools-start",
         "beat",
-        "exec-stop",
+        "tools-stop",
         "terminals-stop",
     ]
-    assert host.calls[0][4] == host_facts(terminal=True, exec_commands=True)
+    assert host.calls[0][4] == host_facts(terminal=True, tools=True)
     assert host.calls[2][1:] == host.calls[1][1:]
 
 
-def test_a_host_that_serves_exec_alone_reports_exec_and_no_terminal() -> None:
+def test_a_host_that_serves_tools_alone_reports_tools_and_no_terminal() -> None:
     _save()
     host = _Host()
 
@@ -973,11 +975,11 @@ def test_a_host_that_serves_exec_alone_reports_exec_and_no_terminal() -> None:
         credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
-        exec_for=lambda _joined: _Terminals(host.calls, "exec"),
+        tools_for=lambda _joined: _Terminals(host.calls, "tools"),
     )
 
-    assert host.calls[0][4] == {**host_facts(), "exec": True}
-    assert "terminal" not in host_facts(exec_commands=True)
+    assert host.calls[0][4] == {**host_facts(), "tools": True}
+    assert "terminal" not in host_facts(tools=True)
 
 
 def test_a_host_that_runs_jobs_says_what_it_offers_and_stops_them_first() -> None:
@@ -991,21 +993,21 @@ def test_a_host_that_runs_jobs_says_what_it_offers_and_stops_them_first() -> Non
         credential_client=host,
         read_token=_no_token,
         sleep=lambda _: None,
-        exec_for=lambda _joined: _Terminals(host.calls, "exec"),
+        tools_for=lambda _joined: _Terminals(host.calls, "tools"),
         jobs_for=lambda _joined: _Terminals(host.calls, "jobs"),
         job_facts=offered,
     )
 
     assert [call[0] for call in host.calls] == [
         "beat",
-        "exec-start",
+        "tools-start",
         "jobs-start",
         "beat",
         "jobs-stop",
-        "exec-stop",
+        "tools-stop",
     ]
     assert host.calls[0][4] == {
-        **host_facts(exec_commands=True),
+        **host_facts(tools=True),
         "jobs": True,
         "gpus": 2,
         "jobs_memory_mb": 61_440,
@@ -1031,7 +1033,7 @@ def test_a_host_that_runs_no_jobs_says_nothing_of_them() -> None:
     assert host_facts(jobs={})["jobs"] is True
 
 
-def test_an_exec_server_that_will_not_start_stops_the_terminals_already_running() -> (
+def test_a_tool_server_that_will_not_start_stops_the_terminals_already_running() -> (
     None
 ):
     _save()
@@ -1045,9 +1047,9 @@ def test_an_exec_server_that_will_not_start_stops_the_terminals_already_running(
             read_token=_no_token,
             sleep=lambda _: None,
             joined_terminals=lambda _joined: _Terminals(host.calls),
-            exec_for=lambda _joined: _Terminals(
+            tools_for=lambda _joined: _Terminals(
                 host.calls,
-                "exec",
+                "tools",
                 start_error=RuntimeError("no bash"),
             ),
         )
@@ -1055,7 +1057,7 @@ def test_an_exec_server_that_will_not_start_stops_the_terminals_already_running(
     assert [call[0] for call in host.calls] == [
         "beat",
         "terminals-start",
-        "exec-start",
+        "tools-start",
         "terminals-stop",
     ]
 

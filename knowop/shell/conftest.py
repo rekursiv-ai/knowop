@@ -12,28 +12,21 @@ from typing import TYPE_CHECKING, Final, Protocol, Self, override
 from unittest.mock import AsyncMock, Mock
 
 import asyncio
-import base64
-import queue
 import sys
 import threading
-import time
 import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix.host import Frame, decode_frame, encode_frame
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.wire import wire_terminals
-from trackinizer.wire.wire_exec import ExecRequest, ExecResult, ExecWait
 from trackinizer.wire.wire_machine_job import MachineJobSpec
 from trackinizer.wire.wire_terminals import TerminalWait
-from treekle import json_loads
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.http11 import Response
 
 from knowop.shell import terminal_host
-from knowop.shell.exec_command import run_command
-from knowop.shell.exec_host import ExecHost
 from knowop.shell.job_folder import JobFolder
 from knowop.shell.terminal_host import TerminalHost
 
@@ -54,37 +47,26 @@ __all__ = [
     "_CREDENTIAL",
     "_INSTANCE",
     "_MACHINE",
-    "_REVOKED",
     "_Client",
     "_FakeSocket",
     "_Messages",
     "_Process",
     "_ScriptedPeer",
-    "_Server",
     "_SetOnceHeld",
-    "_command",
     "_connect",
     "_connector",
-    "_err",
     "_fail_files",
     "_finish_files",
     "_folder",
-    "_host",
-    "_kill_group",
-    "_log_lines",
     "_opened",
-    "_out",
     "_process",
     "_python",
-    "_request",
-    "_run",
     "_signal_process",
     "_startup_log",
     "_status",
     "_terminal_host",
     "_terminal_run",
     "_unscoped",
-    "_wait_until",
 ]
 
 
@@ -135,148 +117,10 @@ def _signal_process(process: _Process, signum: int) -> None:
     process.stderr.feed_eof()
 
 
-def _kill_group(process: _Process, pgid: int, signum: int) -> None:
-    if pgid != process.pid:
-        raise ValueError("Expected pgid == process.pid.")
-    _signal_process(process, signum)
-
-
 _MACHINE: Final = uuid.UUID(int=1)
 _INSTANCE: Final = uuid.UUID(int=2)
+# The machine credential the terminal tests send and expect back, spelled once.
 _CREDENTIAL: Final = "trax_machine_" + "0" * 32 + "_" + "c" * 43
-_REVOKED: Final = ClientError("-> 410", status_code=410)
-
-
-def _request(
-    command: str,
-    *,
-    cwd: Path | str,
-    timeout_sec: float = 10,
-    stdin: bytes | None = None,
-    env: dict[str, str] | None = None,
-) -> ExecRequest:
-    # A fraction of a second, which the wire's whole seconds cannot say, keeps the
-    # timeout tests from waiting out a real one.
-    return ExecRequest.model_construct(
-        command=command,
-        cwd=str(cwd),
-        timeout_sec=timeout_sec,
-        stdin_b64=None if stdin is None else base64.b64encode(stdin).decode(),
-        env=env,
-    )
-
-
-def _run(request: ExecRequest) -> ExecResult:
-    """Run the request; a kill that does not take effect shows as a slow run."""
-    started = time.monotonic()
-    result = asyncio.run(run_command(request))
-    if time.monotonic() - started >= 5:
-        raise ValueError("Expected time.monotonic() - started < 5.")
-    return result
-
-
-def _out(result: ExecResult) -> bytes:
-    return base64.b64decode(result.stdout_b64)
-
-
-def _err(result: ExecResult) -> bytes:
-    return base64.b64decode(result.stderr_b64)
-
-
-def _wait_until(done: Callable[[], bool]) -> None:
-    deadline = time.monotonic() + 5
-    while not done():
-        if time.monotonic() >= deadline:
-            raise TimeoutError("the awaited change never came")
-        time.sleep(0.005)
-
-
-class _Server:
-    """A scripted server: hands out commands, then ends the host as a revoke would."""
-
-    def __init__(self) -> None:
-        self.waits: queue.Queue[ExecWait | ClientError | None] = queue.Queue()
-        self.results: list[tuple[uuid.UUID, ExecResult]] = []
-        self.post_errors: list[ClientError] = []
-        self.posts = 0
-        self.posted = threading.Event()
-        self.keys: list[str] = []
-        self.closed = 0
-
-    def __call__(self, key: str) -> _Server:
-        self.keys.append(key)
-        return self
-
-    def wait_exec(
-        self,
-        machine_id: uuid.UUID,
-        *,
-        instance: uuid.UUID,
-        wait_sec: float,
-    ) -> ExecWait | None:
-        if (machine_id, instance, wait_sec) != (_MACHINE, _INSTANCE, 25):
-            raise ValueError(
-                "Expected (machine_id, instance, wait_sec) == (_MACHINE, _INSTANCE, 25).",
-            )
-        # A wait with nothing to hand out ends empty, as the server's does. Raising
-        # instead would fail the listener of a test that stopped early, after the test.
-        try:
-            answer = self.waits.get(timeout=5)
-        except queue.Empty:
-            return None
-        if isinstance(answer, ClientError):
-            raise answer
-        return answer
-
-    def post_exec_result(
-        self,
-        machine_id: uuid.UUID,
-        exec_id: uuid.UUID,
-        result: ExecResult,
-    ) -> None:
-        if machine_id != _MACHINE:
-            raise ValueError("Expected machine_id == _MACHINE.")
-        self.posts += 1
-        if self.post_errors:
-            raise self.post_errors.pop(0)
-        self.results.append((exec_id, result))
-        self.posted.set()
-
-    def close(self) -> None:
-        self.closed += 1
-
-
-def _command(
-    command: str,
-    *,
-    cwd: Path,
-    timeout_sec: int = 10,
-    env: dict[str, str] | None = None,
-) -> ExecWait:
-    return ExecWait(
-        exec_id=uuid.uuid4(),
-        asker="ada@example.com",
-        command=command,
-        cwd=str(cwd),
-        timeout_sec=timeout_sec,
-        env=env,
-    )
-
-
-def _host(server: _Server) -> ExecHost:
-    return ExecHost(
-        name="box-1",
-        credential=_CREDENTIAL,
-        credential_client=server,
-        retry_sec=0,
-    )
-
-
-def _log_lines() -> list[dict[str, object]]:
-    path = state_dir() / "rekursiv-ai" / "trax" / "machines" / "box-1.exec.log"
-    return [
-        json_loads(line, dict[str, object]) for line in path.read_text().splitlines()
-    ]
 
 
 class _Client:

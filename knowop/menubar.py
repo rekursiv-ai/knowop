@@ -188,7 +188,8 @@ def status() -> Report | None:
     """
     done = subprocess.run(  # noqa: S603 -- this interpreter running this package, fixed words.
         # ``knowop`` once exported; the package that holds this module, in any form.
-        [sys.executable, "-m", __name__.rpartition(".")[0], "status", "--json"],
+        # ``-P``: a launcher starts this at home, which ``-m`` would put on the path.
+        [sys.executable, "-P", "-m", __name__.rpartition(".")[0], "status", "--json"],
         capture_output=True,
         text=True,
         timeout=60,

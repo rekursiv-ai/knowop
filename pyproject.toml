@@ -35,11 +35,11 @@ dependencies = [
     # serialization; 0.3.3 adds `to_plain(target=...)` and `json_dumps(target=...)`.
     # 0.4.1 leaves dataclass fields at their defaults out of trees.
     "treekle>=0.4.1",
-    # data models: the exec and terminal hosts read the server's requests with them.
+    # data models: the tool and terminal hosts read the server's requests with them.
     # 2.12 adds `model_validate(..., extra=)`, with which trackinizer's `Client` ignores
     # a field a newer server added to an answer.
     "pydantic>=2.14.2",
-    # the terminal host's relay to the server
+    # the terminal and tool hosts' relay to the server
     "websockets>=17.4",
     # Include the direct terminal link by default (~25 MB of wheels on macOS).
     "aiortc>=1.15.0",

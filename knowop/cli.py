@@ -287,10 +287,10 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     _add_connect_arguments(
         verbs.add_parser(
             "connect",
-            help="log in if needed, then serve this computer's terminals and commands",
+            help="log in if needed, then serve this computer's terminals and tools",
             description=(
-                "Connect this computer and serve its terminals, and the commands the "
-                "server's assistant sends. At a terminal, join here, then serve it "
+                "Connect this computer and serve its terminals, and its tools to the "
+                "server's assistant. At a terminal, join here, then serve it "
                 "from a user service (launchd on macOS, systemd on Linux) that keeps "
                 "running in the background and starts again at login; knowop logs -f "
                 "follows it and knowop disconnect stops it. Elsewhere, and with "
@@ -361,9 +361,8 @@ def _add_connect_arguments(parser: argparse.ArgumentParser) -> None:
         "--no-exec",
         action="store_true",
         help=(
-            "serve terminals only: refuse the commands the server's assistant would "
-            "run here; each command it runs is logged in NAME.exec.log beside the "
-            "machine credentials"
+            "serve terminals only: serve no tools to the server's assistant, which "
+            "otherwise runs them here, as you"
         ),
     )
     parser.add_argument(
@@ -968,7 +967,7 @@ def _serve(
                 else None
             ),
             sandbox=flags.sandbox,
-            exec_commands=not flags.no_exec,
+            serve_tools=not flags.no_exec,
             # The host waits between heartbeats; a service's own run rotates its log.
             sleep=(
                 functools.partial(_rotating, Path(flags.log_file), sleep)
