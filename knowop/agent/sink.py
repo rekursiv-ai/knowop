@@ -238,6 +238,7 @@ class Sink(Protocol):
         *,
         restart: bool = False,
         on_record: Callable[[TraxRecord], None] | None = None,
+        on_any_record: Callable[[TraxRecord], None] | None = None,
         upload: bool = True,
         annotate: Callable[[TraxRecord], TraxRecord] | None = None,
     ) -> list[str]:
@@ -264,6 +265,10 @@ class Sink(Protocol):
             for an observer that needs the records the chunk produced (the
             worktree-diff capture reads edited paths this way). Runs on the
             caller's thread, inside any ``feed`` lock.
+          on_any_record: Called after ``on_record``, and with a sub-agent's records
+            too, which :class:`~.subagents.SubagentSinks` keeps from ``on_record``:
+            for an observer of what every agent of the run does (the pull request
+            watch reads the ``gh pr create`` a sub-agent ran this way).
           upload: Whether to record what the chunk produces. A chunk of a
             resume's loaded history is still read, so the reader's state and
             each part's positions run on from it, but every record it produces
@@ -294,6 +299,8 @@ class Sink(Protocol):
             kept = record if annotate is None else annotate(record)
             if on_record is not None:
                 on_record(kept)
+            if on_any_record is not None:
+                on_any_record(kept)
             self.emit(adapter.name, Event(record=kept, path=path, restart=restart))
             kinds.append(type(kept).__name__)
         return kinds
@@ -1429,6 +1436,7 @@ class LockedSink(Sink):
         *,
         restart: bool = False,
         on_record: Callable[[TraxRecord], None] | None = None,
+        on_any_record: Callable[[TraxRecord], None] | None = None,
         upload: bool = True,
         annotate: Callable[[TraxRecord], TraxRecord] | None = None,
     ) -> list[str]:
@@ -1442,6 +1450,7 @@ class LockedSink(Sink):
                 raw,
                 restart=restart,
                 on_record=on_record,
+                on_any_record=on_any_record,
                 upload=upload,
                 annotate=annotate,
             )

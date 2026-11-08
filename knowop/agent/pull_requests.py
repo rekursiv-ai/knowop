@@ -41,7 +41,9 @@ __all__ = [
     "merged_text",
     "read_login",
     "read_pull_request",
+    "ready_text",
     "run_gh",
+    "set_auto_merge",
     "wake_text",
 ]
 
@@ -51,6 +53,9 @@ AUTOFIX_SOURCE: Final = "knowop-autofix"
 
 CONFLICT: Final = "merge-conflict"
 """What a row's ``told`` names a head's merge conflict by, beside its failed checks."""
+
+READY: Final = "ready-for-review"
+"""What a row's ``told`` names a draft whose head's checks all passed by."""
 
 HOLD_SEC: Final = 300.0
 """The longest a failure waits for its workflow's running checks before it wakes the
@@ -74,6 +79,7 @@ _FIELDS: Final = ",".join(
         "deletions",
         "mergeable",
         "reviewDecision",
+        "autoMergeRequest",
         "statusCheckRollup",
         "updatedAt",
     ),
@@ -84,7 +90,8 @@ _JQ: Final = (
     '{number, url, title, state, author: (.author.login // ""), draft: .isDraft, '
     'head: .headRefName, updated: (.updatedAt // ""), '
     "head_sha: .headRefOid, base: .baseRefName, additions, deletions, mergeable, "
-    'review: (.reviewDecision // ""), checks: [(.statusCheckRollup // [])[] | '
+    'review: (.reviewDecision // ""), auto_merge: (.autoMergeRequest != null), '
+    "checks: [(.statusCheckRollup // [])[] | "
     '{name: (.name // .context // ""), workflow: (.workflowName // ""), '
     'commit_status: (.__typename == "StatusContext"), status: (.status // ""), '
     'conclusion: (.conclusion // ""), state: (.state // "")}]}'
@@ -188,6 +195,7 @@ class PullRequest:
       mergeable: ``MERGEABLE``, ``CONFLICTING`` or ``UNKNOWN``.
       review: Its review decision; empty for none.
       updated: When it last changed, as GitHub stamps it (ISO 8601); empty for none.
+      auto_merge: Whether GitHub merges it once its checks and reviews allow.
       passed: Checks of the head that passed or need nothing.
       failed: Names of the head's checks that failed.
       pending: Names of the head's checks still running.
@@ -211,11 +219,17 @@ class PullRequest:
     mergeable: str
     review: str
     updated: str
+    auto_merge: bool
     passed: int
     failed: tuple[str, ...]
     pending: tuple[str, ...]
     waiting: tuple[str, ...]
     total: int
+
+    @property
+    def passing(self) -> bool:
+        """Whether the head has checks and every one passed."""
+        return self.total > 0 and self.passed == self.total
 
     def app(self) -> dict[str, object]:
         """Return what a pull request's row keeps of it.
@@ -241,6 +255,7 @@ class PullRequest:
             "review": self.review,
             "author": self.author,
             "updated": self.updated,
+            "auto_merge": self.auto_merge,
             "checks": {
                 "passed": self.passed,
                 "failed": list(self.failed),
@@ -313,12 +328,34 @@ def read_pull_request(run: GhRunner, cwd: Path, *, ref: str = "") -> PullRequest
         mergeable=view["mergeable"],
         review=view["review"],
         updated=view["updated"],
+        auto_merge=view["auto_merge"],
         passed=sum(verdict == "passed" for verdict, _ in verdicts),
         failed=_names(failed),
         pending=_names(pending),
         waiting=_names(check for check in failed if check["workflow"] in running),
         total=len(view["checks"]),
     )
+
+
+# GitHub's own auto-merge, not a merge the run makes: GitHub merges once the required
+# checks pass and the reviews allow, and a change made on github.com shows in the next
+# read. Squash, as this repository's pull requests merge.
+def set_auto_merge(run: GhRunner, cwd: Path, *, url: str, on: bool) -> str | None:
+    """Turn GitHub's auto-merge of a pull request on or off through ``gh pr merge``.
+
+    Args:
+      run: Runs ``gh``.
+      cwd: The checkout to run it in.
+      url: The pull request's link.
+      on: Whether GitHub merges it once it may.
+
+    Returns:
+      error: The first line of why GitHub refused, or ``None`` once it took it.
+
+    """
+    flags = ("--auto", "--squash") if on else ("--disable-auto",)
+    out = run(["pr", "merge", url, *flags], cwd)
+    return None if out.returncode == 0 else _why(out)
 
 
 def read_login(run: GhRunner, cwd: Path) -> str:
@@ -430,6 +467,33 @@ def merged_text(pull_request: PullRequest) -> str:
     )
 
 
+# A reminder, not a task: whether the work is done is the agent's call, so the run
+# never marks one ready itself.
+def ready_text(pull_request: PullRequest) -> str:
+    """Return the line that reminds the agent to mark a passing draft ready.
+
+    Args:
+      pull_request: The draft whose head's checks all passed.
+
+    Returns:
+      text: The line.
+
+    """
+    head = pull_request.head_sha[:10]
+    task = (
+        f"Every check passed on {pull_request.repo}#{pull_request.number} at head "
+        f"{head}, and it is still a draft. Once its work is done, mark it ready for "
+        f"review: `gh pr ready {pull_request.url}`. Until then, leave it a draft."
+    )
+    return "\n".join(
+        (
+            f'<knowop-ready pr="{pull_request.url}" head="{head}">',
+            task,
+            "</knowop-ready>",
+        ),
+    )
+
+
 def wake_text(pull_request: PullRequest, failures: Sequence[str]) -> str:
     """Return the line that wakes the agent to fix ``failures``.
 
@@ -500,6 +564,7 @@ class _View(TypedDict):
     mergeable: str
     review: str
     updated: str
+    auto_merge: bool
     checks: list[_Check]
 
 

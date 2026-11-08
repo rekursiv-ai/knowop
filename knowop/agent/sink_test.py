@@ -1934,6 +1934,22 @@ class TestSinkFeed:
         kinds = sink.feed(IOStreamAdapter(), _PART, b"hello\n", on_record=seen.append)
         assert [type(record).__name__ for record in seen] == kinds
 
+    def test_on_any_record_sees_each_record_after_on_record(self) -> None:
+        """The pull request watch reads every record through ``on_any_record``."""
+        sink = FileSink(io.StringIO())
+        seen: list[tuple[str, TraxRecord]] = []
+
+        kinds = sink.feed(
+            IOStreamAdapter(),
+            _PART,
+            b"hello\n",
+            on_record=lambda record: seen.append(("own", record)),
+            on_any_record=lambda record: seen.append(("any", record)),
+        )
+
+        assert [who for who, _ in seen] == ["own", "any"] * len(kinds)
+        assert seen[0][1] is seen[1][1]
+
     def test_two_files_get_separate_readers(self) -> None:
         """A shared reader would number the second file after the first.
 
@@ -2224,7 +2240,13 @@ class TestLockedSink:
             (
                 "inner.feed",
                 (adapter, _PART, b"x\n"),
-                {"restart": False, "on_record": None, "upload": True, "annotate": None},
+                {
+                    "restart": False,
+                    "on_record": None,
+                    "on_any_record": None,
+                    "upload": True,
+                    "annotate": None,
+                },
             ),
             ("lock.__exit__", (None, None, None), {}),
         ]

@@ -4407,7 +4407,8 @@ def _process_chunk(
             captured.path,
             captured.raw,
             restart=captured.restart,
-            on_record=partial(_note_record, worktree_diff, pull_requests),
+            on_record=None if worktree_diff is None else worktree_diff.note,
+            on_any_record=None if pull_requests is None else pull_requests.note,
             upload=upload,
             annotate=None if inbound is None else inbound.stamp,
         )
@@ -4427,18 +4428,6 @@ def _process_chunk(
         stats.record(kind)
         if config.verbose:
             sys.stderr.write(f"[{PROGRAM}] {adapter.name}: {kind}\n")
-
-
-def _note_record(
-    worktree_diff: WorktreeDiff | None,
-    pull_requests: PullRequestWatch | None,
-    record: TraxRecord,
-) -> None:
-    """Show one emitted record to whichever of the diff and the pull request watch run."""
-    if worktree_diff is not None:
-        worktree_diff.note(record)
-    if pull_requests is not None:
-        pull_requests.note(record)
 
 
 # The same watch the live drain uses, with two differences that are the point of a dry

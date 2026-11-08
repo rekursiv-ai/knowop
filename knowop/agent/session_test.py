@@ -182,6 +182,7 @@ from knowop.agent.sink import (
     TrackinizerSink,
 )
 from knowop.agent.slash import SlashCommand
+from knowop.agent.subagents import SubagentSinks
 from knowop.agent.tool_server import BEARER_ENV, ToolServer
 from knowop.agent.trust import TrustGate
 from knowop.agent.worktree_diff import Output, WorktreeDiff
@@ -10439,6 +10440,38 @@ class TestWhoHoldsARollout:
     ) -> None:
         assert not session._same_open_file(tmp_path / "fd" / "9", tmp_path / "x")
 
+    # Off Linux, procfs is a folder of descriptor symlinks the test lays out itself.
+    def test_procfs_descriptors_name_the_files_they_point_at(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        held, other = tmp_path / "held.jsonl", tmp_path / "other.jsonl"
+        held.write_text("")
+        other.write_text("")
+        descriptors = tmp_path / "fd"
+        descriptors.mkdir()
+        (descriptors / "3").symlink_to(held)
+        (descriptors / "4").symlink_to("relative.jsonl")
+        scan = Mock(
+            side_effect=[
+                os.scandir(descriptors),
+                os.scandir(descriptors),
+                FileNotFoundError("/proc/9/fd"),
+            ],
+        )
+        monkeypatch.setattr(os, "scandir", scan)
+
+        assert session._path_held_in_proc(7, held)
+        assert not session._path_held_in_proc(7, other)
+        # A process gone by now has no folder to read.
+        assert not session._path_held_in_proc(9, held)
+        assert scan.call_args_list == [
+            call("/proc/7/fd"),
+            call("/proc/7/fd"),
+            call("/proc/9/fd"),
+        ]
+
     def test_lsof_names_a_held_file_by_its_path(
         self,
         tmp_path: Path,
@@ -10898,14 +10931,38 @@ def test_a_click_that_cannot_be_read_as_a_run_is_recorded_undelivered(
     ]
 
 
-def test_each_record_is_shown_to_the_pull_request_watch() -> None:
+def test_the_pull_request_watch_sees_a_subagents_records_and_the_diff_does_not(
+    tmp_path: Path,
+) -> None:
+    """A pull request a sub-agent opens is the session's; its edits are its own."""
     noted: list[TraxRecord] = []
     watch = Mock(spec=PullRequestWatch, note=Mock(side_effect=noted.append))
-    record = UserMessage(content="gh pr create")
+    diff = WorktreeDiff(top=tmp_path, run=_unused_git, base="HEAD")
+    adapter = _FakeEditAdapter(tmp_path)
+    kid = tmp_path / "s1" / "subagents" / "agent-a1.jsonl"
+    adapter.subagents[kid] = Subagent(child="agent-a1", parent="s1", note="")
+    sink = SubagentSinks(
+        _RecordingSink(),
+        open_child=Mock(return_value=_RecordingSink()),
+        link=Mock(),
+    )
 
-    session._note_record(None, watch, record)
+    for path, edited in ((tmp_path / "s1.jsonl", "a.py"), (kid, "b.py")):
+        session._process_chunk(
+            session._Captured(path=path, raw=f"{tmp_path / edited}\n".encode()),
+            adapter,
+            sink,
+            _Stats(),
+            RunConfig(cli_name="fakeedit"),
+            worktree_diff=diff,
+            pull_requests=watch,
+        )
 
-    assert noted == [record]
+    assert [getattr(record, "path", None) for record in noted] == [
+        str(tmp_path / "a.py"),
+        str(tmp_path / "b.py"),
+    ]
+    assert diff.touched == {"a.py"}
 
 
 if __name__ == "__main__":

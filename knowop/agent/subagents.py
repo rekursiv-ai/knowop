@@ -110,8 +110,11 @@ class SubagentSinks(Sink):
     def emit_run_record(self, event: Event) -> None:
         self._root.emit_run_record(event)
 
-    # The run's observers watch its own session: the worktree diff is the run's, and
-    # the lines it typed are stamped on its own transcript, not a sub-agent's.
+    # ``on_record`` watches the run's own session: the worktree diff is the run's, and
+    # a sub-agent's own worktree inside the checkout would show as files all added.
+    # The lines the run typed are stamped on its own transcript, not a sub-agent's.
+    # ``on_any_record`` watches them all: a pull request a sub-agent opens is the
+    # session's too.
     @override
     def feed(
         self,
@@ -121,6 +124,7 @@ class SubagentSinks(Sink):
         *,
         restart: bool = False,
         on_record: Callable[[TraxRecord], None] | None = None,
+        on_any_record: Callable[[TraxRecord], None] | None = None,
         upload: bool = True,
         annotate: Callable[[TraxRecord], TraxRecord] | None = None,
     ) -> list[str]:
@@ -134,6 +138,7 @@ class SubagentSinks(Sink):
                 raw,
                 restart=restart,
                 on_record=on_record,
+                on_any_record=on_any_record,
                 upload=upload,
                 annotate=annotate,
             )
@@ -142,7 +147,14 @@ class SubagentSinks(Sink):
             child = self._open_child(subagent)
             self._children[subagent.child] = child
             self._spawned[subagent.child] = subagent
-        return child.feed(adapter, path, raw, restart=restart, upload=upload)
+        return child.feed(
+            adapter,
+            path,
+            raw,
+            restart=restart,
+            on_any_record=on_any_record,
+            upload=upload,
+        )
 
     @override
     def flush(self) -> None:

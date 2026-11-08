@@ -25,7 +25,9 @@ from knowop.agent.pull_requests import (
     merged_text,
     read_login,
     read_pull_request,
+    ready_text,
     run_gh,
+    set_auto_merge,
     wake_text,
 )
 
@@ -82,6 +84,7 @@ def _view(**fields: object) -> str:
         "mergeable": "MERGEABLE",
         "review": "",
         "updated": "2026-11-08T10:00:00Z",
+        "auto_merge": False,
         "checks": [],
     }
     return json.dumps(view | fields)
@@ -151,6 +154,24 @@ def test_read_sorts_checks_into_passed_failed_and_pending() -> None:
         "pending": ["CI / slow", "deploy"],
         "total": 10,
     }
+    assert pull_request.passing is False
+
+
+@pytest.mark.parametrize(
+    ("checks", "passing"),
+    [
+        ([], False),
+        ([_check("lint"), _status("docs", "SUCCESS")], True),
+        ([_check("lint"), _check("slow", status="IN_PROGRESS", conclusion="")], False),
+    ],
+    ids=["none", "all", "running"],
+)
+def test_a_head_passes_once_it_has_checks_and_every_one_passed(
+    *,
+    checks: list[dict[str, object]],
+    passing: bool,
+) -> None:
+    assert _pull_request(checks=checks).passing is passing
 
 
 @pytest.mark.parametrize(
@@ -186,6 +207,7 @@ def test_read_keeps_what_github_says_of_the_pull_request() -> None:
         mergeable="CONFLICTING",
         review="APPROVED",
         updated="2026-11-08T11:30:00Z",
+        auto_merge=True,
     ).app() == {
         "url": _URL,
         "repo": "acme/app",
@@ -202,8 +224,43 @@ def test_read_keeps_what_github_says_of_the_pull_request() -> None:
         "review": "APPROVED",
         "author": "octo",
         "updated": "2026-11-08T11:30:00Z",
+        "auto_merge": True,
         "checks": {"passed": 0, "failed": [], "pending": [], "total": 0},
     }
+
+
+def test_read_asks_gh_whether_it_merges_on_its_own() -> None:
+    gh = _Gh(GhOutput(returncode=0, stdout=_view(), stderr=""))
+    _ = read_pull_request(gh, Path("/work"), ref=_URL)
+    [(args, _)] = gh.calls
+    fields = args[args.index("--json") + 1].split(",")
+    jq = args[args.index("--jq") + 1]
+    assert "autoMergeRequest" in fields
+    assert "auto_merge: (.autoMergeRequest != null)" in jq
+
+
+@pytest.mark.parametrize(
+    ("on", "args"),
+    [
+        (True, ["pr", "merge", _URL, "--auto", "--squash"]),
+        (False, ["pr", "merge", _URL, "--disable-auto"]),
+    ],
+    ids=["on", "off"],
+)
+def test_auto_merge_is_turned_on_or_off_through_github(
+    *,
+    on: bool,
+    args: list[str],
+) -> None:
+    gh = _Gh(GhOutput(returncode=0, stdout="", stderr=""))
+    assert set_auto_merge(gh, Path("/work"), url=_URL, on=on) is None
+    assert gh.calls == [(args, Path("/work"))]
+
+
+def test_auto_merge_says_why_github_refused_it() -> None:
+    said = "GraphQL: Protected branch rules not configured for this branch\n"
+    gh = _Gh(GhOutput(returncode=1, stdout="", stderr=said))
+    assert set_auto_merge(gh, Path("/work"), url=_URL, on=True) == said.strip()
 
 
 def test_read_says_why_in_a_few_hundred_characters_at_most() -> None:
@@ -396,6 +453,20 @@ def test_the_merged_line_reads_as_the_agent_is_told_it() -> None:
                 "and pick up anything that was waiting on this merge."
             ),
             "</knowop-merged>",
+        ),
+    )
+
+
+def test_the_ready_line_reads_as_the_agent_is_told_it() -> None:
+    assert ready_text(_pull_request(draft=True)) == "\n".join(
+        (
+            f'<knowop-ready pr="{_URL}" head="0123456789">',
+            (
+                "Every check passed on acme/app#7 at head 0123456789, and it is still a "
+                "draft. Once its work is done, mark it ready for review: "
+                f"`gh pr ready {_URL}`. Until then, leave it a draft."
+            ),
+            "</knowop-ready>",
         ),
     )
 

@@ -50,7 +50,8 @@ class _Recorded(Sink):
         self.diffs = 0
         self.run_records = 0
         self.fed: list[tuple[Path, bytes, bool, bool]] = []
-        self.observed: list[bool] = []
+        self.observed: list[tuple[bool, bool]] = []
+        """Per feed: whether the run's own observers came, and whether ``on_any_record`` did."""
         self.cli_ids: list[str] = []
         self.restarted: list[Path] = []
         self.passed: list[Path] = []
@@ -111,12 +112,15 @@ class _Recorded(Sink):
         *,
         restart: bool = False,
         on_record: Callable[[TraxRecord], None] | None = None,
+        on_any_record: Callable[[TraxRecord], None] | None = None,
         upload: bool = True,
         annotate: Callable[[TraxRecord], TraxRecord] | None = None,
     ) -> list[str]:
         del adapter
         self.fed.append((path, raw, restart, upload))
-        self.observed.append(on_record is not None or annotate is not None)
+        self.observed.append(
+            (on_record is not None or annotate is not None, on_any_record is not None),
+        )
         return ["UserMessage"]
 
     @override
@@ -229,11 +233,17 @@ def _agents() -> _Agents:
 def test_the_runs_own_lines_reach_its_own_sink_with_its_observers() -> None:
     tree = _Tree()
 
-    kinds = tree.sinks.feed(_agents(), _RUN, b"hi\n", on_record=_ignore)
+    kinds = tree.sinks.feed(
+        _agents(),
+        _RUN,
+        b"hi\n",
+        on_record=_ignore,
+        on_any_record=_ignore,
+    )
 
     assert kinds == ["UserMessage"]
     assert tree.run.fed == [(_RUN, b"hi\n", False, True)]
-    assert tree.run.observed == [True]
+    assert tree.run.observed == [(True, True)]
     assert tree.children == {}
 
 
@@ -242,15 +252,22 @@ def test_a_subagents_lines_reach_one_sink_opened_under_its_own_id() -> None:
     tree = _Tree()
     agents = _agents()
 
-    _ = tree.sinks.feed(agents, _KID, b"one\n", on_record=_ignore)
+    _ = tree.sinks.feed(
+        agents,
+        _KID,
+        b"one\n",
+        on_record=_ignore,
+        on_any_record=_ignore,
+    )
     _ = tree.sinks.feed(agents, _KID, b"two\n", restart=True, upload=False)
 
     kid = tree.children["a1"]
     assert list(tree.children) == ["a1"]
     assert kid.cli_ids == ["a1"]
     assert kid.fed == [(_KID, b"one\n", False, True), (_KID, b"two\n", True, False)]
-    # The run's observers watch its own session: a child's edits and lines are its own.
-    assert kid.observed == [False, False]
+    # The run's own observers watch its own session: a child's edits and lines are its
+    # own. The pull request watch sees every agent's.
+    assert kid.observed == [(False, True), (False, False)]
     assert tree.run.fed == []
     assert agents.asked == [_KID]
 
