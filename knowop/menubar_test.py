@@ -135,7 +135,7 @@ def test_status_reads_what_this_knowop_prints_whatever_it_exits_with(
 
     assert menubar.status() == (_report() if read else None)
     package = menubar.__name__.rpartition(".")[0]
-    assert asked == [[sys.executable, "-m", package, "status", "--json"]]
+    assert asked == [[sys.executable, "-P", "-m", package, "status", "--json"]]
 
 
 def test_status_reads_a_service_written_with_its_defaults_left_out(

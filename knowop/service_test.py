@@ -133,6 +133,7 @@ def _argv(log: Path) -> list[str]:
     """Return what ``_ADA``'s service runs: this interpreter, its knowop package."""
     return [
         sys.executable,
+        "-P",
         "-m",
         service.__name__.rpartition(".")[0],
         "connect",
@@ -156,7 +157,7 @@ def test_a_launchd_agent_runs_this_knowop_with_its_flags_and_the_shells_paths(
         "Label": _LABEL,
         "ProgramArguments": [
             str(data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"),
-            *_argv(log)[3:],
+            *_argv(log)[4:],
         ],
         "EnvironmentVariables": _env(tmp_path),
         "RunAtLoad": True,
@@ -170,7 +171,7 @@ def test_a_launchd_agent_runs_this_knowop_with_its_flags_and_the_shells_paths(
         _launcher_program(
             data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop",
         )
-        == _argv(log)[:3]
+        == _argv(log)[:4]
     )
     assert (
         stat.S_IMODE(
@@ -280,7 +281,7 @@ def test_a_knowop_uvx_runs_from_its_cache_is_served_by_uvx_at_that_version(
     log = state_dir() / "rekursiv-ai" / "knowop" / "connect" / f"ada-mac-{_TAG}.log"
     assert plistlib.loads(path.read_bytes())["ProgramArguments"] == [
         str(data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"),
-        *_argv(log)[3:],
+        *_argv(log)[4:],
     ]
     assert _launcher_program(
         data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop",
@@ -333,7 +334,7 @@ def test_a_knowop_installed_outside_uvs_cache_is_served_by_its_own_interpreter(
         _launcher_program(
             data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop",
         )
-        == _argv(log)[:3]
+        == _argv(log)[:4]
     )
 
 
@@ -632,7 +633,7 @@ def test_showing_the_menu_bar_installs_its_agent_and_starts_it_only_once_ended(
     # Started if it ended (Quit), never restarted while it runs.
     assert again.menubar[-1] == ["launchctl", "kickstart", target]
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
-    assert _launcher_program(launcher) == [sys.executable, "-m", package]
+    assert _launcher_program(launcher) == [sys.executable, "-P", "-m", package]
 
 
 def test_a_menu_bar_this_python_cannot_start_is_said_and_not_left_installed(
@@ -715,7 +716,61 @@ def test_a_launcher_runs_knowop_with_the_arguments_launchd_gives_it(
     )
 
     package = service.__name__.rpartition(".")[0]
-    assert done.stdout.splitlines() == ["[-m]", f"[{package}]", "[connect]", "[a b]"]
+    assert done.stdout.splitlines() == [
+        "[-P]",
+        "[-m]",
+        f"[{package}]",
+        "[connect]",
+        "[a b]",
+    ]
+
+
+@pytest.mark.cli_python_subprocess
+def test_a_module_planted_at_home_does_not_run_under_a_launcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "textwrap.py").write_text("print('planted')\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, sys.path)))
+    Services(manager="launchd", folder=tmp_path / "agents", run=_Manager()).start(_ADA)
+    launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"
+
+    done = subprocess.run(  # noqa: S603 -- the launcher just written, fixed words.
+        [launcher, "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert "planted" not in done.stdout
+
+
+def test_a_launcher_starts_knowop_at_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shown = tmp_path / "python"
+    shown.write_text("#!/bin/sh\npwd -P\n")
+    shown.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(shown))
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    Services(manager="launchd", folder=tmp_path / "agents", run=_Manager()).start(_ADA)
+    launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / "knowop"
+
+    done = subprocess.run(  # noqa: S603 -- the launcher just written, fixed words.
+        [launcher, "connect"],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd="/",
+    )
+
+    assert done.stdout.strip() == str(home.resolve())
 
 
 def test_a_launcher_runs_knowop_under_the_app_that_starts(
@@ -753,6 +808,7 @@ def test_a_launcher_runs_knowop_under_the_app_that_starts(
         "[-S]",
         f"[{app / 'Contents' / 'Resources' / 'keep.py'}]",
         "[/the/python]",
+        "[-P]",
         "[-m]",
         f"[{package}]",
         "[connect]",

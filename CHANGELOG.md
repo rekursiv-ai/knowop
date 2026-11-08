@@ -7,6 +7,12 @@ All notable knowop changes are documented here. This project follows
 
 ### Changed
 
+- `knowop connect` serves sagent's tools to the server's assistant in place of exec.
+  Exec is removed, and `.exec.log` with it: the assistant's
+  calls arrive on a pipe and run in sagent's tool host. That host starts at home,
+  not in the folder `knowop connect` ran in, with `python -P`, so nothing there is
+  imported. `Bash` runs `bash -c`, not a login shell, so it no longer reads your
+  profile files.
 - On macOS, the launchd agents of `knowop connect` run under a `KnowOp.app` that
   `knowop connect` builds from a copy of its Python, so permission dialogs name
   KnowOp, not `python3.14`. An app that will not start falls back to the command

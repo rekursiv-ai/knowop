@@ -1,13 +1,13 @@
 ---
 name: knowop-connect
-description: ALWAYS invoke this skill before connecting a computer with knowop connect, serving or refusing the commands a server's agent may run on it, declaring a sandbox, or reading and changing the registry of machines. Do not tell a person how to connect a computer, or run a machine form, from memory -- invoke this skill first.
+description: ALWAYS invoke this skill before connecting a computer with knowop connect, serving or refusing the tools a server's agent may call on it, declaring a sandbox, or reading and changing the registry of machines. Do not tell a person how to connect a computer, or run a machine form, from memory -- invoke this skill first.
 ---
 
 # knowop connect -- connect this computer
 
 `knowop connect` connects the computer you are on to a server. It serves the
-computer's shell to the person's browser (a phone will do) and runs the commands
-the server's agent sends for that person. The registry of machines is `trax
+computer's shell to the person's browser (a phone will do) and serves its tools to
+the server's agent, for that person. The registry of machines is `trax
 machine`'s.
 
 `knowop connect --help` is the source of truth for the flags; if this skill
@@ -61,17 +61,19 @@ knowop logs -f                                # follow this computer's connect s
   the terminal ends the shell's process group; `tmux` and `nohup` jobs keep running.
   Every install includes aiortc for the direct link.
   `TRAX_MACHINE_TERMINAL_DIRECT=0` turns it off; terminals use the server relay.
-- **Commands.** The server's agent may run `bash -lc COMMAND` as you, in a process
-  group of its own, with at most 600 seconds, standard input from the request, and
-  each output stream cut at 1 MiB from the middle. A command killed at its timeout
-  exits 124. Each command is appended to `NAME.exec.log` in the machines folder of
-  your user state, readable only by you, with who asked for it.
-  `--no-exec` serves terminals only; the server sees no exec fact and refuses.
-  The command inherits this host's environment less `TRACKINIZER_URL`,
-  `TRACKINIZER_TOKEN`, `TRACKINIZER_PROFILE` and every `TRAX_*` and `LC_TRAX_*`
-  name, so the server's agent never reads a key from it. The log line is written
-  when the command ends, and names the variables the request set; a command that
-  takes the host down with it leaves none.
+- **Tools.** The server's agent may call sagent's tools here, as you: `Bash`, `Read`,
+  `Write`, `Edit`, `Grep`, `Glob` and `List`. Each agent session gets a process of its
+  own. A revoke or a stop ends every running call; a job a call left in the background
+  (`nohup`, `setsid`, `&`) is not tracked and keeps running. The host keeps what it needs
+  in `rekursiv-ai/knowop/tools/SERVER/NAME` under your user state, readable only by you,
+  with a `host.log` per session, and listens on no port. The server logs each call.
+  `--no-exec` serves terminals only; the server sees no `tools` fact and refuses, and
+  an install without sagent's host says so in one line and does the same.
+  A tool inherits this host's environment less `KNOWOP_TOOLS_TOKEN` and every
+  `TRACKINIZER_*`, `TRAX_*` and `LC_TRAX_*` name, so the server's agent never reads a
+  key from the environment.
+  That is all it hides: a tool runs as you, so it can read your files, including the
+  saved machine credential and knowop's login.
 - **Jobs.** `--jobs` also runs the jobs your account sends with `knowop job submit
   --machine NAME`, and no one else's. Each fetches your pushed commit into a fresh
   worktree and runs under a memory cap in a `systemd-run --user` scope with no swap,

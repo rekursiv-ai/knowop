@@ -3,9 +3,9 @@
 ## Why this file exists
 
 knowop holds an API key for your account, serves this computer's shell to the
-browser, runs the commands the server's assistant sends, runs agents that act on
-your files, and keeps the secrets your jobs use. Security reports need a private
-path so exploit details are not published before review.
+browser, serves its tools (shell and files) to the server's assistant, runs agents
+that act on your files, and keeps the secrets your jobs use. Security reports need a
+private path so exploit details are not published before review.
 
 ## Reporting a vulnerability
 

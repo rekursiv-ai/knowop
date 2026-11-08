@@ -325,7 +325,9 @@ class Services:
         ):
             return [uvx, f"knowop@{knowop_version()}"]
         # ``knowop`` once exported; the package that holds this module, in any form.
-        return [sys.executable, "-m", __name__.rpartition(".")[0]]
+        # ``-P``: under ``-m`` the working directory, here home, would come first on the
+        # path, and a module left there would run in knowop's place.
+        return [sys.executable, "-P", "-m", __name__.rpartition(".")[0]]
 
     def _definition(self, connect: Connect) -> str:
         """Return the definition file that serves ``connect``."""
@@ -579,6 +581,8 @@ def _environment() -> dict[str, str]:
 
 # ``exec`` keeps the process launchd started, so the app is what macOS holds responsible
 # (:mod:`macos_app`). An app that won't start, its Python gone, costs only that name.
+# Launchd starts it at ``/``; a tool's relative paths land where this leaves it, at home,
+# where a ``systemd --user`` unit starts anyway.
 def _script(program: list[str]) -> str:
     """Return a launcher: it runs ``program`` with the arguments it is given."""
     app = data_dir() / "rekursiv-ai" / "knowop" / "KnowOp.app"
@@ -586,6 +590,7 @@ def _script(program: list[str]) -> str:
     return (
         "#!/bin/sh\n"
         "# knowop connect writes it: launchd runs knowop through it, under its name.\n"
+        'cd "$HOME" 2>/dev/null\n'
         f"if {shlex.join(macos_app.probe(app))} >/dev/null 2>&1; then\n"
         f'  exec {shlex.join(macos_app.command(app))} {plain} "$@"\n'
         "fi\n"

@@ -272,7 +272,7 @@ class _Served:
     token: str
     """The token the host joined with: the one handed in, else one it enrolled."""
 
-    exec_commands: bool
+    serve_tools: bool
     sandbox: bool
     jobs: bool = False
     results_max: int = 256 * 2**20
@@ -309,7 +309,7 @@ class _Host:
         server: str,
         signed_in: Callable[[], Client] | None,
         sandbox: bool,
-        exec_commands: bool,
+        serve_tools: bool,
         sleep: Callable[[float], None],
         token: str = "",
         jobs: bool = False,
@@ -334,7 +334,7 @@ class _Host:
                 name=name,
                 server=server,
                 token=token if self.reads_token else "",
-                exec_commands=exec_commands,
+                serve_tools=serve_tools,
                 sandbox=sandbox,
                 jobs=jobs,
                 results_max=results_max,
@@ -1001,7 +1001,7 @@ def test_connect_without_a_login_enrolls_this_computer_in_the_same_approval(
             name="ada-mac",
             server="https://alpha.knowop.ai",
             token=_LOGIN_TOKEN,
-            exec_commands=True,
+            serve_tools=True,
             sandbox=False,
         ),
     ]
@@ -1024,7 +1024,7 @@ def test_connect_after_a_login_enrolls_the_named_machine_with_knowops_key(
             name="gpu1",
             server="https://acme.knowop.ai",
             token=_ENROLL_TOKEN,
-            exec_commands=True,
+            serve_tools=True,
             sandbox=True,
         ),
     ]
@@ -1056,7 +1056,7 @@ def test_connect_with_no_exec_serves_terminals_only(host: _Host) -> None:
 
     assert _knowop("connect", "--no-exec") == 0
 
-    assert [served.exec_commands for served in host.connects] == [False]
+    assert [served.serve_tools for served in host.connects] == [False]
     assert [served.jobs for served in host.connects] == [False]
 
 
@@ -1070,7 +1070,7 @@ def test_connect_with_jobs_runs_them_and_bounds_what_one_sends_back(
     assert _knowop("connect", "--jobs", "--no-exec", "--job-results-max", "1G") == 0
     assert _knowop("connect", "--jobs", "--job-results-max", "lots") == 1
 
-    assert [(s.jobs, s.exec_commands, s.results_max) for s in host.connects] == [
+    assert [(s.jobs, s.serve_tools, s.results_max) for s in host.connects] == [
         (True, True, 256 * 2**20),
         (True, False, 2**30),
     ]
@@ -1521,7 +1521,7 @@ def test_connect_with_a_piped_token_joins_without_a_login(
             name="box-7",
             server="https://acme.knowop.ai",
             token=_ENROLL_TOKEN,
-            exec_commands=True,
+            serve_tools=True,
             sandbox=True,
         ),
     ]
@@ -1824,7 +1824,7 @@ def test_connect_with_other_flags_reloads_its_service(
     assert _knowop("connect", "--no-exec") == 0
 
     assert [call[1] for call in launchd.calls[-3:]] == ["print", "bootout", "bootstrap"]
-    assert [served.exec_commands for served in host.connects] == [True, False]
+    assert [served.serve_tools for served in host.connects] == [True, False]
     assert terminal.lines()[-3] == _CONNECTED.replace("4243", "4244")
 
 

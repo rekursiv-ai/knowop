@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final, cast
 from unittest.mock import Mock
 
-import base64
 import io
 import os
 import select
+import stat
 import threading
 import time
 import uuid
@@ -27,7 +30,6 @@ from trackinizer.wire.wire_device import (
     DeviceToken,
     IssuedKey,
 )
-from trackinizer.wire.wire_exec import ExecResult, ExecWait
 from trackinizer.wire.wire_machine_host import (
     HEARTBEAT_SEC,
     EnrollResponse,
@@ -36,6 +38,7 @@ from trackinizer.wire.wire_machine_host import (
 )
 from trackinizer.wire.wire_machine_job import MACHINE_WORK_PATH
 from treekle import json_loads
+from wrapt import lazy_import
 
 import httpx2
 import pytest
@@ -45,13 +48,13 @@ from knowop.shell import (
     machine_host,
     serve,
     terminal_direct_aiortc,
+    tool_host,
 )
 from knowop.shell.terminal_direct_aiortc import AiortcPeer
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
     from trackinizer.mock_test_support import MockProtocol
 
@@ -76,12 +79,11 @@ _ACCOUNTS: Final = {
 
 
 class _Server:
-    """A server for one machine: login, enroll, join, heartbeat, terminals and exec."""
+    """A server for one machine: login, enroll, join, heartbeat, terminals and tools."""
 
     def __init__(
         self,
         *,
-        commands: list[ExecWait] | None = None,
         poll: DeviceToken | None = None,
         enroll_status: int = 201,
         revoked: str = "",
@@ -92,9 +94,6 @@ class _Server:
         self.revoked = revoked
         """The machine credential whose heartbeats answer 410, as after a disconnect."""
         self.requests: list[tuple[str, str, str, dict[str, object]]] = []
-        self.commands = list(commands or [])
-        self.results: list[ExecResult] = []
-        self.result_posted = threading.Event()
         self.over = threading.Event()
         self._lock = threading.Lock()
 
@@ -104,13 +103,12 @@ class _Server:
         auth = request.headers.get("authorization", "")
         with self._lock:
             self.requests.append((method, path, auth, body))
-        return self._answer(method, path, body, auth=auth)
+        return self._answer(method, path, auth=auth)
 
     def _answer(
         self,
         method: str,
         path: str,
-        body: dict[str, object],
         *,
         auth: str,
     ) -> httpx2.Response:
@@ -170,12 +168,9 @@ class _Server:
         if path.endswith("/heartbeat"):
             beat = HeartbeatResponse(server_time=datetime(2030, 1, 1, tzinfo=UTC))
             return httpx2.Response(200, content=beat.model_dump_json())
-        if path.endswith("/exec/wait"):
-            return self._next_command()
-        if "/exec/" in path and path.endswith("/result"):
-            self.results.append(ExecResult.model_validate(body))
-            self.result_posted.set()
-            return httpx2.Response(204)
+        if path.endswith("/tools/wait"):
+            self.over.wait(0.02)
+            return httpx2.Response(200, content=b"null")
         if path == wire_terminals.MACHINE_TERMINAL_WAIT_PATH.format(
             machine_id=_MACHINE_ID,
         ):
@@ -185,14 +180,6 @@ class _Server:
             self.over.wait(0.02)
             return httpx2.Response(200, json={"work": None})
         raise AssertionError(f"unexpected request {method} {path}")
-
-    def _next_command(self) -> httpx2.Response:
-        with self._lock:
-            command = self.commands.pop(0) if self.commands else None
-        if command is None:
-            self.over.wait(0.02)
-            return httpx2.Response(200, content=b"null")
-        return httpx2.Response(200, content=command.model_dump_json())
 
     def asked(self, *suffixes: str) -> Callable[[], bool]:
         """Return a check that every path ending in one of ``suffixes`` was requested."""
@@ -216,6 +203,37 @@ class _Waits:
             assert time.monotonic() < deadline, "the host never served"
             time.sleep(0.005)
         raise KeyboardInterrupt
+
+
+class _NoToolServer:
+    """Stands in for sagent's ``Server``: these tests cover connect, not what it serves."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def aopen(self) -> None:
+        return
+
+    async def aclose(self) -> None:
+        return
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Dirs:
+    secrets: Path
+    state: Path
+
+
+@pytest.fixture(autouse=True)
+def _no_sagent_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serve tools the same with or without sagent's host, which an export may lack."""
+    monkeypatch.setattr(
+        tool_host,
+        "sagent_server",
+        SimpleNamespace(HOST_COMMAND=(), Server=_NoToolServer),
+    )
+    monkeypatch.setattr(tool_host, "strings", SimpleNamespace(ServeDirs=_Dirs))
+    monkeypatch.setattr(tool_host, "tool_bridge", SimpleNamespace(bridged=None))
 
 
 @pytest.fixture(autouse=True)
@@ -249,7 +267,7 @@ def _connect(
     name: str = "dev-box",
     signed_in: Callable[[], Client] | None = None,
     sandbox: bool = False,
-    exec_commands: bool = True,
+    serve_tools: bool = True,
     token: str = "",
     jobs: bool = False,
 ) -> None:
@@ -259,7 +277,7 @@ def _connect(
             server=_SERVER,
             signed_in=signed_in,
             sandbox=sandbox,
-            exec_commands=exec_commands,
+            serve_tools=serve_tools,
             sleep=waits,
             token=token,
             jobs=jobs,
@@ -286,7 +304,7 @@ def test_a_computer_with_no_login_logs_in_joins_with_the_returned_token_and_serv
     _on(server, monkeypatch)
     _stdin(monkeypatch, "")
 
-    _connect(_Waits(server.asked("/exec/wait", "/terminals/wait")))
+    _connect(_Waits(server.asked("/tools/wait", "/terminals/wait")))
 
     [code] = server.calls("/auth/device/code")
     assert code[3] == {"client": "knowop", "host": "Dev_box", "machine": "dev-box"}
@@ -296,8 +314,8 @@ def test_a_computer_with_no_login_logs_in_joins_with_the_returned_token_and_serv
     assert join[2] == ""
     facts = join[3]["facts"]
     assert isinstance(facts, dict)
-    assert (facts["terminal"], facts["exec"]) == (True, True)
-    assert server.calls("/exec/wait")
+    assert (facts["terminal"], facts["tools"]) == (True, True)
+    assert server.calls("/tools/wait")
     assert server.calls("/terminals/wait")
     # The key the login returned is saved, so the next run needs no browser.
     assert [name for name, _ in list_profiles()] == ["know.example"]
@@ -322,7 +340,7 @@ def test_a_computer_that_runs_jobs_offers_its_capped_memory_and_its_own_gpus(
         ],
     )
 
-    _connect(_Waits(server.asked("/exec/wait", "/work")), jobs=True)
+    _connect(_Waits(server.asked("/tools/wait", "/work")), jobs=True)
 
     [join] = server.calls("/api/machines/join")
     facts = join[3]["facts"]
@@ -336,7 +354,7 @@ def test_a_computer_that_runs_jobs_offers_its_capped_memory_and_its_own_gpus(
         "not bound, so no job is given it"
     ) in out
     assert "jobs: on, up to 61440 MiB together, GPUs: 1" in out
-    assert "(terminals, commands and jobs)" in out
+    assert "(terminals, tools and jobs)" in out
 
 
 def test_jobs_where_no_memory_cap_holds_are_refused_before_anything_is_asked(
@@ -352,7 +370,7 @@ def test_jobs_where_no_memory_cap_holds_are_refused_before_anything_is_asked(
             server=_SERVER,
             signed_in=None,
             sandbox=False,
-            exec_commands=True,
+            serve_tools=True,
             jobs=True,
         )
 
@@ -374,7 +392,7 @@ def test_a_computer_joined_by_a_piped_token_runs_no_ones_jobs(
             server=_SERVER,
             signed_in=None,
             sandbox=False,
-            exec_commands=False,
+            serve_tools=False,
             jobs=True,
         )
 
@@ -436,7 +454,7 @@ def test_another_account_on_this_computer_is_never_served_the_first_ones_machine
             server=_SERVER,
             signed_in=lambda: bob,
             sandbox=False,
-            exec_commands=True,
+            serve_tools=True,
             sleep=_Waits(),
         )
 
@@ -508,7 +526,7 @@ def test_an_enrollment_refused_for_another_reason_is_said_as_the_server_said_it(
             server=_SERVER,
             signed_in=lambda: keyed,
             sandbox=False,
-            exec_commands=True,
+            serve_tools=True,
             sleep=_Waits(),
         )
 
@@ -532,7 +550,7 @@ def test_a_join_only_connect_enrolls_joins_and_returns_serving_nothing(
         server=_SERVER,
         signed_in=lambda: keyed,
         sandbox=False,
-        exec_commands=True,
+        serve_tools=True,
         sleep=_Waits(lambda: False),
         join_only=True,
     )
@@ -607,7 +625,7 @@ def test_a_later_run_reuses_the_machine_credential_and_asks_for_nothing(
     assert (take[3]["claim"], release[3]["claim"]) == ("take", "release")
     facts = take[3]["facts"]
     assert isinstance(facts, dict)
-    assert facts["exec"] is True
+    assert facts["tools"] is True
 
 
 def test_a_computer_disconnected_since_its_last_connect_joins_again_with_no_login(
@@ -632,7 +650,7 @@ def test_a_computer_disconnected_since_its_last_connect_joins_again_with_no_logi
     _stdin(monkeypatch, "")
     keyed = Client(_SERVER, api_key=_PROFILE_KEY)
 
-    _connect(_Waits(server.asked("/exec/wait")), signed_in=lambda: keyed)
+    _connect(_Waits(server.asked("/tools/wait")), signed_in=lambda: keyed)
 
     assert server.calls("/auth/device/code") == []
     [enroll] = server.calls("/api/machines/enroll")
@@ -651,49 +669,69 @@ def test_a_computer_disconnected_since_its_last_connect_joins_again_with_no_logi
     ) in capsys.readouterr().out.splitlines()
 
 
-def test_no_exec_serves_no_commands_and_does_not_say_it_does(
+def test_no_exec_serves_no_tools_and_does_not_say_it_does(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = _Server()
     _on(server, monkeypatch)
     _stdin(monkeypatch, f"{_ENROLLMENT}\n")
 
-    _connect(_Waits(server.asked("/terminals/wait")), exec_commands=False)
+    _connect(_Waits(server.asked("/terminals/wait")), serve_tools=False)
 
     [join] = server.calls("/api/machines/join")
     facts = join[3]["facts"]
     assert isinstance(facts, dict)
     assert "exec" not in facts
+    assert "tools" not in facts
     assert facts["terminal"] is True
-    assert server.calls("/exec/wait") == []
+    assert server.calls("/tools/wait") == []
     assert server.calls("/terminals/wait")
 
 
-def test_a_command_the_server_hands_over_is_run_and_its_result_posted(
+@pytest.mark.parametrize(
+    ("seam", "module"),
+    [
+        ("sagent_server", "trackinizer.sagent.host.absent_from_this_install"),
+        ("tool_bridge", "trackinizer.client.absent_from_this_install"),
+    ],
+)
+def test_an_install_without_what_tools_need_serves_none_and_does_not_say_it_does(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    seam: str,
+    module: str,
 ) -> None:
-    command = ExecWait(
-        exec_id=uuid.uuid4(),
-        asker="ada@example.com",
-        command="echo from the assistant",
-        cwd=str(tmp_path),
-        timeout_sec=10,
-    )
-    server = _Server(commands=[command])
+    server = _Server()
     _on(server, monkeypatch)
     _stdin(monkeypatch, f"{_ENROLLMENT}\n")
-    waits = _Waits(server.result_posted.is_set)
+    monkeypatch.setattr(tool_host, seam, lazy_import(module))
 
-    _connect(waits)
+    _connect(_Waits(server.asked("/terminals/wait")))
 
-    [result] = server.results
-    assert base64.b64decode(result.stdout_b64) == b"from the assistant\n"
-    [posted] = server.calls("/result")
-    assert posted[1] == f"{_MACHINE_PATH}/exec/{command.exec_id}/result"
-    assert posted[2] == f"Bearer {_CREDENTIAL}"
-    log = state_dir() / "rekursiv-ai" / "trax" / "machines" / "dev-box.exec.log"
-    assert "ada@example.com" in log.read_text()
+    [join] = server.calls("/api/machines/join")
+    facts = join[3]["facts"]
+    assert isinstance(facts, dict)
+    assert "tools" not in facts
+    assert facts["terminal"] is True
+    assert server.calls("/tools/wait") == []
+    captured = capsys.readouterr()
+    assert "(terminals)" in captured.out
+    assert sum("tools: off" in line for line in captured.err.splitlines()) == 1
+
+
+def test_the_tool_host_asks_with_the_machine_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _Server()
+    _on(server, monkeypatch)
+    _stdin(monkeypatch, f"{_ENROLLMENT}\n")
+
+    _connect(_Waits(server.asked("/tools/wait")))
+
+    assert server.calls("/tools/wait")[0][2] == f"Bearer {_CREDENTIAL}"
+    tools = state_dir() / "rekursiv-ai" / "knowop" / "tools" / server_dir(_SERVER)
+    tools /= "dev-box"
+    assert stat.S_IMODE(tools.stat().st_mode) == 0o700
 
 
 def test_the_sandbox_declaration_is_recorded_by_the_connect(
@@ -721,7 +759,7 @@ def test_a_login_the_person_denies_ends_the_connect_with_nothing_saved(
             server=_SERVER,
             signed_in=None,
             sandbox=False,
-            exec_commands=True,
+            serve_tools=True,
             sleep=_Waits(),
         )
 
@@ -869,7 +907,7 @@ def _terminals_started(
         server=_SERVER,
         signed_in=None,
         sandbox=False,
-        exec_commands=True,
+        serve_tools=True,
     )
     joined_terminals = cast(
         "Callable[[JoinResponse], TerminalHost]",

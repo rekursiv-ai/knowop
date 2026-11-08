@@ -23,9 +23,9 @@ the host keeps serving.
 It uses the machine's own credential, never the profile's key, so it runs in the
 calling process rather than in traxd.
 
-A host serves terminals (``terminal_host.py``) and commands (``exec_host.py``) for as
-long as it stays connected, and kills every shell and command when the machine is
-revoked.
+A host serves terminals (``terminal_host.py``) and sagent's tools (``tool_host.py``) for
+as long as it stays connected. When the machine is revoked it kills every shell and ends
+every running tool call; what a tool left running in the background goes on.
 
 Each connect also records whether the person declared this computer a sandbox, a
 disposable computer where agents may act freely (:func:`is_sandbox`). ``knowop run``
@@ -118,7 +118,7 @@ class HostClient(Protocol):
 
 
 class Serving(Protocol):
-    """Serves a joined machine's terminals, commands or jobs; started, stopped once."""
+    """Serves a joined machine's terminals, tools or jobs; started, stopped once."""
 
     def start(self, machine_id: uuid.UUID, instance: uuid.UUID) -> None:
         """Start listening for terminals to open."""
@@ -137,7 +137,7 @@ def connect(
     read_token: Callable[[], str],
     sleep: Callable[[float], None],
     joined_terminals: Callable[[JoinResponse], Serving] | None = None,
-    exec_for: Callable[[JoinResponse], Serving] | None = None,
+    tools_for: Callable[[JoinResponse], Serving] | None = None,
     jobs_for: Callable[[JoinResponse], Serving] | None = None,
     job_facts: Mapping[str, FactValue] | None = None,
     sandbox: bool = False,
@@ -158,8 +158,8 @@ def connect(
       sleep: Waits the given seconds between heartbeats.
       joined_terminals: Makes the terminal server for the joined machine's credential;
         ``None`` serves none, whatever the server asks.
-      exec_for: Makes the command server the same way; ``None`` serves none, and the
-        facts do not say ``exec``.
+      tools_for: Makes the tool server the same way; ``None`` serves none, and the
+        facts do not say ``tools``.
       jobs_for: Makes the job host the same way; ``None`` runs no jobs, and the facts
         do not say ``jobs``.
       job_facts: What the job host offers jobs (its GPUs and memory), reported beside
@@ -185,7 +185,7 @@ def connect(
     version = _host_version()
     facts = host_facts(
         terminal=joined_terminals is not None,
-        exec_commands=exec_for is not None,
+        tools=tools_for is not None,
         jobs=None if jobs_for is None else {} if job_facts is None else job_facts,
     )
     join = partial(
@@ -206,7 +206,7 @@ def connect(
         instance=instance,
         version=version,
         sleep=sleep,
-        makers=(joined_terminals, exec_for, jobs_for),
+        makers=(joined_terminals, tools_for, jobs_for),
     )
     who = "" if account is None else f" as {account.lower()}"
     saved = _saved_credential(path)
@@ -236,7 +236,7 @@ def connect(
 def host_facts(
     *,
     terminal: bool = False,
-    exec_commands: bool = False,
+    tools: bool = False,
     jobs: Mapping[str, FactValue] | None = None,
 ) -> Facts:
     """Return what this host reports about itself.
@@ -244,8 +244,8 @@ def host_facts(
     Args:
       terminal: Whether this host serves terminals, and with them a ``files``
         terminal, which the facts then say.
-      exec_commands: Whether this host runs commands the assistant sends, which the
-        facts then say as ``exec``.
+      tools: Whether this host serves sagent's tools to the assistant, which the facts
+        then say.
       jobs: What this host offers jobs, when it runs them; the facts then say
         ``jobs: true`` beside it.
 
@@ -253,13 +253,13 @@ def host_facts(
       facts: Its OS and architecture, CPU count, memory in MB, the user it runs
         as, which of :data:`HOST_CLIS` are on ``PATH``, its process id, when it
         started and its knowop version, ``terminal: true`` and ``files: true`` when
-        it serves terminals, ``exec: true`` when it runs commands, and ``jobs: true``
+        it serves terminals, ``tools: true`` when it serves tools, and ``jobs: true``
         with what it offers jobs when it runs them.
 
     """
     return {
         **({"terminal": True, "files": True} if terminal else {}),
-        **({"exec": True} if exec_commands else {}),
+        **({"tools": True} if tools else {}),
         **({JOBS_FACT: True, **jobs} if jobs is not None else {}),
         "os": platform.system().lower(),
         "arch": platform.machine(),
