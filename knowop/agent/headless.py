@@ -3,7 +3,7 @@
 A Chat run on a person's machine does not draw a TUI. :class:`HeadlessRun` drives the
 CLI through its programmatic protocol (a :class:`~.asks.Driver`) and writes what the
 driver reports as the records of the chat's session: a card when the agent asks, and its
-end when the ask is answered or released. The transcript still comes from tailing the
+end when the ask is answered or released, and each end of a compaction. The transcript still comes from tailing the
 CLI's own session file, as it does for a TUI run. The run's state goes to the server
 beside its drains (:class:`StateReporter`), so Chat can show a badge.
 
@@ -512,6 +512,8 @@ class HeadlessRun:
                     self._record(asks.opened_record(event, at=_now()))
                 case asks.Resolved():
                     self._record(asks.resolved_record(event, at=_now()))
+                case asks.Compaction():
+                    self._record(asks.compaction_record(event, at=_now()))
                 case asks.StateChanged():
                     self._set_state(event.state)
         if self._live is not None and self._live.driver is driver:

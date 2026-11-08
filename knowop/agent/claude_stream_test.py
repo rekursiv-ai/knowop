@@ -30,6 +30,7 @@ from trackinizer.lib.posix.pipes import Piped
 from trackinizer.runs.asks import (
     Answer,
     Ask,
+    Compaction,
     Driver,
     Option,
     Resolved,
@@ -318,10 +319,51 @@ def test_the_session_id_and_state_follow_the_cli() -> None:
     assert wire.session_id == "s2"
 
 
+# The shapes claude 2.1.319 writes: ``status`` ``compacting`` when a compaction begins and
+# every 30 seconds while it runs, then ``status`` ``null`` with its result.
+def _status(status: str | None, **result: str) -> _ClaudeFrame:
+    return {
+        "type": "system",
+        "subtype": "status",
+        "status": status,
+        **result,
+        "uuid": "0e7d",
+        "session_id": "s1",
+    }
+
+
+def test_a_compaction_is_one_start_however_often_claude_repeats_it_then_its_end() -> (
+    None
+):
+    wire = ClaudeWire(cwd=_CWD)
+    assert wire.read(_status("compacting")).events == (Compaction(state="started"),)
+    assert wire.read(_status("compacting")) == Reading()
+    assert wire.read(_status(None, compact_result="success")).events == (
+        Compaction(state="ended"),
+    )
+    assert wire.read(_status(None)) == Reading()
+
+
+@pytest.mark.parametrize(
+    ("result", "error"),
+    [
+        ({"compact_result": "failed", "compact_error": "aborted"}, "aborted"),
+        ({"compact_result": "failed"}, "failed"),
+    ],
+)
+def test_a_failed_compaction_ends_with_why(result: dict[str, str], error: str) -> None:
+    wire = ClaudeWire(cwd=_CWD)
+    _ = wire.read(_status("compacting"))
+    assert wire.read(_status(None, **result)).events == (
+        Compaction(state="ended", error=error),
+    )
+
+
 @pytest.mark.parametrize(
     "frame",
     [
         {"type": "assistant", "message": {"content": []}},
+        _status(None),
         {"type": "result", "subtype": "success"},
         {"type": "system", "subtype": "session_state_changed", "state": "asleep"},
         {"type": "system", "subtype": "init"},

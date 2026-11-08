@@ -11,9 +11,9 @@ answers, the turn state and the interrupt, and nothing of the transcript.
 
 Two halves:
 
-- :class:`ClaudeWire` turns frames into :class:`~.asks.Ask`, :class:`~.asks.Resolved`
-  and :class:`~.asks.StateChanged`, and an :class:`~.asks.Answer` into the frame that
-  answers it. It does no I/O.
+- :class:`ClaudeWire` turns frames into :class:`~.asks.Ask`, :class:`~.asks.Resolved`,
+  :class:`~.asks.StateChanged` and :class:`~.asks.Compaction`, and an
+  :class:`~.asks.Answer` into the frame that answers it. It does no I/O.
 - :class:`ClaudeStreamDriver` is the :class:`~.asks.Driver`: it runs the process and
   moves lines between it and the wire.
 
@@ -25,6 +25,12 @@ What was measured on claude 2.1.306 (haiku, ``--permission-mode default``):
   is answered at once, so the driver sends it first and knows the CLI is alive.
 - ``session_state_changed`` is written only when ``CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS``
   is set. It reports ``running`` and ``requires_action`` and, per turn, ``idle``.
+- A compaction, automatic or ``/compact``, is ``status`` ``compacting``, written again
+  every 30 seconds while it runs, then ``status`` ``null`` with ``compact_result``
+  ``success`` or ``failed`` (and ``compact_error``); read from 2.1.319's own code, not
+  probed. The session file holds nothing of it until the end, a ``compact_boundary``
+  line whose ``compactMetadata.durationMs`` was 100 and 179 seconds on two automatic
+  ones in the person's transcripts.
 - A deny with ``interrupt: true`` ends the turn at once (``terminal_reason``
   ``aborted_tools``) and puts claude's own words in the tool result in place of ours.
 - A line sent while an ask is open is queued and joins the turn after the answer.
@@ -54,7 +60,15 @@ import re
 import uuid
 
 from trackinizer.lib.posix.pipes import Piped
-from trackinizer.runs.asks import Answer, Ask, Option, Resolved, StateChanged
+from trackinizer.runs.asks import (
+    Answer,
+    Ask,
+    Compaction,
+    DriverEvent,
+    Option,
+    Resolved,
+    StateChanged,
+)
 from treekle import PlainTree, ReadError, from_plain, json_loads
 
 
@@ -67,7 +81,6 @@ __all__ = ["REMOTE_CONTROL", "ClaudeStreamDriver", "ClaudeWire", "Reading", "Rep
 
 
 type _Frame = dict[str, PlainTree]
-type _Event = Ask | Resolved | StateChanged
 
 
 _STATE_ENV: Final = "CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS"
@@ -95,7 +108,7 @@ REMOTE_CONTROL: Final = frozenset({"rc", "remote-control"})
 class Reading:
     """What one frame from claude means."""
 
-    events: tuple[_Event, ...] = ()
+    events: tuple[DriverEvent, ...] = ()
     replies: tuple[_Frame, ...] = ()
     """Frames to write back at once: answers to requests nobody here can serve."""
 
@@ -130,6 +143,7 @@ class ClaudeWire:
         self.session_id = session_id
         self._cwd = str(cwd)
         self._open: dict[str, _Open] = {}
+        self._compacting = False
 
     def read(self, frame: Mapping[str, PlainTree]) -> Reading:
         """Read one frame claude wrote.
@@ -207,9 +221,24 @@ class ClaudeWire:
                         return Reading(events=(StateChanged(state=state),))
                     case _:
                         pass
+            case "status":
+                return self._status(frame)
             case _:
                 pass
         return Reading()
+
+    # ``compacting`` comes again every 30 seconds of one compaction, and ``null`` after
+    # any other status, such as a permission mode switch: only a change is an end.
+    def _status(self, frame: Mapping[str, PlainTree]) -> Reading:
+        compacting = frame.get("status") == "compacting"
+        if compacting == self._compacting:
+            return Reading()
+        self._compacting = compacting
+        if compacting:
+            return Reading(events=(Compaction(state="started"),))
+        failed = _text(frame, "compact_result") == "failed"
+        error = (_text(frame, "compact_error") or "failed") if failed else ""
+        return Reading(events=(Compaction(state="ended", error=error),))
 
     def _request(self, frame: Mapping[str, PlainTree]) -> Reading:
         request_id = _text(frame, "request_id")
@@ -357,7 +386,7 @@ class ClaudeStreamDriver:
         self._env = dict(env or {})
         self._permission_mode = permission_mode
         self._request_timeout_sec = request_timeout_sec
-        self._events: asyncio.Queue[_Event | None] = asyncio.Queue()
+        self._events: asyncio.Queue[DriverEvent | None] = asyncio.Queue()
         self._process: _Process | None = None
         self._waiting: dict[str, asyncio.Future[_Frame]] = {}
         self._stderr = ""
@@ -523,7 +552,7 @@ class ClaudeStreamDriver:
         await self._process.piped.terminate()
         await self._process.reader
 
-    async def events(self) -> AsyncIterator[_Event]:
+    async def events(self) -> AsyncIterator[DriverEvent]:
         """Stream what claude reports until it ends."""
         while (event := await self._events.get()) is not None:
             yield event
