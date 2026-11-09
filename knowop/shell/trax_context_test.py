@@ -17,6 +17,7 @@ def test_the_routing_variables_and_every_trax_name_are_withheld(
     for name in (
         "TRACKINIZER_URL",
         "TRACKINIZER_TOKEN",
+        "TRACKINIZER_TOKEN_FILE",
         "TRACKINIZER_PROFILE",
         "TRAX_CANVAS",
         "LC_TRAX_SERVER",
@@ -29,6 +30,7 @@ def test_the_routing_variables_and_every_trax_name_are_withheld(
     assert {
         "TRACKINIZER_URL",
         "TRACKINIZER_TOKEN",
+        "TRACKINIZER_TOKEN_FILE",
         "TRACKINIZER_PROFILE",
         "TRAX_CANVAS",
         "LC_TRAX_SERVER",

@@ -15,7 +15,12 @@ import os
 __all__ = ["inherited_trax_context"]
 
 _ROUTING_ENV: Final = frozenset(
-    {"TRACKINIZER_URL", "TRACKINIZER_TOKEN", "TRACKINIZER_PROFILE"},
+    {
+        "TRACKINIZER_URL",
+        "TRACKINIZER_TOKEN",
+        "TRACKINIZER_TOKEN_FILE",
+        "TRACKINIZER_PROFILE",
+    },
 )
 """The variables ``trax`` reads to choose its server, credential and profile."""
 
