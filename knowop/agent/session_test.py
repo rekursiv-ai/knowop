@@ -323,6 +323,29 @@ def _codex_line(text: str) -> str:
     return json.dumps({"type": "response_item", "payload": payload}) + "\n"
 
 
+def _claude_subagent(session_dir: Path, agent: str, text: str) -> None:
+    """Write a background sub-agent's transcript and meta, as claude files them."""
+    folder = session_dir / "subagents"
+    folder.mkdir(parents=True)
+    line = {
+        "parentUuid": None,
+        "isSidechain": True,
+        "agentId": agent,
+        "type": "user",
+        "uuid": text,
+        "message": {"role": "user", "content": text},
+    }
+    _ = (folder / f"agent-{agent}.jsonl").write_text(json.dumps(line) + "\n")
+    meta = {
+        "agentType": "general-purpose",
+        "description": text,
+        "toolUseId": "toolu_018jCzmctBCuvhTvWEh6F9a8",
+        "spawnDepth": 1,
+        "requestShape": "background",
+    }
+    _ = (folder / f"agent-{agent}.meta.json").write_text(json.dumps(meta))
+
+
 def _append(path: Path, text: str, argv: Sequence[str]) -> None:
     """Act as a CLI that appends ``text`` to ``path``."""
     del argv
@@ -1607,6 +1630,33 @@ class TestAResumedTranscriptIsCaptured:
         assert minted != _OLD
         assert _texts(sink) == ["before", "forked"]
         assert sink.known_at_open == [minted]
+
+    def test_each_subagent_of_the_run_is_captured_in_whichever_project(
+        self,
+        claude_scope: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Measured on claude 2.1.319: a sub-agent is filed under its spawn-time cwd.
+
+        A session that ``cd``s keeps its own transcript under the project it began
+        in, and files each sub-agent spawned after under the new cwd's project.
+        """
+        moved = claude_scope.parent / "-opt-scratch-runs-moved"
+
+        def spawn_before_and_after_a_cd(argv: Sequence[str]) -> None:
+            minted = argv[argv.index("--session-id") + 1]
+            _ = (claude_scope / f"{minted}.jsonl").write_text(_claude_line("asked"))
+            _claude_subagent(claude_scope / minted, "a13baf685cde6fa99", "here")
+            _claude_subagent(moved / minted, "a4f0c64478370db58", "there")
+            _claude_subagent(moved / _ELSEWHERE, "a33e18188a71fb9f2", "theirs")
+
+        sink, _argv = self._spawn(
+            monkeypatch,
+            RunConfig(cli_name="claude"),
+            spawn_before_and_after_a_cd,
+        )
+
+        assert sorted(_texts(sink)) == ["asked", "here", "there"]
 
     @pytest.mark.usefixtures("claude_scope")
     def test_a_fresh_run_is_stamped_with_its_minted_id_at_open(
@@ -6034,6 +6084,46 @@ class TestDeliverOne:
         ]
         assert "Trackinizer context" in relay.submitted[0]
 
+    def test_a_chat_line_says_only_what_the_cli_lacks(self) -> None:
+        """The owner's lines go unnamed, and the context only until it is told."""
+        relay = _RecordingRelay()
+        inbound = InboundState(fallback_sec=0.0)
+        context = CanvasMessageContext(canvas_id=uuid.uuid4(), visible_visuals=[])
+        for text in ("look", "again"):
+            session._deliver_one(
+                relay,
+                InboundDrainItem(text=text, source="ann@x", context=context),
+                stream=False,
+                cli="claude",
+                inbound=inbound,
+            )
+
+        assert relay.submitted == [
+            f"look\nTrackinizer context (verify with trax): {context.model_dump_json()}",
+            "again",
+        ]
+
+    def test_a_line_the_cli_would_not_take_is_recorded_undelivered(self) -> None:
+        records: list[SystemMessage] = []
+
+        session._deliver_one(
+            _PickyRelay(reject="ann@x: hi"),
+            InboundDrainItem(text="hi", source="ann@x"),
+            stream=False,
+            cli="claude",
+            record=records.append,
+        )
+
+        assert [record.extra["$delivery"] for record in records] == [
+            {
+                "text": "hi",
+                "kind": "line",
+                "source": "ann@x",
+                "refused": False,
+                "reason": "pty write failed",
+            },
+        ]
+
     def test_each_kind_is_delivered_the_way_the_cli_acts_on_it(
         self,
         caplog: pytest.LogCaptureFixture,
@@ -8997,16 +9087,11 @@ class TestDeliveringToAHeadlessRun:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        delivered: list[tuple[str, str]] = []
+        delivered: list[tuple[str, str, str | None]] = []
         monkeypatch.setattr(
             session,
             "_deliver_headless",
             partial(_note_delivery, delivered),
-        )
-        monkeypatch.setattr(
-            session,
-            "_deliver_headless_command",
-            partial(_note_command, delivered),
         )
         server = _OneBatchServer([InboundDrainItem(text="hello")])
         stop = server.stop
@@ -9026,9 +9111,10 @@ class TestDeliveringToAHeadlessRun:
         assert delivered == [
             (
                 "command",
-                "/compact|the loaded conversation is past what claude holds comfortably",
+                "/compact",
+                "the loaded conversation is past what claude holds comfortably",
             ),
-            ("one", "hello"),
+            ("line", "hello", None),
         ]
 
     def test_a_refusal_for_good_ends_the_headless_run(self) -> None:
@@ -9052,27 +9138,16 @@ class TestDeliveringToAHeadlessRun:
 
 
 def _note_delivery(
-    delivered: list[tuple[str, str]],
-    run: HeadlessRun,
-    item: InboundDrainItem,
-    **_: object,
-) -> None:
-    """Note a message the poll loop gave a headless run."""
-    del run
-    delivered.append(("one", item.text))
-
-
-def _note_command(
-    delivered: list[tuple[str, str]],
+    delivered: list[tuple[str, str, str | None]],
     run: HeadlessRun,
     item: InboundDrainItem,
     *,
-    reason: str,
+    reason: str | None = None,
     **_: object,
 ) -> None:
-    """Note a command the poll loop gave a headless run, with why it was sent."""
+    """Note a message the poll loop gave a headless run, with why the run sent it."""
     del run
-    delivered.append(("command", f"{item.text}|{reason}"))
+    delivered.append((item.kind, item.text, reason))
 
 
 _WORKSPACE: Final = "5e5e5e5e-0000-4000-8000-0000000000bb"
@@ -10519,20 +10594,18 @@ class TestTheInboundLoopStops:
     """The poll loop ends when stopped while it waits, whatever it waits for."""
 
     def test_while_the_run_has_no_session_yet(self) -> None:
+        """It looks again every half second unless told otherwise."""
         relay = _RecordingRelay()
+        stop = _StopOnItsFirstWait()
 
-        _inbound_poll_loop(
-            _UndrainedClient(),
-            _NoSessionSink(),
-            relay,
-            _StopOnItsFirstWait(),
-            poll_interval=0.5,
-        )
+        _inbound_poll_loop(_UndrainedClient(), _NoSessionSink(), relay, stop)
 
         assert relay.submitted == []
+        assert stop.timeouts == [0.5]
 
     def test_while_the_cli_is_not_ready_for_a_line(self, tmp_path: Path) -> None:
         relay = _RecordingRelay()
+        stop = _StopOnItsFirstWait()
         state = InboundState(
             marker=tmp_path / "never",
             fallback_sec=20.0,
@@ -10543,13 +10616,320 @@ class TestTheInboundLoopStops:
             _UndrainedClient(),
             _SessionSink(),
             relay,
-            _StopOnItsFirstWait(),
-            poll_interval=0.5,
+            stop,
+            poll_interval=0.25,
             inbound=state,
         )
 
         assert relay.submitted == []
         assert not state.ready()
+        assert stop.timeouts == [0.25]
+
+
+class _LoopRun(_NotedRun):
+    """A headless run the poll loop hands its messages to, which notes each."""
+
+    def __init__(self) -> None:
+        super().__init__(threading.Event(), [])
+        self.told: list[tuple[str, object]] = []
+
+    @override
+    def send_line(self, text: str) -> None:
+        self.told.append(("line", text))
+
+    @override
+    def command(self, verb: str, args: str) -> str:
+        self.told.append(("command", (verb, args)))
+        return ""
+
+
+def _relay_told(relay: _RecordingRelay | _LoopRun) -> list[object]:
+    """Return what reached the CLI: typed into a terminal, or handed to a headless run."""
+    if isinstance(relay, _LoopRun):
+        return list(relay.told)
+    return [*relay.submitted, *relay.written]
+
+
+def _typist() -> _RecordingRelay:
+    return _RecordingRelay()
+
+
+_RELAYS: Final = pytest.mark.parametrize(
+    "relay",
+    [_typist, _LoopRun],
+    ids=["typed", "headless"],
+)
+
+
+class TestTheInboundLoopHandsEachMessageOn:
+    """What the poll loop is given reaches each message it delivers."""
+
+    @classmethod
+    def _poll(
+        cls,
+        relay: _RecordingRelay | _LoopRun,
+        batches: list[list[InboundDrainItem]],
+        *,
+        account: str | None = None,
+        inbound: InboundState | None = None,
+        cli: str = "",
+        gate: TrustGate | None = None,
+        compact: str | None = None,
+        runs: ClickedRuns | None = None,
+    ) -> list[SystemMessage]:
+        """Poll ``batches`` into ``relay``; return what the run recorded."""
+        stop = threading.Event()
+        records: list[SystemMessage] = []
+        _inbound_poll_loop(
+            _ScriptedClient(batches, stop=stop),
+            _SessionSink(account=account),
+            relay,
+            stop,
+            poll_interval=0.001,
+            inbound=inbound,
+            cli=cli,
+            record=records.append,
+            gate=gate,
+            compact=compact,
+            runs=runs,
+        )
+        return records
+
+    def test_a_change_envelope_is_unwrapped_unless_the_run_streams(self) -> None:
+        envelope = json.dumps({"agent_message": "Issue#7 changed", "seq": 7})
+        told: list[list[str]] = []
+        for streams in (None, True):
+            relay = _RecordingRelay()
+            stop = threading.Event()
+            client = _ScriptedClient(
+                [[InboundDrainItem(text=envelope, source="trackinizer")]],
+                stop=stop,
+            )
+            if streams is None:
+                _inbound_poll_loop(client, _SessionSink(), relay, stop)
+            else:
+                _inbound_poll_loop(client, _SessionSink(), relay, stop, stream=True)
+            told.append(relay.submitted)
+
+        assert told == [["Issue#7 changed"], [f"trackinizer: {envelope}"]]
+
+    @_RELAYS
+    def test_a_line_is_remembered_for_the_record_the_cli_writes_of_it(
+        self,
+        relay: Callable[[], _RecordingRelay | _LoopRun],
+    ) -> None:
+        inbound = InboundState(fallback_sec=0.0)
+        given = relay()
+
+        _ = self._poll(
+            given,
+            [[InboundDrainItem(text="hi", source="ann@x")]],
+            inbound=inbound,
+        )
+
+        line = "ann@x: hi"
+        assert _relay_told(given) == [
+            ("line", line) if isinstance(given, _LoopRun) else line,
+        ]
+        stamped = inbound.stamp(UserMessage(content=line))
+        assert isinstance(stamped, UserMessage)
+        assert stamped.extra["$inbound"] == {
+            "source": "ann@x",
+            "room": None,
+            "kind": "line",
+        }
+
+    @_RELAYS
+    def test_a_command_is_recorded(
+        self,
+        relay: Callable[[], _RecordingRelay | _LoopRun],
+    ) -> None:
+        records = self._poll(
+            relay(),
+            [[InboundDrainItem(text="/model opus", kind="command", source="ann@x")]],
+        )
+
+        assert [record.extra["$command"] for record in records] == [
+            {
+                "text": "/model opus",
+                "verb": "model",
+                "args": "opus",
+                "source": "ann@x",
+                "room": None,
+                "state": "typed",
+                "reason": None,
+            },
+        ]
+
+    def test_an_interrupt_is_the_key_its_cli_halts_on(self) -> None:
+        relay = _RecordingRelay()
+
+        _ = self._poll(
+            relay,
+            [[InboundDrainItem(text="stop", kind="interrupt")]],
+            cli="sagent",
+        )
+
+        assert relay.written == [b"\x03"]
+
+    def test_an_answer_goes_to_the_trust_card_it_names(self) -> None:
+        answer = Mock(return_value=True)
+        gate = Mock(spec=TrustGate, holds=Mock(return_value=True), answer=answer)
+        payload: dict[str, object] = {"prompt_id": "p1", "decision": "allow"}
+
+        _ = self._poll(
+            _RecordingRelay(),
+            [[InboundDrainItem(text="allow", kind="answer", payload=payload)]],
+            inbound=InboundState(fallback_sec=0.0),
+            gate=gate,
+        )
+
+        assert answer.call_args_list == [call(payload)]
+
+    @_RELAYS
+    def test_compact_goes_first_and_says_why(
+        self,
+        relay: Callable[[], _RecordingRelay | _LoopRun],
+    ) -> None:
+        given = relay()
+
+        records = self._poll(
+            given,
+            [[]],
+            inbound=InboundState(fallback_sec=0.0),
+            cli="codex",
+            compact="past what the CLI holds",
+        )
+
+        assert _relay_told(given) == [
+            ("command", ("compact", "")) if isinstance(given, _LoopRun) else "/compact",
+        ]
+        assert [record.extra["$command"] for record in records] == [
+            {
+                "text": "/compact",
+                "verb": "compact",
+                "args": "",
+                "source": "trax run",
+                "room": None,
+                "state": "typed",
+                "reason": "past what the CLI holds",
+            },
+        ]
+
+    def test_compact_waits_while_a_trust_card_is_open(self) -> None:
+        relay = _RecordingRelay()
+        inbound = InboundState(fallback_sec=0.0)
+        inbound.trust_pending.set()
+
+        records = self._poll(relay, [[]], inbound=inbound, compact="too long")
+
+        assert (relay.submitted, records) == ([], [])
+
+    def test_a_stranger_may_not_run_a_command_here(self) -> None:
+        records = self._poll(
+            _RecordingRelay(),
+            [[InboundDrainItem(text="ls", kind="run", source="bob@x")]],
+            account="ann@x",
+        )
+
+        assert [record.extra["$delivery"] for record in records] == [
+            {
+                "text": "ls",
+                "kind": "run",
+                "source": "bob@x",
+                "refused": True,
+                "reason": "bob@x does not hold this run",
+            },
+        ]
+
+    def test_a_run_that_runs_clicks_still_types_lines(self) -> None:
+        relay = _RecordingRelay()
+        clicked = InboundDrainItem(text="ls", kind="run")
+        handle = Mock(side_effect=RuntimeError("no shell"))
+        runs = Mock(
+            spec=ClickedRuns,
+            take=Mock(return_value=[]),
+            running=Mock(return_value=False),
+            handle=handle,
+        )
+
+        records = self._poll(
+            relay,
+            [[InboundDrainItem(text="hi"), clicked]],
+            runs=runs,
+        )
+
+        assert relay.submitted == ["hi"]
+        assert handle.call_args_list == [call(clicked)]
+        assert [record.extra["$delivery"] for record in records] == [
+            {
+                "text": "ls",
+                "kind": "run",
+                "source": None,
+                "refused": False,
+                "reason": "no shell",
+            },
+        ]
+
+    def test_each_outage_warns_once_and_logs_every_failure(
+        self,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        stop = threading.Event()
+        client = _OutageClient(
+            [RuntimeError("down"), RuntimeError("still down"), None, OSError("gone")],
+            stop=stop,
+        )
+
+        with caplog.at_level(logging.DEBUG, logger=session.__name__):
+            _inbound_poll_loop(
+                client,
+                _SessionSink(),
+                _RecordingRelay(),
+                stop,
+                poll_interval=0.001,
+            )
+
+        assert capsys.readouterr().err == "".join(
+            f"[knowop run] inbound delivery failed ({error}); messages will not be "
+            "delivered until it recovers\n"
+            for error in ("down", "gone")
+        )
+        assert [
+            (each.getMessage(), bool(each.exc_info))
+            for each in caplog.records
+            if each.name == session.__name__
+        ] == [("inbound wait failed", True)] * 3
+
+
+class _OutageClient:
+    """Fails each drain its script names a failure for; ends the poll once it is done."""
+
+    def __init__(
+        self,
+        script: list[Exception | None],
+        *,
+        stop: threading.Event,
+    ) -> None:
+        self._script = script
+        self._stop = stop
+
+    def drain_inbound(
+        self,
+        session_id: UUID,
+        *,
+        wait_sec: float = 0.0,
+        **where: str | bool | None,
+    ) -> list[InboundDrainItem]:
+        del session_id, wait_sec, where
+        if not self._script:
+            self._stop.set()
+            return []
+        failure = self._script.pop(0)
+        if failure is not None:
+            raise failure
+        return []
 
 
 class TestCaptureEdges:
@@ -10561,12 +10941,51 @@ class TestCaptureEdges:
 
     def test_an_unknown_codex_reviewer_is_refused(self) -> None:
         with pytest.raises(SystemExit) as refused:
-            _ = session._codex_reviewer(("-c", "approvals_reviewer=bob"))
+            _ = session._codex_reviewer(("-c", "approvals_reviewer='Xavier'"))
 
         assert str(refused.value) == (
-            "knowop run codex: unknown approvals reviewer 'bob'; "
+            "knowop run codex: unknown approvals reviewer 'Xavier'; "
             "use user or auto_review"
         )
+
+    @pytest.mark.parametrize(
+        ("cli_args", "reviewer"),
+        [
+            (("-c", 'approvals_reviewer="user"'), "user"),
+            (("--approve-for-me", "-c", "approvals_reviewer=user"), "auto_review"),
+        ],
+        ids=["configured", "--approve-for-me wins"],
+    )
+    def test_the_codex_reviewer_is_the_flag_else_the_configured_one(
+        self,
+        cli_args: tuple[str, ...],
+        reviewer: str,
+    ) -> None:
+        assert session._codex_reviewer(cli_args) == reviewer
+
+    def test_a_codex_override_splits_at_its_first_equals_sign(self) -> None:
+        assert session._codex_config_pairs(("-c", "k = a=b", "-c", "k=c")) == {
+            "k": "c",
+        }
+        assert session._codex_config_pairs(("-c", "k=a=b")) == {"k": "a=b"}
+
+    @pytest.mark.parametrize(
+        ("told", "source", "named"),
+        [
+            (session._Told(), None, True),
+            (session._Told(), AUTOFIX_SOURCE, True),
+            (session._Told(owner="ann@x"), "ann@x", False),
+            (session._Told(owner="ann@x"), "bob@x", True),
+            (session._Told(owner="ann@x", others=True), "ann@x", True),
+        ],
+    )
+    def test_a_line_names_its_sender_unless_its_owner_alone_speaks(
+        self,
+        told: session._Told,
+        source: str | None,
+        named: bool,
+    ) -> None:
+        assert told.names(source) is named
 
     def test_a_session_folder_that_does_not_exist_holds_no_old_files(
         self,
@@ -10661,11 +11080,15 @@ class _NoSessionSink:
 
 
 class _StopOnItsFirstWait(threading.Event):
-    """A stop asked for while the loop under test waits on it."""
+    """A stop asked for while the loop under test waits on it, noting for how long."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts: list[float | None] = []
 
     @override
     def wait(self, timeout: float | None = None) -> bool:
-        del timeout
+        self.timeouts.append(timeout)
         self.set()
         return True
 
@@ -10808,6 +11231,36 @@ class TestSubagentSessions:
 
         assert not owner.owns(self._adapter(parent="s9"), self._KID)
 
+    @pytest.mark.parametrize("parent", ["s1", "s9"])
+    def test_out_of_scope_only_the_owner_vouches_for_a_subagent(
+        self,
+        parent: str,
+    ) -> None:
+        owned = partial(
+            session._owned,
+            self._KID,
+            adapter=self._adapter(parent=parent),
+            baseline=frozenset(),
+            scope=Path("/elsewhere"),
+            resume=frozenset(),
+        )
+
+        assert owned(owner=session._SessionOwner(session_id="s1")) is (parent == "s1")
+        assert not owned(owner=None)
+
+    def test_a_file_from_before_the_run_or_no_transcript_is_never_owned(self) -> None:
+        owned = partial(
+            session._owned,
+            adapter=self._adapter(),
+            scope=None,
+            resume=frozenset(),
+            owner=session._SessionOwner(session_id="s1"),
+        )
+
+        assert owned(self._KID, baseline=frozenset())
+        assert not owned(self._KID, baseline=frozenset({self._KID}))
+        assert not owned(self._KID.with_suffix(".json"), baseline=frozenset())
+
     def test_a_spawned_rollout_the_cli_holds_is_never_claimed_as_the_runs_own(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -10926,8 +11379,8 @@ def test_a_click_that_cannot_be_read_as_a_run_is_recorded_undelivered(
     assert (delivery["kind"], delivery["refused"]) == ("run", False)
     assert str(delivery["reason"]).startswith("1 validation error for ChatRun")
     assert not runs.running()
-    assert [each.getMessage() for each in caplog.records] == [
-        "knowop run: could not run a clicked command",
+    assert [(each.getMessage(), bool(each.exc_info)) for each in caplog.records] == [
+        ("knowop run: could not run a clicked command", True),
     ]
 
 
