@@ -3289,7 +3289,7 @@ def _inbound_poll_loop(
     runs: ClickedRuns | None = None,
 ) -> None:
     """Wait on server-queued inbound messages and type them into the CLI."""
-    warned = False
+    failures = 0
     instance = instance or uuid.uuid4().hex
     held: deque[InboundDrainItem] = deque()
     deliver = (
@@ -3311,35 +3311,17 @@ def _inbound_poll_loop(
         if session_id is None:
             # No session yet; nothing to wait on. Re-check on the interval.
             if stop.wait(poll_interval):
-                break
+                return
             continue
         if inbound is not None and not inbound.wait_open(stop, poll_sec=poll_interval):
-            break
+            return
         if gate is not None and inbound is not None:
             gate.check(ready=inbound.ready())
         if compact is not None and not _holding(inbound):
-            command = InboundDrainItem(
-                text="/compact",
-                kind="command",
-                source="trax run",
+            deliver(
+                InboundDrainItem(text="/compact", kind="command", source="trax run"),
+                reason=compact,
             )
-            if isinstance(relay, HeadlessRun):
-                _deliver_headless_command(
-                    relay,
-                    command,
-                    inbound=inbound,
-                    record=record,
-                    reason=compact,
-                )
-            else:
-                _deliver_command(
-                    relay,
-                    command,
-                    cli=cli,
-                    inbound=inbound,
-                    record=record,
-                    reason=compact,
-                )
             compact = None
         if pull_requests is not None:
             held.extend(pull_requests.take())
@@ -3381,7 +3363,7 @@ def _inbound_poll_loop(
                     held.append(item)
                 else:
                     deliver(item)
-            warned = False  # Recovered; allow a fresh warning next outage.
+            failures = 0  # Recovered; the next outage warns afresh.
             # No sleep: the request itself was the wait, so re-arming
             # immediately is what keeps the channel continuously parked.
             continue
@@ -3405,17 +3387,17 @@ def _inbound_poll_loop(
             # Warn once per outage on stderr (mirrors the capture sink's
             # degrade banner) so a token expiry / network drop is visible,
             # not a silent stop; repeats stay at DEBUG to avoid flooding.
-            if not warned:
+            failures += 1
+            if failures == 1:
                 sys.stderr.write(
                     f"[{PROGRAM}] inbound delivery failed ({error}); messages will not "
                     "be delivered until it recovers\n",
                 )
-                warned = True
             _logger.debug("inbound wait failed", exc_info=True)
         # Only a failure lands here: back off before re-arming so a persistent
         # outage is not a hot retry loop.
         if stop.wait(poll_interval):
-            break
+            return
 
 
 # The server checks this as a message comes in, and it is checked again here, where the
@@ -3474,6 +3456,7 @@ def _deliver_one(
     bridge: PromptBridge | None = None,
     record: Callable[[SystemMessage], None] | None = None,
     gate: TrustGate | None = None,
+    reason: str | None = None,
 ) -> None:
     """Deliver one inbound message as its kind says; a failure is logged."""
     if item.kind == "answer":
@@ -3484,7 +3467,14 @@ def _deliver_one(
             _logger.info("knowop run: an answer names no open prompt: %s", item.payload)
         return
     if item.kind == "command":
-        _deliver_command(relay, item, cli=cli, inbound=inbound, record=record)
+        _deliver_command(
+            relay,
+            item,
+            cli=cli,
+            inbound=inbound,
+            record=record,
+            reason=reason,
+        )
         return
     rendered = render_inbound(
         item.text,
@@ -3610,6 +3600,7 @@ def _deliver_headless(
     *,
     inbound: InboundState | None,
     record: Callable[[SystemMessage], None] | None,
+    reason: str | None = None,
 ) -> None:
     """Hand one inbound message to the headless run as its kind says; a failure is logged."""
     try:
@@ -3625,7 +3616,13 @@ def _deliver_headless(
                 run.settings(model=model, effort=effort)
                 _record_settings(item, model=model, effort=effort, record=record)
             case "command":
-                _deliver_headless_command(run, item, inbound=inbound, record=record)
+                _deliver_headless_command(
+                    run,
+                    item,
+                    inbound=inbound,
+                    record=record,
+                    reason=reason,
+                )
             case "line":
                 _deliver_headless_line(run, item, inbound=inbound)
             case "run":
@@ -4086,7 +4083,10 @@ async def _follow_session_files(
 # narrows workspace-based layouts; and the owned session ID distinguishes new files from
 # simultaneous runs in the same workspace. A resumed transcript is exempt from the scope
 # as it is from the baseline: claude keeps appending to one filed under ANOTHER
-# project's directory when that is where the session started.
+# project's directory when that is where the session started. So is a sub-agent's,
+# when the owner can say whose it is: claude files it under the project of the cwd it
+# was spawned in, which a session that ``cd``s has moved off the scope, and the owner
+# claims it only for a session of this run's.
 def _owned(
     path: Path,
     *,
@@ -4099,7 +4099,12 @@ def _owned(
     """Return whether this run should capture ``path``."""
     if path in baseline or not adapter.matches_session_file(path):
         return False
-    if scope is not None and scope not in path.parents and path not in resume:
+    if (
+        scope is not None
+        and scope not in path.parents
+        and path not in resume
+        and (owner is None or adapter.subagent(path) is None)
+    ):
         return False
     return owner is None or owner.owns(adapter, path)
 
