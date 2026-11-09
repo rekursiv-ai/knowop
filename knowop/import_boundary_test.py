@@ -36,9 +36,9 @@ _ALLOWED: Final = (
     # per-user folders.
     "trackinizer.sagent.session",
     "trackinizer.lib.agent",
-    # Sagent's tool server, imported only when tools are served; an install without it
-    # serves none (shell/tool_host.py).
-    "trackinizer.sagent.host",
+    # Sagent's tool server, from the sagent package knowop depends on: the tool host
+    # serves sagent's remote tools through it (shell/tool_host.py).
+    "sagent.host",
     "trackinizer.lib.posix",
     "trackinizer.lib.userdirs",
     # Vendored by knowop's own export (copy.barista.toml), beside the package.
