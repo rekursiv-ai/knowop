@@ -1416,12 +1416,10 @@ _READ_TAGS: Final[dict[str, dict[str, object]]] = {
     "allowed-object": {"py/object": "DaemonControl", "stop": True},
     "path": {"py/path": "/etc/passwd"},
 }
-"""Tags the wire reads, of a type the field does not declare: below the root a tag decides."""
+"""Tags the wire reads, of a type the field does not declare: it refuses each one."""
 
-_TAG_DOES_NOT_STOP_A_CALL: Final = frozenset(
-    {"id", "agent", "window", "arguments", "granted"},
-)
-"""The ``Call`` fields no step before the tool looks into, so a read tag there runs it."""
+_TAG_DOES_NOT_STOP_A_CALL: Final = frozenset({"arguments"})
+"""The ``Call`` field of plain data, where a read tag is data and the tool runs."""
 
 _WRONG_VALUES: Final[dict[str, object]] = {
     "int": 5,
@@ -1506,7 +1504,7 @@ def _each_field() -> dict[str, _Hostile]:
 
 
 # Below ``arguments`` a tag outside the allow-list reads as data, so the tool gets the
-# plain mapping; as a ``json://`` key it does not read at all.
+# plain mapping; as a ``json://`` key it is refused, as no key but text is.
 def _inside_arguments() -> dict[str, _Hostile]:
     """Return a tag at each place a ``Call``'s arguments can hold one."""
     cases: dict[str, _Hostile] = {}
@@ -1522,7 +1520,6 @@ def _inside_arguments() -> dict[str, _Hostile]:
             )
         cases[f"arguments-key-{name}"] = _in_a_session(
             {**_CALL_LINE, "arguments": {"json://" + json.dumps(tag): 1}},
-            runs=name in _READ_TAGS,
         )
         cases[f"root-{name}"] = _in_a_session(tag)
         cases[f"first-line-{name}"] = _Hostile(line=_json_line(tag))
@@ -1735,11 +1732,10 @@ def _session_lines() -> dict[str, _Hostile]:
 
 
 def _wire_class_lines() -> dict[str, _Hostile]:
-    """Return a field that takes text holding a wire message: a real child exits on it."""
+    """Return a field that takes text holding a wire message, which ended its host."""
     return {
         "wire-class-address-book": _in_a_session(
             {**_CALL_LINE, "address_book": {"py/object": "Ping"}},
-            runs=None,
         ),
         "wire-class-note-sender": _in_a_session(
             {
@@ -1850,6 +1846,12 @@ async def test_a_hostile_line_acts_on_nothing_and_stays_on_its_pipe(
     assert withheld.ran == []
     if hostile.runs is not None:
         assert bool(spy.ran) == hostile.runs
+    # No line ends a session's host: each one stopped, when the tool host did, unbroken.
+    assert [
+        repr(host.task.exception())
+        for host in local.started
+        if not host.task.cancelled() and host.task.exception() is not None
+    ] == []
 
 
 async def test_importing_the_tool_host_does_not_load_sagents_host() -> None:

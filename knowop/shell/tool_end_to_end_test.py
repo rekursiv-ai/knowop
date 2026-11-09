@@ -936,8 +936,8 @@ class _Stuck:
             self.sent.set()
 
 
-def _stuck_first_pipe(monkeypatch: pytest.MonkeyPatch) -> _Stuck:
-    """Have the host's first pipe stuck, and each later one served as usual."""
+def _stuck_pipes(monkeypatch: pytest.MonkeyPatch, *, every: bool = False) -> _Stuck:
+    """Have the host's first pipe stuck, or ``every`` one; any other is served as usual."""
     real = tool_host._adopted
     stuck = _Stuck()
     taken: list[str] = []
@@ -950,7 +950,7 @@ def _stuck_first_pipe(monkeypatch: pytest.MonkeyPatch) -> _Stuck:
         end_sec: float,
         line_bytes: int,
     ) -> None:
-        if taken:
+        if taken and not every:
             await real(
                 server,
                 socket,
@@ -972,7 +972,7 @@ async def test_a_host_stuck_mid_line_harms_no_one_and_still_ends(
     tmp_path: Path,
     ending: str,
 ) -> None:
-    stuck = _stuck_first_pipe(monkeypatch)
+    stuck = _stuck_pipes(monkeypatch)
     _ = _local(monkeypatch, Read=Read())
     readme = tmp_path / "readme.txt"
     readme.write_text("carried on\n")
@@ -1015,7 +1015,9 @@ async def test_a_host_stuck_mid_line_harms_no_one_and_still_ends(
 async def test_a_host_stuck_mid_line_cannot_hold_an_agent_past_its_silence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    stuck = _stuck_first_pipe(monkeypatch)
+    # A silence this short also times out a handshake slowed by load. Were only the first
+    # pipe stuck, the agent would then redial onto a served one, and never be held.
+    stuck = _stuck_pipes(monkeypatch, every=True)
     _ = _local(monkeypatch, Read=Read())
     async with (
         _serving() as relay,
