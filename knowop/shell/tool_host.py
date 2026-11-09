@@ -16,9 +16,9 @@ a call left running in the background (``nohup``, ``setsid``, ``&``) is not trac
 goes on.
 
 This module imports sagent's host and the tool wire only when it is used, so ``knowop``'s
-other commands do not load them. An install that cannot import them, a sagent or
-trackinizer older than knowop's floors, makes :func:`can_serve` say so, and the machine
-serves no tools.
+other commands do not load them. An install whose sagent or trackinizer predates them,
+which knowop's floors allow, makes :func:`can_serve` say so, and the machine serves no
+tools.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 else:
     from wrapt import lazy_import
 
-    # Absent from a sagent or trackinizer below knowop's floors: ``can_serve`` says.
+    # Absent from a released sagent or trackinizer that predates them: ``can_serve`` says.
     sagent_server = lazy_import("sagent.host.server")
     strings = lazy_import("sagent.host.strings")
     wire = lazy_import("sagent.host.wire")
@@ -104,12 +104,18 @@ def can_serve() -> bool:
     """Say whether this install can serve tools; when not, say so in one line too.
 
     Returns:
-      can: Whether sagent's host and the tool wire import here.
+      can: Whether sagent's host, as new as the tool host uses, and the tool wire
+        import here.
 
     """
     try:
-        _ = sagent_server.HOST_COMMAND, tool_bridge.bridged, wire_tools.WAIT_MAX_SEC
-    except ImportError as error:
+        _ = (
+            sagent_server.Server.adopt,
+            tool_bridge.bridged,
+            wire_tools.WAIT_MAX_SEC,
+        )
+    # An older sagent has the host module but not ``Server.adopt``.
+    except (ImportError, AttributeError) as error:
         echo(f"knowop: tools: off, this install lacks them: {error}", err=True)
         return False
     return True

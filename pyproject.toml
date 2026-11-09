@@ -31,12 +31,13 @@ dependencies = [
     # `Client.disconnect_machine`, which `knowop status` and `knowop disconnect` call,
     # and the `Client` that ignores a field a newer server adds to an answer.
     # 0.1.12 ships `trackinizer.sagent`, where the session records now live.
-    # 0.1.14 adds the tool pipe the tool host serves on (`client/tool_bridge.py`,
-    # `wire/wire_tools.py`).
-    "trackinizer>=0.1.14",
+    # The tool pipe the tool host serves on (`client/tool_bridge.py`,
+    # `wire/wire_tools.py`) is unreleased; until it is, `can_serve` turns tools off.
+    "trackinizer>=0.1.12",
     # the agent: the tool host serves sagent's remote tools through sagent's own tool
-    # server. 0.2.4 adds `Server.adopt`, which serves a pipe the relay dialed.
-    "sagent>=0.2.4",
+    # server. `Server.adopt`, which serves a pipe the relay dialed, is unreleased;
+    # until it is, `can_serve` turns tools off.
+    "sagent>=0.2.3",
     # serialization; 0.3.3 adds `to_plain(target=...)` and `json_dumps(target=...)`.
     # 0.4.1 leaves dataclass fields at their defaults out of trees.
     "treekle>=0.4.1",
@@ -804,7 +805,8 @@ compile-bytecode = true
 rekursiv-ai-typings = { git = "https://github.com/rekursiv-ai/typings", branch = "main" }
 codedoctor = { git = "https://github.com/rekursiv-ai/codedoctor", branch = "main" }
 # knowop follows trackinizer's main, so a uv install from this repository resolves
-# trackinizer from its main branch. Wheel metadata keeps the `>=0.1.10` floor, which
-# publish-pypi.yml resolves from PyPI alone. Sagent the same.
+# trackinizer from its main branch. Wheel metadata keeps the floor above, which
+# publish-pypi.yml resolves from PyPI alone, so a floor names a released version.
+# Sagent the same.
 trackinizer = { git = "https://github.com/rekursiv-ai/trackinizer", branch = "main" }
 sagent = { git = "https://github.com/rekursiv-ai/sagent", branch = "main" }

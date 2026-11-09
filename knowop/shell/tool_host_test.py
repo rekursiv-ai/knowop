@@ -909,6 +909,25 @@ async def test_an_install_without_what_tools_need_says_so_once(
     assert "tools: off" in said[0]
 
 
+async def test_a_sagent_without_server_adopt_serves_no_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _OlderServer:
+        """sagent 0.2.3's ``Server``: a host module, and no ``adopt``."""
+
+    monkeypatch.setattr(
+        tool_host,
+        "sagent_server",
+        SimpleNamespace(HOST_COMMAND=HOST_COMMAND, Server=_OlderServer),
+    )
+
+    assert not tool_host.can_serve()
+    (said,) = capsys.readouterr().err.splitlines()
+    assert "tools: off" in said
+    assert "adopt" in said
+
+
 @pytest.mark.parametrize(
     "command",
     [
