@@ -691,7 +691,7 @@ def test_no_exec_serves_no_tools_and_does_not_say_it_does(
 @pytest.mark.parametrize(
     ("seam", "module"),
     [
-        ("sagent_server", "trackinizer.sagent.host.absent_from_this_install"),
+        ("sagent_server", "sagent.host.absent_from_this_install"),
         ("tool_bridge", "trackinizer.client.absent_from_this_install"),
     ],
 )

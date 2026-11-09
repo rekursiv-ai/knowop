@@ -15,9 +15,10 @@ that pipe alone. A revoke or a stop closes every pipe and ends every running cal
 a call left running in the background (``nohup``, ``setsid``, ``&``) is not tracked, and
 goes on.
 
-This module imports sagent's host and the tool wire only when it is used, for ``knowop``'s
-other commands and for a published install, which may lack them: :func:`can_serve` then
-says so, and the machine serves no tools.
+This module imports sagent's host and the tool wire only when it is used, so ``knowop``'s
+other commands do not load them. An install that cannot import them, a sagent or
+trackinizer older than knowop's floors, makes :func:`can_serve` say so, and the machine
+serves no tools.
 """
 
 from __future__ import annotations
@@ -48,24 +49,24 @@ if TYPE_CHECKING:
 
     import uuid
 
-    from trackinizer.client import tool_bridge
-    from trackinizer.sagent.host import (
+    from sagent.host import (
         server as sagent_server,
         strings,
         wire,
     )
-    from trackinizer.sagent.host.server import Host, Server
-    from trackinizer.sagent.host.strings import ServeDirs
+    from sagent.host.server import Host, Server
+    from sagent.host.strings import ServeDirs
+    from trackinizer.client import tool_bridge
     from trackinizer.wire import wire_tools
     from trackinizer.wire.wire_tools import ToolOffer
     from websockets.asyncio.client import ClientConnection
 else:
     from wrapt import lazy_import
 
-    # Absent from a published install, or from an older trackinizer: ``can_serve`` says.
-    sagent_server = lazy_import("trackinizer.sagent.host.server")
-    strings = lazy_import("trackinizer.sagent.host.strings")
-    wire = lazy_import("trackinizer.sagent.host.wire")
+    # Absent from a sagent or trackinizer below knowop's floors: ``can_serve`` says.
+    sagent_server = lazy_import("sagent.host.server")
+    strings = lazy_import("sagent.host.strings")
+    wire = lazy_import("sagent.host.wire")
     tool_bridge = lazy_import("trackinizer.client.tool_bridge")
     wire_tools = lazy_import("trackinizer.wire.wire_tools")
 
@@ -83,6 +84,9 @@ _STOP_SEC: Final = 2 * HEARTBEAT_SEC
 
 _BRIDGE_END_SEC: Final = 5.0
 """How long a closed pipe's bridge may take to send what it holds."""
+
+_CLOSE_SEC: Final = 1.0
+"""How long a pipe's websocket waits for the server to answer its close."""
 
 _MAX_PIPES: Final = 16
 """The most pipes this host serves at once: its own defence against a server that offers
@@ -186,6 +190,7 @@ class ToolHost:
         They come on if the lock frees later.
       stop_sec: How long ``stop`` waits for every session's child to end.
       bridge_end_sec: How long a closed pipe's bridge may take to send what it holds.
+      close_sec: How long a pipe's websocket waits for the server to answer its close.
       wait_sec: How long to ask the server to hold each wait; ``0`` asks for the
         longest it holds, ``WAIT_MAX_SEC``.
       max_pipes: The most pipes it serves at once; an offer past them is refused.
@@ -207,6 +212,7 @@ class ToolHost:
         lock_wait_sec: float = _LOCK_WAIT_SEC,
         stop_sec: float = _STOP_SEC,
         bridge_end_sec: float = _BRIDGE_END_SEC,
+        close_sec: float = _CLOSE_SEC,
         wait_sec: float = 0.0,
         max_pipes: int = _MAX_PIPES,
         dial_sec: float | None = None,
@@ -221,6 +227,7 @@ class ToolHost:
         self._lock_wait_sec = lock_wait_sec
         self._stop_sec = stop_sec
         self._bridge_end_sec = bridge_end_sec
+        self._close_sec = close_sec
         # The wire is imported only once a host is made: ``can_serve`` guards it.
         self._wait_sec = wait_sec or wire_tools.WAIT_MAX_SEC
         self._max_pipes = max_pipes
@@ -410,7 +417,7 @@ class ToolHost:
                     additional_headers={"Authorization": f"Bearer {self._credential}"},
                     max_size=wire_tools.FRAME_BYTES,
                     ping_interval=20,
-                    close_timeout=1,
+                    close_timeout=self._close_sec,
                 )
             echo(f"knowop: tool pipe adopted: pipe={offer.pipe_id}", err=True)
             await _adopted(
