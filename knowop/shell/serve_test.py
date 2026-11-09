@@ -217,6 +217,9 @@ class _NoToolServer:
     async def aclose(self) -> None:
         return
 
+    async def adopt(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Dirs:
