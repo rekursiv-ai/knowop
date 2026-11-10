@@ -9,8 +9,8 @@ import io
 import sys
 
 from trackinizer.client.errors import ClientError
+from trackinizer.wire.wire_host_job import HostJobList, HostJobView
 from trackinizer.wire.wire_job import JobList, JobView, SecretNames
-from trackinizer.wire.wire_machine_job import MachineJobList, MachineJobView
 
 import pytest
 
@@ -49,11 +49,11 @@ def _job(state: str = "queued", **fields: object) -> JobView:
     )
 
 
-def _machine_job(state: str = "running", **fields: object) -> MachineJobView:
-    return MachineJobView.model_validate(
+def _host_job(state: str = "running", **fields: object) -> HostJobView:
+    return HostJobView.model_validate(
         {
             "id": 9,
-            "machine": "gx10",
+            "host": "gx10",
             "state": state,
             "gpus": 0,
             "memory_mb": 2_048,
@@ -86,9 +86,9 @@ class _Server:
         self.view = _job("queued")
         self.jobs = [_job("running"), _job("completed", id=6, node=None)]
         self.names: list[str] = []
-        self.machine_jobs: list[MachineJobView] = []
+        self.host_jobs: list[HostJobView] = []
         self.gpu_answer = 200
-        self.machine_answer = 200
+        self.host_answer = 200
 
     def job_view(self, job_id: int) -> JobView:
         self.calls.append(("job", job_id))
@@ -104,24 +104,24 @@ class _Server:
         self.calls.append(("cancel", job_id))
         return _job("cancelled")
 
-    def machine_job_view(self, job_id: int) -> MachineJobView:
-        self.calls.append(("machine_job", job_id))
-        return self._machine(job_id)
+    def host_job_view(self, job_id: int) -> HostJobView:
+        self.calls.append(("host_job", job_id))
+        return self._host(job_id)
 
-    def machine_job_list(self) -> MachineJobList:
-        self.calls.append(("machine_jobs", None))
-        if self.machine_answer != 200:
-            raise _refusal(self.machine_answer)
-        return MachineJobList(jobs=self.machine_jobs)
+    def host_job_list(self) -> HostJobList:
+        self.calls.append(("host_jobs", None))
+        if self.host_answer != 200:
+            raise _refusal(self.host_answer)
+        return HostJobList(jobs=self.host_jobs)
 
-    def machine_job_cancel(self, job_id: int) -> MachineJobView:
-        self.calls.append(("machine_cancel", job_id))
-        return self._machine(job_id).model_copy(update={"state": "cancelled"})
+    def host_job_cancel(self, job_id: int) -> HostJobView:
+        self.calls.append(("host_cancel", job_id))
+        return self._host(job_id).model_copy(update={"state": "cancelled"})
 
-    def _machine(self, job_id: int) -> MachineJobView:
-        if self.machine_answer != 200:
-            raise _refusal(self.machine_answer)
-        for each in self.machine_jobs:
+    def _host(self, job_id: int) -> HostJobView:
+        if self.host_answer != 200:
+            raise _refusal(self.host_answer)
+        for each in self.host_jobs:
             if each.id == job_id:
                 return each
         raise _refusal(404)
@@ -323,7 +323,7 @@ def test_status_of_one_job_shows_every_field(
         "charged:  240 gpu-s, usd 0.2\n"
         "reason:   Stopped: $0.01 is left today.\n"
     )
-    assert server.calls == [("machine_job", 7), ("job", 7)]
+    assert server.calls == [("host_job", 7), ("job", 7)]
 
 
 def test_status_of_a_job_not_yet_started_shows_dashes(
@@ -363,18 +363,18 @@ def test_cancel_reports_the_state_the_server_gave(
 ) -> None:
     _run(server, "cancel", "7")
 
-    assert server.calls == [("machine_cancel", 7), ("cancel", 7)]
+    assert server.calls == [("host_cancel", 7), ("cancel", 7)]
     assert capsys.readouterr().out == "job 7: cancelled\n"
 
 
-# -- Jobs on the person's own machines.
+# -- Jobs on the person's own hosts.
 
 
-def test_status_lists_gpu_and_machine_jobs_together_newest_first(
+def test_status_lists_gpu_and_host_jobs_together_newest_first(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server.machine_jobs = [_machine_job(), _machine_job("completed", id=5)]
+    server.host_jobs = [_host_job(), _host_job("completed", id=5)]
 
     _run(server, "status")
 
@@ -387,7 +387,7 @@ def test_status_lists_gpu_and_machine_jobs_together_newest_first(
 
 
 @pytest.mark.parametrize(
-    ("gpu", "machine", "listed"),
+    ("gpu", "host", "listed"),
     [
         (503, 200, ["9"]),
         (200, 404, ["7", "6"]),
@@ -399,11 +399,11 @@ def test_status_lists_what_a_server_that_runs_one_kind_holds(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
     gpu: int,
-    machine: int,
+    host: int,
     listed: list[str],
 ) -> None:
-    server.machine_jobs = [_machine_job()]
-    server.gpu_answer, server.machine_answer = gpu, machine
+    server.host_jobs = [_host_job()]
+    server.gpu_answer, server.host_answer = gpu, host
 
     _run(server, "status")
 
@@ -413,7 +413,7 @@ def test_status_lists_what_a_server_that_runs_one_kind_holds(
 
 
 def test_status_of_a_listing_that_fails_otherwise_says_so(server: _Server) -> None:
-    server.machine_answer = 500
+    server.host_answer = 500
 
     with pytest.raises(ClientError, match="500"):
         _run(server, "status")
@@ -422,38 +422,38 @@ def test_status_of_a_listing_that_fails_otherwise_says_so(server: _Server) -> No
 def test_a_key_both_kinds_of_route_refuse_is_said_to_be_refused(
     server: _Server,
 ) -> None:
-    server.gpu_answer = server.machine_answer = 401
+    server.gpu_answer = server.host_answer = 401
 
     with pytest.raises(ClientError, match="401"):
         _run(server, "status")
 
 
-def test_a_box_credential_the_machine_routes_refuse_reaches_its_gpu_job(
+def test_a_box_credential_the_host_routes_refuse_reaches_its_gpu_job(
     server: _Server,
 ) -> None:
     # A campaign box's credential opens only the GPU job routes; elsewhere it is 401.
-    server.machine_answer = 401
+    server.host_answer = 401
 
     _run(server, "status", "7")
     _run(server, "cancel", "7")
-    view = job_records.machine_view(cast("Client", server), 7)
+    view = job_records.host_view(cast("Client", server), 7)
 
     assert view is None
     assert server.calls == [
-        ("machine_job", 7),
+        ("host_job", 7),
         ("job", 7),
-        ("machine_cancel", 7),
+        ("host_cancel", 7),
         ("cancel", 7),
-        ("machine_job", 7),
+        ("host_job", 7),
     ]
 
 
-def test_status_of_a_machine_job_shows_its_machine_limits_and_commit(
+def test_status_of_a_host_job_shows_its_host_limits_and_commit(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server.machine_jobs = [
-        _machine_job(
+    server.host_jobs = [
+        _host_job(
             "failed",
             exit_code=3,
             reason="exit 3",
@@ -468,7 +468,7 @@ def test_status_of_a_machine_job_shows_its_machine_limits_and_commit(
     assert capsys.readouterr().out == (
         "job:      9\n"
         "state:    failed\n"
-        "machine:  gx10\n"
+        "host:     gx10\n"
         "limits:   0 GPUs, 2048 MiB, up to 5 min\n"
         "label:    smoke\n"
         "command:  python train.py\n"
@@ -479,14 +479,14 @@ def test_status_of_a_machine_job_shows_its_machine_limits_and_commit(
         "exit:     3\n"
         "reason:   exit 3\n"
     )
-    assert server.calls == [("machine_job", 9)]
+    assert server.calls == [("host_job", 9)]
 
 
-def test_status_of_a_machine_job_not_yet_ended_shows_dashes(
+def test_status_of_a_host_job_not_yet_ended_shows_dashes(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server.machine_jobs = [_machine_job("requested")]
+    server.host_jobs = [_host_job("requested")]
 
     _run(server, "status", "9")
 
@@ -495,27 +495,27 @@ def test_status_of_a_machine_job_not_yet_ended_shows_dashes(
     assert out[8:] == ["started:  -", "ended:    -", "exit:     -", "reason:   -"]
 
 
-def test_cancel_of_a_machine_job_goes_to_its_machine(
+def test_cancel_of_a_host_job_goes_to_its_host(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server.machine_jobs = [_machine_job()]
+    server.host_jobs = [_host_job()]
 
     _run(server, "cancel", "9")
 
-    assert server.calls == [("machine_cancel", 9)]
+    assert server.calls == [("host_cancel", 9)]
     assert capsys.readouterr().out == "job 9: cancelled\n"
 
 
 def test_a_failure_other_than_not_found_is_not_taken_for_a_gpu_job(
     server: _Server,
 ) -> None:
-    server.machine_answer = 500
+    server.host_answer = 500
 
     with pytest.raises(ClientError, match="500"):
         _run(server, "cancel", "9")
     with pytest.raises(ClientError, match="500"):
-        _ = job_records.machine_view(cast("Client", server), 9)
+        _ = job_records.host_view(cast("Client", server), 9)
 
     assert ("cancel", 9) not in server.calls
 

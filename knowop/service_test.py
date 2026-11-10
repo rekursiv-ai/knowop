@@ -28,7 +28,7 @@ from knowop.service import Connect, Services
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from knowop.shell.job_limits import Run
+    from knowop.connect.job_limits import Run
 
 
 _SERVER: Final = "https://acme.knowop.ai"
@@ -92,7 +92,7 @@ def _env(tmp_path: Path) -> dict[str, str]:
         "LANG": "en_US.UTF-8",
         "LC_CTYPE": "UTF-8",
         "PATH": "/opt/homebrew/bin:/usr/bin:/bin",
-        # Where the shell finds knowop's login and the machine's credential.
+        # Where the shell finds knowop's login and the host's credential.
         "XDG_CACHE_HOME": str(tmp_path / "cache"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_DATA_HOME": str(tmp_path / "data"),

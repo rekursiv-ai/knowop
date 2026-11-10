@@ -13,14 +13,14 @@ Examples:
   knowop login acme       log in to https://acme.knowop.ai, without connecting
   knowop run              sagent in this folder, recorded, reachable from Chat
   knowop run claude       Claude Code, the same way
-  knowop run stop NAME    stop a run of yours, here or on another machine
+  knowop run stop NAME    stop a run of yours, here or on another host
   knowop job submit -- python train.py
                           run a job on a GPU node from this repository
   knowop job status       list your jobs
-  knowop machine          list the machines campaigns may run on
-  knowop host start       rent a KnowHost that joins as one of your machines
+  knowop host             list your hosts, where campaigns may run, and KnowHosts
+  knowop host start       rent a KnowHost that joins as one of your hosts
   knowop canvas           read the canvas a run sits on; --help shows how to change it
-  knowop status           profile, server, account, machines, their runs, services
+  knowop status           profile, server, account, hosts, their runs, services
   knowop logs -f          follow this computer's connect
   knowop disconnect       stop this computer's runs and connect, everywhere
 
@@ -53,14 +53,13 @@ from trackinizer.trax.render import echo
 from treekle import from_plain, json_dumps
 
 from knowop import menubar, service
-from knowop.knowhosts import KNOWHOST_WORD, KnowHosts
-from knowop.machines import (
-    MACHINE_WORD,
-    Machines,
+from knowop.connect import serve
+from knowop.hosts import (
+    HOST_WORD,
+    Hosts,
     check_name,
     host_name,
 )
-from knowop.shell import serve
 
 
 if TYPE_CHECKING:
@@ -68,15 +67,15 @@ if TYPE_CHECKING:
     from types import FrameType
 
     from trackinizer.trax import login
-    from trackinizer.wire.wire_machines import MachineDetail
+    from trackinizer.wire.wire_hosts import HostDetail
 
     from knowop import canvas
     from knowop.agent import (
         cli as agent_cli,
         detach,
     )
+    from knowop.connect import daemon, job_limits
     from knowop.jobs import cli as jobs_cli
-    from knowop.shell import job_limits, machine_host
 else:
     from wrapt import lazy_import
 
@@ -87,8 +86,8 @@ else:
     canvas = lazy_import("knowop.canvas")
     detach = lazy_import("knowop.agent.detach")
     jobs_cli = lazy_import("knowop.jobs.cli")
-    job_limits = lazy_import("knowop.shell.job_limits")
-    machine_host = lazy_import("knowop.shell.machine_host")
+    job_limits = lazy_import("knowop.connect.job_limits")
+    daemon = lazy_import("knowop.connect.daemon")
     login = lazy_import("trackinizer.trax.login")
 
 
@@ -132,8 +131,8 @@ def main(
             return 0
         # Everything after ``run`` or ``job`` belongs to the runner, ``--help`` and
         # every other flag included; argparse would read them as knowop's own. Every
-        # ``machine``, ``host`` and ``canvas`` form is that verb's, its help pages too.
-        if args[:1] in ([MACHINE_WORD], [KNOWHOST_WORD], [_CANVAS_WORD]) or (
+        # ``host`` and ``canvas`` form is that verb's, its help pages too.
+        if args[:1] in ([HOST_WORD], [_CANVAS_WORD]) or (
             args[:1] in (["run"], ["job"]) and args[1:] not in (["-h"], ["--help"])
         ):
             return _hand_off(args[0], args[1:], sleep=sleep, clock=clock)
@@ -201,9 +200,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "logout",
         help="log this computer out, revoke knowop's key and delete its profile",
         description=(
-            "Log this computer's machine out on the server, revoke knowop's key, "
+            "Log this computer's host out on the server, revoke knowop's key, "
             "delete its profile and remove this computer's connect services. NAME "
-            "logs that machine out alone, as the Machines page does: its connect is "
+            "logs that host out alone, as the Hosts page does: its connect is "
             "revoked, its runs stop, and the keys its logins made are revoked."
         ),
     ).add_mutually_exclusive_group()
@@ -211,20 +210,20 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "name",
         nargs="?",
         default="",
-        help="a machine of yours to log out, keeping this computer's login",
+        help="a host of yours to log out, keeping this computer's login",
     )
     logout.add_argument(
         "--all",
         action="store_true",
-        help="log every machine of yours out first",
+        help="log every host of yours out first",
     )
     verbs.add_parser(
         "status",
-        help="show knowop's profile, server, account, role, machines and their runs",
+        help="show knowop's profile, server, account, role, hosts and their runs",
         description=(
-            "Show knowop's profile, server, account and role; each of your machines, "
+            "Show knowop's profile, server, account and role; each of your hosts, "
             "online or not, with its knowop version and process while online, and "
-            "its live runs; and this computer's connect services, with their flags."
+            "its live sessions; and this computer's connect services, with their flags."
         ),
     ).add_argument(
         "--json",
@@ -237,24 +236,24 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         description=(
             "Show the knowop mark in the macOS menu bar, dimmed while a connect "
             "service here is not online, with a menu of each server knowop is logged "
-            "in to and its machines. knowop connect starts it at login beside its "
+            "in to and its hosts. knowop connect starts it at login beside its "
             "connect services; Quit ends it until then."
         ),
     )
     logs = verbs.add_parser(
         "logs",
-        help="print or follow the log of a machine's connect on this computer",
+        help="print or follow the log of a host's connect on this computer",
         description=(
-            "Print the log the connect service of a machine writes on this computer, "
+            "Print the log the connect service of a host writes on this computer, "
             "or follow it. A connect in the foreground prints to its terminal "
-            "instead, and a machine connected elsewhere keeps its log there."
+            "instead, and a host connected elsewhere keeps its log there."
         ),
     )
     logs.add_argument(
         "name",
         nargs="?",
         default="",
-        help="the machine; default this computer's short host name",
+        help="the host; default this computer's short host name",
     )
     logs.add_argument(
         "-f",
@@ -271,12 +270,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     verbs.add_parser(
         "disconnect",
-        help="stop this computer's runs, then disconnect its machine on the server",
+        help="stop this computer's runs, then disconnect its host on the server",
         description=(
-            "Stop every detached run on this computer, then disconnect the machine on "
+            "Stop every detached run on this computer, then disconnect the host on "
             "the server: its connect is revoked, and every run of yours that names it "
             "is stopped, here or anywhere. Its connect service on this computer is "
-            "removed, and it waits until the server shows the machine offline. "
+            "removed, and it waits until the server shows the host offline. "
             "knowop connect joins it again, with no login; knowop logout also "
             "revokes this computer's key."
         ),
@@ -284,7 +283,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "name",
         nargs="?",
         default="",
-        help="the machine; default this computer's short host name",
+        help="the host; default this computer's short host name",
     )
     _add_connect_arguments(
         verbs.add_parser(
@@ -330,15 +329,10 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         nargs=argparse.REMAINDER,
         metavar="submit|logs|results|status|cancel|secrets|secret ...",
     )
-    # Only listed here: ``main`` hands every ``machine`` form to the registry.
+    # Only listed here: ``main`` hands every ``host`` form to its command.
     verbs.add_parser(
-        MACHINE_WORD,
-        help="list, show, set and delete the machines campaigns may run on",
-    )
-    # Only listed here too: ``main`` hands every ``host`` form to KnowHost's client.
-    verbs.add_parser(
-        KNOWHOST_WORD,
-        help="rent KnowHosts that join as your machines: start, list, pause, resume",
+        HOST_WORD,
+        help="list, show, set and delete hosts; rent, pause, wake and end KnowHosts",
     )
     # Only listed here too: ``main`` hands every ``canvas`` form to trax's verb.
     verbs.add_parser(
@@ -362,7 +356,7 @@ def _add_connect_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--name",
         default="",
-        help="the machine's name; default this computer's short host name",
+        help="the host's name; default this computer's short host name",
     )
     parser.add_argument(
         "--no-exec",
@@ -382,7 +376,7 @@ def _add_connect_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help=(
             "also run the jobs your account sends here with knowop job submit "
-            "--machine NAME, each in a fresh worktree of its pushed commit under a "
+            "--host NAME, each in a fresh worktree of its pushed commit under a "
             "memory cap; needs systemd's user manager"
         ),
     )
@@ -473,30 +467,30 @@ def _log_out(name: str, *, every: bool) -> None:
     with Client(profile.url, api_key=profile.api_key) as http:
         if name:
             check_name(name)
-            _log_out_machine(http, name)
+            _log_out_host(http, name)
             _remove_service(services, name, profile.url)
             return
         if (caller := _caller(http)) is not None:
             key = from_plain(caller.get("api_key_id"), uuid.UUID)
             email = from_plain(caller.get("email"), str)
-            machines = [host_name()]
+            hosts = [host_name()]
             if every:
-                # The machine a login made this key for goes last: its logout revokes
+                # The host a login made this key for goes last: its logout revokes
                 # the key the others' sign with.
-                made_for = caller.get("machine")
-                machines = sorted(
-                    (m.name for m in http.list_machines() if m.owner == email),
-                    key=lambda machine: machine == made_for,
+                made_for = caller.get("host")
+                hosts = sorted(
+                    (m.name for m in http.list_hosts() if m.owner == email),
+                    key=lambda host: host == made_for,
                 )
-            for machine in machines:
-                # A machine of another account by this computer's name, or none, is
-                # not this one's: it reads as no machine, and the key alone is revoked.
+            for host in hosts:
+                # A host of another account by this computer's name, or none, is
+                # not this one's: it reads as no host, and the key alone is revoked.
                 try:
-                    _log_out_machine(http, machine)
+                    _log_out_host(http, host)
                 except ClientError as error:
                     if error.status_code != 404:
                         raise
-            # Logging a machine out revokes the keys its logins made, this one among them.
+            # Logging a host out revokes the keys its logins made, this one among them.
             if _caller(http) is not None:
                 http.post(f"/api/me/tokens/{key}/revoke")
     for each in [] if services is None else services.every():
@@ -516,12 +510,12 @@ def _log_out(name: str, *, every: bool) -> None:
         echo(f"knowop now uses: profile {left[0]} ({left[1].url})")
 
 
-def _log_out_machine(http: Client, machine: str) -> None:
-    """Log ``machine`` out on the server, and say what stopped."""
-    out = http.logout_machine(machine)
+def _log_out_host(http: Client, host: str) -> None:
+    """Log ``host`` out on the server, and say what stopped."""
+    out = http.logout_host(host)
     runs = ", ".join(run.run or str(run.session_id) for run in out.runs) or "none"
     echo(
-        f"logged out: machine {machine}; runs stopped: {runs}; keys revoked: {out.keys}",
+        f"logged out: host {host}; runs stopped: {runs}; keys revoked: {out.keys}",
     )
 
 
@@ -532,12 +526,12 @@ def _remove_service(
 ) -> None:
     """Remove the connect service of ``name`` on ``server`` from here, if it is here."""
     if services is not None and services.remove(name, server):
-        echo(f"removed: the connect service of machine {name} on this computer")
+        echo(f"removed: the connect service of host {name} on this computer")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Run:
-    """A live run, as ``knowop status`` shows it."""
+    """A live session, as ``knowop status`` shows it."""
 
     run: str | None
     """Its detached host's name; ``None`` for a run in a terminal of its own."""
@@ -549,8 +543,8 @@ class _Run:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class _Machine:
-    """One of the account's machines, as ``knowop status`` shows it."""
+class _Host:
+    """One of the account's hosts, as ``knowop status`` shows it."""
 
     name: str
     status: str
@@ -573,8 +567,8 @@ class _Login:
     """``None`` when the server refused the key."""
 
     role: str | None
-    machines: list[_Machine] | None
-    """``None`` when the key was refused, or the role may not list machines."""
+    hosts: list[_Host] | None
+    """``None`` when the key was refused, or the role may not list hosts."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -585,7 +579,7 @@ class _Status:
     """Each server knowop is logged in to, the one its verbs use first."""
 
     here: list[_Run]
-    """Live detached runs here that name no machine of the accounts'."""
+    """Live detached runs here that name no host of the accounts'."""
 
     services: list[service.Connect]
     menubar: str | None
@@ -594,12 +588,12 @@ class _Status:
 
 # A refused login is shown with the others, and then fails the command.
 def _status(*, as_json: bool) -> None:
-    """Print each of knowop's logins with its account's machines, and services here."""
+    """Print each of knowop's logins with its account's hosts, and services here."""
     _profile()
     logins = [_login(name, profile) for name, profile in _logins()]
     services = service.here()
-    # A run the server places on no machine of these accounts' still runs here.
-    listed = {run.run for each in logins for m in each.machines or [] for run in m.runs}
+    # A run the server places on no host of these accounts' still runs here.
+    listed = {run.run for each in logins for m in each.hosts or [] for run in m.runs}
     report = _Status(
         logins=logins,
         here=[
@@ -610,7 +604,7 @@ def _status(*, as_json: bool) -> None:
                 session_id=None,
             )
             for host in detach.live_hosts()
-            if any(each.machines is not None for each in logins)
+            if any(each.hosts is not None for each in logins)
             and host.name not in listed
         ],
         services=[] if services is None else services.every(),
@@ -630,7 +624,7 @@ def _status(*, as_json: bool) -> None:
 
 
 def _login(name: str, profile: Profile) -> _Login:
-    """Return the login ``profile`` holds: its account, role and account's machines."""
+    """Return the login ``profile`` holds: its account, role and account's hosts."""
     with Client(profile.url, api_key=profile.api_key) as http:
         if (caller := _caller(http)) is None:
             return _Login(
@@ -638,11 +632,11 @@ def _login(name: str, profile: Profile) -> _Login:
                 server=profile.url,
                 account=None,
                 role=None,
-                machines=None,
+                hosts=None,
             )
         email = from_plain(caller.get("email"), str)
         try:
-            own = [m.name for m in http.list_machines() if m.owner == email]
+            own = [m.name for m in http.list_hosts() if m.owner == email]
         except ClientError as error:
             if error.status_code != 403:
                 raise
@@ -652,15 +646,15 @@ def _login(name: str, profile: Profile) -> _Login:
             server=profile.url,
             account=email,
             role=from_plain(caller.get("role"), str),
-            machines=None if own is None else [_machine(http, each) for each in own],
+            hosts=None if own is None else [_host(http, each) for each in own],
         )
 
 
-def _machine(http: Client, name: str) -> _Machine:
-    """Return one of the account's machines, its facts while online, and its runs."""
-    detail = http.get_machine(name)
+def _host(http: Client, name: str) -> _Host:
+    """Return one of the account's hosts, its facts while online, and its runs."""
+    detail = http.get_host(name)
     online = detail.status == "online"
-    return _Machine(
+    return _Host(
         name=name,
         status=detail.status,
         this_computer=name == host_name(),
@@ -677,7 +671,7 @@ def _machine(http: Client, name: str) -> _Machine:
         ),
         runs=[
             _Run(run=run.run, cli=run.cli, cwd=run.cwd, session_id=str(run.session_id))
-            for run in http.machine_runs(name)
+            for run in http.host_runs(name)
         ],
     )
 
@@ -704,27 +698,27 @@ def _say_status(report: _Status, *, manager: str | None) -> None:
 
 
 def _say_login(login: _Login) -> None:
-    """Print ``login``: its account, role and machines, once the server accepts it."""
+    """Print ``login``: its account, role and hosts, once the server accepts it."""
     echo(f"profile: {login.profile}")
     echo(f"server:  {login.server}")
     if login.account is None:
         return
     echo(f"account: {login.account}")
     echo(f"role:    {login.role}")
-    if login.machines is None:
-        echo("machine: listing machines needs the writer role")
-    elif not login.machines:
-        echo("machine: none; run knowop connect")
-    for machine in login.machines or []:
-        version = machine.knowop_version
+    if login.hosts is None:
+        echo("host: listing hosts needs the writer role")
+    elif not login.hosts:
+        echo("host: none; run knowop connect")
+    for host in login.hosts or []:
+        version = host.knowop_version
         served = (f", knowop {version}" if version is not None else "") + (
-            f", pid {machine.pid}" if machine.pid is not None else ""
+            f", pid {host.pid}" if host.pid is not None else ""
         )
-        live = len(machine.runs)
+        live = len(host.runs)
         count = f", {live} run{'' if live == 1 else 's'} live" if live else ""
-        mark = " (this computer)" if machine.this_computer else ""
-        echo(f"machine: {machine.name} {machine.status}{served}{count}{mark}")
-        for run in machine.runs:
+        mark = " (this computer)" if host.this_computer else ""
+        echo(f"host: {host.name} {host.status}{served}{count}{mark}")
+        for run in host.runs:
             short = (run.session_id or "")[:8]
             echo(f"  run:   {run.run or short}  {run.cli}  {run.cwd or ''}")
 
@@ -741,7 +735,7 @@ def _next_step() -> None:
         here = host_name()
         connected = any(
             m.name == here and m.owner == email and m.status == "online"
-            for m in http.list_machines()
+            for m in http.list_hosts()
         )
     if connected:
         echo(f"Connected as {here} to {profile.url}. Next:  knowop run")
@@ -751,22 +745,22 @@ def _next_step() -> None:
 
 # This computer's runs first: once the server stops them, each is already ending,
 # and a stop here would race its exit. Its service goes too, which would otherwise join
-# the machine again when it next starts.
+# the host again when it next starts.
 def _disconnect(name: str, *, sleep: Callable[[float], None]) -> None:
-    """Stop this computer's runs when it is the machine, then disconnect the machine."""
-    machine = name or host_name()
-    check_name(machine)
+    """Stop this computer's runs when it is the host, then disconnect the host."""
+    host = name or host_name()
+    check_name(host)
     _, profile = _profile()
-    if machine == host_name() and detach.stop_all() != 0:
+    if host == host_name() and detach.stop_all() != 0:
         raise ClientError("a run here did not stop; see knowop run ls")
     with Client(profile.url, api_key=profile.api_key) as http:
-        for run in http.disconnect_machine(machine):
+        for run in http.disconnect_host(host):
             echo(f"stopped: run {run.run or run.session_id} ({run.cli})")
-        _remove_service(service.here(), machine, profile.url)
-        if _await(http, machine, lambda d: d.status != "online", sleep=sleep) is None:
-            raise ClientError(f"machine {machine} still reads online after 30 s")
+        _remove_service(service.here(), host, profile.url)
+        if _await(http, host, lambda d: d.status != "online", sleep=sleep) is None:
+            raise ClientError(f"host {host} still reads online after 30 s")
     echo(
-        f"disconnected: machine {machine}; its connect stops at its next heartbeat, "
+        f"disconnected: host {host}; its connect stops at its next heartbeat, "
         "and knowop connect joins it again",
     )
 
@@ -794,7 +788,7 @@ def _connect(
         if saved is not None and not flags.target
         else _server(flags.target)
     )
-    # A saved login the server now refuses (its machine was logged out elsewhere) is
+    # A saved login the server now refuses (its host was logged out elsewhere) is
     # no login: at a terminal connect logs in again, and a service's run says so.
     found = next(
         (each for each in _logins() if each[1].url == server.rstrip("/")),
@@ -821,7 +815,7 @@ def _connect(
         # its one-use token: one step for the person, and no second login.
         result = login.login(
             server,
-            machine=name,
+            host=name,
             client="knowop",
             sleep=sleep,
             clock=clock,
@@ -829,7 +823,7 @@ def _connect(
         _remember(result.profile)
         echo(f"logged in: profile {result.profile} ({result.role})")
         profile, url = result.profile, read_profile(result.profile).url
-        token = result.machine_token
+        token = result.host_token
     if background and (services := service.here()) is not None:
         _connect_service(
             name,
@@ -844,13 +838,13 @@ def _connect(
     if background:
         echo(
             "knowop: no user service manager answers here (systemctl --user), so "
-            "this terminal serves the machine until Ctrl-C",
+            "this terminal serves the host until Ctrl-C",
             err=True,
         )
     _serve(name, url, profile=profile, token=token, flags=flags, sleep=sleep)
 
 
-# Joined here first, so what a service could only log (another account's machine,
+# Joined here first, so what a service could only log (another account's host,
 # --jobs with no memory cap, a refused login token) shows at this terminal.
 def _connect_service(
     name: str,
@@ -882,7 +876,7 @@ def _connect_service(
         ours = any((c.name, c.server) == (name, url) for c in services.every())
         if pid is not None and not ours:
             echo(
-                f"connected already: machine {name} at {url}, by knowop pid {pid}, "
+                f"connected already: host {name} at {url}, by knowop pid {pid}, "
                 "which no service of this computer runs; stop that connect, then run "
                 "knowop connect again to serve it from one",
             )
@@ -894,7 +888,7 @@ def _connect_service(
             and services.unchanged(unit)
             and before is not None
             and before.facts.get("knowop_version") == service.knowop_version()
-            and before.facts.get("clis") == machine_host.host_facts()["clis"]
+            and before.facts.get("clis") == daemon.host_facts()["clis"]
         )
         if not current:
             _serve(
@@ -909,18 +903,18 @@ def _connect_service(
             services.start(unit)
 
             # Not this process: the join here heartbeats once, and reads online.
-            def started_elsewhere(d: MachineDetail) -> bool:
+            def started_elsewhere(d: HostDetail) -> bool:
                 return d.status == "online" and _pid(d) not in {None, pid, os.getpid()}
 
             started = _await(http, name, started_elsewhere, sleep=sleep)
             if started is None:
                 raise ClientError(
-                    f"machine {name} did not come online in 30 s; see knowop logs"
+                    f"host {name} did not come online in 30 s; see knowop logs"
                     f"{_named(name)}",
                 )
             pid = _pid(started)
     echo(
-        f"connected{' already' if current else ''}: machine {name} at {url} in the "
+        f"connected{' already' if current else ''}: host {name} at {url} in the "
         f"background (pid {pid}); it starts again at login",
     )
     echo(f"log:  knowop logs -f{_named(name)}")
@@ -948,7 +942,7 @@ def _connect_service(
 
 
 # A service manager stops a process with SIGTERM, and a closed ssh or tmux session sends
-# SIGHUP; either must release the machine as Ctrl-C does, or it reads online for three
+# SIGHUP; either must release the host as Ctrl-C does, or it reads online for three
 # minutes after it is gone.
 def _serve(
     name: str,
@@ -965,7 +959,7 @@ def _serve(
         sig: signal.signal(sig, _interrupt) for sig in (signal.SIGTERM, signal.SIGHUP)
     }
     try:
-        serve.connect_machine(
+        serve.connect_host(
             name,
             server=server,
             signed_in=(
@@ -989,7 +983,7 @@ def _serve(
     except ClientError as error:
         status = error.status_code or 0
         # A service's own run exits 0 on a refusal no restart can change (a revoked
-        # login, another account's machine), so its manager starts nothing again;
+        # login, another account's host), so its manager starts nothing again;
         # 408 and 429 ask to try again later.
         if flags.log_file and 400 <= status < 500 and status not in {408, 429}:
             echo(f"knowop: {error}", err=True)
@@ -1018,19 +1012,19 @@ def _logs(
     sleep: Callable[[float], None],
 ) -> None:
     """Print the log of ``name``'s connect service here; with ``follow``, follow it."""
-    machine = name or host_name()
-    check_name(machine)
+    host = name or host_name()
+    check_name(host)
     _, profile = _profile()
     log = (
         state_dir()
         / "rekursiv-ai"
         / "knowop"
         / "connect"
-        / f"{machine}-{service.server_tag(profile.url)}.log"
+        / f"{host}-{service.server_tag(profile.url)}.log"
     )
     if not log.is_file():
         raise ClientError(
-            f"no log of machine {machine} on this computer: its log is on the "
+            f"no log of host {host} on this computer: its log is on the "
             "computer whose service connects it, and a connect in the foreground "
             "prints to its terminal",
         )
@@ -1065,8 +1059,8 @@ def _print_log(
             text = source.read()
 
 
-# The machine reads offline once its connect lets go, but a detached run reaches the
-# server with the account's key, not the machine's: it is not stopped with the connect.
+# The host reads offline once its connect lets go, but a detached run reaches the
+# server with the account's key, not the host's: it is not stopped with the connect.
 def _say_runs_left() -> None:
     """Name the detached runs still live on this computer, and how to stop them."""
     hosts = detach.live_hosts()
@@ -1101,12 +1095,9 @@ def _hand_off(
     clock: Callable[[], float],
 ) -> int:
     """Run a verb ``main`` hands off as knowop's account; return its exit code."""
-    if verb in (MACHINE_WORD, KNOWHOST_WORD, _CANVAS_WORD):
+    if verb in (HOST_WORD, _CANVAS_WORD):
         # The login is read only when a form asks the server: help needs none.
-        command = {MACHINE_WORD: Machines, KNOWHOST_WORD: KnowHosts}.get(
-            verb,
-            canvas.Canvas,
-        )
+        command = Hosts if verb == HOST_WORD else canvas.Canvas
         command.dispatch(
             verb,
             args,
@@ -1160,11 +1151,11 @@ def _starts_an_agent(args: Sequence[str]) -> bool:
 # A run reaches Chat without this computer being connected; a connected one also opens
 # its terminal there, which is how a person takes the run over from a browser.
 def _say_whether_connected(profile: Profile) -> None:
-    """Say to run ``knowop connect`` when this computer is not an online machine."""
+    """Say to run ``knowop connect`` when this computer is not an online host."""
     try:
         here = host_name()
         with Client(profile.url, api_key=profile.api_key) as http:
-            listed = http.list_machines()
+            listed = http.list_hosts()
     except ClientError:
         return
     if not any(m.name == here and m.status == "online" for m in listed):
@@ -1175,42 +1166,42 @@ def _say_whether_connected(profile: Profile) -> None:
         )
 
 
-# A run here stops through its own socket, as ever; any other live run of the account
-# stops through the server, on whichever machine it says it runs.
+# A run here stops through its own socket, as ever; any other live session of the account
+# stops through the server, on whichever host it says it runs.
 def _stop_run(run: str) -> None:
-    """Stop the live run of yours ``run`` names: its name, its session or its first 8."""
+    """Stop the live session of yours ``run`` names: its name, its session or its first 8."""
     _, profile = _profile()
     with Client(profile.url, api_key=profile.api_key) as http:
         email = from_plain(_signed_in(http).get("email"), str)
         found = [
-            (machine.name, each)
-            for machine in http.list_machines()
-            if machine.owner == email
-            for each in http.machine_runs(machine.name)
+            (host.name, each)
+            for host in http.list_hosts()
+            if host.owner == email
+            for each in http.host_runs(host.name)
             if run in {each.run, str(each.session_id), str(each.session_id)[:8]}
         ]
         if len(found) > 1:
             listed = "".join(
-                f"\n  {machine}  {each.run or '-'}  {each.session_id}  {each.cli}  "
+                f"\n  {host}  {each.run or '-'}  {each.session_id}  {each.cli}  "
                 f"{each.cwd or ''}"
-                for machine, each in found
+                for host, each in found
             )
             raise ClientError(
-                f"{run} names {len(found)} live runs; stop one by its session:{listed}",
+                f"{run} names {len(found)} live sessions; stop one by its session:{listed}",
             )
         if not found:
-            raise ClientError(f"no live run {run} here or on your machines")
-        [(machine, stopped)] = found
-        http.stop_machine_run(machine, stopped.session_id)
+            raise ClientError(f"no live session {run} here or on your hosts")
+        [(host, stopped)] = found
+        http.stop_host_run(host, stopped.session_id)
     echo(
-        f"stopped: run {stopped.run or stopped.session_id} ({stopped.cli}) on {machine}",
+        f"stopped: run {stopped.run or stopped.session_id} ({stopped.cli}) on {host}",
     )
 
 
-def _detail(http: Client, name: str) -> MachineDetail | None:
-    """Return the server's view of machine ``name``; ``None`` before it is enrolled."""
+def _detail(http: Client, name: str) -> HostDetail | None:
+    """Return the server's view of host ``name``; ``None`` before it is enrolled."""
     try:
-        return http.get_machine(name)
+        return http.get_host(name)
     except ClientError as error:
         if error.status_code != 404:
             raise
@@ -1220,25 +1211,25 @@ def _detail(http: Client, name: str) -> MachineDetail | None:
 def _await(
     http: Client,
     name: str,
-    until: Callable[[MachineDetail], bool],
+    until: Callable[[HostDetail], bool],
     *,
     sleep: Callable[[float], None],
-) -> MachineDetail | None:
+) -> HostDetail | None:
     """Ask the server for ``name`` until ``until`` holds, for 30 s; ``None`` past it."""
     for _ in range(30):
-        if until(detail := http.get_machine(name)):
+        if until(detail := http.get_host(name)):
             return detail
         sleep(1.0)
     return None
 
 
-def _pid(detail: MachineDetail) -> int | None:
-    """Return the process its facts say serves a machine; ``None`` from an old knowop."""
+def _pid(detail: HostDetail) -> int | None:
+    """Return the process its facts say serves a host; ``None`` from an old knowop."""
     return from_plain(detail.facts.get("pid"), int, default=None)
 
 
 def _named(name: str) -> str:
-    """Return a space and ``name``, or nothing for the machine verbs default to."""
+    """Return a space and ``name``, or nothing for the host verbs default to."""
     return "" if name == host_name() else f" {name}"
 
 

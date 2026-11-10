@@ -5,13 +5,13 @@ as something that CLI wrote. That is what the IR's byte-exact round-trip buys:
 the file is not a rendering for a human, it is the provider's own format, and a
 provider is entitled to reject a transcript it did not write.
 
-Three things make the written file THIS machine's rather than the captured
+Three things make the written file THIS host's rather than the captured
 one's:
 
 - The session id is minted FRESH. Reusing the captured one would collide with
   the original locally, and across a crossing it would name an id the target
   CLI never issued.
-- The path derives from the LOCAL machine's layout, which each adapter owns:
+- The path derives from the LOCAL host's layout, which each adapter owns:
   claude encodes the working directory in its project directory name, codex
   shards by date. Resuming in a different directory is expected.
 - The id INSIDE the file is rewritten to the minted uuid, so the file's
@@ -314,7 +314,7 @@ def _codex_scope() -> Path:
 # ONE record, unlike claude's per-line ``sessionId``: codex declares its identity once,
 # on the ``session_meta`` line, which the IR carries as the ``payload`` residual of the
 # opening :class:`TurnContext`. A rollout whose payload still names the captured session
-# resumes one this machine does not have.
+# resumes one this host does not have.
 #
 # ``id`` and ``session_id`` both, because the launch payload states both and the CLI
 # reads the pair; ``parent_thread_id`` is dropped rather than rewritten, since the
@@ -382,9 +382,9 @@ def _codex_stamped(record: SessionRecord, at: str) -> SessionRecord:
 #
 # A captured codex rollout already declares all of it, and keeps its own: only identity
 # is restated, since the cwd and provider it ran under are facts about that session
-# rather than about this machine.
+# rather than about this host.
 def _codex_declared(record: TurnContext, session_id: UUID) -> TurnContext:
-    """Return the launch settings with this machine's declaration in them."""
+    """Return the launch settings with this host's declaration in them."""
     extra = dict(mutable(record.extra))
     stated = str(session_id)
     # The launch line's own ordinal, which is how codex numbers a rollout it
@@ -397,14 +397,14 @@ def _codex_declared(record: TurnContext, session_id: UUID) -> TurnContext:
             from_plain(extra.get("payload"), dict[str, object], default={}),
         ).items()
         # The thread this session forked FROM is not being materialized, so
-        # naming it would point the CLI at a rollout the machine may not hold.
+        # naming it would point the CLI at a rollout the host may not hold.
         if key not in {"id", "session_id", "parent_thread_id"}
     }
     extra["payload"] = (
         {
             "timestamp": _stamp(),
             # The LOCAL cwd, as claude's project directory is derived locally:
-            # a resume happens on this machine, in this directory.
+            # a resume happens on this host, in this directory.
             "cwd": str(Path.cwd()),
             "originator": "codex-tui",
             "cli_version": _codex_cli_version(),
@@ -672,7 +672,7 @@ def _spliced(
 # chain, so the writer took it for a native file and wrote the lines unlinked.
 #
 # The cwd goes on the opening context of a claude file only when claude synthesizes
-# lines, which take their working directory from here. It is this machine's, since the
+# lines, which take their working directory from here. It is this host's, since the
 # resume runs here and claude looks for the project in the directory it runs from.
 def _opening(
     *,

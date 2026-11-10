@@ -131,7 +131,7 @@ class HostRecord:
 
     exit_code: int | None = None
     ended: str | None = None
-    machine: str = ""
+    host: str = ""
     """The computer the host runs on, which alone can attach to it; empty in a record
     from before hosts named theirs."""
 
@@ -309,7 +309,7 @@ def live_hosts() -> list[HostRecord]:
     return [
         record
         for record in _records()
-        if (not record.machine or record.machine == here) and _state(record) in _LIVE
+        if (not record.host or record.host == here) and _state(record) in _LIVE
     ]
 
 
@@ -534,10 +534,10 @@ def _require_local(name: str) -> HostRecord:
     """Return ``name``'s record, or exit when the host runs on another computer."""
     record = _require_record(name)
     here = socket.gethostname()
-    if record.machine and record.machine != here:
+    if record.host and record.host != here:
         raise SystemExit(
-            f"{PROGRAM}: host {name!r} runs on {record.machine}, not on this "
-            f"machine ({here}); run this command there",
+            f"{PROGRAM}: host {name!r} runs on {record.host}, not on this "
+            f"host ({here}); run this command there",
         )
     return record
 
@@ -709,7 +709,7 @@ def _detach(
         pid=os.getpid(),
         address=str(address),
         started=_now(),
-        machine=socket.gethostname(),
+        host=socket.gethostname(),
         control=str(control),
     )
     _write_record(paths, record)

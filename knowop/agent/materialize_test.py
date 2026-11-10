@@ -106,7 +106,7 @@ def _without_session_id(records: Sequence[TraxRecord]) -> list[TraxRecord]:
     return out
 
 
-class TestTheFileIsThisMachinesOwn:
+class TestTheFileIsThisHostsOwn:
     """Three things make the written file resumable HERE, not where captured."""
 
     def test_the_session_id_is_minted_fresh(self) -> None:
@@ -482,7 +482,7 @@ class TestMaterializingCodex:
 
         The same rule claude's ``_renamed`` enforces, for the same reason: a
         transcript naming the session it came from, under a filename naming a
-        fresh one, resumes a session the local machine does not have.
+        fresh one, resumes a session the local host does not have.
         """
         written = materialize(
             attach=uuid4(),
@@ -876,7 +876,7 @@ class TestACrossingIsStampedAndLinked:
         """A sagent part states no encoding, and claude then wrote unlinked lines.
 
         Each line names its predecessor, and every line carries a timestamp and this
-        machine's cwd: claude finds the project by the cwd, and refuses a line with no
+        host's cwd: claude finds the project by the cwd, and refuses a line with no
         timestamp.
         """
         written = materialize(

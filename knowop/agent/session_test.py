@@ -186,8 +186,8 @@ from knowop.agent.subagents import SubagentSinks
 from knowop.agent.tool_server import BEARER_ENV, ToolServer
 from knowop.agent.trust import TrustGate
 from knowop.agent.worktree_diff import Output, WorktreeDiff
+from knowop.connect import daemon
 from knowop.lib.testing.posix import poll_fsevents
-from knowop.shell import machine_host
 
 
 _THIS: Final = Path(__file__).resolve()
@@ -986,11 +986,11 @@ class TestMainDispatch:
     ) -> None:
         heard: list[tuple[list[str], str]] = []
 
-        def host(argv: Sequence[str], *, prog: str) -> int:
+        def detached(argv: Sequence[str], *, prog: str) -> int:
             heard.append((list(argv), prog))
             return 2
 
-        monkeypatch.setattr(detach, "main", host)
+        monkeypatch.setattr(detach, "main", detached)
         assert session.main(["ls", "x"]) == 2
         assert session.main(["ls"], default_cli="codex") == 2
         assert heard == [(["ls", "x"], "knowop run"), (["ls"], "knowop run")]
@@ -1019,7 +1019,7 @@ class TestMainDispatch:
 
 
 class TestARunSaysWhereItIs:
-    """Each drain names the run's detached host, machine and folder, for Chat."""
+    """Each drain names the run's detached host, host and folder, for Chat."""
 
     @pytest.mark.parametrize(
         ("argv", "run_name"),
@@ -1076,7 +1076,7 @@ class TestARunSaysWhereItIs:
             _RecordingRelay(),
             stop,
             run_name="chat-1a2b3c4d",
-            machine="gx10",
+            host="gx10",
             cwd="~/work",
             cli="claude",
         )
@@ -1085,7 +1085,7 @@ class TestARunSaysWhereItIs:
         instance = said.pop("instance")
         assert said == {
             "run": "chat-1a2b3c4d",
-            "machine": "gx10",
+            "host": "gx10",
             "cwd": "~/work",
             "cli": "claude",
             "runs": False,
@@ -1304,18 +1304,18 @@ class TestARunSaysWhereItIs:
         assert capsys.readouterr().err.count("inbound delivery failed") == 1
 
     @pytest.mark.parametrize(
-        ("hostname", "machine"),
+        ("hostname", "host"),
         [("GX10.lan", "gx10"), ("init", None), ("...", None)],
     )
-    def test_a_hostname_names_the_machine_only_as_connect_would(
+    def test_a_hostname_names_the_host_only_as_connect_would(
         self,
         monkeypatch: pytest.MonkeyPatch,
         hostname: str,
-        machine: str | None,
+        host: str | None,
     ) -> None:
         monkeypatch.setattr("socket.gethostname", lambda: hostname)
 
-        assert session._machine_name() == machine
+        assert session._host_name() == host
 
     @pytest.mark.parametrize(
         ("cwd", "shown"),
@@ -3398,10 +3398,10 @@ def test_json_host_rebuild_preserves_the_run(
             json_dumps(cast(object, launcher.call_args.kwargs["request"])),
             RunRequest,
         )
-        host = _spec(tmp_path)
+        detached = _spec(tmp_path)
         start = session.host_start(request)
         connect.assert_not_called()
-        assert start(host) == 0
+        assert start(detached) == 0
         [config] = ran
         assert config == RunConfig(
             cli_name=cli_name,
@@ -3424,7 +3424,7 @@ def test_json_host_rebuild_preserves_the_run(
             prefix_bytes=1234,
             compact_after_load=True,
             profile="remote",
-            host=host,
+            detached=detached,
             run_name="host-json",
             headless=mode == "sync",
             instance=config.instance,
@@ -4201,12 +4201,16 @@ class TestASagentRun:
         *,
         hosted: bool,
     ) -> None:
-        host = HostSpec(address=tmp_path / "s", scrollback=tmp_path / "scrollback")
+        detached = HostSpec(address=tmp_path / "s", scrollback=tmp_path / "scrollback")
 
         wiring, _ = _wire(
             monkeypatch,
             tmp_path,
-            RunConfig(cli_name="sagent", sync=False, host=host if hosted else None),
+            RunConfig(
+                cli_name="sagent",
+                sync=False,
+                detached=detached if hosted else None,
+            ),
             SagentAdapter(),
         )
 
@@ -4388,7 +4392,7 @@ class TestChatRunApprovals:
         args: tuple[str, ...],
         declared: bool,
     ) -> None:
-        machine_host.set_sandbox(on=declared)
+        daemon.set_sandbox(on=declared)
         assert _spawned("codex", cli_args=(*args, "exec", "hi"), attach=_CHAT_RUN) == [
             "codex",
             "--no-daemon",
@@ -4429,7 +4433,7 @@ class TestChatRunApprovals:
         # Bypass mode opens a startup dialog whose default is "No, exit"; the inline
         # setting skips it for this launch only and writes nothing to the person's
         # settings (measured on claude 2.1.306).
-        machine_host.set_sandbox(on=True)
+        daemon.set_sandbox(on=True)
 
         assert _spawned("claude", cli_args=args, attach=attach) == [
             "claude",
@@ -4445,7 +4449,7 @@ class TestChatRunApprovals:
         self,
         spelled: str,
     ) -> None:
-        machine_host.set_sandbox(on=True)
+        daemon.set_sandbox(on=True)
         given = '{"model":"opus","skipDangerousModePermissionPrompt":false}'
         flag = ("--settings", given) if spelled == "split" else (f"--settings={given}",)
 
@@ -4477,7 +4481,7 @@ class TestChatRunApprovals:
     ) -> None:
         # Claude's help does not say what two ``--settings`` do, so the run keeps the
         # person's one flag untouched and takes the mode that opens no dialog.
-        machine_host.set_sandbox(on=True)
+        daemon.set_sandbox(on=True)
 
         assert _spawned("claude", cli_args=flag, attach=None) == [
             "claude",
@@ -4487,7 +4491,7 @@ class TestChatRunApprovals:
         ]
 
     def test_the_skip_survives_the_box_hook_merge_into_one_settings_file(self) -> None:
-        machine_host.set_sandbox(on=True)
+        daemon.set_sandbox(on=True)
         argv = _spawned("claude", cli_args=("-p", "hi"), attach=None)
 
         argv, files = _with_box_hook(
@@ -4516,7 +4520,7 @@ class TestChatRunApprovals:
         self,
         attach: UUID | None,
     ) -> None:
-        machine_host.set_sandbox(on=True)
+        daemon.set_sandbox(on=True)
         assert _spawned("codex", cli_args=("exec", "hi"), attach=attach) == [
             "codex",
             "--dangerously-bypass-approvals-and-sandbox",
@@ -4530,7 +4534,7 @@ class TestChatRunApprovals:
         ]
 
     def test_other_codex_config_on_a_sandbox_still_gets_the_bypass(self) -> None:
-        machine_host.set_sandbox(on=True)
+        daemon.set_sandbox(on=True)
         args = (
             "-c",
             'model="o3"',
@@ -4563,19 +4567,19 @@ class TestChatRunApprovals:
         self,
         args: tuple[str, ...],
     ) -> None:
-        machine_host.set_sandbox(on=True)
+        daemon.set_sandbox(on=True)
         assert _spawned("claude", cli_args=args, attach=None) == ["claude", *args]
 
     def test_claude_on_a_sandbox_keeps_the_settings_beside_the_persons_own_mode(
         self,
     ) -> None:
-        machine_host.set_sandbox(on=True)
+        daemon.set_sandbox(on=True)
         args = ("--permission-mode", "plan", "--settings", '{"model":"opus"}')
         assert _spawned("claude", cli_args=args, attach=None) == ["claude", *args]
 
     def test_withdrawing_the_declaration_returns_to_the_default(self) -> None:
-        machine_host.set_sandbox(on=True)
-        machine_host.set_sandbox(on=False)
+        daemon.set_sandbox(on=True)
+        daemon.set_sandbox(on=False)
         assert _spawned("codex", cli_args=("exec", "hi"), attach=None) == [
             "codex",
             "--no-daemon",
@@ -4593,7 +4597,7 @@ class TestChatRunApprovals:
         ]
 
     def test_another_cli_gets_no_approval_flags(self) -> None:
-        machine_host.set_sandbox(on=True)
+        daemon.set_sandbox(on=True)
         assert _spawned("gemini", cli_args=("-p", "x"), attach=_CHAT_RUN) == [
             "gemini",
             "-p",
@@ -5043,14 +5047,14 @@ class TestSpawnWiring:
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        host = HostSpec(address=tmp_path / "s", scrollback=tmp_path / "scrollback")
+        detached = HostSpec(address=tmp_path / "s", scrollback=tmp_path / "scrollback")
         wiring, _ = _wire(
             monkeypatch,
             tmp_path,
-            RunConfig(cli_name="claude", sync=False, host=host),
+            RunConfig(cli_name="claude", sync=False, detached=detached),
             ClaudeAdapter(),
         )
-        assert wiring.relay["host"] is host
+        assert wiring.relay["host"] is detached
 
     def test_a_detached_run_opens_its_session_before_its_host_listens(
         self,
@@ -5067,16 +5071,16 @@ class TestSpawnWiring:
                 observed.append(sink.session_id)
                 return super().run()
 
-        host = HostSpec(address=tmp_path / "s", scrollback=tmp_path / "scrollback")
+        detached = HostSpec(address=tmp_path / "s", scrollback=tmp_path / "scrollback")
         wiring, status = _wire(
             monkeypatch,
             tmp_path,
-            RunConfig(cli_name="claude", sync=False, host=host),
+            RunConfig(cli_name="claude", sync=False, detached=detached),
             ClaudeAdapter(),
             sink=sink,
             relay=_SessionAtListen,
         )
-        assert wiring.relay["host"] is host
+        assert wiring.relay["host"] is detached
         assert status == 0
         assert observed == [sink.session_id]
         assert observed[0] is not None
@@ -5269,12 +5273,12 @@ class TestSpawnWiring:
         assert isinstance(named.pop("pull_requests"), PullRequestWatch)
         # And runs the commands Chat's Run button clicks.
         assert isinstance(named.pop("runs"), ClickedRuns)
-        # A run in this terminal names its machine and folder, and no host; a trusted
+        # A run in this terminal names its host and folder, and no host; a trusted
         # CLI opens no trust card, and one that loaded nothing compacts nothing.
         assert named == {
             "stream": stream,
             "run_name": None,
-            "machine": "gx10",
+            "host": "gx10",
             "cwd": f"~/{tmp_path.name}",
             "cli": cli,
             "gate": None,
@@ -5482,7 +5486,7 @@ class TestTeardownRunsEvenWhenTheRelayRaises:
                 cli_name="claude",
                 client=server,
                 quiesce_seconds=0.0,
-                host=HostSpec(address=tmp_path / "s", scrollback=tmp_path / "log"),
+                detached=HostSpec(address=tmp_path / "s", scrollback=tmp_path / "log"),
             ),
             ClaudeAdapter(),
             LockedSink(TrackinizerSink(server, "claude")),
@@ -5776,7 +5780,7 @@ class TestARefusedRunLeavesTheChatsSessionOpen:
 
 
 class _RefusingServer(_HoldingServer):
-    """A server whose chat already has a live run, so every drain here is refused."""
+    """A server whose chat already has a live session, so every drain here is refused."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -7324,7 +7328,7 @@ class TestATrustCardHoldsTheRun:
             rearm=state.rearm,
             relay=relay,
         )
-        gate.open("claude", "~/proj", machine=None, remembered=True)
+        gate.open("claude", "~/proj", host=None, remembered=True)
         stop = threading.Event()
         client = _ScriptedClient(
             [[InboundDrainItem(text="hi", source="ann@x")], []],
@@ -7365,7 +7369,7 @@ class TestATrustCardHoldsTheRun:
             rearm=opened.inbound.rearm,
             relay=relay,
         )
-        gate.open("codex", "~/proj", machine="gx10", remembered=True)
+        gate.open("codex", "~/proj", host="gx10", remembered=True)
         card = from_plain(records[0].extra["$interaction"], dict[str, object])
         deliver = partial(
             session._deliver_one,
@@ -7426,7 +7430,7 @@ class TestATrustCardHoldsTheRun:
         assert gate.relay is relay
         first, *_, last = _run_records(wiring)
         card = from_plain(first.extra["$interaction"], dict[str, object])
-        assert (card["cli"], card["machine"]) == ("claude", "gx10")
+        assert (card["cli"], card["host"]) == ("claude", "gx10")
         # The CLI exited with the card open: it quit at the dialog.
         assert last.extra["$interaction_resolved"] == {
             "id": card["id"],
@@ -8011,7 +8015,7 @@ class TestAChatRunIsHeadless:
         argv: Sequence[str],
         *,
         lines: Sequence[str] = (),
-        host: HostSpec | None = None,
+        detached: HostSpec | None = None,
         scoped: bool = False,
         client: _ChatClient | None = None,
     ) -> RunConfig:
@@ -8026,7 +8030,7 @@ class TestAChatRunIsHeadless:
         monkeypatch.setattr(session, "connect", Mock(return_value=client))
         assert session.main(argv, client_factory=lambda: client) == 0
         for start in hosted:
-            assert start(host if host is not None else _spec(tmp_path)) == 0
+            assert start(detached if detached is not None else _spec(tmp_path)) == 0
         [config] = ran
         return config
 
@@ -8084,7 +8088,7 @@ class TestAChatRunIsHeadless:
             monkeypatch,
             tmp_path,
             argv,
-            host=replace(_spec(tmp_path), resume=_OLD),
+            detached=replace(_spec(tmp_path), resume=_OLD),
             client=client,
             scoped=True,
         )
@@ -8110,7 +8114,7 @@ class TestAChatRunIsHeadless:
             monkeypatch,
             tmp_path,
             argv,
-            host=replace(_spec(tmp_path), resume=_ELSEWHERE),
+            detached=replace(_spec(tmp_path), resume=_ELSEWHERE),
             client=client,
             scoped=True,
         )
@@ -9632,7 +9636,7 @@ class TestAHeadlessRunsWiring:
         assert isinstance(polled[2], HeadlessRun)
         assert polled[3] is stop
         assert found["inbound"] is wiring.drain["inbound"]
-        assert found["machine"] == session._machine_name()
+        assert found["host"] == session._host_name()
         assert found["cwd"] == session._shown_cwd(Path.cwd())
         assert wiring.poll_thread == "inbound poll"
         # What the poll records lands among the records the drain writes.
@@ -10156,10 +10160,10 @@ class TestATakeoverFromAHeadlessRun:
             rollout=True,
         )
 
-        host = wiring.relays[0].kwargs["host"]
-        assert isinstance(host, HeadlessSpec)
-        assert host.address == _spec(tmp_path).address
-        assert host.scrollback == _spec(tmp_path).scrollback
+        detached = wiring.relays[0].kwargs["host"]
+        assert isinstance(detached, HeadlessSpec)
+        assert detached.address == _spec(tmp_path).address
+        assert detached.scrollback == _spec(tmp_path).scrollback
         assert wiring.relays[0].kwargs["drop_env"] == (
             ClaudeAdapter.parent_session_env
             | {"TRAX_ACTOR", "TRAX_ROOMS", "TRAX_WORKSPACE", "TRAX_CANVAS"}
@@ -10175,7 +10179,7 @@ class TestATakeoverFromAHeadlessRun:
         monkeypatch.setattr(session, "ThreadedRelay", partial(_TuiRelay, wiring=wiring))
 
         _ = session._make_tui(
-            replace(RunConfig(cli_name="claude"), host=_spec(tmp_path)),
+            replace(RunConfig(cli_name="claude"), detached=_spec(tmp_path)),
             ClaudeAdapter(),
             env={"TRAX_CANVAS": _CANVAS},
             tools="",

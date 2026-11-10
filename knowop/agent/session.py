@@ -184,7 +184,7 @@ from knowop.agent.worktree_diff import (
     WorktreeDiff,
     open_worktree_diff,
 )
-from knowop.machines import host_name
+from knowop.hosts import host_name
 
 
 if TYPE_CHECKING:
@@ -202,7 +202,7 @@ if TYPE_CHECKING:
     from knowop.agent.box_hook import hook
     from knowop.agent.headless import HostState
     from knowop.agent.resume import prepare_resume
-    from knowop.shell import machine_host
+    from knowop.connect import daemon
 else:
     from wrapt import lazy_import
 
@@ -210,7 +210,7 @@ else:
     # (0.4 ms measured, so this is about scope, not speed).
     hook = lazy_import("knowop.agent.box_hook.hook")
     # Only spawning a CLI asks whether the person declared this computer a sandbox.
-    machine_host = lazy_import("knowop.shell.machine_host")
+    daemon = lazy_import("knowop.connect.daemon")
     # Only a run attached to a chat loads its conversation, and the loader brings the
     # readers and writers of every CLI's format.
     prepare_resume = lazy_import(
@@ -551,7 +551,7 @@ class _InboundClient(Protocol):
         *,
         wait_sec: float = 0.0,
         run: str | None = None,
-        machine: str | None = None,
+        host: str | None = None,
         cwd: str | None = None,
         cli: str | None = None,
         instance: str | None = None,
@@ -676,7 +676,7 @@ class RunConfig:
     quiesce_seconds: float = 1.0
     """Seconds to keep draining after the CLI exits."""
 
-    host: HostSpec | None = None
+    detached: HostSpec | None = None
     """Serve the CLI to attachable viewers instead of this process's terminal.
 
     Set by ``--detach``, in the background process it launches; see
@@ -695,7 +695,7 @@ class RunConfig:
 
     headless: bool = False
     """Drive the CLI through its driver instead of a terminal: a chat's run, started by
-    a machine's terminal host (``--detach --attach``) for claude or codex. The CLI's
+    a host's terminal host (``--detach --attach``) for claude or codex. The CLI's
     own terminal is hosted only while a person has taken the run over."""
 
     diff: bool = False
@@ -1467,7 +1467,7 @@ def _session_file(adapter: Adapter, session_id: str) -> Path | None:
 # and, on macOS, the system frameworks the TLS trust check loads, which a forked child
 # may not use: the host's first file watch then crashes it.
 def _run_flags(
-    host: HostSpec | None,
+    detached: HostSpec | None,
     *,
     flags: _Flags,
     cli_argv: tuple[str, ...],
@@ -1486,12 +1486,12 @@ def _run_flags(
     if (
         flags.attach is not None
         and resume_path is None
-        and isinstance(host, detach.HeadlessSpec)
-        and host.resume
+        and isinstance(detached, detach.HeadlessSpec)
+        and detached.resume
     ):
-        taken = _session_file(_ADAPTERS[flags.cli](), host.resume)
+        taken = _session_file(_ADAPTERS[flags.cli](), detached.resume)
         if taken is not None:
-            resume_path, cli_session_id = taken, host.resume
+            resume_path, cli_session_id = taken, detached.resume
             prefix_bytes = taken.stat().st_size
     if (
         flags.attach is not None
@@ -1518,7 +1518,7 @@ def _run_flags(
     # resumes by the id it is handed, so the resume argument is not its argument.
     headless = (
         flags.attach is not None
-        and host is not None
+        and detached is not None
         and flags.cli in _HEADLESS_CLIS
         and not flags.dry_run
     )
@@ -1544,7 +1544,7 @@ def _run_flags(
             prefix_bytes=prefix_bytes,
             compact_after_load=compact_after_load,
             profile=profile,
-            host=host,
+            detached=detached,
             run_name=run_name,
             headless=headless,
         ),
@@ -1799,23 +1799,23 @@ def _spawn_and_drain(
     if hook_files is not None:
         # Set before the poller starts, which is the only reader of it.
         inbound.marker = hook_files.ready
-    machine = _machine_name()
+    host = _host_name()
     env = (
         _routing_env(config, granted_actor=granted_actor)
         | placed
         | _tools_env(tools)
-        | _cli_env(adapter, hosted=config.host is not None)
+        | _cli_env(adapter, hosted=config.detached is not None)
     )
     runs = _clicked_runs(
         config,
         adapter=adapter,
         env=env,
         record=record,
-        machine=machine,
+        host=host,
         sink=sink,
     )
     trust = (
-        _trust_gate(adapter, record=record, inbound=inbound, machine=machine)
+        _trust_gate(adapter, record=record, inbound=inbound, host=host)
         if config.syncing
         else None
     )
@@ -1855,7 +1855,7 @@ def _spawn_and_drain(
         argv,
         env=env,
         drop_env=_dropped_env(adapter),
-        host=config.host,
+        host=config.detached,
         on_input=detector.feed,
         on_output=_observers(
             None if stream_capture is None else stream_capture.feed,
@@ -1885,7 +1885,7 @@ def _spawn_and_drain(
                 inbound=inbound,
                 bridge=bridge,
                 run_name=config.run_name,
-                machine=machine,
+                host=host,
                 cwd=_shown_cwd(Path.cwd()),
                 cli=adapter.name,
                 record=record,
@@ -2184,7 +2184,7 @@ def _clicked_runs(
     adapter: Adapter,
     env: Mapping[str, str],
     record: Callable[[SystemMessage], None],
-    machine: str | None,
+    host: str | None,
     sink: Sink,
 ) -> ClickedRuns | None:
     """Return what runs the commands clicked in Chat, or ``None`` with no server."""
@@ -2197,7 +2197,7 @@ def _clicked_runs(
         cwd=Path.cwd(),
         env=given,
         shell_path=given.get("SHELL") or "/bin/sh",
-        machine=machine,
+        host=host,
         shown_cwd=_shown_cwd(Path.cwd()),
         publish=partial(_put_run_output, config.client, sink, config.instance),
     )
@@ -2218,7 +2218,7 @@ def _headless_and_drain(
     """Drive the CLI through a driver while daemon threads drain logs and feed lines."""
     # A computer the person declared a sandbox (``knowop connect --sandbox``) is
     # one where agents act freely, so a headless run there asks nothing.
-    sandboxed = machine_host.is_sandbox()
+    sandboxed = daemon.is_sandbox()
     # A permission the run cannot start with ends it here, before any worker starts,
     # not when the driver is built; the policy is read again, unchanged, then.
     if adapter.name == "codex":
@@ -2278,15 +2278,15 @@ def _headless_and_drain(
     tools_url = "" if tools is None else tools.url
     argv = _with_knowop(argv, adapter=adapter, placed=placed, tools=tools_url)
     model, effort = _model_and_effort(config.cli_args)
-    host = config.host
+    detached = config.detached
     instance = config.instance
-    machine = _machine_name()
+    host = _host_name()
     runs = _clicked_runs(
         config,
         adapter=adapter,
         env=env,
         record=record,
-        machine=machine,
+        host=host,
         sink=sink,
     )
     reporter = (
@@ -2311,10 +2311,12 @@ def _headless_and_drain(
         make_tui=partial(_make_tui, config, adapter, env=env, tools=tools_url),
         record=record,
         on_session=owner.adopt,
-        on_listening=None if host is None else host.on_listening,
+        on_listening=None if detached is None else detached.on_listening,
         on_state=None if reporter is None else reporter.report,
-        on_takeover=host.on_takeover if isinstance(host, detach.HeadlessSpec) else None,
-        control=host.control if isinstance(host, detach.HeadlessSpec) else None,
+        on_takeover=detached.on_takeover
+        if isinstance(detached, detach.HeadlessSpec)
+        else None,
+        control=detached.control if isinstance(detached, detach.HeadlessSpec) else None,
     )
     poll_thread = (
         threading.Thread(
@@ -2327,7 +2329,7 @@ def _headless_and_drain(
                 stop,
                 inbound=inbound,
                 run_name=config.run_name,
-                machine=machine,
+                host=host,
                 cwd=_shown_cwd(Path.cwd()),
                 cli=adapter.name,
                 record=record,
@@ -2608,8 +2610,8 @@ def _make_tui(
     listening: Callable[[], None],
 ) -> ThreadedRelay:
     """Build the terminal that continues ``session_id`` in ``adapter``'s own CLI."""
-    host = config.host
-    if host is None:
+    detached = config.detached
+    if detached is None:
         raise RuntimeError("this run has no terminal host to serve a terminal from")
     if _session_file(adapter, session_id) is not None:
         resume = resume_argv(adapter.name, session_id)
@@ -2628,7 +2630,7 @@ def _make_tui(
         _with_knowop(argv, adapter=adapter, placed=env, tools=tools),
         env=env,
         drop_env=_dropped_env(adapter),
-        host=replace(host, on_listening=listening),
+        host=replace(detached, on_listening=listening),
     )
 
 
@@ -2728,7 +2730,7 @@ def _cli_argv(
         adapter.name,
         cli_args=config.cli_args,
         attached=config.attach is not None,
-        sandbox=machine_host.is_sandbox(),
+        sandbox=daemon.is_sandbox(),
     )
     if "--settings" in approval:
         # Ours carries the person's, merged, so theirs leaves the argv.
@@ -2932,7 +2934,7 @@ def _trust_gate(
     *,
     record: Callable[[SystemMessage], None],
     inbound: InboundState,
-    machine: str | None,
+    host: str | None,
 ) -> tuple[TrustGate, TrustScreen | None] | None:
     """Return the gate for a CLI not trusted in this folder, and the screen it awaits."""
     cwd = Path.cwd()
@@ -2964,7 +2966,7 @@ def _trust_gate(
         gate.open,
         adapter.name,
         folder,
-        machine=machine,
+        host=host,
         remembered=remembered,
     )
     if adapter.name == "claude":
@@ -3150,10 +3152,10 @@ def _enqueue_stream_line(queue: deque[bytes], stats: _Stats, raw: bytes) -> None
     queue.append(raw)
 
 
-# A hostname that makes no machine name, one ``knowop connect`` refuses too, leaves
+# A hostname that makes no host name, one ``knowop connect`` refuses too, leaves
 # the run unnamed rather than stopping it.
-def _machine_name() -> str | None:
-    """Return this computer's machine name, as ``knowop connect`` names it."""
+def _host_name() -> str | None:
+    """Return this computer's host name, as ``knowop connect`` names it."""
     try:
         return host_name()
     except ClientError:
@@ -3247,7 +3249,7 @@ class _Typist(Protocol):
 # Server errors are swallowed: a flaky back-channel must not crash the run or corrupt
 # the terminal, exactly like the capture sink's resilience.
 #
-# Every drain says where the run is -- its ``--detach`` host, machine and folder -- so
+# Every drain says where the run is -- its ``--detach`` host, host and folder -- so
 # Chat shows it for as long as the lease the drain renews holds. It also names the CLI
 # this run is and an id the run minted for itself: the server routes and judges liveness
 # by that CLI, not by what the run wrote, and refuses a second run of one chat.
@@ -3278,7 +3280,7 @@ def _inbound_poll_loop(
     inbound: InboundState | None = None,
     bridge: PromptBridge | None = None,
     run_name: str | None = None,
-    machine: str | None = None,
+    host: str | None = None,
     cwd: str | None = None,
     cli: str = "",
     record: Callable[[SystemMessage], None] | None = None,
@@ -3339,7 +3341,7 @@ def _inbound_poll_loop(
                 session_id,
                 wait_sec=hold,
                 run=run_name,
-                machine=machine,
+                host=host,
                 cwd=cwd,
                 cli=cli or None,
                 instance=instance,
@@ -3404,7 +3406,7 @@ def _inbound_poll_loop(
 # harm is done: a ``run`` runs a shell and an ``answer`` allows a tool, as this person,
 # so a server route that misses its check still reaches neither.
 def _from_a_stranger(item: InboundDrainItem, *, account: str | None) -> bool:
-    """Say whether ``item`` acts on this machine for anyone but the session's account."""
+    """Say whether ``item`` acts on this host for anyone but the session's account."""
     return (
         item.kind in {"answer", "run"}
         and account is not None

@@ -1,6 +1,6 @@
 """The ``knowop`` command, against a scripted server and a clock that never waits.
 
-The machine host, the agent runners and the job runner are stood in for: each test
+The daemon, the agent runners and the job runner are stood in for: each test
 reads what knowop handed them.
 """
 
@@ -32,6 +32,7 @@ from trackinizer.trax.profile import (
     save_profile,
     switch_profile,
 )
+from trackinizer.wire.wire_daemon import ENROLL_PATH
 from trackinizer.wire.wire_device import (
     DEVICE_CODE_PATH,
     DEVICE_POLL_PATH,
@@ -39,7 +40,6 @@ from trackinizer.wire.wire_device import (
     DeviceToken,
     IssuedKey,
 )
-from trackinizer.wire.wire_machine_host import ENROLL_PATH
 from treekle import json_loads
 
 import httpx2
@@ -51,10 +51,10 @@ from knowop.agent import (
     detach,
 )
 from knowop.agent.detach import HostRecord
+from knowop.connect import serve
+from knowop.connect.daemon import host_facts
 from knowop.jobs import cli as jobs_cli
 from knowop.service import Connect, Services
-from knowop.shell import serve
-from knowop.shell.machine_host import host_facts
 
 
 if TYPE_CHECKING:
@@ -75,7 +75,7 @@ _VISUAL: Final = "33333333-3333-4333-8333-3333333333c3"
 
 
 class _Server:
-    """One scripted server behind every host: device login, the caller, machines."""
+    """One scripted server behind every host: device login, the caller, hosts."""
 
     def __init__(self) -> None:
         self.requests: list[httpx2.Request] = []
@@ -84,33 +84,33 @@ class _Server:
         """Whether the key was revoked: every authenticated route answers 401."""
         self.refuse: dict[str, int] = {}
         """The status each listed path answers with, in place of its answer."""
-        self.machines = [
-            _machine("ada-mac", status="online", owner=_EMAIL),
-            _machine("gpu1", status="offline", owner=_EMAIL),
-            _machine("lab", status="online", owner="bob@example.com"),
+        self.hosts = [
+            _host("ada-mac", status="online", owner=_EMAIL),
+            _host("gpu1", status="offline", owner=_EMAIL),
+            _host("lab", status="online", owner="bob@example.com"),
         ]
-        """What ``/api/machines`` lists: the caller's two, and another person's."""
-        self.machine: object = None
+        """What ``/api/hosts`` lists: the caller's two, and another person's."""
+        self.host: object = None
         self.runs: dict[str, list[dict[str, object]]] = {}
-        """Each machine's live runs, as its runs route lists them."""
+        """Each host's live sessions, as its runs route lists them."""
         self.facts: dict[str, dict[str, object]] = {}
-        """What each machine's host last reported about itself."""
+        """What each daemon last reported about itself."""
         self.disconnected: list[str] = []
-        """Each machine disconnected, in order."""
+        """Each host disconnected, in order."""
         self.logged_out: list[str] = []
-        """Each machine logged out, in order."""
+        """Each host logged out, in order."""
         self.stopped: list[str] = []
-        """Each run stopped through its machine, as ``MACHINE/SESSION``."""
+        """Each run stopped through its host, as ``HOST/SESSION``."""
         self.lingering: set[str] = set()
-        """Machines that still read online once disconnected."""
-        self.key_machine: str | None = None
-        """The machine a login made the key for, as the profile names it, since keys
-        name one: that machine's logout revokes the key."""
+        """Hosts that still read online once disconnected."""
+        self.key_host: str | None = None
+        """The host a login made the key for, as the profile names it, since keys
+        name one: that host's logout revokes the key."""
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
         if request.url.path == DEVICE_CODE_PATH:
-            self.machine = json_loads(request.content, dict[str, object])["machine"]
+            self.host = json_loads(request.content, dict[str, object])["host"]
             return httpx2.Response(201, content=_CODE.model_dump_json())
         if request.url.path == DEVICE_POLL_PATH:
             return httpx2.Response(200, content=self._poll().model_dump_json())
@@ -120,19 +120,19 @@ class _Server:
             return httpx2.Response(status, json={"detail": "refused"})
         return self._answer((request.method, request.url.path))
 
-    def hosts(self) -> set[str]:
+    def netlocs(self) -> set[str]:
         """Return every host a request went to."""
         return {request.url.host for request in self.requests}
 
     def serves(self, name: str, *, pid: int, version: str = "unknown") -> None:
         """Show ``name`` online, served by knowop ``version`` in process ``pid``."""
         # By name, as the server lists them.
-        self.machines = sorted(
+        self.hosts = sorted(
             [
-                *(machine for machine in self.machines if machine["name"] != name),
-                _machine(name, status="online", owner=_EMAIL),
+                *(host for host in self.hosts if host["name"] != name),
+                _host(name, status="online", owner=_EMAIL),
             ],
-            key=lambda machine: str(machine["name"]),
+            key=lambda host: str(host["name"]),
         )
         # The CLIs a host finds as it starts: those on this computer's PATH.
         self.facts[name] = {
@@ -143,12 +143,12 @@ class _Server:
 
     def server_status(self, name: str) -> str:
         """Return the status the server lists ``name`` with."""
-        return next(str(m["status"]) for m in self.machines if m["name"] == name)
+        return next(str(m["status"]) for m in self.hosts if m["name"] == name)
 
     def _set_status(self, name: str, status: str) -> None:
-        for machine in self.machines:
-            if machine["name"] == name:
-                machine["status"] = status
+        for host in self.hosts:
+            if host["name"] == name:
+                host["status"] = status
 
     def paths(self) -> list[str]:
         """Return every request's path, in order."""
@@ -165,7 +165,7 @@ class _Server:
                 api_key=_KEY,
                 role="writer",
                 email=_EMAIL,
-                machine_token="" if self.machine is None else _LOGIN_TOKEN,
+                host_token="" if self.host is None else _LOGIN_TOKEN,
             ),
         )
 
@@ -178,14 +178,14 @@ class _Server:
                     "name": "Ada",
                     "role": "writer",
                     "api_key_id": _KEY_ID,
-                    "machine": self.key_machine,
+                    "host": self.key_host,
                 },
             )
         if route == ("POST", f"/api/me/tokens/{_KEY_ID}/revoke"):
             self.revoked = True
             return httpx2.Response(200, json={"ok": True})
-        if route == ("GET", "/api/machines"):
-            return httpx2.Response(200, json={"machines": self.machines})
+        if route == ("GET", "/api/hosts"):
+            return httpx2.Response(200, json={"hosts": self.hosts})
         if route == ("GET", f"/api/canvases/{_CANVAS}"):
             return httpx2.Response(200, json={"id": _CANVAS, "revision": 3})
         if route == ("POST", f"/api/canvases/{_CANVAS}/operations"):
@@ -198,32 +198,32 @@ class _Server:
                     "visuals": [{**shown, "record_id": _RECORD}],
                 },
             )
-        for machine in list(self.machines):
-            name = str(machine["name"])
-            if route == ("GET", f"/api/machines/{name}"):
+        for host in list(self.hosts):
+            name = str(host["name"])
+            if route == ("GET", f"/api/hosts/{name}"):
                 detail = {
-                    **machine,
-                    "host_version": "",
+                    **host,
+                    "daemon_version": "",
                     "facts": self.facts.get(name, {}),
                 }
                 return httpx2.Response(200, json=detail)
-            if route == ("GET", f"/api/machines/{name}/runs"):
+            if route == ("GET", f"/api/hosts/{name}/runs"):
                 return httpx2.Response(200, json={"runs": self.runs.get(name, [])})
             for run in self.runs.get(name, []):
                 session = run["session_id"]
-                if route == ("POST", f"/api/machines/{name}/runs/{session}/stop"):
+                if route == ("POST", f"/api/hosts/{name}/runs/{session}/stop"):
                     self.stopped.append(f"{name}/{session}")
                     return httpx2.Response(204)
-            if route == ("POST", f"/api/machines/{name}/disconnect"):
+            if route == ("POST", f"/api/hosts/{name}/disconnect"):
                 self.disconnected.append(name)
                 if name not in self.lingering:
                     self._set_status(name, "revoked")
                 return httpx2.Response(200, json={"runs": self.runs.pop(name, [])})
-            if route == ("POST", f"/api/machines/{name}/logout"):
+            if route == ("POST", f"/api/hosts/{name}/logout"):
                 self.logged_out.append(name)
                 self._set_status(name, "revoked")
-                self.revoked = name == self.key_machine
-                keys = int(name == self.key_machine)
+                self.revoked = name == self.key_host
+                keys = int(name == self.key_host)
                 return httpx2.Response(
                     200,
                     json={"runs": self.runs.pop(name, []), "keys": keys},
@@ -265,7 +265,7 @@ class _Time:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Served:
-    """One ``serve.connect_machine`` call, as the machine host saw it."""
+    """One ``serve.connect_host`` call, as the daemon saw it."""
 
     name: str
     server: str
@@ -283,7 +283,7 @@ class _Served:
 
 
 class _Host:
-    """Stands in for ``serve.connect_machine``: records the call, takes a token."""
+    """Stands in for ``serve.connect_host``: records the call, takes a token."""
 
     def __init__(
         self,
@@ -324,7 +324,7 @@ class _Host:
             os.kill(os.getpid(), self.ending)
             time.sleep(5)
         if self.reads_token and not token and signed_in is not None:
-            token = signed_in().enroll_machine(name).token
+            token = signed_in().enroll_host(name).token
         signed_in_to = ""
         if signed_in is not None:
             with signed_in() as http:
@@ -347,12 +347,12 @@ class _Host:
 
 
 class _Launchd:
-    """Stands in for launchctl, and systemctl: a started service serves its machine.
+    """Stands in for launchctl, and systemctl: a started service serves its host.
 
     Each start is a new process, on the server with this knowop's version unless
     ``version`` names another; a scripted answer replaces what a command does. This
     computer has no ``uv``, so the service runs this interpreter. The menu bar agent
-    serves no machine: its commands are kept apart, by verb.
+    serves no host: its commands are kept apart, by verb.
     """
 
     def __init__(self, server: _Server, **answers: tuple[int, str]) -> None:
@@ -463,7 +463,7 @@ def server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Server:
     # A person at a terminal pipes no token; a test that does sets its own stdin.
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     # The real host serves until Ctrl-C, and the real runners start an agent or a job.
-    monkeypatch.setattr(serve, "connect_machine", _never_runs("connect_machine"))
+    monkeypatch.setattr(serve, "connect_host", _never_runs("connect_host"))
     monkeypatch.setattr(agent_cli, "sagent_main", _never_runs("the sagent runner"))
     monkeypatch.setattr(agent_cli, "main", _never_runs("the claude runner"))
     monkeypatch.setattr(agent_cli, "codex_main", _never_runs("the codex runner"))
@@ -498,7 +498,7 @@ def agents(
 @pytest.fixture
 def host(monkeypatch: pytest.MonkeyPatch) -> _Host:
     stand_in = _Host()
-    monkeypatch.setattr(serve, "connect_machine", stand_in)
+    monkeypatch.setattr(serve, "connect_host", stand_in)
     return stand_in
 
 
@@ -523,11 +523,11 @@ def test_login_with_no_argument_signs_in_to_the_default_server(
 ) -> None:
     assert _knowop("login") == 0
 
-    assert server.hosts() == {"alpha.knowop.ai"}
+    assert server.netlocs() == {"alpha.knowop.ai"}
     assert json_loads(server.requests[0].content, dict[str, object]) == {
         "client": "knowop",
-        "host": "Ada_Mac",
-        "machine": None,
+        "hostname": "Ada_Mac",
+        "host": None,
     }
     assert read_profile("alpha.knowop.ai") == Profile(
         url="https://alpha.knowop.ai",
@@ -677,13 +677,13 @@ def test_every_verb_reaches_knowops_server_while_trax_points_at_another(
         ["connect"],
         ["run", "claude"],
         ["job", "logs", "7"],
-        ["machine"],
+        ["host"],
         ["canvas", _CANVAS],
     ):
         assert _knowop(*argv) == 0, argv
     assert _knowop("logout") == 0
 
-    assert server.hosts() == {"acme.knowop.ai"}
+    assert server.netlocs() == {"acme.knowop.ai"}
     # The host enrolled this computer with knowop's key, not trax's.
     assert [(served.server, served.token) for served in host.connects] == [
         ("https://acme.knowop.ai", _ENROLL_TOKEN),
@@ -696,7 +696,7 @@ def test_every_verb_reaches_knowops_server_while_trax_points_at_another(
     assert current_profile() == "prod"
 
 
-def test_status_names_the_profile_server_account_role_and_the_accounts_machines(
+def test_status_names_the_profile_server_account_role_and_the_accounts_hosts(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert _knowop("login", "acme") == 0
@@ -709,12 +709,12 @@ def test_status_names_the_profile_server_account_role_and_the_accounts_machines(
         "server:  https://acme.knowop.ai",
         "account: ada@example.com",
         "role:    writer",
-        "machine: ada-mac online (this computer)",
-        "machine: gpu1 offline",
+        "host: ada-mac online (this computer)",
+        "host: gpu1 offline",
     ]
 
 
-def test_status_lists_each_machines_runs_and_the_runs_here_it_names_on_none(
+def test_status_lists_each_hosts_runs_and_the_runs_here_it_names_on_none(
     server: _Server,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -723,7 +723,7 @@ def test_status_lists_each_machines_runs_and_the_runs_here_it_names_on_none(
     monkeypatch.setattr(
         detach,
         "live_hosts",
-        lambda: [_host("chat-1a2b3c4d"), _host("scratch")],
+        lambda: [_detached("chat-1a2b3c4d"), _detached("scratch")],
     )
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
@@ -731,8 +731,8 @@ def test_status_lists_each_machines_runs_and_the_runs_here_it_names_on_none(
     assert _knowop("status") == 0
 
     assert capsys.readouterr().out.splitlines()[4:] == [
-        "machine: ada-mac online (this computer)",
-        "machine: gpu1 offline, 1 run live",
+        "host: ada-mac online (this computer)",
+        "host: gpu1 offline, 1 run live",
         "  run:   chat-1a2b3c4d  claude  ~/work",
         "here:    scratch  claude",
     ]
@@ -780,37 +780,37 @@ def test_status_with_a_revoked_key_says_to_log_in_again(
     assert "knowop login" in err
 
 
-def test_status_says_when_the_account_has_no_machine(
+def test_status_says_when_the_account_has_no_host(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server.machines = server.machines[2:]
+    server.hosts = server.hosts[2:]
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
     assert _knowop("status") == 0
 
     assert capsys.readouterr().out.splitlines()[-1] == (
-        "machine: none; run knowop connect"
+        "host: none; run knowop connect"
     )
 
 
-def test_status_of_a_viewer_says_machines_need_the_writer_role(
+def test_status_of_a_viewer_says_hosts_need_the_writer_role(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server.refuse["/api/machines"] = 403
+    server.refuse["/api/hosts"] = 403
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
     assert _knowop("status") == 0
 
     assert capsys.readouterr().out.splitlines()[-1] == (
-        "machine: listing machines needs the writer role"
+        "host: listing hosts needs the writer role"
     )
 
 
-@pytest.mark.parametrize("path", ["/api/me/profile", "/api/machines"])
+@pytest.mark.parametrize("path", ["/api/me/profile", "/api/hosts"])
 def test_status_reports_a_refusal_it_cannot_explain(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
@@ -846,11 +846,11 @@ def test_logout_revokes_this_logins_key_then_removes_its_profile(
     assert _knowop("status") == 1
 
 
-def test_logout_logs_this_computers_machine_out_and_its_key_goes_with_it(
+def test_logout_logs_this_computers_host_out_and_its_key_goes_with_it(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server.key_machine = "ada-mac"
+    server.key_host = "ada-mac"
     server.runs["ada-mac"] = [_run("chat-1a2b3c4d")]
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
@@ -858,21 +858,21 @@ def test_logout_logs_this_computers_machine_out_and_its_key_goes_with_it(
     assert _knowop("logout") == 0
 
     assert server.logged_out == ["ada-mac"]
-    # The machine's logout revoked the key a login made for it, so nothing is left to revoke.
+    # The host's logout revoked the key a login made for it, so nothing is left to revoke.
     assert not any(path.endswith("/revoke") for path in server.paths())
     assert list_profiles() == []
     assert capsys.readouterr().out.splitlines() == [
-        "logged out: machine ada-mac; runs stopped: chat-1a2b3c4d; keys revoked: 1",
+        "logged out: host ada-mac; runs stopped: chat-1a2b3c4d; keys revoked: 1",
         "logged out: revoked its key; deleted profile acme.knowop.ai",
     ]
 
 
-def test_logout_of_a_machine_the_server_does_not_know_as_ours_revokes_the_key_alone(
+def test_logout_of_a_host_the_server_does_not_know_as_ours_revokes_the_key_alone(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert _knowop("login", "acme") == 0
-    server.refuse["/api/machines/ada-mac/logout"] = 404
+    server.refuse["/api/hosts/ada-mac/logout"] = 404
     capsys.readouterr()
 
     assert _knowop("logout") == 0
@@ -884,12 +884,12 @@ def test_logout_of_a_machine_the_server_does_not_know_as_ours_revokes_the_key_al
     ]
 
 
-def test_logout_keeps_the_profile_when_the_machine_logout_is_refused(
+def test_logout_keeps_the_profile_when_the_host_logout_is_refused(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert _knowop("login", "acme") == 0
-    server.refuse["/api/machines/ada-mac/logout"] = 409
+    server.refuse["/api/hosts/ada-mac/logout"] = 409
 
     assert _knowop("logout") == 1
 
@@ -952,13 +952,13 @@ def test_disconnect_stops_the_runs_here_before_it_disconnects_this_computer(
     assert capsys.readouterr().out.splitlines() == [
         "stopped: run chat-1a2b3c4d (claude)",
         (
-            "disconnected: machine ada-mac; its connect stops at its next heartbeat, and "
+            "disconnected: host ada-mac; its connect stops at its next heartbeat, and "
             "knowop connect joins it again"
         ),
     ]
 
 
-def test_disconnect_of_another_machine_leaves_the_runs_here(
+def test_disconnect_of_another_host_leaves_the_runs_here(
     server: _Server,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -993,8 +993,8 @@ def test_connect_without_a_login_enrolls_this_computer_in_the_same_approval(
 
     assert json_loads(server.requests[0].content, dict[str, object]) == {
         "client": "knowop",
-        "host": "Ada_Mac",
-        "machine": "ada-mac",
+        "hostname": "Ada_Mac",
+        "host": "ada-mac",
     }
     assert host.connects == [
         _Served(
@@ -1011,7 +1011,7 @@ def test_connect_without_a_login_enrolls_this_computer_in_the_same_approval(
     assert "profile: alpha.knowop.ai\n" in capsys.readouterr().out
 
 
-def test_connect_after_a_login_enrolls_the_named_machine_with_knowops_key(
+def test_connect_after_a_login_enrolls_the_named_host_with_knowops_key(
     server: _Server,
     host: _Host,
 ) -> None:
@@ -1040,7 +1040,7 @@ def test_connect_logs_in_again_when_the_server_refuses_the_saved_login(
     host: _Host,
 ) -> None:
     assert _knowop("login", "acme") == 0
-    # Logging this machine out elsewhere revoked the key the saved login holds.
+    # Logging this host out elsewhere revoked the key the saved login holds.
     server.revoked = True
 
     assert _knowop("connect", "--name", "gpu1") == 0
@@ -1094,7 +1094,7 @@ def test_connect_to_another_server_logs_in_there_enrolling_this_computer(
         f"https://acme.knowop.ai{DEVICE_CODE_PATH}",
         f"http://127.0.0.1:8790{DEVICE_CODE_PATH}",
     ]
-    assert json_loads(codes[1].content, dict[str, object])["machine"] == "ada-mac"
+    assert json_loads(codes[1].content, dict[str, object])["host"] == "ada-mac"
     assert [(served.server, served.token) for served in host.connects] == [
         ("http://127.0.0.1:8790", _LOGIN_TOKEN),
     ]
@@ -1125,7 +1125,7 @@ def test_connect_with_a_saved_credential_enrolls_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     joined = _Host(reads_token=False)
-    monkeypatch.setattr(serve, "connect_machine", joined)
+    monkeypatch.setattr(serve, "connect_host", joined)
     assert _knowop("login", "acme") == 0
 
     assert _knowop("connect") == 0
@@ -1137,12 +1137,12 @@ def test_connect_with_a_saved_credential_enrolls_nothing(
 @pytest.mark.parametrize(
     ("name", "said"),
     [
-        ("Ada_Mac", "invalid machine name 'Ada_Mac'; expected "),
-        ("connect", "machine name 'connect' is reserved"),
-        ("a" * 64, f"invalid machine name '{'a' * 64}'; expected "),
+        ("Ada_Mac", "invalid host name 'Ada_Mac'; expected "),
+        ("connect", "host name 'connect' is reserved"),
+        ("a" * 64, f"invalid host name '{'a' * 64}'; expected "),
     ],
 )
-def test_connect_refuses_a_name_no_machine_may_take_before_logging_in(
+def test_connect_refuses_a_name_no_host_may_take_before_logging_in(
     server: _Server,
     host: _Host,
     capsys: pytest.CaptureFixture[str],
@@ -1157,7 +1157,7 @@ def test_connect_refuses_a_name_no_machine_may_take_before_logging_in(
 
 
 def test_ctrl_c_stops_connect_with_130(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(serve, "connect_machine", _Host(ending=KeyboardInterrupt()))
+    monkeypatch.setattr(serve, "connect_host", _Host(ending=KeyboardInterrupt()))
     assert _knowop("login", "acme") == 0
 
     assert _knowop("connect") == 130
@@ -1167,9 +1167,9 @@ def test_ctrl_c_names_the_runs_it_leaves_reaching_the_server(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The machine reads offline once its connect lets go; a detached run does not."""
-    monkeypatch.setattr(serve, "connect_machine", _Host(ending=KeyboardInterrupt()))
-    monkeypatch.setattr(detach, "live_hosts", lambda: [_host("chat-1a2b3c4d")])
+    """The host reads offline once its connect lets go; a detached run does not."""
+    monkeypatch.setattr(serve, "connect_host", _Host(ending=KeyboardInterrupt()))
+    monkeypatch.setattr(detach, "live_hosts", lambda: [_detached("chat-1a2b3c4d")])
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
@@ -1187,7 +1187,7 @@ def test_a_stop_or_a_hangup_ends_connect_like_ctrl_c_and_is_then_forgotten(
     ending: signal.Signals,
 ) -> None:
     """``systemctl stop`` sends one, a closed ssh session the other: both release."""
-    monkeypatch.setattr(serve, "connect_machine", _Host(ending=ending))
+    monkeypatch.setattr(serve, "connect_host", _Host(ending=ending))
     assert _knowop("login", "acme") == 0
     original = signal.signal(ending, _handler_before)
     try:
@@ -1301,42 +1301,43 @@ def test_job_hands_the_job_runner_knowops_profile_and_the_rest(
     assert runners.calls() == [("job", ["--profile", "acme.knowop.ai", *argv])]
 
 
-def test_machine_lists_the_machines_of_knowops_server(
+def test_host_lists_the_hosts_of_knowops_server(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
-    assert _knowop("machine") == 0
+    assert _knowop("host") == 0
 
     assert capsys.readouterr().out.splitlines() == [
         "ada-mac  personal  -  -",
         "gpu1     personal  -  -",
         "lab      personal  -  -",
     ]
-    assert server.paths()[-1] == "/api/machines"
+    # The KnowHosts it rents, if any, follow the registry's hosts.
+    assert server.paths()[-2:] == ["/api/hosts", "/api/addons/knowhost/hosts"]
 
 
-def test_machine_refuses_without_a_login_before_any_request(
+def test_host_refuses_without_a_login_before_any_request(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert _knowop("machine", "gpu1") == 1
+    assert _knowop("host", "gpu1") == 1
 
     assert server.requests == []
     assert capsys.readouterr().err == "knowop: not logged in; run knowop login\n"
 
 
 @pytest.mark.parametrize("argv", [["--help"], ["help"], ["gpu1", "role", "-h"]])
-def test_machine_help_needs_no_login_and_asks_the_server_nothing(
+def test_host_help_needs_no_login_and_asks_the_server_nothing(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
     argv: list[str],
 ) -> None:
-    assert _knowop("machine", *argv) == 0
+    assert _knowop("host", *argv) == 0
 
-    assert capsys.readouterr().out.startswith("Usage: knowop machine")
+    assert capsys.readouterr().out.startswith("Usage: knowop host")
     assert server.requests == []
 
 
@@ -1356,7 +1357,7 @@ def test_canvas_shows_a_visual_on_the_runs_canvas_on_knowops_server(
     shown = ["show", "trax.subgraph", "--record", _RECORD, "--placement", "side"]
     assert _knowop("canvas", *shown) == 0
 
-    assert server.hosts() == {"acme.knowop.ai"}
+    assert server.netlocs() == {"acme.knowop.ai"}
     assert server.paths()[-2:] == [
         f"/api/canvases/{_CANVAS}",
         f"/api/canvases/{_CANVAS}/operations",
@@ -1406,7 +1407,7 @@ def test_host_help_is_knowops_and_needs_no_login(
 ) -> None:
     assert _knowop("host", "--help") == 0
 
-    assert "knowop host [start | list" in capsys.readouterr().out
+    assert "knowop host [start | NAME [pause | resume | del" in capsys.readouterr().out
     assert server.requests == []
 
 
@@ -1437,11 +1438,11 @@ def test_a_first_run_logs_in_to_the_default_server_then_runs(
 ) -> None:
     assert _knowop("run", "claude", "--as", "ada") == 0
 
-    assert server.hosts() == {"alpha.knowop.ai"}
+    assert server.netlocs() == {"alpha.knowop.ai"}
     assert json_loads(server.requests[0].content, dict[str, object]) == {
         "client": "knowop",
-        "host": "Ada_Mac",
-        "machine": None,
+        "hostname": "Ada_Mac",
+        "host": None,
     }
     assert runners.calls() == [
         ("claude", ["--profile", "alpha.knowop.ai", "--as", "ada"]),
@@ -1461,9 +1462,9 @@ def test_a_run_says_to_connect_when_this_computer_is_not_online(
     here: str,
     said: bool,
 ) -> None:
-    others = [_machine("gpu1", status="online", owner=_EMAIL)]
-    mine = [_machine("ada-mac", status=here, owner=_EMAIL)] if here else []
-    server.machines = [*others, *mine]
+    others = [_host("gpu1", status="online", owner=_EMAIL)]
+    mine = [_host("ada-mac", status=here, owner=_EMAIL)] if here else []
+    server.hosts = [*others, *mine]
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
@@ -1477,14 +1478,14 @@ def test_a_run_says_to_connect_when_this_computer_is_not_online(
     assert [runner for runner, _ in runners.calls()] == ["codex"]
 
 
-def test_a_run_says_nothing_of_connecting_when_the_machines_cannot_be_listed(
+def test_a_run_says_nothing_of_connecting_when_the_hosts_cannot_be_listed(
     server: _Server,
     runners: _Runners,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
-    server.refuse["/api/machines"] = 403
+    server.refuse["/api/hosts"] = 403
 
     assert _knowop("run", "codex") == 0
 
@@ -1514,7 +1515,7 @@ def test_a_host_command_still_names_knowops_profile_once_logged_in(
     runners: _Runners,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(detach, "live_hosts", lambda: [_host("nightly")])
+    monkeypatch.setattr(detach, "live_hosts", lambda: [_detached("nightly")])
     assert _knowop("login", "acme") == 0
     asked = len(server.requests)
 
@@ -1643,9 +1644,9 @@ def test_bare_knowop_does_not_count_another_computers_connection(
     capsys: pytest.CaptureFixture[str],
     here: str,
 ) -> None:
-    server.machines = [
-        _machine("gpu1", status="online", owner=_EMAIL),
-        *([_machine("ada-mac", status=here, owner=_EMAIL)] if here else []),
+    server.hosts = [
+        _host("gpu1", status="online", owner=_EMAIL),
+        *([_host("ada-mac", status=here, owner=_EMAIL)] if here else []),
     ]
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
@@ -1659,7 +1660,7 @@ def test_bare_knowop_does_not_count_another_persons_computer(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server.machines = [_machine("ada-mac", status="online", owner="bob@example.com")]
+    server.hosts = [_host("ada-mac", status="online", owner="bob@example.com")]
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
@@ -1685,7 +1686,7 @@ def test_bare_knowop_reports_a_revoked_login_instead_of_saying_connected(
 
 _ACME: Final = "https://acme.knowop.ai"
 _CONNECTED: Final = (
-    f"connected: machine ada-mac at {_ACME} in the background (pid 4243); it starts "
+    f"connected: host ada-mac at {_ACME} in the background (pid 4243); it starts "
     "again at login"
 )
 
@@ -1707,7 +1708,7 @@ def _screen_lines(fd: int, *, count: int) -> list[str]:
     return printed.decode().replace("\r\n", "\n").splitlines()
 
 
-def test_connect_at_a_terminal_returns_once_its_service_serves_the_machine(
+def test_connect_at_a_terminal_returns_once_its_service_serves_the_host(
     host: _Host,
     launchd: _Launchd,
     agents: Services,
@@ -1872,7 +1873,7 @@ def test_connect_restarts_a_service_whose_host_would_now_report_otherwise(
     assert terminal.lines()[-3] == _CONNECTED.replace("4243", "4244")
 
 
-def test_connect_starts_nothing_where_another_connect_serves_the_machine(
+def test_connect_starts_nothing_where_another_connect_serves_the_host(
     server: _Server,
     host: _Host,
     launchd: _Launchd,
@@ -1886,13 +1887,13 @@ def test_connect_starts_nothing_where_another_connect_serves_the_machine(
 
     assert (host.connects, launchd.calls) == ([], [])
     assert terminal.lines()[-1] == (
-        f"connected already: machine ada-mac at {_ACME}, by knowop pid 777, which no "
+        f"connected already: host ada-mac at {_ACME}, by knowop pid 777, which no "
         "service of this computer runs; stop that connect, then run knowop connect "
         "again to serve it from one"
     )
 
 
-def test_connect_names_a_machine_new_to_the_server_in_what_to_run_next(
+def test_connect_names_a_host_new_to_the_server_in_what_to_run_next(
     host: _Host,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1971,7 +1972,7 @@ def test_a_terminal_with_no_service_manager_serves_in_the_foreground_and_says_wh
     assert [served.join_only for served in host.connects] == [False]
     assert capsys.readouterr().err == (
         "knowop: no user service manager answers here (systemctl --user), so this "
-        "terminal serves the machine until Ctrl-C\n"
+        "terminal serves the host until Ctrl-C\n"
     )
 
 
@@ -1991,9 +1992,9 @@ def test_a_service_that_never_comes_online_is_left_running_and_said(
     assert _knowop("connect") == 1
 
     assert capsys.readouterr().err == (
-        "knowop: machine ada-mac did not come online in 30 s; see knowop logs\n"
+        "knowop: host ada-mac did not come online in 30 s; see knowop logs\n"
     )
-    assert server.paths().count("/api/machines/ada-mac") == 31
+    assert server.paths().count("/api/hosts/ada-mac") == 31
     assert len(agents.every()) == 1
 
 
@@ -2005,7 +2006,7 @@ def test_the_join_here_is_not_taken_for_the_service_serving(
     tmp_path: Path,
 ) -> None:
     _at_terminal(monkeypatch)
-    # The join here heartbeats once, so the machine reads online with this process.
+    # The join here heartbeats once, so the host reads online with this process.
     host.joined = lambda name: server.serves(name, pid=os.getpid())
     silent = _Launchd(server, bootstrap=(0, ""))
     agents = Services(manager="launchd", folder=tmp_path / "agents", run=silent)
@@ -2015,12 +2016,12 @@ def test_the_join_here_is_not_taken_for_the_service_serving(
     assert _knowop("connect") == 1
 
     assert capsys.readouterr().err == (
-        "knowop: machine ada-mac did not come online in 30 s; see knowop logs\n"
+        "knowop: host ada-mac did not come online in 30 s; see knowop logs\n"
     )
 
 
 @pytest.mark.usefixtures("host")
-def test_connect_at_a_terminal_says_when_the_server_will_not_show_the_machine(
+def test_connect_at_a_terminal_says_when_the_server_will_not_show_the_host(
     server: _Server,
     launchd: _Launchd,
     monkeypatch: pytest.MonkeyPatch,
@@ -2028,12 +2029,12 @@ def test_connect_at_a_terminal_says_when_the_server_will_not_show_the_machine(
 ) -> None:
     _at_terminal(monkeypatch)
     assert _knowop("login", "acme") == 0
-    server.refuse["/api/machines/ada-mac"] = 403
+    server.refuse["/api/hosts/ada-mac"] = 403
 
     assert _knowop("connect") == 1
 
     assert launchd.calls == []
-    assert "GET /api/machines/ada-mac -> 403" in capsys.readouterr().err
+    assert "GET /api/hosts/ada-mac -> 403" in capsys.readouterr().err
 
 
 @pytest.mark.usefixtures("host")
@@ -2075,13 +2076,13 @@ def test_connect_follow_follows_the_services_log_until_ctrl_c(
         if len(waits) > 1:
             raise KeyboardInterrupt
         with (folder / f"ada-mac-{service.server_tag(_ACME)}.log").open("a") as file:
-            file.write("serving: machine ada-mac\n")
+            file.write("serving: host ada-mac\n")
 
     assert _knowop("login", "acme") == 0
 
     assert cli.main(["connect", "--follow"], sleep=sleep, clock=_Time().clock) == 130
 
-    assert terminal.lines()[-1] == "serving: machine ada-mac"
+    assert terminal.lines()[-1] == "serving: host ada-mac"
     assert waits == [0.5, 0.5]
 
 
@@ -2089,7 +2090,7 @@ def test_the_services_own_run_rotates_its_log_while_it_serves(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(serve, "connect_machine", _Host(waits=1))
+    monkeypatch.setattr(serve, "connect_host", _Host(waits=1))
     log = tmp_path / "ada-mac.log"
     log.write_bytes(b"x" * 5 * 2**20)
     assert _knowop("login", "acme") == 0
@@ -2122,7 +2123,7 @@ def test_the_services_own_run_exits_0_on_a_refusal_no_restart_can_change(
 ) -> None:
     """Launchd and systemd start again what exits nonzero, and nothing that exits 0."""
     refused = ClientError("POST /heartbeat -> refused", status_code=status)
-    monkeypatch.setattr(serve, "connect_machine", _Host(ending=refused))
+    monkeypatch.setattr(serve, "connect_host", _Host(ending=refused))
     assert _knowop("login", "acme") == 0
     log = str(tmp_path / "ada-mac.log")
 
@@ -2265,7 +2266,7 @@ def _connect_log(name: str) -> Path:
         (["gpu1", "-n", "0"], ""),
     ],
 )
-def test_logs_prints_a_machines_log_here_or_its_last_lines(
+def test_logs_prints_a_hosts_log_here_or_its_last_lines(
     capsys: pytest.CaptureFixture[str],
     argv: list[str],
     printed: str,
@@ -2306,7 +2307,7 @@ def test_logs_follow_reads_on_from_the_start_of_a_rotated_log(
     assert capsys.readouterr().out.splitlines()[-2:] == ["taken over: four", "five"]
 
 
-def test_logs_of_a_machine_connected_elsewhere_say_where_its_log_is(
+def test_logs_of_a_host_connected_elsewhere_say_where_its_log_is(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert _knowop("login", "acme") == 0
@@ -2315,13 +2316,13 @@ def test_logs_of_a_machine_connected_elsewhere_say_where_its_log_is(
     assert _knowop("logs", "gpu1") == 1
 
     assert capsys.readouterr().err == (
-        "knowop: no log of machine gpu1 on this computer: its log is on the computer "
+        "knowop: no log of host gpu1 on this computer: its log is on the computer "
         "whose service connects it, and a connect in the foreground prints to its "
         "terminal\n"
     )
 
 
-def test_status_shows_the_version_and_process_of_an_online_machine_alone(
+def test_status_shows_the_version_and_process_of_an_online_host_alone(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2333,8 +2334,8 @@ def test_status_shows_the_version_and_process_of_an_online_machine_alone(
     assert _knowop("status") == 0
 
     assert capsys.readouterr().out.splitlines()[4:] == [
-        "machine: ada-mac online, knowop 0.1.6, pid 4242 (this computer)",
-        "machine: gpu1 offline",
+        "host: ada-mac online, knowop 0.1.6, pid 4242 (this computer)",
+        "host: gpu1 offline",
     ]
 
 
@@ -2396,7 +2397,7 @@ def test_status_json_holds_each_login_the_runs_here_and_the_services(
         "started_at": started,
     }
     server.runs["gpu1"] = [_run("chat-1a2b3c4d")]
-    monkeypatch.setattr(detach, "live_hosts", lambda: [_host("scratch")])
+    monkeypatch.setattr(detach, "live_hosts", lambda: [_detached("scratch")])
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
@@ -2409,7 +2410,7 @@ def test_status_json_holds_each_login_the_runs_here_and_the_services(
                 "server": _ACME,
                 "account": _EMAIL,
                 "role": "writer",
-                "machines": [
+                "hosts": [
                     {
                         "name": "ada-mac",
                         "status": "online",
@@ -2462,7 +2463,7 @@ def test_status_shows_a_run_without_a_name_by_its_short_session(
 
 
 @pytest.mark.parametrize("named", ["chat-1a2b3c4d", "11111111"])
-def test_run_stop_stops_a_run_of_yours_on_another_machine_through_the_server(
+def test_run_stop_stops_a_run_of_yours_on_another_host_through_the_server(
     server: _Server,
     runners: _Runners,
     capsys: pytest.CaptureFixture[str],
@@ -2495,7 +2496,7 @@ def test_run_stop_lists_the_runs_a_name_matches_and_stops_none(
 
     assert server.stopped == []
     assert capsys.readouterr().err.splitlines() == [
-        "knowop: chat-1a2b3c4d names 2 live runs; stop one by its session:",
+        "knowop: chat-1a2b3c4d names 2 live sessions; stop one by its session:",
         "  ada-mac  chat-1a2b3c4d  22222222-2222-2222-2222-222222222222  claude  ~/work",
         "  gpu1  chat-1a2b3c4d  11111111-1111-1111-1111-111111111111  claude  ~/work",
     ]
@@ -2507,11 +2508,11 @@ def test_run_stop_of_a_run_nowhere_says_so(capsys: pytest.CaptureFixture[str]) -
     assert _knowop("run", "stop", "nightly") == 1
 
     assert capsys.readouterr().err == (
-        "knowop: no live run nightly here or on your machines\n"
+        "knowop: no live session nightly here or on your hosts\n"
     )
 
 
-def test_logout_of_one_machine_keeps_this_computers_login(
+def test_logout_of_one_host_keeps_this_computers_login(
     server: _Server,
     agents: Services,
     capsys: pytest.CaptureFixture[str],
@@ -2527,17 +2528,17 @@ def test_logout_of_one_machine_keeps_this_computers_login(
     assert agents.every() == []
     assert [name for name, _ in list_profiles()] == ["acme.knowop.ai"]
     assert capsys.readouterr().out.splitlines() == [
-        "logged out: machine gpu1; runs stopped: none; keys revoked: 0",
-        "removed: the connect service of machine gpu1 on this computer",
+        "logged out: host gpu1; runs stopped: none; keys revoked: 0",
+        "removed: the connect service of host gpu1 on this computer",
     ]
 
 
-def test_logout_of_a_machine_that_is_not_yours_says_the_server_refused(
+def test_logout_of_a_host_that_is_not_yours_says_the_server_refused(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert _knowop("login", "acme") == 0
-    server.refuse["/api/machines/lab/logout"] = 404
+    server.refuse["/api/hosts/lab/logout"] = 404
 
     assert _knowop("logout", "lab") == 1
 
@@ -2545,7 +2546,7 @@ def test_logout_of_a_machine_that_is_not_yours_says_the_server_refused(
     assert [name for name, _ in list_profiles()] == ["acme.knowop.ai"]
 
 
-def test_logout_all_logs_out_every_machine_of_yours_then_this_computer(
+def test_logout_all_logs_out_every_host_of_yours_then_this_computer(
     server: _Server,
     agents: Services,
     capsys: pytest.CaptureFixture[str],
@@ -2562,16 +2563,16 @@ def test_logout_all_logs_out_every_machine_of_yours_then_this_computer(
     # Another server's login is not this one: its service stays.
     assert [each.server for each in agents.every()] == ["https://other.example"]
     assert capsys.readouterr().out.splitlines()[-2:] == [
-        "removed: the connect service of machine ada-mac on this computer",
+        "removed: the connect service of host ada-mac on this computer",
         "logged out: revoked its key; deleted profile acme.knowop.ai",
     ]
 
 
-def test_logout_all_logs_out_the_machine_this_login_was_made_for_last(
+def test_logout_all_logs_out_the_host_this_login_was_made_for_last(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    server.key_machine = "ada-mac"
+    server.key_host = "ada-mac"
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
@@ -2581,8 +2582,8 @@ def test_logout_all_logs_out_the_machine_this_login_was_made_for_last(
     assert server.logged_out == ["gpu1", "ada-mac"]
     assert list_profiles() == []
     assert capsys.readouterr().out.splitlines() == [
-        "logged out: machine gpu1; runs stopped: none; keys revoked: 0",
-        "logged out: machine ada-mac; runs stopped: none; keys revoked: 1",
+        "logged out: host gpu1; runs stopped: none; keys revoked: 0",
+        "logged out: host ada-mac; runs stopped: none; keys revoked: 1",
         "logged out: revoked its key; deleted profile acme.knowop.ai",
     ]
 
@@ -2615,11 +2616,11 @@ def test_disconnect_removes_this_computers_service_once_the_server_lets_go(
     assert launchd.calls[-1][1] == "bootout"
     assert server.server_status("ada-mac") == "revoked"
     assert capsys.readouterr().out.splitlines()[0] == (
-        "removed: the connect service of machine ada-mac on this computer"
+        "removed: the connect service of host ada-mac on this computer"
     )
 
 
-def test_disconnect_says_when_the_machine_still_reads_online(
+def test_disconnect_says_when_the_host_still_reads_online(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2631,7 +2632,7 @@ def test_disconnect_says_when_the_machine_still_reads_online(
     assert _knowop("disconnect", "gpu1") == 1
 
     assert capsys.readouterr().err == (
-        "knowop: machine gpu1 still reads online after 30 s\n"
+        "knowop: host gpu1 still reads online after 30 s\n"
     )
 
 
@@ -2664,7 +2665,7 @@ def _never_runs(name: str) -> Callable[..., int]:
     return refuse
 
 
-def _machine(name: str, *, status: str, owner: str) -> dict[str, object]:
+def _host(name: str, *, status: str, owner: str) -> dict[str, object]:
     return {
         "name": name,
         "role": "personal",
@@ -2679,7 +2680,7 @@ def _machine(name: str, *, status: str, owner: str) -> dict[str, object]:
 
 
 def _run(name: str) -> dict[str, object]:
-    """Return a live claude run, as a machine's runs route lists it."""
+    """Return a live claude run, as a host's runs route lists it."""
     return {
         "session_id": "11111111-1111-1111-1111-111111111111",
         "cli": "claude",
@@ -2689,7 +2690,7 @@ def _run(name: str) -> dict[str, object]:
     }
 
 
-def _host(name: str) -> HostRecord:
+def _detached(name: str) -> HostRecord:
     """Return the record of a detached claude run on this computer."""
     return HostRecord(
         name=name,

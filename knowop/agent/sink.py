@@ -523,7 +523,7 @@ class FileSink(Sink):
             {
                 "adapter": adapter_name,
                 # The BASENAME, matching how the server resolves a part: the
-                # absolute path differs across machines, so a capture replayed
+                # absolute path differs across hosts, so a capture replayed
                 # elsewhere must still name the same file.
                 "part_name": _part_name(path),
                 **body.model_dump(mode="json"),
@@ -589,7 +589,7 @@ class TrackinizerSink(Sink):
 
     The session opens on whichever comes first: an explicit :meth:`open` or
     the first send. The runner calls ``open`` before forking the child, so a
-    live run opens eagerly -- the server-granted routing handle has to be in
+    live session opens eagerly -- the server-granted routing handle has to be in
     the child's environment from the start (#453). Opening at the first SEND
     rather than the first event means taking an event never needs the server,
     so a run that could not open its session buffers until it can. A caller

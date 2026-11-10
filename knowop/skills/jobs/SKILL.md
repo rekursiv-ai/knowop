@@ -51,7 +51,7 @@ command, 130 when you interrupt a log.
 
 ## On a computer of your own
 
-`knowop job submit --machine NAME [--memory SIZE] [--gpus N] [--minutes M] --
+`knowop job submit --host NAME [--memory SIZE] [--gpus N] [--minutes M] --
 CMD...` runs CMD on your computer NAME, which must run `knowop connect --jobs`.
 
 - No snapshot: the computer fetches the commit your branch was pushed at. The

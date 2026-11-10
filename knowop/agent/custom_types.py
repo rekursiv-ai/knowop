@@ -79,7 +79,7 @@ class Event:
     path: Path
     """The session file this record was read from. The server resolves a part
     number from its BASENAME, since the absolute path differs across
-    machines -- which is what lets a resumed run append to the part it
+    hosts -- which is what lets a resumed run append to the part it
     materialized."""
 
     restart: bool = False

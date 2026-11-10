@@ -4,7 +4,7 @@
 On macOS, ``knowop connect`` at a terminal starts ``knowop menubar`` beside its connect
 services, as a launchd agent of its own (:mod:`service`). It shows the knowop mark,
 dimmed while a connect service of this computer is not online, and a menu with each
-server knowop is logged in to: the account, its machines and their live runs, as
+server knowop is logged in to: the account, its hosts and their live sessions, as
 ``knowop status`` shows them, and a line that opens the server's web app. Every 10 s it
 reads ``knowop status --json`` from a process of its own, so a slow server never holds
 the menu bar and a knowop upgraded since gives the next answer. Quit ends it until the
@@ -65,7 +65,7 @@ _VARIABLE_LENGTH: Final = -1.0
 """``NSVariableStatusItemLength``: as wide as the mark."""
 
 
-class _Machine(TypedDict):
+class _Host(TypedDict):
     name: str
     status: str
     runs: list[object]
@@ -74,7 +74,7 @@ class _Machine(TypedDict):
 class _Login(TypedDict):
     server: str
     account: str | None
-    machines: list[_Machine] | None
+    hosts: list[_Host] | None
 
 
 class _Service(TypedDict):
@@ -112,19 +112,19 @@ def view(report: Report | None) -> tuple[bool, list[Line]]:
       report: ``knowop status --json``; ``None`` when it gave none, as before a login.
 
     Returns:
-      connected: Whether every connect service here that is on serves a machine
+      connected: Whether every connect service here that is on serves a host
         its server shows online; never without one.
-      lines: A heading; then each login: its server and account, its machines with
-        their state and live runs, and a line that opens the server.
+      lines: A heading; then each login: its server and account, its hosts with
+        their state and live sessions, and a line that opens the server.
 
     """
     if report is None:
         return False, [Line(title="knowop: not logged in; run knowop connect")]
     online = {
-        (login["server"], machine["name"])
+        (login["server"], host["name"])
         for login in report["logins"]
-        for machine in login["machines"] or []
-        if machine["status"] == "online"
+        for host in login["hosts"] or []
+        if host["status"] == "online"
     }
     served = {
         (s["server"], s["name"])
@@ -138,16 +138,14 @@ def view(report: Report | None) -> tuple[bool, list[Line]]:
     for login in report["logins"]:
         who = login["account"] or "it refused this login; run knowop login"
         lines += [Line(title=""), Line(title=f"{login['server']}: {who}")]
-        for machine in login["machines"] or []:
-            count = len(machine["runs"])
+        for host in login["hosts"] or []:
+            count = len(host["runs"])
             runs = f", {count} run{'' if count == 1 else 's'} live" if count else ""
             here = (
-                " (this computer)"
-                if (login["server"], machine["name"]) in served
-                else ""
+                " (this computer)" if (login["server"], host["name"]) in served else ""
             )
             lines.append(
-                Line(title=f"{machine['name']}: {machine['status']}{runs}{here}"),
+                Line(title=f"{host['name']}: {host['status']}{runs}{here}"),
             )
         lines.append(Line(title=f"Open {login['server']}", url=login["server"]))
     return connected, lines

@@ -56,7 +56,7 @@ from knowop.agent.conftest import (
     _signal_app,
     _Tree,
 )
-from knowop.shell.conftest import _process
+from knowop.connect.conftest import _process
 
 
 _CWD: Final = _THIS.parent
@@ -64,7 +64,7 @@ _CWD: Final = _THIS.parent
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from knowop.shell.conftest import _Process
+    from knowop.connect.conftest import _Process
 
 
 _AMEND: Final[PlainTree] = {

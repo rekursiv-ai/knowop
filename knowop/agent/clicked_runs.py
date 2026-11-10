@@ -3,7 +3,7 @@
 The agent writes a command in a fenced shell block, and Chat draws a Run button on it
 for the chat's starter. A click reaches this run as a ``run`` message
 (:data:`~trackinizer.wire.wire_sessions.InboundKind`), never the server's to run:
-the command runs here, on the run's machine, in the folder the run started in, with
+the command runs here, on the run's host, in the folder the run started in, with
 the environment the CLI has, in the background, in a process group of its own, reading
 nothing. Each start and end is a ``run`` record of the session, which Chat draws under
 the block; each end is also one line from :data:`RUN_SOURCE`, which the inbound loop
@@ -88,7 +88,7 @@ class Ended:
     closed: bool = False
     """Whether the run ended first and stopped it."""
 
-    machine: str | None = None
+    host: str | None = None
     cwd: str | None = None
 
 
@@ -104,7 +104,7 @@ class ClickedRuns:
       cwd: The folder each command runs in: the run's.
       env: The environment each command runs with: the CLI's.
       shell_path: The shell that reads each command (``$SHELL -c``).
-      machine: This computer's machine name, as the line names it.
+      host: This computer's host name, as the line names it.
       shown_cwd: ``cwd`` as Chat shows it, ``~/...`` under the home directory.
       publish: Shows Chat what a running command has printed so far, given its run
         id and the end of its output; ``None`` shows nothing until it ends.
@@ -120,7 +120,7 @@ class ClickedRuns:
         cwd: Path,
         env: Mapping[str, str],
         shell_path: str,
-        machine: str | None = None,
+        host: str | None = None,
         shown_cwd: str | None = None,
         publish: Callable[[str, str], None] | None = None,
         publish_sec: float = _PUBLISH_SEC,
@@ -130,7 +130,7 @@ class ClickedRuns:
         self._cwd = cwd
         self._env = dict(env)
         self._shell = shell_path
-        self._machine = machine
+        self._host = host
         self._shown_cwd = shown_cwd
         self._publish = publish
         self._publish_sec = publish_sec
@@ -258,7 +258,7 @@ class ClickedRuns:
             stderr=_tail(running.err),
             stopped_by=running.stopped_by,
             closed=closed and running.stopped_by is None,
-            machine=self._machine,
+            host=self._host,
             cwd=self._shown_cwd,
         )
         self._note(
@@ -326,7 +326,7 @@ class ClickedRuns:
             "by": by,
             "state": state,
             "reason": reason,
-            "machine": self._machine,
+            "host": self._host,
             "cwd": self._shown_cwd,
         }
         if ended is not None:
@@ -374,8 +374,8 @@ def wake_text(ended: Ended) -> str:
     ]
     if ended.stopped_by is not None:
         attributes.append(f'stopped-by="{html.escape(ended.stopped_by)}"')
-    if ended.machine is not None:
-        attributes.append(f'machine="{html.escape(ended.machine)}"')
+    if ended.host is not None:
+        attributes.append(f'host="{html.escape(ended.host)}"')
     if ended.cwd is not None:
         attributes.append(f'cwd="{html.escape(ended.cwd)}"')
     said = (

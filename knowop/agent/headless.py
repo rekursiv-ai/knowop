@@ -1,6 +1,6 @@
 """Run a chat's CLI headless, and hand it to a terminal on takeover.
 
-A Chat run on a person's machine does not draw a TUI. :class:`HeadlessRun` drives the
+A Chat run on a person's host does not draw a TUI. :class:`HeadlessRun` drives the
 CLI through its programmatic protocol (a :class:`~.asks.Driver`) and writes what the
 driver reports as the records of the chat's session: a card when the agent asks, and its
 end when the ask is answered or released, and each end of a compaction. The transcript still comes from tailing the

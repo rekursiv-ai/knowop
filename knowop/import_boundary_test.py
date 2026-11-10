@@ -37,7 +37,7 @@ _ALLOWED: Final = (
     "trackinizer.sagent.session",
     "trackinizer.lib.agent",
     # Sagent's tool server, from the sagent package knowop depends on: the tool host
-    # serves sagent's remote tools through it (shell/tool_host.py).
+    # serves sagent's remote tools through it (connect/tool_serving.py).
     "sagent.host",
     "trackinizer.lib.posix",
     "trackinizer.lib.userdirs",
