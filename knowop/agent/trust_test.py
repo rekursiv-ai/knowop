@@ -312,7 +312,7 @@ class _Card:
             sleep=self.slept.append,
             clock=lambda: datetime(2026, 10, 20, tzinfo=UTC),
         )
-        self.gate.open(cli, "~/proj", machine="gx10", remembered=cli == "codex")
+        self.gate.open(cli, "~/proj", host="gx10", remembered=cli == "codex")
         card = self.records[0].extra["$interaction"]
         assert isinstance(card, Mapping)
         self.id = card["id"]
@@ -348,7 +348,7 @@ class TestTrustGate:
 
     def test_open_writes_one_trust_card_and_holds_the_lines(self) -> None:
         card = _Card()
-        card.gate.open("claude", "~/other", machine=None, remembered=True)
+        card.gate.open("claude", "~/other", host=None, remembered=True)
 
         [record] = card.records
         assert record.subtype == "interaction"
@@ -364,7 +364,7 @@ class TestTrustGate:
             "state": "pending",
             "cli": "claude",
             "folder": "~/proj",
-            "machine": "gx10",
+            "host": "gx10",
             "remembered": False,
         }
         assert card.pending.is_set()
@@ -487,7 +487,7 @@ class TestTrustGate:
             rearm=lambda: None,
         )
         before = datetime.now(UTC)
-        gate.open("claude", "/work", machine=None, remembered=True)
+        gate.open("claude", "/work", host=None, remembered=True)
 
         (record,) = records
         assert record.timestamp is not None

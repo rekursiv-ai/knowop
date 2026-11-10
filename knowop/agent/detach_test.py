@@ -210,7 +210,7 @@ class TestRecords:
             '"command":"python worker","cwd":"/srv/work","pid":42,'
             '"address":"/var/run/host.sock","started":"2026-10-03T00:00:00+00:00",'
             '"state":"exited","exit_code":7,'
-            '"ended":"2026-10-03T00:01:00+00:00","machine":"host-a",'
+            '"ended":"2026-10-03T00:01:00+00:00","host":"host-a",'
             '"control":"/var/run/control.sock","session":"session-1"}'
         ).replace("__HOST_TYPE__", tagged_type)
         (tmp_path / "host.json").write_text(text)
@@ -225,7 +225,7 @@ class TestRecords:
             state="exited",
             exit_code=7,
             ended="2026-10-03T00:01:00+00:00",
-            machine="host-a",
+            host="host-a",
             control="/var/run/control.sock",
             session="session-1",
         )
@@ -630,7 +630,7 @@ class TestCommands:
 
     def test_the_live_hosts_are_this_computers_hosts_still_there(self) -> None:
         here = socket.gethostname()
-        for name, state, machine in (
+        for name, state, host in (
             ("alpha", "exited", here),
             ("beta", "starting", here),
             ("gamma", "starting", f"not-{here}"),
@@ -640,10 +640,10 @@ class TestCommands:
             root.mkdir(parents=True)
             detach._write_record(
                 root,
-                _record(root, name=name, state=state, pid=os.getpid(), machine=machine),
+                _record(root, name=name, state=state, pid=os.getpid(), host=host),
             )
 
-        assert [host.name for host in detach.live_hosts()] == ["beta", "delta"]
+        assert [detached.name for detached in detach.live_hosts()] == ["beta", "delta"]
 
     @pytest.mark.parametrize(("failed", "status"), [(set[str](), 0), ({"beta"}, 1)])
     def test_stop_all_stops_each_live_host_and_fails_when_one_did_not_stop(
@@ -805,13 +805,13 @@ class TestCommands:
         root.mkdir(parents=True)
         scrollback = root / "scrollback.log"
         scrollback.write_bytes(b"one\r\n")
-        with contextlib.ExitStack() as host:
-            address = host.enter_context(hosts.listen(root / "s"))
+        with contextlib.ExitStack() as detached:
+            address = detached.enter_context(hosts.listen(root / "s"))
             detach._write_record(root, _record(root, name="zeta", address=address))
             monkeypatch.setattr(
                 hosts.clock,
                 "sleep",
-                partial(_write_then_close, scrollback, host),
+                partial(_write_then_close, scrollback, detached),
             )
 
             assert main(["log", "zeta", "--follow"]) == 0
@@ -914,11 +914,11 @@ class TestAHeadlessHostIsRecordedAndFound:
         control = socket_address(detach._paths("theta") / "control.sock")
         assert said == f"[knowop run] control {control} resume ''"
 
-    def test_the_record_names_the_machine_and_the_socket(self) -> None:
+    def test_the_record_names_the_host_and_the_socket(self) -> None:
         assert launch("iota", command="sh", start=_say_the_spec) == 0
         record = detach._read_record(detach._paths("iota"))
         assert record is not None
-        assert record.machine == socket.gethostname()
+        assert record.host == socket.gethostname()
         assert record.control == str(
             socket_address(detach._paths("iota") / "control.sock"),
         )
@@ -953,12 +953,12 @@ class TestAHeadlessHostIsRecordedAndFound:
         old = {
             key: value
             for key, value in written.items()
-            if key not in {"machine", "control"}
+            if key not in {"host", "control"}
         }
         (tmp_path / "host.json").write_text(json.dumps(old))
         record = detach._read_record(tmp_path)
         assert record is not None
-        assert (record.machine, record.control) == ("", "")
+        assert (record.host, record.control) == ("", "")
 
 
 class TestTakingAHeadlessRunOver:
@@ -1041,7 +1041,7 @@ class TestTakingAHeadlessRunOver:
         with hosts.listen(root / "s") as address:
             detach._write_record(
                 root,
-                _record(root, name="lambda", address=address, machine=_HERE),
+                _record(root, name="lambda", address=address, host=_HERE),
             )
             assert main(["attach", "lambda"]) == 0
         assert steps == ["attach"]
@@ -1049,7 +1049,7 @@ class TestTakingAHeadlessRunOver:
         assert "detached from lambda; it is still running" in said
         assert "Reattach" not in said
 
-    def test_a_host_of_another_machine_is_refused_with_its_name(
+    def test_a_host_of_another_host_is_refused_with_its_name(
         self,
         tmp_path: Path,
         hosts: _Hosts,
@@ -1063,7 +1063,7 @@ class TestTakingAHeadlessRunOver:
                 monkeypatch,
                 steps,
                 Reply(ok=True),
-                machine="elsewhere",
+                host="elsewhere",
             ),
             pytest.raises(SystemExit) as refused,
         ):
@@ -1074,7 +1074,7 @@ class TestTakingAHeadlessRunOver:
         assert steps == []
 
     @pytest.mark.parametrize("command", ["send", "stop"])
-    def test_stop_and_send_refuse_another_machines_host_too(
+    def test_stop_and_send_refuse_another_hosts_host_too(
         self,
         command: str,
         tmp_path: Path,
@@ -1089,20 +1089,20 @@ class TestTakingAHeadlessRunOver:
                 monkeypatch,
                 [],
                 Reply(ok=True),
-                machine="elsewhere",
+                host="elsewhere",
             ),
             pytest.raises(SystemExit, match="runs on elsewhere"),
         ):
             _ = main(argv)
 
-    def test_a_record_that_names_no_machine_is_attached_anywhere(
+    def test_a_record_that_names_no_host_is_attached_anywhere(
         self,
         tmp_path: Path,
         hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         steps: list[str] = []
-        with _headless(hosts, tmp_path, monkeypatch, steps, Reply(ok=True), machine=""):
+        with _headless(hosts, tmp_path, monkeypatch, steps, Reply(ok=True), host=""):
             assert main(["attach", "kappa"]) == 0
         assert steps == ["takeover", "attach"]
 
@@ -1498,7 +1498,7 @@ def _record(
     pid: int = 1,
     address: Path | None = None,
     exit_code: int | None = None,
-    machine: str = "",
+    host: str = "",
     control: Path | None = None,
     session: str = "",
     command: str = "sh -- true",
@@ -1514,7 +1514,7 @@ def _record(
         started="2026-10-03T00:00:00+00:00",
         state=state,
         exit_code=exit_code,
-        machine=machine,
+        host=host,
         control="" if control is None else str(control),
         session=session,
         ended=ended,
@@ -1627,7 +1627,7 @@ def _headless(
     reply: Reply,
     *,
     status: int | None = None,
-    machine: str = _HERE,
+    host: str = _HERE,
 ) -> Generator[_Control]:
     """Record a live headless host named ``kappa`` whose control socket gives ``reply``."""
     _fake_attach(monkeypatch, steps, status=status)
@@ -1640,7 +1640,7 @@ def _headless(
                 root,
                 name="kappa",
                 pid=_dead_pid(),
-                machine=machine,
+                host=host,
                 control=control.address,
             ),
         )
@@ -1676,14 +1676,14 @@ _HOST_ENDS: Final = {
 
 def _write_then_close(
     scrollback: Path,
-    host: contextlib.ExitStack,
+    detached: contextlib.ExitStack,
     seconds: float,
 ) -> None:
     """Stand in for the follower's wait: the host writes once more, then exits."""
     del seconds
     with scrollback.open("ab") as tail:
         _ = tail.write(b"two\r\n")
-    host.close()
+    detached.close()
 
 
 # Written to the descriptor, not ``sys.stderr``: the host points descriptor 2 at its

@@ -1,10 +1,10 @@
 """The ``knowop job`` verbs that read and change only what the server holds.
 
-``status`` lists your jobs, on GPU nodes and on your own machines, or shows one,
+``status`` lists your jobs, on GPU nodes and on your own hosts, or shows one,
 ``cancel`` stops one, and ``secrets`` and ``secret`` keep the values a job's requests
 to Hugging Face and Weights & Biases carry. None of them reaches a node, so none needs
-ssh. A GPU job and a machine job never share an id, so a verb given an id asks for the
-machine job first and falls back to the GPU job.
+ssh. A GPU job and a host job never share an id, so a verb given an id asks for the
+host job first and falls back to the GPU job.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
     from trackinizer.client.client import Client
     from trackinizer.wire import wire_job
-    from trackinizer.wire.wire_machine_job import MachineJobView
+    from trackinizer.wire.wire_host_job import HostJobView
 else:
     from wrapt import lazy_import
 
@@ -31,32 +31,32 @@ else:
     wire_job = lazy_import("trackinizer.wire.wire_job")
 
 
-__all__ = ["machine_view", "run_cancel", "run_secret", "run_secrets", "run_status"]
+__all__ = ["host_view", "run_cancel", "run_secret", "run_secrets", "run_status"]
 
 _NOT_HERE: Final = frozenset({404, 503})
 """The answers of a server that holds no such job of the kind asked, or runs none."""
 
-_NO_MACHINE_JOB: Final = _NOT_HERE | {401}
-"""Those, and the 401 a campaign box's credential gets on the machine-job routes,
+_NO_HOST_JOB: Final = _NOT_HERE | {401}
+"""Those, and the 401 a campaign box's credential gets on the host-job routes,
 which take only a person's key; a key refused everywhere fails on the GPU job's call."""
 
 
-def machine_view(client: Client, job: int) -> MachineJobView | None:
-    """Return the caller's machine job ``job``, or ``None`` when it is no machine job.
+def host_view(client: Client, job: int) -> HostJobView | None:
+    """Return the caller's host job ``job``, or ``None`` when it is no host job.
 
     Args:
       client: The server.
       job: A job id.
 
     Returns:
-      view: The machine job; ``None`` when the server holds no machine job of the
-        caller's by that id, or runs no machine jobs.
+      view: The host job; ``None`` when the server holds no host job of the
+        caller's by that id, or runs no host jobs.
 
     """
     try:
-        return client.machine_job_view(job)
+        return client.host_job_view(job)
     except ClientError as error:
-        if error.status_code in _NO_MACHINE_JOB:
+        if error.status_code in _NO_HOST_JOB:
             return None
         raise
 
@@ -72,8 +72,8 @@ def run_status(client: Client, job: int | None) -> None:
     if job is None:
         _list_jobs(client)
         return
-    if (machine := machine_view(client, job)) is not None:
-        _show_machine(machine)
+    if (host := host_view(client, job)) is not None:
+        _show_host(host)
         return
     view = client.job_view(job)
     charged = "-" if view.gpu_seconds is None else f"{view.gpu_seconds} gpu-s"
@@ -104,13 +104,13 @@ def run_cancel(client: Client, job: int) -> None:
 
     Args:
       client: The server.
-      job: The job id: a machine job's, else a GPU job's.
+      job: The job id: a host job's, else a GPU job's.
 
     """
     try:
-        state = client.machine_job_cancel(job).state
+        state = client.host_job_cancel(job).state
     except ClientError as error:
-        if error.status_code not in _NO_MACHINE_JOB:
+        if error.status_code not in _NO_HOST_JOB:
             raise
         state = client.job_cancel(job).state
     echo(f"job {job}: {state}")
@@ -148,13 +148,13 @@ def run_secret(client: Client, name: str, *, op: str) -> None:
     echo(f"set: job secret {name}")
 
 
-def _show_machine(view: MachineJobView) -> None:
-    """Print one machine job, a field a line."""
+def _show_host(view: HostJobView) -> None:
+    """Print one host job, a field a line."""
     _show(
         {
             "job": view.id,
             "state": view.state,
-            "machine": view.machine,
+            "host": view.host,
             "limits": f"{view.gpus} GPUs, {view.memory_mb} MiB, up to {view.minutes} min",
             "label": view.label or "-",
             "command": " ".join(view.argv),
@@ -180,10 +180,10 @@ def _list_jobs(client: Client) -> None:
         (each.id, each.state, each.node or "-", each.argv)
         for each in _listed(lambda: client.job_list().jobs, not_here=_NOT_HERE)
     ] + [
-        (each.id, each.state, each.machine, each.argv)
+        (each.id, each.state, each.host, each.argv)
         for each in _listed(
-            lambda: client.machine_job_list().jobs,
-            not_here=_NO_MACHINE_JOB,
+            lambda: client.host_job_list().jobs,
+            not_here=_NO_HOST_JOB,
         )
     ]
     if not rows:

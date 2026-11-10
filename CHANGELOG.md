@@ -5,11 +5,24 @@ All notable knowop changes are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `knowop host start` rents a KnowHost: a host the server starts and bills to your
+  account, which joins as one of your hosts. `knowop host NAME pause` stops its
+  charge, `resume` wakes it, and `knowop host NAME del` ends it, VM and all. A server
+  that rents none says so. Bare `knowop host` lists your KnowHosts after the
+  registry.
+
 ### Changed
 
+- **Breaking:** `knowop machine` is `knowop host`, with the same forms; `start` is
+  now a reserved host name. A computer enrolled with the server is a host, and this
+  `knowop connect` speaks the server's renamed host wire (trackinizer's `/api/hosts`
+  routes, `daemon_version`), so it needs a server with the rename, and a server with
+  the rename needs it: upgrade both together.
 - `knowop connect` serves sagent's tools to the server's assistant in place of exec.
   Exec is removed, and `.exec.log` with it: the assistant's
-  calls arrive on a pipe and run in sagent's tool host. That host starts at home,
+  calls arrive on a tool connection and run in sagent's tool host. That host starts at home,
   not in the folder `knowop connect` ran in, with `python -P`, so nothing there is
   imported. `Bash` runs `bash -c`, not a login shell, so it no longer reads your
   profile files.

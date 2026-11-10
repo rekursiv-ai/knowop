@@ -26,7 +26,7 @@ import sys
 
 
 if TYPE_CHECKING:
-    from knowop.shell import job_limits
+    from knowop.connect import job_limits
 
 
 __all__ = ["command", "install", "probe"]

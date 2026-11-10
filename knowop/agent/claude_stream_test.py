@@ -64,13 +64,13 @@ from knowop.agent.conftest import (
     _state,
     _step,
 )
-from knowop.shell.conftest import _process
+from knowop.connect.conftest import _process
 
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
 
-    from knowop.shell.conftest import _Process
+    from knowop.connect.conftest import _Process
 
 
 _CWD: Final = Path("/work")

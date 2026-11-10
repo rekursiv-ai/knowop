@@ -1,7 +1,7 @@
 """Run ``knowop connect`` as a user service: launchd's on macOS, systemd's on Linux.
 
-``knowop connect`` at a terminal installs one service per machine name and server,
-which serves the machine in the background and starts again at login, as ``code
+``knowop connect`` at a terminal installs one service per host name and server,
+which serves the host in the background and starts again at login, as ``code
 tunnel service install`` and ``cloudflared service install`` do. Each is a definition
 file, ``ai.rekursiv.knowop.connect.NAME.TAG.plist`` in ``~/Library/LaunchAgents`` or
 ``knowop-connect-NAME-TAG.service`` in systemd's user folder, where ``TAG`` is
@@ -9,7 +9,7 @@ file, ``ai.rekursiv.knowop.connect.NAME.TAG.plist`` in ``~/Library/LaunchAgents`
 gave: this interpreter's ``-m knowop``, which ``uv tool upgrade knowop`` updates in
 place, or ``uvx knowop@VERSION`` when this knowop runs from uv's cache.
 
-The definition holds no secret: the host reads its saved machine credential, readable
+The definition holds no secret: the host reads its saved host credential, readable
 by this user only, each time it starts. Its environment is ``PATH``, ``LANG``, ``LC_*``
 (except ``LC_TRAX*``), ``SAGENT_PROVIDER`` and ``SAGENT_ALLOW_PROVIDERS`` as set in the
 installing shell, so CLIs resolve as they did there and sagent selects the same
@@ -53,7 +53,7 @@ from trackinizer.lib.userdirs import (
 from treekle import from_plain
 
 from knowop import macos_app, menubar
-from knowop.shell import job_limits
+from knowop.connect import job_limits
 
 
 if TYPE_CHECKING:
@@ -72,10 +72,10 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Connect:
-    """One machine's ``knowop connect``, as a service of this computer.
+    """One host's ``knowop connect``, as a service of this computer.
 
     Attributes:
-      name: The machine's name.
+      name: The host's name.
       server: The server's URL, as knowop's login names it.
       flags: The connect flags it runs with, such as ``--sandbox``.
       disabled: Whether the person turned it off (macOS Login Items, ``systemctl
@@ -122,7 +122,7 @@ class Services:
         """Install ``connect``'s service and start it, or restart it when it runs.
 
         Args:
-          connect: The machine, server and flags to serve.
+          connect: The host, server and flags to serve.
 
         Raises:
           ClientError: A manager command failed.
@@ -198,7 +198,7 @@ class Services:
         The menu bar agent, and the launchers, go with the last connect agent here.
 
         Args:
-          name: The machine's name.
+          name: The host's name.
           server: The server's URL.
 
         Returns:
@@ -229,7 +229,7 @@ class Services:
         """Return each connect service installed here, by definition file name.
 
         Returns:
-          services: Each one's machine, server and flags, and whether the person
+          services: Each one's host, server and flags, and whether the person
             turned it off.
 
         """
@@ -268,7 +268,7 @@ class Services:
         """Return whether ``connect``'s service is installed as :meth:`start` would.
 
         Args:
-          connect: The machine, server and flags it serves.
+          connect: The host, server and flags it serves.
 
         Returns:
           unchanged: Whether its definition, and under launchd its launcher, hold

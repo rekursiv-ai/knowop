@@ -230,10 +230,10 @@ def test_the_host_entry_reads_and_closes_its_private_descriptor(
     assert config.cli_name == "sh"
     assert config.run_name == "json-host"
     assert config.client is None
-    assert isinstance(config.host, detach.HeadlessSpec)
-    assert str(config.host.address) == request["address"]
-    assert str(config.host.control) == request["control"]
-    assert config.host.resume == request["resume"]
+    assert isinstance(config.detached, detach.HeadlessSpec)
+    assert str(config.detached.address) == request["address"]
+    assert str(config.detached.control) == request["control"]
+    assert config.detached.resume == request["resume"]
     record = detach._read_record(Path(request["paths"]))
     assert record is not None
     assert (record.state, record.exit_code) == ("exited", 7)
@@ -242,9 +242,9 @@ def test_the_host_entry_reads_and_closes_its_private_descriptor(
 
 def _record_host_run(ran: list[session.RunConfig], config: session.RunConfig) -> int:
     ran.append(config)
-    assert config.host is not None
-    assert config.host.on_listening is not None
-    config.host.on_listening()
+    assert config.detached is not None
+    assert config.detached.on_listening is not None
+    config.detached.on_listening()
     return 7
 
 

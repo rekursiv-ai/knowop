@@ -155,7 +155,7 @@ class TestUsingKnowop:
     def test_a_terminal_asked_for_opens_in_the_canvas(self) -> None:
         assert (
             "A terminal, when asked for one: knowop canvas show trax.terminal --param "
-            "machine=NAME --param start=true (NAME from `knowop status`). Never a "
+            "host=NAME --param start=true (NAME from `knowop status`). Never a "
             "desktop terminal app"
         ) in _said()
 

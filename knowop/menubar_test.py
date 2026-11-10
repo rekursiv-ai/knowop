@@ -26,13 +26,13 @@ _LAB: Final = "http://127.0.0.1:8802"
 
 
 def _report(*, lab: str = "online", lab_service: bool = True) -> Report:
-    """Return a status of two logins, each with a machine this computer serves."""
+    """Return a status of two logins, each with a host this computer serves."""
     return {
         "logins": [
             {
                 "server": _ALPHA,
                 "account": "ada@example.com",
-                "machines": [
+                "hosts": [
                     {"name": "ada-mac", "status": "online", "runs": [{}, {}]},
                     {"name": "gpu1", "status": "offline", "runs": [{}]},
                 ],
@@ -40,7 +40,7 @@ def _report(*, lab: str = "online", lab_service: bool = True) -> Report:
             {
                 "server": _LAB,
                 "account": "ada@example.com",
-                "machines": [{"name": "lab-mac", "status": lab, "runs": []}],
+                "hosts": [{"name": "lab-mac", "status": lab, "runs": []}],
             },
         ],
         "services": [
@@ -50,7 +50,7 @@ def _report(*, lab: str = "online", lab_service: bool = True) -> Report:
     }
 
 
-def test_the_menu_shows_each_login_its_machines_and_a_line_opening_it() -> None:
+def test_the_menu_shows_each_login_its_hosts_and_a_line_opening_it() -> None:
     connected, lines = view(_report())
 
     assert connected
@@ -75,7 +75,7 @@ def test_the_menu_shows_each_login_its_machines_and_a_line_opening_it() -> None:
         ("never", True, False),
         ("offline", False, True),
     ],
-    ids=["a service's machine offline", "never online", "that service turned off"],
+    ids=["a service's host offline", "never online", "that service turned off"],
 )
 def test_this_computer_reads_connected_while_every_service_on_serves_online(
     lab: str,
@@ -95,9 +95,9 @@ def test_no_service_here_reads_not_connected() -> None:
     assert lines[0] == Line(title="knowop: not connected")
 
 
-def test_a_refused_login_says_to_log_in_again_and_lists_no_machine() -> None:
+def test_a_refused_login_says_to_log_in_again_and_lists_no_host() -> None:
     report = _report()
-    report["logins"][1] = {"server": _LAB, "account": None, "machines": None}
+    report["logins"][1] = {"server": _LAB, "account": None, "hosts": None}
 
     connected, lines = view(report)
 

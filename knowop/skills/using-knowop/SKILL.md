@@ -37,7 +37,7 @@ RECORD_UUID is page.record.id or any record's uuid.
 - Its files: knowop canvas show trax.files --record RECORD_UUID (--param path=DIR/,
   --param changed=true, --param file=NAME)
 - A terminal, when asked for one: knowop canvas show trax.terminal --param
-  machine=NAME --param start=true (NAME from `knowop status`). Never a desktop
+  host=NAME --param start=true (NAME from `knowop status`). Never a desktop
   terminal app: the person can't see it.
 - Point at records: knowop canvas highlight UUID[,UUID...] ('' clears)
 - A view: knowop canvas navigate '#/list/Issue' (or '#/graph', '#/activity',

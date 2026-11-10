@@ -189,7 +189,7 @@ class TrustGate:
         cli: str,
         folder: str,
         *,
-        machine: str | None,
+        host: str | None,
         remembered: bool,
     ) -> None:
         """Open the card, once; a card already open or answered stays as it is.
@@ -197,7 +197,7 @@ class TrustGate:
         Args:
           cli: ``claude`` or ``codex``.
           folder: The folder as Chat shows it.
-          machine: The machine the run is on, if it has a name.
+          host: The host the run is on, if it has a name.
           remembered: Whether the CLI saves the trust it is given there.
 
         """
@@ -223,7 +223,7 @@ class TrustGate:
                             "state": "pending",
                             "cli": cli,
                             "folder": folder,
-                            "machine": machine,
+                            "host": host,
                             "remembered": remembered,
                         },
                     },

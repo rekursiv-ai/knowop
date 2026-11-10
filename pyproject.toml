@@ -27,8 +27,8 @@ classifiers = [
 dependencies = [
     # Prefer https://awesome-python.com deps over alternatives.
     # The server's client, login and profiles, the wire models, and the session
-    # records the agent runner captures into. 0.1.11 adds `Client.machine_runs` and
-    # `Client.disconnect_machine`, which `knowop status` and `knowop disconnect` call,
+    # records the agent runner captures into. 0.1.11 adds `Client.host_runs` and
+    # `Client.disconnect_host`, which `knowop status` and `knowop disconnect` call,
     # and the `Client` that ignores a field a newer server adds to an answer.
     # 0.1.12 ships `trackinizer.sagent`, where the session records now live.
     # The tool pipe the tool host serves on (`client/tool_bridge.py`,

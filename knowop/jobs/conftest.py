@@ -1,4 +1,4 @@
-"""Fakes the job tests share: a machine's job calls, a checkout, a clock.
+"""Fakes the job tests share: a host's job calls, a checkout, a clock.
 
 Each test module keeps its own tests; what more than one reads lives here, so no test
 module imports another.
@@ -19,6 +19,14 @@ import json
 import tarfile
 
 from trackinizer.client.errors import ClientError
+from trackinizer.wire.wire_host_job import (
+    Chunk,
+    HostJobList,
+    HostJobSpec,
+    HostJobSubmit,
+    HostJobView,
+    ReadReply,
+)
 from trackinizer.wire.wire_job import (
     Grant,
     GrantStatus,
@@ -30,23 +38,15 @@ from trackinizer.wire.wire_job import (
     StartBody,
     SubmitBody,
 )
-from trackinizer.wire.wire_machine_job import (
-    Chunk,
-    MachineJobList,
-    MachineJobSpec,
-    MachineJobSubmit,
-    MachineJobView,
-    ReadReply,
-)
 
 import pytest
 
+from knowop.connect.job_folder import Ended, JobFolder
 from knowop.jobs import job_source
+from knowop.jobs.host_job import run_submit
 from knowop.jobs.job import Rig
 from knowop.jobs.job_source import BundleInfo, Snapshot
 from knowop.jobs.job_ssh import Tools
-from knowop.jobs.machine_job import run_submit
-from knowop.shell.job_folder import Ended, JobFolder
 
 
 if TYPE_CHECKING:
@@ -61,7 +61,7 @@ __all__ = [
     "_REMOTE",
     "_TOOLS",
     "_Clock",
-    "_Machine",
+    "_Host",
     "_Rig",
     "_Server",
     "_Time",
@@ -97,11 +97,11 @@ def repo(tmp_path: Path) -> Path:
     return work
 
 
-def _view(state: str, **fields: object) -> MachineJobView:
-    return MachineJobView.model_validate(
+def _view(state: str, **fields: object) -> HostJobView:
+    return HostJobView.model_validate(
         {
             "id": 9,
-            "machine": "gx10",
+            "host": "gx10",
             "state": state,
             "gpus": 0,
             "memory_mb": 2_048,
@@ -123,12 +123,12 @@ def _view(state: str, **fields: object) -> MachineJobView:
 
 
 @dataclass(slots=True, kw_only=True)
-class _Machine:
-    """The server's machine-job calls, answered from a job folder as the host would."""
+class _Host:
+    """The server's host-job calls, answered from a job folder as the host would."""
 
     folder: JobFolder
-    views: list[MachineJobView] = field(default_factory=list)
-    submitted: list[MachineJobSubmit] = field(default_factory=list)
+    views: list[HostJobView] = field(default_factory=list)
+    submitted: list[HostJobSubmit] = field(default_factory=list)
     reads: list[tuple[str, int]] = field(default_factory=list)
     results_max: int = 1_000
     grow: list[bytes] = field(default_factory=list)
@@ -143,16 +143,16 @@ class _Machine:
     listing: ReadReply | None = None
     """What the manifest answers, in place of the folder's."""
 
-    def machine_job_submit(self, body: MachineJobSubmit) -> MachineJobView:
+    def host_job_submit(self, body: HostJobSubmit) -> HostJobView:
         self.submitted.append(body)
         return _view("requested")
 
-    def machine_job_view(self, job_id: int) -> MachineJobView:
+    def host_job_view(self, job_id: int) -> HostJobView:
         if job_id != 9:
             raise ValueError("Expected job_id == 9.")
         return self.views.pop(0) if len(self.views) > 1 else self.views[0]
 
-    def machine_job_log(self, job_id: int, *, offset: int, wait: float) -> ReadReply:
+    def host_job_log(self, job_id: int, *, offset: int, wait: float) -> ReadReply:
         if job_id != 9:
             raise ValueError("Expected job_id == 9.")
         del wait
@@ -168,7 +168,7 @@ class _Machine:
                 )
         return ReadReply(reply=reply)
 
-    def machine_job_manifest(self, job_id: int) -> ReadReply:
+    def host_job_manifest(self, job_id: int) -> ReadReply:
         if job_id != 9:
             raise ValueError("Expected job_id == 9.")
         if self.listing is not None:
@@ -177,7 +177,7 @@ class _Machine:
             reply=self.folder.manifest(results_max=self.results_max, where="gx10"),
         )
 
-    def machine_job_file(self, job_id: int, path: str, *, offset: int) -> ReadReply:
+    def host_job_file(self, job_id: int, path: str, *, offset: int) -> ReadReply:
         if job_id != 9:
             raise ValueError("Expected job_id == 9.")
         self.reads.append((path, offset))
@@ -196,9 +196,9 @@ class _Machine:
 
 
 @pytest.fixture
-def machine(tmp_path: Path) -> _Machine:
+def host(tmp_path: Path) -> _Host:
     """Return the server's calls for job 9, answered from a fresh job folder."""
-    spec = MachineJobSpec(
+    spec = HostJobSpec(
         id=9,
         owner="jan@example.com",
         argv=["python", "train.py"],
@@ -210,7 +210,7 @@ def machine(tmp_path: Path) -> _Machine:
         minutes=5,
         label="",
     )
-    return _Machine(folder=JobFolder.create(tmp_path / "machine" / "9", spec))
+    return _Host(folder=JobFolder.create(tmp_path / "host" / "9", spec))
 
 
 class _Clock:
@@ -224,11 +224,11 @@ class _Clock:
         self.now += seconds
 
 
-def _submit(machine: _Machine, repo: Path, clock: _Clock, *, gpus: int = 0) -> int:
+def _submit(host: _Host, repo: Path, clock: _Clock, *, gpus: int = 0) -> int:
     return run_submit(
-        machine,
+        host,
         repo=repo,
-        machine="gx10",
+        host="gx10",
         command=("python", "train.py"),
         gpus=gpus,
         memory_mb=2_048,
@@ -360,18 +360,18 @@ class _Server:
         self.calls.append(("cancel", job_id))
         return _job("cancelled")
 
-    # Every job here is a GPU job: the server holds no machine job of the caller's.
-    def machine_job_view(self, job_id: int) -> JobView:
-        self.calls.append(("machine_job", job_id))
+    # Every job here is a GPU job: the server holds no host job of the caller's.
+    def host_job_view(self, job_id: int) -> JobView:
+        self.calls.append(("host_job", job_id))
         raise ClientError("-> 404", status_code=404)
 
-    def machine_job_cancel(self, job_id: int) -> JobView:
-        self.calls.append(("machine_cancel", job_id))
+    def host_job_cancel(self, job_id: int) -> JobView:
+        self.calls.append(("host_cancel", job_id))
         raise ClientError("-> 404", status_code=404)
 
-    def machine_job_list(self) -> MachineJobList:
-        self.calls.append(("machine_jobs", None))
-        return MachineJobList(jobs=[])
+    def host_job_list(self) -> HostJobList:
+        self.calls.append(("host_jobs", None))
+        return HostJobList(jobs=[])
 
     def job_secret_names(self) -> SecretNames:
         return SecretNames(names=self.names)

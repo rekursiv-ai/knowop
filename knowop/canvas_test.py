@@ -23,7 +23,7 @@ def test_the_grammar_is_traxs_own() -> None:
         "show",
         "trax.terminal",
         "--param",
-        "machine=ada-mac",
+        "host=ada-mac",
         "--placement",
         "side",
     ]

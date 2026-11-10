@@ -114,8 +114,8 @@ from knowop.agent.sink import (
 from knowop.agent.tool_server import (
     ToolError,
 )
-from knowop.shell import machine_host
-from knowop.shell.conftest import _signal_process
+from knowop.connect import daemon
+from knowop.connect.conftest import _signal_process
 
 
 if TYPE_CHECKING:
@@ -130,7 +130,7 @@ if TYPE_CHECKING:
 
     from knowop.agent.custom_types import Event
     from knowop.agent.slash import SlashCommand
-    from knowop.shell.conftest import _Process
+    from knowop.connect.conftest import _Process
 
 __all__ = [
     "ME",
@@ -226,7 +226,7 @@ def local_session_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     Each adapter derives its own root, so isolating one leaves the other writing
     real rollouts into the operator's home, which its resume picker then offers
-    and which makes a result depend on the machine. The pinned version keeps a
+    and which makes a result depend on the host. The pinned version keeps a
     test from running the installed codex.
     """
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
@@ -2058,13 +2058,13 @@ def _wire_headless(
     )
     monkeypatch.setattr(session, "_inbound_poll_loop", partial(_hw_poll, wiring))
     monkeypatch.setattr(session, "ThreadedRelay", partial(_TuiRelay, wiring=wiring))
-    machine_host.set_sandbox(on=sandboxed)
+    daemon.set_sandbox(on=sandboxed)
     status = session._spawn_and_drain(  # noqa: SLF001 -- The run's wiring under test.
         replace(
             config,
             headless=True,
             client=None if clientless else client or _NoServer(),
-            host=hosts[host],
+            detached=hosts[host],
             run_name="chat-1",
             quiesce_seconds=0.0,
         ),
