@@ -57,12 +57,14 @@ from knowop.shell.terminal_host import (
     _pump,
     _read,
 )
+from knowop.shell.wake import Wake
 
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
 
     from trackinizer.mock_test_support import AsyncMockProtocol, MockProtocol
+    from trackinizer.wire.wire_terminals import TerminalWait
     from websockets.asyncio.client import ClientConnection
 
 pytestmark = pytest.mark.asyncio
@@ -853,6 +855,64 @@ async def test_a_wait_that_fails_otherwise_is_said_and_waited_out_until_stopped(
     assert await asyncio.to_thread(client.closed.wait, 10)
 
     assert "knowop: terminal wait failed: -> 503" in capsys.readouterr().err
+
+
+class _Held:
+    """A wait the server holds until the test lets it go, as one a pause cut is."""
+
+    def __init__(self) -> None:
+        self.asks = 0
+        self.asked = threading.Event()
+        self.release = threading.Event()
+        self.closed = threading.Event()
+
+    def wait_terminals(
+        self,
+        machine_id: uuid.UUID,
+        *,
+        instance: uuid.UUID,
+        wait_sec: float,
+    ) -> TerminalWait | None:
+        del machine_id, instance, wait_sec
+        self.asks += 1
+        self.asked.set()
+        assert self.release.wait(10)
+        return None
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+async def test_a_wake_from_a_pause_starts_a_new_wait_and_the_dead_one_ends_after() -> (
+    None
+):
+    dead, fresh = _Held(), _Held()
+    clients = [dead, fresh]
+    wall = [0.0]
+    wake = Wake(wall=lambda: wall[0], clock=lambda: 0.0)
+    host = TerminalHost(
+        name="box",
+        server_url="http://127.0.0.1:1",
+        credential=_CREDENTIAL,
+        credential_client=lambda _key: clients.pop(0),
+        trax_env={},
+        wake=wake,
+    )
+    host.start(_MACHINE, _INSTANCE)
+    assert await asyncio.to_thread(dead.asked.wait, 10)
+
+    wall[0] += 30.0
+    assert wake.check()
+    assert await asyncio.to_thread(fresh.asked.wait, 10)
+    dead.release.set()
+    assert await asyncio.to_thread(dead.closed.wait, 10)
+    host.stop()
+    fresh.release.set()
+    assert await asyncio.to_thread(fresh.closed.wait, 10)
+    wall[0] += 30.0
+    assert wake.check()
+
+    assert (dead.asks, clients) == (1, [])
 
 
 async def test_an_open_that_arrives_once_the_host_stopped_starts_no_bridge() -> None:

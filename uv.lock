@@ -2784,7 +2784,7 @@ wheels = [
 [[package]]
 name = "rekursiv-ai-typings"
 version = "0.1.18"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#f10631e66d0a8b79990c31abca57800a7862ceb7" }
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#ad599f9d1e5b2468ec60b5576c60d20033ccebf1" }
 
 [[package]]
 name = "requests"
@@ -3026,7 +3026,7 @@ wheels = [
 [[package]]
 name = "sagent"
 version = "0.2.3"
-source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#e9040d5d678b9a2b4ee1913dded548b0441527d3" }
+source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#c3976daefe52f56741c692d1d117ecb16592bac8" }
 dependencies = [
     { name = "bashlex" },
     { name = "cachetools" },
@@ -3365,7 +3365,7 @@ wheels = [
 [[package]]
 name = "trackinizer"
 version = "0.1.13"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#472878b0a372b0a0bef1a7eaf0702ea8a7997992" }
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#46e8b80ad82ee496300869522a73e36da0b6428e" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },

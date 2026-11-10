@@ -33,6 +33,7 @@ from knowop.shell.machine_host import (
     is_sandbox,
     set_sandbox,
 )
+from knowop.shell.wake import Wake
 
 
 if TYPE_CHECKING:
@@ -404,6 +405,35 @@ def test_each_process_heartbeats_as_its_own_instance() -> None:
         )
 
     assert first.calls[0][2] != second.calls[0][2]
+
+
+@pytest.mark.parametrize("answer", [None, ClientError("unreachable")])
+def test_a_wake_from_a_pause_heartbeats_at_once_and_ends_with_the_host(
+    answer: ClientError | None,
+) -> None:
+    _save()
+    host = _Host(beats=(None, answer, _TAKEN))
+    wall = [1_000.0]
+    wake = Wake(wall=lambda: wall[0], clock=lambda: 0.0)
+
+    def paused(seconds: float) -> None:
+        # The heartbeat's sleep spans a pause: the wall clock leaps, the monotonic not.
+        del seconds
+        wall[0] += 30.0
+        assert wake.check()
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        credential_client=host,
+        read_token=_no_token,
+        sleep=paused,
+        wake=wake,
+    )
+    wall[0] += 30.0
+    assert wake.check()
+
+    assert [call[-1] for call in host.calls] == ["take", "keep", "keep"]
 
 
 def test_lost_contact_is_retried_sooner_at_first_and_never_ends_the_host(

@@ -23,6 +23,7 @@ tools.
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol
 
@@ -42,6 +43,7 @@ from trackinizer.wire.wire_machine_host import HEARTBEAT_SEC
 from websockets.asyncio.client import connect
 
 from knowop.agent.tool_server import BEARER_ENV
+from knowop.shell.wake import Listener, Wake
 
 
 if TYPE_CHECKING:
@@ -203,6 +205,8 @@ class ToolHost:
       dial_sec: How long a dial-back may take to open; ``None`` for websockets' own.
       line_bytes: The longest line it reads from an agent; ``0`` for sagent's own
         ``MAX_LINE_BYTES``, as the agent reads with. The relay caps what reaches it.
+      wake: Tells when this computer wakes from a pause: the wait held across it then
+        waits on a dead socket, so a new one is started at once. ``None`` watches not.
 
     """
 
@@ -223,6 +227,7 @@ class ToolHost:
         max_pipes: int = _MAX_PIPES,
         dial_sec: float | None = None,
         line_bytes: int = 0,
+        wake: Wake | None = None,
     ) -> None:
         self._url = url.replace("http", "ws", 1).rstrip("/")
         self._credential = credential
@@ -241,6 +246,7 @@ class ToolHost:
         self._line_bytes = line_bytes or wire.MAX_LINE_BYTES
         self._stop = threading.Event()
         self._serving: threading.Thread | None = None
+        self._wake = wake
 
     def start(self, machine_id: uuid.UUID, instance: uuid.UUID) -> None:
         """Start serving on a thread; what stops it from serving does not raise here.
@@ -310,12 +316,11 @@ class ToolHost:
             pipe.add_done_callback(pipes.discard)
 
         try:
-            threading.Thread(
+            Listener(
                 name="tool-listener",
-                target=self._listen,
-                args=(machine_id, instance, loop, start_pipe),
-                daemon=True,
-            ).start()
+                listen=partial(self._listen, machine_id, instance, loop, start_pipe),
+                stop=self._stop,
+            ).start(self._wake)
             # Waited for on a thread: a stop that came before this line needs no loop.
             _ = await asyncio.to_thread(self._stop.wait)
         finally:
@@ -361,8 +366,9 @@ class ToolHost:
         instance: uuid.UUID,
         loop: asyncio.AbstractEventLoop,
         start_pipe: Callable[[ToolOffer], None],
+        current: Callable[[], bool],
     ) -> None:
-        """Wait for offers until stopped or revoked, starting a pipe for each."""
+        """Wait for offers until stopped, revoked or replaced, starting a pipe for each."""
         try:
             client = self._client_for(self._credential)
         except Exception as error:  # noqa: BLE001 -- A host left serving nothing would not say so.
@@ -371,7 +377,7 @@ class ToolHost:
             return
         said = ""
         try:
-            while not self._stop.is_set():
+            while not self._stop.is_set() and current():
                 asked = time.monotonic()
                 try:
                     offer = client.wait_tools(

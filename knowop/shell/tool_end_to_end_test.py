@@ -193,6 +193,7 @@ class _Relay:
             alive=self._alive,
             pipes_per_machine=Config().tool_pipes_per_machine,
             dial_back_sec=self.dial_back_sec,
+            line_bytes=Config().tool_line_bytes,
         )
         self._server = await serve(self._handle, "127.0.0.1", self.port)
         self.port = cast(int, next(iter(self._server.sockets)).getsockname()[1])

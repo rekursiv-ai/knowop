@@ -40,6 +40,8 @@ from trackinizer.trax.profile import profile_for_server, read_profile
 from trackinizer.trax.render import echo
 from treekle import from_plain
 
+from knowop.shell.wake import Wake
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -131,8 +133,10 @@ def connect_machine(
     offer = _job_offer() if jobs else None
     tools = serve_tools and tool_host.can_serve()
     direct = None
+    wake = Wake()
     if not join_only:
         direct = _direct_link()
+        wake.start()
         echo(
             f"serving: machine {name} at {server} "
             f"({_what_is_served(tools, jobs=jobs)})",
@@ -159,25 +163,34 @@ def connect_machine(
             offer=offer,
             results_max=results_max,
         )
-    machine_host.connect(
-        name,
-        server=server,
-        credential_client=lambda key: Client(server, api_key=key),
-        read_token=read_token,
-        sleep=sleep,
-        joined_terminals=lambda joined: _terminal_host(
+    try:
+        machine_host.connect(
             name,
-            server,
-            joined,
-            direct=direct,
-        ),
-        tools_for=(lambda joined: _tool_host(name, server, joined)) if tools else None,
-        jobs_for=jobs_for,
-        job_facts=None if offer is None else offer.facts,
-        sandbox=sandbox,
-        account=account,
-        join_only=join_only,
-    )
+            server=server,
+            credential_client=lambda key: Client(server, api_key=key),
+            read_token=read_token,
+            sleep=sleep,
+            joined_terminals=lambda joined: _terminal_host(
+                name,
+                server,
+                joined,
+                direct=direct,
+                wake=wake,
+            ),
+            tools_for=(
+                (lambda joined: _tool_host(name, server, joined, wake=wake))
+                if tools
+                else None
+            ),
+            jobs_for=jobs_for,
+            job_facts=None if offer is None else offer.facts,
+            sandbox=sandbox,
+            account=account,
+            join_only=join_only,
+            wake=wake,
+        )
+    finally:
+        wake.stop()
 
 
 # A token is read from stdin only when it is piped in: a person at a terminal has a
@@ -219,6 +232,7 @@ def _terminal_host(
     joined: JoinResponse,
     *,
     direct: PeerFactory | None = None,
+    wake: Wake | None = None,
 ) -> TerminalHost:
     """Make the terminal server for a joined machine; its shells name the server."""
     # A URL with credentials in it would be sent to every ssh server by ``SendEnv LC_*``.
@@ -232,10 +246,17 @@ def _terminal_host(
         credential_client=lambda key: Client(url, api_key=key),
         trax_env=trax_env,
         direct=direct,
+        wake=wake,
     )
 
 
-def _tool_host(name: str, url: str, joined: JoinResponse) -> tool_host.ToolHost:
+def _tool_host(
+    name: str,
+    url: str,
+    joined: JoinResponse,
+    *,
+    wake: Wake | None = None,
+) -> tool_host.ToolHost:
     """Make the tool server for a joined machine."""
     return tool_host.ToolHost(
         url,
@@ -243,6 +264,7 @@ def _tool_host(name: str, url: str, joined: JoinResponse) -> tool_host.ToolHost:
         name=name,
         client_for=lambda key: Client(url, api_key=key),
         dirs=tool_host.tool_dirs(name, server=url),
+        wake=wake,
     )
 
 

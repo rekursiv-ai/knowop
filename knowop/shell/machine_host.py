@@ -64,6 +64,8 @@ if TYPE_CHECKING:
     from trackinizer.wire.wire_machines import Facts, FactValue
 
     import pydantic
+
+    from knowop.shell.wake import Wake
 else:
     from wrapt import lazy_import
 
@@ -143,6 +145,7 @@ def connect(
     sandbox: bool = False,
     account: str | None = None,
     join_only: bool = False,
+    wake: Wake | None = None,
 ) -> None:
     """Join ``name`` when no credential is saved, then heartbeat until it is revoked.
 
@@ -172,6 +175,9 @@ def connect(
         whose credential belongs to the machine.
       join_only: Return once a credential is saved, joining only when none is,
         and serve nothing: the connect that serves it records the sandbox.
+      wake: Tells when this computer wakes from a pause, on which it heartbeats at
+        once rather than when its sleep, which the pause stopped, runs out. ``None``
+        watches not.
 
     Raises:
       ClientError: The token was refused, which after a refused saved credential
@@ -207,6 +213,7 @@ def connect(
         version=version,
         sleep=sleep,
         makers=(joined_terminals, tools_for, jobs_for),
+        wake=wake,
     )
     who = "" if account is None else f" as {account.lower()}"
     saved = _saved_credential(path)
@@ -313,12 +320,25 @@ def _host(
     sleep: Callable[[float], None],
     makers: Sequence[Callable[[JoinResponse], Serving] | None],
     rejoin: bool,
+    wake: Wake | None,
 ) -> _Ending:
     """Serve with ``joined``'s credential until it ends; Ctrl-C releases the machine."""
     with (
         ExitStack() as serving,
         closing(credential_client(joined.credential)) as client,
     ):
+        if wake is not None:
+            serving.callback(
+                wake.on_wake(
+                    partial(
+                        _beat_now,
+                        client,
+                        machine_id=joined.machine_id,
+                        instance=instance,
+                        version=version,
+                    ),
+                ),
+            )
         try:
             return _heartbeat(
                 client,
@@ -412,6 +432,25 @@ def _heartbeat(
         claim = "keep"
         failures = 0
         sleep(HEARTBEAT_SEC)
+
+
+# From the wake's thread, beside the loop's own: the loop goes on as before, its next
+# heartbeat as due. One that fails changes nothing; the loop's next says what is wrong.
+def _beat_now(
+    client: HostClient,
+    *,
+    machine_id: uuid.UUID,
+    instance: uuid.UUID,
+    version: str,
+) -> None:
+    """Heartbeat once, as the instance that holds the machine."""
+    with suppress(ClientError):
+        _ = client.heartbeat_machine(
+            machine_id,
+            instance=instance,
+            host_version=version,
+            claim="keep",
+        )
 
 
 def _serve(
