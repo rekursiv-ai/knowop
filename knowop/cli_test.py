@@ -1400,6 +1400,26 @@ def test_canvas_help_is_knowops_needs_no_login_and_asks_the_server_nothing(
     assert server.requests == []
 
 
+def test_host_help_is_knowops_and_needs_no_login(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("host", "--help") == 0
+
+    assert "knowop host [start | list" in capsys.readouterr().out
+    assert server.requests == []
+
+
+def test_knowops_help_lists_host_among_its_verbs(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        _knowop("--help")
+
+    assert exited.value.code == 0
+    assert "    host " in capsys.readouterr().out
+
+
 def test_knowops_help_lists_canvas_among_its_verbs(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

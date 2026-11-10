@@ -74,6 +74,7 @@ import pytest
 from knowop.lib.testing.import_graph import Counted, import_graph
 from knowop.shell import tool_host
 from knowop.shell.tool_host import ToolHost, scrubbed_host, tool_dirs
+from knowop.shell.wake import Wake
 
 
 _THIS: Final = Path(__file__).resolve()
@@ -259,6 +260,7 @@ def _host(
     max_pipes: int = 16,
     dial_sec: float | None = None,
     line_bytes: int = 0,
+    wake: Wake | None = None,
 ) -> ToolHost:
     return ToolHost(
         relay.url,
@@ -274,6 +276,7 @@ def _host(
         max_pipes=max_pipes,
         dial_sec=dial_sec,
         line_bytes=line_bytes,
+        wake=wake,
     )
 
 
@@ -1018,6 +1021,8 @@ async def test_a_wait_answered_at_once_is_not_asked_again_at_once(
         relay.client = _AnsweredAtOnce()
         host = _host(relay, retry_sec=0.01)
         host.start(_MACHINE, _INSTANCE)
+        # The first ask may come late on a loaded machine; what counts is the next ones.
+        await _until(lambda: bool(relay.client.waits))
         await asyncio.sleep(0.05)
         await asyncio.to_thread(host.stop)
         # Asked again at once, it would ask thousands of times in this time.
@@ -1050,6 +1055,69 @@ async def test_a_wait_held_to_its_end_is_asked_again_at_once(
             await _until(lambda: len(relay.client.waits) >= 3)
             await asyncio.to_thread(host.stop)
         assert {wait_sec for _, _, wait_sec in relay.client.waits} == {0.01}
+
+
+async def test_a_wake_from_a_pause_asks_again_at_once_beside_the_dead_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _local(monkeypatch, Read=Read())
+    dead = threading.Event()
+    cut = threading.Event()
+    anew = threading.Event()
+    listeners: list[threading.Thread] = []
+
+    # Each listener is known by the thread its waits come from, not by a count of
+    # threads or waits, which other tests' threads and the scheduler would sway.
+    class _DeadFirst(_Client):
+        @override
+        def wait_tools(
+            self,
+            machine_id: uuid.UUID,
+            *,
+            instance: uuid.UUID,
+            wait_sec: float,
+        ) -> ToolOffer | None:
+            self.waits.append((machine_id, instance, wait_sec))
+            here = threading.current_thread()
+            if not listeners:
+                listeners.append(here)
+                cut.set()
+                # A wait a pause cut: its socket answers nothing until released.
+                assert dead.wait(10)
+                return None
+            if here is not listeners[0]:
+                listeners.append(here)
+                anew.set()
+            return None
+
+    wall = [0.0]
+    wake = Wake(wall=lambda: wall[0], clock=lambda: 0.0)
+    async with _relay() as relay:
+        relay.client = _DeadFirst()
+        host = _host(relay, wake=wake)
+        try:
+            async with asyncio.timeout(10):
+                host.start(_MACHINE, _INSTANCE)
+                assert await asyncio.to_thread(cut.wait, 10)
+                wall[0] += 30.0
+                # Called on this thread, which is no daemon: the new listener is one anyway.
+                assert wake.check()
+                assert await asyncio.to_thread(anew.wait, 10)
+                old, new = listeners[0], listeners[1]
+                assert (new.name, new.daemon, old.is_alive()) == (
+                    "tool-listener",
+                    True,
+                    True,
+                )
+                # The listener the wake replaced ends once its cut wait returns.
+                dead.set()
+                await asyncio.to_thread(old.join, 10)
+                assert (old.is_alive(), new.is_alive()) == (False, True)
+        finally:
+            dead.set()
+            await asyncio.to_thread(host.stop)
+        wall[0] += 30.0
+        assert wake.check()
 
 
 async def test_a_wait_failing_the_same_way_is_said_once(
@@ -1159,7 +1227,9 @@ class _OfferedAsStopped(ToolHost):
         instance: uuid.UUID,
         loop: asyncio.AbstractEventLoop,
         start_pipe: Callable[[ToolOffer], None],
+        current: Callable[[], bool],
     ) -> None:
+        del current
         # The loop is held while the offer and the stop are queued, so the offer
         # is always started after the stop: an offer racing a stop is made certain.
         held = threading.Event()

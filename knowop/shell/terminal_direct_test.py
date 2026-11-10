@@ -494,6 +494,8 @@ async def test_a_keepalive_reports_the_idle_time_every_period_while_output_goes_
     None
 ):
     world = _World()
+    await world.router.output(b"$ ")
+    world.now += 1
     await world.router.from_relay(Frame.INPUT, b"a")
     world.now += 4
     await world.offer()
@@ -501,6 +503,8 @@ async def test_a_keepalive_reports_the_idle_time_every_period_while_output_goes_
     world.dc(Frame.ROUTE, wire_terminals.encode_route(wire_terminals.ROUTE_DIRECT, 0))
     await world.settle()
     world.now += 10
+    await world.router.output(b"tick")
+    world.now += 2
     world.ticks.put_nowait(None)
     await world.settle()
 
@@ -509,7 +513,7 @@ async def test_a_keepalive_reports_the_idle_time_every_period_while_output_goes_
         for kind, payload in world.relay
         if kind is Frame.KEEPALIVE
     ]
-    assert reports == [4_000, 14_000]
+    assert reports == [(4_000, 5_000), (16_000, 2_000)]
 
 
 async def test_the_keepalive_stops_once_output_is_back_on_the_relay() -> None:

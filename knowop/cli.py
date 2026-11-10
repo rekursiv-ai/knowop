@@ -18,6 +18,7 @@ Examples:
                           run a job on a GPU node from this repository
   knowop job status       list your jobs
   knowop machine          list the machines campaigns may run on
+  knowop host start       rent a KnowHost that joins as one of your machines
   knowop canvas           read the canvas a run sits on; --help shows how to change it
   knowop status           profile, server, account, machines, their runs, services
   knowop logs -f          follow this computer's connect
@@ -52,6 +53,7 @@ from trackinizer.trax.render import echo
 from treekle import from_plain, json_dumps
 
 from knowop import menubar, service
+from knowop.knowhosts import KNOWHOST_WORD, KnowHosts
 from knowop.machines import (
     MACHINE_WORD,
     Machines,
@@ -130,8 +132,8 @@ def main(
             return 0
         # Everything after ``run`` or ``job`` belongs to the runner, ``--help`` and
         # every other flag included; argparse would read them as knowop's own. Every
-        # ``machine`` and ``canvas`` form is that verb's, its help pages too.
-        if args[:1] in ([MACHINE_WORD], [_CANVAS_WORD]) or (
+        # ``machine``, ``host`` and ``canvas`` form is that verb's, its help pages too.
+        if args[:1] in ([MACHINE_WORD], [KNOWHOST_WORD], [_CANVAS_WORD]) or (
             args[:1] in (["run"], ["job"]) and args[1:] not in (["-h"], ["--help"])
         ):
             return _hand_off(args[0], args[1:], sleep=sleep, clock=clock)
@@ -332,6 +334,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     verbs.add_parser(
         MACHINE_WORD,
         help="list, show, set and delete the machines campaigns may run on",
+    )
+    # Only listed here too: ``main`` hands every ``host`` form to KnowHost's client.
+    verbs.add_parser(
+        KNOWHOST_WORD,
+        help="rent KnowHosts that join as your machines: start, list, pause, resume",
     )
     # Only listed here too: ``main`` hands every ``canvas`` form to trax's verb.
     verbs.add_parser(
@@ -1094,9 +1101,13 @@ def _hand_off(
     clock: Callable[[], float],
 ) -> int:
     """Run a verb ``main`` hands off as knowop's account; return its exit code."""
-    if verb in (MACHINE_WORD, _CANVAS_WORD):
+    if verb in (MACHINE_WORD, KNOWHOST_WORD, _CANVAS_WORD):
         # The login is read only when a form asks the server: help needs none.
-        (Machines if verb == MACHINE_WORD else canvas.Canvas).dispatch(
+        command = {MACHINE_WORD: Machines, KNOWHOST_WORD: KnowHosts}.get(
+            verb,
+            canvas.Canvas,
+        )
+        command.dispatch(
             verb,
             args,
             lambda: connect(argparse.Namespace(profile=_profile()[0])),

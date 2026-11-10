@@ -10,7 +10,8 @@ This module owns that choice for one terminal:
   from an offset, and a browser that asks for the relay again (its channel dropped, or a
   new window attached) is replayed from there.
 - While output goes direct the server sees none of it, so the router sends the server a
-  ``KEEPALIVE`` every few seconds saying how long ago input was last seen.
+  ``KEEPALIVE`` every few seconds saying how long ago input was last seen, and output
+  last written: the server's idle rules count both.
 - Input is applied from either path, in the order it arrives on that path. The browser
   fences the switch so the two paths never interleave.
 
@@ -138,6 +139,7 @@ class DirectRouter:
         """The browser's relay fence came before it switched the route."""
 
         self._last_input = clock()
+        self._last_output = clock()
         self._window_start = 0.0
         self._window_bytes = 0
         self._inbox: asyncio.Queue[tuple[DirectPeer, bytes]] = asyncio.Queue()
@@ -153,6 +155,7 @@ class DirectRouter:
 
         """
         self._ring.append(chunk)
+        self._last_output = self._clock()
         if self._route == wire_terminals.ROUTE_RELAY:
             await self._flush_relay()
         else:
@@ -383,10 +386,12 @@ class DirectRouter:
             await peer.close()
 
     async def _report_idle(self) -> None:
-        """Tell the server how long input has been idle, while output goes direct."""
+        """Tell the server how long input and output have been idle, while output goes direct."""
         while self._route == wire_terminals.ROUTE_DIRECT:
-            idle_ms = int((self._clock() - self._last_input) * 1_000)
-            await self._relay(
-                encode_frame(Frame.KEEPALIVE, wire_terminals.encode_keepalive(idle_ms)),
+            now = self._clock()
+            keepalive = wire_terminals.encode_keepalive(
+                int((now - self._last_input) * 1_000),
+                output_idle_ms=int((now - self._last_output) * 1_000),
             )
+            await self._relay(encode_frame(Frame.KEEPALIVE, keepalive))
             await self._sleep(wire_terminals.KEEPALIVE_SEC)

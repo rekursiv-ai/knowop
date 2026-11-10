@@ -15,6 +15,7 @@ says opened it, so a dishonest server can lie about the opener but cannot hide a
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
@@ -40,6 +41,7 @@ from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidSta
 from knowop.shell.files_channel import FilesChannel
 from knowop.shell.terminal_direct import DirectRouter
 from knowop.shell.trax_context import inherited_trax_context
+from knowop.shell.wake import Listener, Wake
 
 
 if TYPE_CHECKING:
@@ -87,6 +89,8 @@ class TerminalHost:
         it left running on the pty can prolong, before the exit is reported anyway.
       direct: Makes the peer that answers a browser's offer of a direct link; ``None``
         when no WebRTC library is installed, which keeps every terminal on the relay.
+      wake: Tells when this computer wakes from a pause: the wait held across it then
+        waits on a dead socket, so a new one is started at once. ``None`` watches not.
 
     """
 
@@ -101,6 +105,7 @@ class TerminalHost:
         shell: Sequence[str] = (),
         drain_sec: float = 0.5,
         direct: PeerFactory | None = None,
+        wake: Wake | None = None,
     ) -> None:
         self.direct = direct
         """Makes the peer for a browser's offer; ``None`` keeps every terminal on the relay."""
@@ -119,7 +124,7 @@ class TerminalHost:
             uuid.UUID,
             tuple[asyncio.AbstractEventLoop, asyncio.Event],
         ] = {}
-        self._listener: threading.Thread | None = None
+        self._wake = wake
 
     def start(self, machine_id: uuid.UUID, instance: uuid.UUID) -> None:
         """Start listening for opens on a thread.
@@ -129,13 +134,11 @@ class TerminalHost:
           instance: This host's instance.
 
         """
-        self._listener = threading.Thread(
+        Listener(
             name="terminal-listener",
-            target=self._listen,
-            args=(machine_id, instance),
-            daemon=True,
-        )
-        self._listener.start()
+            listen=partial(self._listen, machine_id, instance),
+            stop=self._stop,
+        ).start(self._wake)
 
     def stop(self) -> None:
         """Stop listening and kill every shell; returns once the bridges have ended."""
@@ -149,11 +152,16 @@ class TerminalHost:
         for bridge in bridges:
             bridge.join(timeout=10)
 
-    def _listen(self, machine_id: uuid.UUID, instance: uuid.UUID) -> None:
-        """Wait for opens until stopped, starting a bridge thread for each."""
+    def _listen(
+        self,
+        machine_id: uuid.UUID,
+        instance: uuid.UUID,
+        current: Callable[[], bool],
+    ) -> None:
+        """Wait for opens until stopped or replaced, starting a bridge for each."""
         client = self._client_for(self._credential)
         try:
-            while not self._stop.is_set():
+            while not self._stop.is_set() and current():
                 try:
                     opened = client.wait_terminals(
                         machine_id,
