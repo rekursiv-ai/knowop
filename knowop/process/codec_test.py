@@ -151,6 +151,8 @@ def test_a_slash_line_reads_as_a_command() -> None:
         ("UserMessage", {"py/object": "AgentToAgentMessage", "content": "hi"}),
         ("Halt", {"py/object": "UserMessage", "content": "hi"}),
         ("Command", {"line": ""}),
+        # A line with no slash would be pushed as a user's message with no sender.
+        ("Command", {"line": "model opus"}),
     ],
 )
 def test_a_payload_that_is_not_its_kind_does_not_read(
