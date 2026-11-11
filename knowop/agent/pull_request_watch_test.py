@@ -19,7 +19,6 @@ from uuid import UUID, uuid4
 
 import json
 import threading
-import time
 
 from trackinizer.client.errors import ClientError
 from trackinizer.sagent.session.types import BashResult, ToolCall
@@ -1197,13 +1196,12 @@ def test_a_tool_call_is_answered_when_its_pass_fails(
     finally:
         watch.close()
     assert answer == "The run could not do that; its log says why."
-    # The call is answered before the failed pass is logged; left unwaited, the
-    # line lands in whichever test's log runs next.
-    deadline = time.monotonic() + 5
-    while "knowop run: pull request watch failed" not in caplog.messages:
-        assert time.monotonic() < deadline, "the failed pass was never logged"
-        # The pass is logged from another thread after the answer.
-        time.sleep(0.001)  # house-ignore[sleep] -- See above.
+    # The call is answered before the failed pass is logged; the watch's thread,
+    # closed, ends after logging it, so a join leaves no line for the next test.
+    for thread in threading.enumerate():
+        if thread.name == "pull request watch":
+            thread.join(5)
+    assert "knowop run: pull request watch failed" in caplog.messages
 
 
 def test_a_read_that_fails_says_why_on_the_row() -> None:

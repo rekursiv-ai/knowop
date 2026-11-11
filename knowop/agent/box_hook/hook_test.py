@@ -63,13 +63,15 @@ def _state(*marks: dict[str, PlainTree]) -> dict[str, PlainTree]:
 class _Canvas(BaseHTTPRequestHandler):
     state: ClassVar[dict[str, PlainTree]] = {}
     status: ClassVar[int] = HTTPStatus.OK
-    delay_sec: ClassVar[float] = 0.0
+    held: ClassVar[threading.Event | None] = None
+    """When set, each answer waits for it: a server slower than any budget."""
+
     requests: ClassVar[list[str]] = []
 
     def do_GET(self) -> None:
         type(self).requests.append(self.path)
-        # Models a slow server for the timeout under test.
-        time.sleep(type(self).delay_sec)  # house-ignore[sleep] -- See above.
+        if (held := type(self).held) is not None:
+            _ = held.wait(10)
         body = json.dumps(type(self).state).encode()
         self.send_response(type(self).status)
         self.send_header("Content-Length", str(len(body)))
@@ -86,7 +88,7 @@ def canvas(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_Canvas]]:
     """Serve, on loopback, ``GET /api/canvases/ID`` answers from ``state``."""
     _Canvas.state = _state()
     _Canvas.status = HTTPStatus.OK
-    _Canvas.delay_sec = 0.0
+    _Canvas.held = None
     _Canvas.requests = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Canvas)
     thread = threading.Thread(
@@ -98,6 +100,8 @@ def canvas(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_Canvas]]:
     monkeypatch.setenv("TRACKINIZER_URL", f"http://127.0.0.1:{server.server_port}")
     monkeypatch.setenv("TRAX_CANVAS", CANVAS)
     yield _Canvas
+    if _Canvas.held is not None:
+        _Canvas.held.set()
     server.shutdown()
     server.server_close()
 
@@ -230,7 +234,7 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         canvas.state = _state(_mark(FIRST, 1))
-        canvas.delay_sec = 0.5
+        canvas.held = threading.Event()
         started: list[threading.Thread] = []
 
         class _Seen(threading.Thread):

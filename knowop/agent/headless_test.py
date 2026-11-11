@@ -9,11 +9,13 @@ from __future__ import annotations
 from concurrent import futures
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, ClassVar, Final, cast, override
 from unittest.mock import ANY, Mock, call, patch
 
 import asyncio
 import logging
+import queue
 import signal
 import socket
 import threading
@@ -604,16 +606,51 @@ class TestStateReporter:
 
         assert set(posted) == {"taken_over"}
 
-    def test_idle_is_not_posted_again(self) -> None:
+    def test_idle_is_not_posted_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
         posted: list[HostState] = []
+        _Lapses.made.clear()
+        monkeypatch.setattr(
+            headless,
+            "queue",
+            SimpleNamespace(SimpleQueue=_Lapses, Empty=queue.Empty),
+        )
         reporter = StateReporter(posted.append, again_sec=0.001)
+        [states] = _Lapses.made
         reporter.start()
         reporter.report("idle")
-        # Proves absence: idle must not post again in this window.
-        time.sleep(0.02)  # house-ignore[sleep] -- See above.
+        # Five of the reporter's waits ran out with idle held, each a chance to post.
+        states.lapsed(5)
         reporter.close()
 
         assert posted == ["idle"]
+
+
+class _Lapses(queue.SimpleQueue[HostState | None]):
+    """The reporter's queue, counting each wait for a state that ran out."""
+
+    made: ClassVar[list[_Lapses]] = []
+    """Each one made, as the reporter makes its own."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        type(self).made.append(self)
+        self._count = 0
+        self._changed = threading.Condition()
+
+    @override
+    def get(self, block: bool = True, timeout: float | None = None) -> HostState | None:
+        try:
+            return super().get(block, timeout)
+        except queue.Empty:
+            with self._changed:
+                self._count += 1
+                self._changed.notify_all()
+            raise
+
+    def lapsed(self, count: int) -> None:
+        """Return once ``count`` waits have run out."""
+        with self._changed:
+            assert self._changed.wait_for(lambda: self._count >= count, timeout=_WAIT)
 
 
 class TestAHungDriver:

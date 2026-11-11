@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final, cast
@@ -95,14 +96,16 @@ class _Server:
         """The host credential whose heartbeats answer 410, as after a disconnect."""
         self.requests: list[tuple[str, str, str, dict[str, object]]] = []
         self.over = threading.Event()
-        self._lock = threading.Lock()
+        self.requested = threading.Condition()
+        """Notified at each request; the daemon's threads make them."""
 
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         body = json_loads(request.content, dict[str, object]) if request.content else {}
         method, path = request.method, request.url.path
         auth = request.headers.get("authorization", "")
-        with self._lock:
+        with self.requested:
             self.requests.append((method, path, auth, body))
+            self.requested.notify_all()
         return self._answer(method, path, auth=auth)
 
     def _answer(
@@ -178,28 +181,38 @@ class _Server:
             return httpx2.Response(200, json={"work": None})
         raise AssertionError(f"unexpected request {method} {path}")
 
-    def asked(self, *suffixes: str) -> Callable[[], bool]:
-        """Return a check that every path ending in one of ``suffixes`` was requested."""
-        return lambda: all(self.calls(suffix) for suffix in suffixes)
+    def asked(self, *suffixes: str) -> Callable[[float], bool]:
+        """Return a wait until every path ending in one of ``suffixes`` was requested."""
+        return partial(self._asked, suffixes)
+
+    def _asked(self, suffixes: tuple[str, ...], timeout: float) -> bool:
+        with self.requested:
+            return self.requested.wait_for(
+                lambda: all(self.calls(suffix) for suffix in suffixes),
+                timeout=timeout,
+            )
 
     def calls(self, suffix: str) -> list[tuple[str, str, str, dict[str, object]]]:
         return [call for call in self.requests if call[1].endswith(suffix)]
 
 
-class _Waits:
-    """The waits between polls: the heartbeat's is Ctrl-C, once ``served`` is true."""
+def _never(timeout: float) -> bool:
+    """Serve nothing, at once."""
+    del timeout
+    return False
 
-    def __init__(self, served: Callable[[], bool] = lambda: True) -> None:
+
+class _Waits:
+    """The waits between polls: the heartbeat's is Ctrl-C, once ``served`` holds."""
+
+    def __init__(self, served: Callable[[float], bool] = bool) -> None:
         self.served = served
+        """Waits up to its argument, in seconds, for the daemon to have served."""
 
     def __call__(self, seconds: float) -> None:
         if seconds != HEARTBEAT_SEC:
             return
-        deadline = time.monotonic() + 5
-        while not self.served():
-            assert time.monotonic() < deadline, "the daemon never served"
-            # Polls state the daemon's threads change; nothing signals it.
-            time.sleep(0.005)  # house-ignore[sleep] -- See above.
+        assert self.served(5), "the daemon never served"
         raise KeyboardInterrupt
 
 
@@ -372,6 +385,7 @@ def test_jobs_where_no_memory_cap_holds_are_refused_before_anything_is_asked(
             signed_in=None,
             sandbox=False,
             serve_tools=True,
+            sleep=_Waits(_never),
             jobs=True,
         )
 
@@ -387,13 +401,21 @@ def test_a_computer_joined_by_a_piped_token_runs_no_ones_jobs(
     _cap(monkeypatch)
     _stdin(monkeypatch, f"{_ENROLLMENT}\n")
 
-    with pytest.raises(ClientError, match="runs the jobs of a signed-in account"):
+    with pytest.raises(
+        ClientError,
+        match=(
+            r"^--jobs runs the jobs of a signed-in account; a computer joined by a "
+            r"piped token runs none$"
+        ),
+    ):
         serve.connect_host(
             "dev-box",
             server=_SERVER,
             signed_in=None,
             sandbox=False,
             serve_tools=False,
+            # Refused before it serves: a heartbeat here is a failure, not a hang.
+            sleep=_Waits(_never),
             jobs=True,
         )
 
@@ -456,7 +478,7 @@ def test_another_account_on_this_computer_is_never_served_the_first_ones_host(
             signed_in=lambda: bob,
             sandbox=False,
             serve_tools=True,
-            sleep=_Waits(),
+            sleep=_Waits(_never),
         )
 
     assert str(err.value) == (
@@ -528,7 +550,7 @@ def test_an_enrollment_refused_for_another_reason_is_said_as_the_server_said_it(
             signed_in=lambda: keyed,
             sandbox=False,
             serve_tools=True,
-            sleep=_Waits(),
+            sleep=_Waits(_never),
         )
 
     assert err.value.status_code == 409
@@ -552,7 +574,7 @@ def test_a_join_only_connect_enrolls_joins_and_returns_serving_nothing(
         signed_in=lambda: keyed,
         sandbox=False,
         serve_tools=True,
-        sleep=_Waits(lambda: False),
+        sleep=_Waits(_never),
         join_only=True,
     )
 
@@ -761,7 +783,7 @@ def test_a_login_the_person_denies_ends_the_connect_with_nothing_saved(
             signed_in=None,
             sandbox=False,
             serve_tools=True,
-            sleep=_Waits(),
+            sleep=_Waits(_never),
         )
 
     assert server.calls("/api/hosts/join") == []
@@ -953,6 +975,88 @@ def test_the_direct_link_can_be_switched_off_though_the_library_is_installed(
     assert capsys.readouterr().out.splitlines()[0] == (
         "direct terminal link: off (TRAX_HOST_TERMINAL_DIRECT=0)"
     )
+
+
+def test_each_server_is_made_for_this_host_with_the_one_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _Server()
+    _on(server, monkeypatch)
+    _stdin(monkeypatch, "")
+    _cap(monkeypatch)
+    monkeypatch.setattr(tool_serving, "can_serve", lambda: True)
+    seen: dict[str, object] = {}
+    made: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(daemon, "connect", partial(_noted, seen))
+    for factory in ("_terminal_serving", "_tool_serving", "_job_serving"):
+        monkeypatch.setattr(serve, factory, partial(_made, made, factory))
+    keyed = Client(_SERVER, api_key=_PROFILE_KEY)
+
+    serve.connect_host(
+        "gx10",
+        server=_SERVER,
+        signed_in=lambda: keyed,
+        sandbox=False,
+        serve_tools=True,
+        jobs=True,
+        results_max=7,
+    )
+    joined = JoinResponse(host_id=_HOST_ID, credential=_CREDENTIAL)
+    for each in ("joined_terminals", "tools_for", "jobs_for"):
+        made_for = seen[each]
+        assert callable(made_for)
+        _ = made_for(joined)
+
+    wake = seen["wake"]
+    assert seen["name"] == "gx10"
+    assert [
+        (factory, args[0], kwargs.get("wake")) for factory, args, kwargs in made
+    ] == [
+        ("_terminal_serving", "gx10", wake),
+        ("_tool_serving", "gx10", wake),
+        ("_job_serving", "gx10", None),
+    ]
+    assert made[2][2]["results_max"] == 7
+
+
+def test_a_join_only_connect_makes_its_terminals_with_no_direct_link(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _on(_Server(), monkeypatch)
+    _stdin(monkeypatch, f"{_ENROLLMENT}\n")
+    seen: dict[str, object] = {}
+    made: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(daemon, "connect", partial(_noted, seen))
+    monkeypatch.setattr(serve, "_terminal_serving", partial(_made, made, "terminals"))
+
+    serve.connect_host(
+        "gx10",
+        server=_SERVER,
+        signed_in=None,
+        sandbox=False,
+        serve_tools=False,
+        join_only=True,
+    )
+    made_for = seen["joined_terminals"]
+    assert callable(made_for)
+    _ = made_for(JoinResponse(host_id=_HOST_ID, credential=_CREDENTIAL))
+
+    assert made[0][2]["direct"] is None
+
+
+def _noted(seen: dict[str, object], name: str, **kwargs: object) -> None:
+    """Note what ``daemon.connect`` was given, serving nothing."""
+    seen.update(kwargs, name=name)
+
+
+def _made(
+    made: list[tuple[str, tuple[object, ...], dict[str, object]]],
+    factory: str,
+    *args: object,
+    **kwargs: object,
+) -> None:
+    """Note one server's making: which factory, and what it was given."""
+    made.append((factory, args, kwargs))
 
 
 if __name__ == "__main__":
