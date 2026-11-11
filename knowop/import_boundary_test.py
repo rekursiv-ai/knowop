@@ -3,9 +3,10 @@
 The client ships alone, as the public ``knowop`` package; the project around it stays
 private. A shipped module may import the standard library, the client itself, and
 what a ``trackinizer`` install provides (trackinizer, the ``lib`` modules it carries,
-and its dependencies), and the ``lib`` modules knowop's export vendors itself. Any
-other import fails on a public install, or ships private code. Every export withholds
-a module with ``private`` in its path, so none of these is allowed from any package.
+and its dependencies), and the ``lib`` modules knowop's export vendors itself. The
+agent process's folder, ``process/``, may also import all of sagent. Any other import
+fails on a public install, or ships private code. Every export withholds a module
+with ``private`` in its path, so none of these is allowed from any package.
 """
 
 from __future__ import annotations
@@ -60,6 +61,12 @@ _ALLOWED: Final = (
     "_typeshed",
 )
 
+# The agent process runs sagent itself, in-process, so ``process/`` alone may import
+# all of the sagent package knowop depends on. Anywhere else the export reads a sagent
+# name as trackinizer's copy of the session records, which carries no runtime, so such
+# an import would fail on a public install.
+_PROCESS_ALLOWED: Final = ("sagent",)
+
 
 def _shipped() -> list[Path]:
     """Return the modules the wheel ships: no tests, conftests or test support."""
@@ -80,7 +87,18 @@ def _shipped() -> list[Path]:
 def test_a_shipped_module_imports_only_the_client_trackinizer_and_the_stdlib(
     path: Path,
 ) -> None:
-    assert [name for name in _imports(path) if not _allowed(name)] == []
+    also = _PROCESS_ALLOWED if path.relative_to(_CWD).parts[0] == "process" else ()
+
+    assert [name for name in _imports(path) if not _allowed(name, also=also)] == []
+
+
+def test_all_of_sagent_is_allowed_in_the_agent_process_alone() -> None:
+    runtime = f"{_PROCESS_ALLOWED[0]}.runtime.types"
+
+    assert _CWD / "process" / "codec.py" in _shipped()
+    assert runtime in set(_imports(_CWD / "process" / "codec.py"))
+    assert not _allowed(runtime)
+    assert _allowed(runtime, also=_PROCESS_ALLOWED)
 
 
 def test_a_module_an_export_withholds_is_never_allowed() -> None:
@@ -116,13 +134,13 @@ def test_the_scan_reads_the_cli_and_its_lazy_imports() -> None:
     )
 
 
-def _allowed(name: str) -> bool:
-    """Whether a shipped module may import ``name``."""
+def _allowed(name: str, *, also: tuple[str, ...] = ()) -> bool:
+    """Whether a shipped module may import ``name``; ``also`` is what its folder adds."""
     # The exports leave out ``**/*private*``, so such a module is in no public install.
     if any("private" in part for part in name.split(".")):
         return False
     return name.split(".", maxsplit=1)[0] in sys.stdlib_module_names or any(
-        name == prefix or name.startswith(f"{prefix}.") for prefix in _ALLOWED
+        name == prefix or name.startswith(f"{prefix}.") for prefix in (*_ALLOWED, *also)
     )
 
 
