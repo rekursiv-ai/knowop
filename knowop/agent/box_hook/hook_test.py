@@ -68,7 +68,8 @@ class _Canvas(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         type(self).requests.append(self.path)
-        time.sleep(type(self).delay_sec)
+        # Models a slow server for the timeout under test.
+        time.sleep(type(self).delay_sec)  # house-ignore[sleep] -- See above.
         body = json.dumps(type(self).state).encode()
         self.send_response(type(self).status)
         self.send_header("Content-Length", str(len(body)))

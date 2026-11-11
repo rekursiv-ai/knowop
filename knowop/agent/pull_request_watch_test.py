@@ -1202,7 +1202,8 @@ def test_a_tool_call_is_answered_when_its_pass_fails(
     deadline = time.monotonic() + 5
     while "knowop run: pull request watch failed" not in caplog.messages:
         assert time.monotonic() < deadline, "the failed pass was never logged"
-        time.sleep(0.001)
+        # The pass is logged from another thread after the answer.
+        time.sleep(0.001)  # house-ignore[sleep] -- See above.
 
 
 def test_a_read_that_fails_says_why_on_the_row() -> None:

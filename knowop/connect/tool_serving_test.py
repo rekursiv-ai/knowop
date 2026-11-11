@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
@@ -125,10 +126,7 @@ def _empty_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def _no_thread_left() -> Generator[None]:
     """End each test with its daemon's threads gone, however it stopped them."""
     yield
-    deadline = time.monotonic() + 10
-    while _threads():
-        assert time.monotonic() < deadline, f"left running: {_threads()}"
-        time.sleep(0.001)
+    _joined()
 
 
 class _Client:
@@ -139,6 +137,8 @@ class _Client:
         self.waits: list[tuple[uuid.UUID, uuid.UUID, float]] = []
         self.keys: list[str] = []
         self.closed = threading.Event()
+        self.changed = threading.Condition()
+        """Notified as each wait is asked; the daemon asks from its listener thread."""
 
     def __call__(self, key: str) -> _Client:
         self.keys.append(key)
@@ -151,7 +151,7 @@ class _Client:
         instance: uuid.UUID,
         wait_sec: float,
     ) -> ToolOffer | None:
-        self.waits.append((host_id, instance, wait_sec))
+        self.asked(host_id, instance, wait_sec)
         try:
             answer = self.answers.get(timeout=0.005)
         except queue.Empty:
@@ -162,6 +162,20 @@ class _Client:
 
     def close(self) -> None:
         self.closed.set()
+
+    def asked(self, host_id: uuid.UUID, instance: uuid.UUID, wait_sec: float) -> None:
+        """Record one wait and wake whoever waits for it."""
+        with self.changed:
+            self.waits.append((host_id, instance, wait_sec))
+            self.changed.notify_all()
+
+    async def reached(self, count: int) -> None:
+        """Return once ``count`` waits were asked."""
+        assert await asyncio.to_thread(self._reached, count), f"never asked {count}"
+
+    def _reached(self, count: int) -> bool:
+        with self.changed:
+            return self.changed.wait_for(lambda: len(self.waits) >= count, timeout=10)
 
 
 class _Socket:
@@ -320,7 +334,17 @@ async def _until(done: Callable[[], bool]) -> None:
     deadline = time.monotonic() + 10
     while not done():
         assert time.monotonic() < deadline, "the awaited change never came"
-        await asyncio.sleep(0.005)
+        # What it reads -- captured stderr, the log, a Gate's events on the daemon's
+        # own loop, a thread's start -- offers no wait this loop could await.
+        await asyncio.sleep(0.005)  # house-ignore[sleep] -- See above.
+
+
+def _joined() -> None:
+    """Join the daemon's threads, failing if any outlives 10s."""
+    for thread in threading.enumerate():
+        if thread.name.startswith("tool-"):
+            thread.join(10)
+    assert not _threads(), f"left running: {_threads()}"
 
 
 async def _result(socket: _Socket, call_id: str) -> Result:
@@ -409,11 +433,41 @@ class _Waits(threading.Event):
     def __init__(self) -> None:
         super().__init__()
         self.waited: list[float | None] = []
+        self.changed = threading.Condition()
 
     @override
     def wait(self, timeout: float | None = None) -> bool:
-        self.waited.append(timeout)
+        with self.changed:
+            self.waited.append(timeout)
+            self.changed.notify_all()
         return super().wait(timeout)
+
+    async def entered(self, seconds: float, count: int) -> None:
+        """Return once ``count`` waits of ``seconds`` have begun."""
+        assert await asyncio.to_thread(self._entered, seconds, count)
+
+    def _entered(self, seconds: float, count: int) -> bool:
+        with self.changed:
+            return self.changed.wait_for(
+                lambda: self.waited.count(seconds) >= count,
+                timeout=10,
+            )
+
+
+def _stops(monkeypatch: pytest.MonkeyPatch) -> list[_Waits]:
+    """Give each daemon a recording stop event; return them as they are made."""
+    stops: list[_Waits] = []
+    monkeypatch.setattr(
+        tool_serving,
+        "threading",
+        SimpleNamespace(Event=partial(_made, stops), Thread=threading.Thread),
+    )
+    return stops
+
+
+def _made(stops: list[_Waits]) -> _Waits:
+    stops.append(_Waits())
+    return stops[-1]
 
 
 async def test_a_daemon_with_its_defaults_dials_sagents_wire_as_the_server_names_it(
@@ -423,19 +477,9 @@ async def test_a_daemon_with_its_defaults_dials_sagents_wire_as_the_server_names
     websocket = SimpleNamespace(close_code=1000, close_reason="")
     dialed = AsyncMock(return_value=websocket)
     adopted = AsyncMock()
-    stops: list[_Waits] = []
-
-    def event() -> _Waits:
-        stops.append(_Waits())
-        return stops[-1]
-
+    stops = _stops(monkeypatch)
     monkeypatch.setattr(tool_serving, "connect", dialed)
     monkeypatch.setattr(tool_serving, "_adopted", adopted)
-    monkeypatch.setattr(
-        tool_serving,
-        "threading",
-        SimpleNamespace(Event=event, Thread=threading.Thread),
-    )
     client = _Client()
     # ``http`` twice, a trailing slash, and a last letter ``rstrip`` might take too.
     url = "http://http.X/"
@@ -450,7 +494,7 @@ async def test_a_daemon_with_its_defaults_dials_sagents_wire_as_the_server_names
     client.answers.put(ToolOffer(connection_id=connection))
     daemon.start(_HOST, _INSTANCE)
     # The next wait, answered at once, waits the default before it asks again.
-    await _until(lambda: 5.0 in stops[0].waited)
+    await stops[0].entered(5.0, 1)
     await asyncio.to_thread(daemon.stop)
 
     assert client.waits[0][2] == WAIT_MAX_SEC
@@ -511,7 +555,7 @@ async def test_a_410_stops_the_daemon(monkeypatch: pytest.MonkeyPatch) -> None:
 
         await socket.closed()
         await _until(gate.stopped.is_set)
-        await _until(lambda: not _threads())
+        await asyncio.to_thread(_joined)
         assert relay.client.closed.is_set()
         # Nothing was left to stop, and the state's lock is free for a next daemon.
         await asyncio.to_thread(daemon.stop)
@@ -555,7 +599,7 @@ async def test_stop_ends_running_tools(monkeypatch: pytest.MonkeyPatch) -> None:
         assert gate.stopped.is_set()
         for socket in (running, idle, silent):
             await socket.closed()
-        await _until(lambda: not _threads())
+        await asyncio.to_thread(_joined)
         assert relay.client.closed.is_set()
         _assert_lock_free(_dirs(relay))
 
@@ -594,7 +638,7 @@ async def test_an_offer_handed_over_as_the_daemon_stops_dials_nothing(
             instance: uuid.UUID,
             wait_sec: float,
         ) -> ToolOffer | None:
-            self.waits.append((host_id, instance, wait_sec))
+            self.asked(host_id, instance, wait_sec)
             _ = daemon_stopped.wait(10)
             return ToolOffer(connection_id=uuid.uuid4())
 
@@ -603,10 +647,10 @@ async def test_an_offer_handed_over_as_the_daemon_stops_dials_nothing(
         relay.client = _LateOffer()
         daemon = _daemon(relay)
         daemon.start(_HOST, _INSTANCE)
-        await _until(lambda: bool(relay.client.waits))
+        await relay.client.reached(1)
         await asyncio.to_thread(daemon.stop)
         daemon_stopped.set()
-        await _until(lambda: not _threads())
+        await asyncio.to_thread(_joined)
         assert relay.dials == []
 
 
@@ -726,12 +770,14 @@ async def test_a_held_lock_says_so_once_and_serves_when_it_frees(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _local(monkeypatch, Read=Read())
+    stops = _stops(monkeypatch)
     async with _relay() as relay:
         holder = _HeldLock(_dirs(relay))
         async with _serving(relay):
             await _until(lambda: "tools: off" in capsys.readouterr().err)
             # It goes on trying, saying nothing more, and the rest of the daemon goes on.
-            await asyncio.sleep(0.05)
+            tried = stops[0].waited.count(0.005)
+            await stops[0].entered(0.005, tried + 3)
             assert capsys.readouterr().err == ""
             assert relay.client.waits == []
 
@@ -747,10 +793,12 @@ async def test_a_lock_freed_within_the_wait_serves_after_all(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     _local(monkeypatch, Read=Read())
+    stops = _stops(monkeypatch)
     async with _relay() as relay:
         holder = _HeldLock(_dirs(relay))
         async with _serving(relay, lock_wait_sec=30):
-            await asyncio.sleep(0.02)
+            # Retried twice on the held lock, and asked for nothing meanwhile.
+            await stops[0].entered(0.005, 2)
             assert relay.client.waits == []
             holder.close()
             socket = await relay.socket()
@@ -762,15 +810,16 @@ async def test_a_lock_freed_within_the_wait_serves_after_all(
 
 async def test_stop_ends_a_wait_for_the_lock(monkeypatch: pytest.MonkeyPatch) -> None:
     _local(monkeypatch, Read=Read())
+    stops = _stops(monkeypatch)
     async with _relay() as relay:
         with _HeldLock(_dirs(relay)):
             daemon = _daemon(relay, lock_wait_sec=600)
             daemon.start(_HOST, _INSTANCE)
-            await asyncio.sleep(0.02)
+            await stops[0].entered(0.005, 1)
             started = time.monotonic()
             await asyncio.to_thread(daemon.stop)
             assert time.monotonic() - started < 5
-            await _until(lambda: not _threads())
+            await asyncio.to_thread(_joined)
 
 
 async def test_a_state_folder_it_cannot_make_is_one_line_and_no_tools(
@@ -1019,7 +1068,7 @@ class _AnsweredAtOnce(_Client):
         instance: uuid.UUID,
         wait_sec: float,
     ) -> ToolOffer | None:
-        self.waits.append((host_id, instance, wait_sec))
+        self.asked(host_id, instance, wait_sec)
         return None
 
 
@@ -1027,16 +1076,16 @@ async def test_a_wait_answered_at_once_is_not_asked_again_at_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _local(monkeypatch, Read=Read())
+    stops = _stops(monkeypatch)
     async with _relay() as relay:
         relay.client = _AnsweredAtOnce()
         daemon = _daemon(relay, retry_sec=0.01)
         daemon.start(_HOST, _INSTANCE)
-        # The first ask may come late on a loaded host; what counts is the next ones.
-        await _until(lambda: bool(relay.client.waits))
-        await asyncio.sleep(0.05)
+        await relay.client.reached(3)
         await asyncio.to_thread(daemon.stop)
-        # Asked again at once, it would ask thousands of times in this time.
-        assert 1 <= len(relay.client.waits) <= 10
+        # Each ask answered at once is followed by a wait of retry_sec before the next.
+        asked = len(relay.client.waits)
+        assert stops[0].waited.count(0.01) >= asked - 1
 
 
 async def test_a_wait_held_to_its_end_is_asked_again_at_once(
@@ -1053,16 +1102,19 @@ async def test_a_wait_held_to_its_end_is_asked_again_at_once(
             instance: uuid.UUID,
             wait_sec: float,
         ) -> ToolOffer | None:
-            self.waits.append((host_id, instance, wait_sec))
-            time.sleep(wait_sec)
+            self.asked(host_id, instance, wait_sec)
+            # A long-poll held for all of its wait, on the clock the daemon reads.
+            clock.now += wait_sec
             return None
 
+    clock = _Clock()
+    monkeypatch.setattr(tool_serving, "time", SimpleNamespace(monotonic=clock))
     async with _relay() as relay:
         relay.client = _Held()
         async with asyncio.timeout(10):
             daemon = _daemon(relay, retry_sec=60, wait_sec=0.01)
             daemon.start(_HOST, _INSTANCE)
-            await _until(lambda: len(relay.client.waits) >= 3)
+            await relay.client.reached(3)
             await asyncio.to_thread(daemon.stop)
         assert {wait_sec for _, _, wait_sec in relay.client.waits} == {0.01}
 
@@ -1087,7 +1139,7 @@ async def test_a_wake_from_a_pause_asks_again_at_once_beside_the_dead_wait(
             instance: uuid.UUID,
             wait_sec: float,
         ) -> ToolOffer | None:
-            self.waits.append((host_id, instance, wait_sec))
+            self.asked(host_id, instance, wait_sec)
             here = threading.current_thread()
             if not listeners:
                 listeners.append(here)
@@ -1139,13 +1191,12 @@ async def test_a_wait_failing_the_same_way_is_said_once(
     async with _relay() as relay, _serving(relay):
         for _ in range(3):
             relay.client.answers.put(refused)
-        await _until(relay.client.answers.empty)
+        await relay.client.reached(3)
         socket = await relay.socket()
         assert isinstance(await socket.open_session(), Welcome)
         # A failure after a wait that worked is news again.
         relay.client.answers.put(refused)
-        await _until(relay.client.answers.empty)
-        await _until(lambda: len(relay.client.waits) > 6)
+        await relay.client.reached(len(relay.client.waits) + 3)
     said = capsys.readouterr().err.splitlines()
     assert sum("tool wait failed" in line for line in said) == 2
 
@@ -1163,7 +1214,7 @@ async def test_a_client_that_cannot_be_made_is_one_line_and_ends_the_tools(
         monkeypatch.setattr(relay, "client", no_client)
         daemon = _daemon(relay)
         daemon.start(_HOST, _INSTANCE)
-        await _until(lambda: not _threads())
+        await asyncio.to_thread(_joined)
         assert "tools: off" in capsys.readouterr().err
         await asyncio.to_thread(daemon.stop)
         _assert_lock_free(_dirs(relay))
@@ -1205,7 +1256,7 @@ async def test_stop_says_so_when_the_tools_outlast_its_wait(
             assert "still stopping" in capsys.readouterr().err
         finally:
             release.set()
-            await _until(lambda: not _threads())
+            await asyncio.to_thread(_joined)
 
 
 async def test_a_serving_loop_that_raises_says_so_and_ends_the_listener(
@@ -1220,7 +1271,7 @@ async def test_a_serving_loop_that_raises_says_so_and_ends_the_listener(
             dirs=_dirs(relay),
         )
         daemon.start(_HOST, _INSTANCE)
-        await _until(lambda: not _threads())
+        await asyncio.to_thread(_joined)
         assert "tools: stopped: RuntimeError('the serving loop broke')" in (
             capsys.readouterr().err
         )
@@ -1277,7 +1328,7 @@ async def test_an_offer_started_after_the_stop_opens_no_connection(
             dirs=_dirs(relay),
         )
         daemon.start(_HOST, _INSTANCE)
-        await _until(lambda: not _threads())
+        await asyncio.to_thread(_joined)
         await asyncio.to_thread(daemon.stop)
     assert opened == []
 
@@ -1955,6 +2006,16 @@ async def test_importing_the_tool_serving_does_not_load_sagents_daemon() -> None
 
 def _first_party(module: str) -> bool:
     return module.split(".", maxsplit=1)[0] in _FIRST_PARTY
+
+
+class _Clock:
+    """A monotonic clock that moves only when a test moves it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
 
 
 class _HeldLock:

@@ -451,7 +451,8 @@ async def _until(done: Callable[[], bool]) -> None:
     deadline = time.monotonic() + _LIMIT_SEC
     while not done():
         assert time.monotonic() < deadline, "the awaited change never came"
-        await asyncio.sleep(0.005)
+        # Polls state the daemon's threads change; nothing signals it.
+        await asyncio.sleep(0.005)  # house-ignore[sleep] -- See above.
 
 
 async def _up(session: RemoteSession, name: str = _NAME) -> Endpoint:

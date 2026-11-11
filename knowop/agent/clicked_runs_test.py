@@ -324,7 +324,8 @@ def _drain(runs: ClickedRuns) -> list[InboundDrainItem]:
         if time.monotonic() > deadline:
             raise AssertionError("Clicked commands did not end within 5 s.")
         lines += runs.take()
-        time.sleep(0.001)
+        # Clicked commands are other processes; only their output says they ran.
+        time.sleep(0.001)  # house-ignore[sleep] -- See above.
     return lines
 
 

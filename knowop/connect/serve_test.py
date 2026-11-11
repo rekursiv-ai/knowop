@@ -198,7 +198,8 @@ class _Waits:
         deadline = time.monotonic() + 5
         while not self.served():
             assert time.monotonic() < deadline, "the daemon never served"
-            time.sleep(0.005)
+            # Polls state the daemon's threads change; nothing signals it.
+            time.sleep(0.005)  # house-ignore[sleep] -- See above.
         raise KeyboardInterrupt
 
 
