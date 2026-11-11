@@ -16,13 +16,11 @@ from uuid import UUID
 
 from sagent.runtime.types import (
     AgentIdle,
-    AgentSendDeferredMessage,
     ChildEvent,
     Halt,
     ModelResponseError,
     ModelResponsePartial,
     RuntimeEvent,
-    UserDeferredMessage,
 )
 from sagent.session.types import (
     AgentToAgentMessage,
@@ -134,21 +132,6 @@ def test_a_person_s_line_becomes_a_message_named_by_its_author() -> None:
     )
 
 
-def test_a_deferred_line_becomes_a_deferred_message_named_by_its_author() -> None:
-    held = UserDeferredMessage(
-        text="later",
-        attachments=(Attachment(mime_descriptor="text/plain", data=b"a"),),
-    )
-
-    assert input_message(
-        _input("UserDeferredMessage", event_payload(held)),
-    ) == AgentSendDeferredMessage(
-        sender="dan@example.com",
-        text="later",
-        attachments=held.attachments,
-    )
-
-
 def test_a_halt_reads_as_a_halt() -> None:
     assert input_message(_input("Halt", event_payload(Halt()))) == Halt()
 
@@ -166,7 +149,6 @@ def test_a_slash_line_reads_as_a_command() -> None:
         ("UserMessage", {"py/object": "UserMessage", "sender": "eve@example.com"}),
         # Another record with words would pass for a line, under a sender of its own.
         ("UserMessage", {"py/object": "AgentToAgentMessage", "content": "hi"}),
-        ("UserDeferredMessage", {"py/object": "UserMessage", "content": "hi"}),
         ("Halt", {"py/object": "UserMessage", "content": "hi"}),
         ("Command", {"line": ""}),
     ],

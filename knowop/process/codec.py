@@ -23,11 +23,7 @@ from typing import TYPE_CHECKING, Final, cast
 
 from sagent.model import types as model_types
 from sagent.runtime import types as runtime_types
-from sagent.runtime.types import (
-    AgentSendDeferredMessage,
-    Halt,
-    UserDeferredMessage,
-)
+from sagent.runtime.types import Halt
 from sagent.session.types import (
     AgentToAgentMessage,
     UserMessage,
@@ -72,9 +68,7 @@ def event_payload(event: object) -> JSON:
     return stored_plain(_worded(event), classes=CLASSES)
 
 
-def input_message(
-    sent: Input,
-) -> AgentToAgentMessage | AgentSendDeferredMessage | Halt | Command:
+def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
     """Return what the agent takes for ``sent``: a line as a message from its author.
 
     A line reaches the agent as sagent's own message between agents, so the model
@@ -85,8 +79,7 @@ def input_message(
       sent: An input, as the server handed it down.
 
     Returns:
-      message: A line, now or deferred, named by ``sent.author``; a halt; or a slash
-        line.
+      message: A line, named by ``sent.author``; a halt; or a slash line.
 
     Raises:
       ValueError: The payload does not read as ``sent.kind``.
@@ -100,13 +93,6 @@ def input_message(
                 attachments=said.attachments,
                 sender=sent.author,
                 extra={"author": sent.author, "input": str(sent.id)},
-            )
-        case "UserDeferredMessage":
-            held = stored_record(sent.payload, UserDeferredMessage, classes=CLASSES)
-            return AgentSendDeferredMessage(
-                sender=sent.author,
-                text=held.text,
-                attachments=held.attachments,
             )
         case "Halt":
             return stored_record(sent.payload, Halt, classes=CLASSES)
