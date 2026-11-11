@@ -526,7 +526,8 @@ class _Rig:
     async def sent(self, frames: int) -> None:
         """Wait until the fake has logged ``frames`` frames."""
         while len(self.log.read_text().splitlines()) < frames:  # noqa: ASYNC110 -- The fake is another process; only its log file says what it got.
-            await asyncio.sleep(0.002)
+            # The fake is another process; only its log file says what it got.
+            await asyncio.sleep(0.002)  # house-ignore[sleep] -- See above.
 
 
 async def _bounded[T](
@@ -1217,7 +1218,8 @@ def _lines(runs: ClickedRuns) -> list[InboundDrainItem]:
     while not (lines := runs.take()) and runs.running():
         if time.monotonic() > deadline:
             raise AssertionError("A clicked command did not end within 5 s.")
-        time.sleep(0.001)
+        # Clicked commands are other processes; only their output says they ran.
+        time.sleep(0.001)  # house-ignore[sleep] -- See above.
     return lines
 
 
@@ -1240,6 +1242,8 @@ class _RecordingSink(Sink):
         self.closed = False
         self.flushes = 0
         self.cli_session_ids: list[str] = []
+        self.changed = threading.Condition()
+        """Notified as each event is recorded; the drain records from its thread."""
         self._next_idx: dict[Path, int] = {}
 
     @property
@@ -1267,7 +1271,9 @@ class _RecordingSink(Sink):
     def emit(self, adapter_name: str, event: Event) -> None:
         idx = self._next_idx.get(event.path, 0)
         self._next_idx[event.path] = idx + 1
-        self.events.append((idx, adapter_name, event))
+        with self.changed:
+            self.events.append((idx, adapter_name, event))
+            self.changed.notify_all()
 
     @override
     def emit_slash_command(self, command: SlashCommand, at: datetime) -> None:
@@ -1405,9 +1411,8 @@ def _always_found(
 # assertion names what is missing.
 def _wait_for_events(sink: _RecordingSink, count: int) -> None:
     """Block until ``sink`` holds ``count`` events, or give up after 3s."""
-    deadline = time.monotonic() + 3.0
-    while len(sink.events) < count and time.monotonic() < deadline:
-        time.sleep(0.005)
+    with sink.changed:
+        _ = sink.changed.wait_for(lambda: len(sink.events) >= count, timeout=3.0)
 
 
 # The drain is wake-driven, so a test cannot call one scan and inspect the result: it
@@ -1845,9 +1850,18 @@ class _RecordingRelay:
         self.submitted: list[str] = []
         self.written: list[bytes] = []
         self.terminated = 0
+        self.changed = threading.Condition()
+        """Notified as each line is submitted; the inbound loop submits from its thread."""
 
     def submit(self, text: str) -> None:
-        self.submitted.append(text)
+        with self.changed:
+            self.submitted.append(text)
+            self.changed.notify_all()
+
+    def wait_submitted(self, count: int) -> None:
+        """Block until ``count`` lines are submitted, or give up after 3s."""
+        with self.changed:
+            _ = self.changed.wait_for(lambda: len(self.submitted) >= count, timeout=3.0)
 
     def write(self, data: bytes) -> None:
         self.written.append(data)
@@ -2006,7 +2020,8 @@ def _hw_poll(wiring: _HeadlessWiring, *args: object, **kwargs: object) -> None:
     if wiring.script is not None:
         wiring.script(run)
     run.terminate()
-    time.sleep(wiring.after_ending)
+    # Models the poll thread outliving the run, the window under test.
+    time.sleep(wiring.after_ending)  # house-ignore[sleep] -- See above.
     wiring.poll_done.set()
 
 

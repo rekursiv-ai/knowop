@@ -419,7 +419,8 @@ def _log(name: str, *, follow: bool) -> int:
                 _ = out.write(source.read())
                 out.flush()
                 return 0
-            time.sleep(0.2)
+            # Tails a log another process writes; nothing signals a write.
+            time.sleep(0.2)  # house-ignore[sleep] -- See above.
 
 
 def _send(name: str, text: str) -> int:
@@ -473,7 +474,8 @@ def _wait_exit(record: HostRecord) -> bool:
     """Wait for the host process to end; return whether it did within the time."""
     deadline = time.monotonic() + _STOP_TIMEOUT_SEC
     while running(record.pid) and time.monotonic() < deadline:
-        time.sleep(0.05)
+        # Not our child: no event marks its exit.
+        time.sleep(0.05)  # house-ignore[sleep] -- See above.
     return not running(record.pid)
 
 

@@ -322,7 +322,8 @@ class _Host:
             raise self.ending
         if isinstance(self.ending, int):
             os.kill(os.getpid(), self.ending)
-            time.sleep(5)
+            # The signal's handler raises into this wait at once; 5 s only bounds a broken one.
+            time.sleep(5)  # house-ignore[sleep] -- See above.
         if self.reads_token and not token and signed_in is not None:
             token = signed_in().enroll_host(name).token
         signed_in_to = ""

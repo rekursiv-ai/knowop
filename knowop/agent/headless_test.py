@@ -609,7 +609,8 @@ class TestStateReporter:
         reporter = StateReporter(posted.append, again_sec=0.001)
         reporter.start()
         reporter.report("idle")
-        time.sleep(0.02)
+        # Proves absence: idle must not post again in this window.
+        time.sleep(0.02)  # house-ignore[sleep] -- See above.
         reporter.close()
 
         assert posted == ["idle"]

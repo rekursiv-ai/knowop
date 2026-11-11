@@ -1477,7 +1477,8 @@ class TestALaunchOfATakenOverName:
         end = time.monotonic() + 10
         record = detach._read_record(detach._paths("tau"))
         while (record is None or record.state != "exited") and time.monotonic() < end:
-            time.sleep(0.01)
+            # The host is another process; only its record says it ended.
+            time.sleep(0.01)  # house-ignore[sleep] -- See above.
             record = detach._read_record(detach._paths("tau"))
         assert record is not None
         assert (record.session, record.state) == ("sess-5", "exited")

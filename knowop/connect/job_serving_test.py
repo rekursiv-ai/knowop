@@ -307,9 +307,7 @@ def test_cancellation_interrupts_preparation(tmp_path: Path) -> None:
         rig.daemon.step()
         _until(lambda: bool(repos.fetching))
         rig.daemon.handle(CancelWork(job_id=7))
-        deadline = time.monotonic() + 1
-        while _phase(rig, 7) == "fetching" and time.monotonic() < deadline:
-            time.sleep(0.01)
+        _until(lambda: _phase(rig, 7) != "fetching")
         rig.daemon.step()
         _cleaned(rig)
         assert (7, "cancelled") in rig.server.states()
@@ -365,7 +363,9 @@ def _until(condition: Callable[[], bool]) -> None:
     deadline = time.monotonic() + 5
     while not condition():
         assert time.monotonic() < deadline, "the condition never held"
-        time.sleep(0.005)
+        # Its conditions read job folders on disk, the launcher's units, the fake
+        # server's replies and the daemon's job table, none of which notifies.
+        time.sleep(0.005)  # house-ignore[sleep] -- See above.
 
 
 def _daemon(

@@ -953,7 +953,8 @@ class JobServing:
                 for unit in launched:
                     self._launcher.kill(unit, signal.SIGKILL)
                 break
-            time.sleep(0.2)
+            # Polls launched units, which are not our children.
+            time.sleep(0.2)  # house-ignore[sleep] -- See above.
         for job in jobs:
             self._repos.remove(remote=job.spec.remote, dest=job.folder.src)
             job.folder.note("the host was revoked; the job was stopped")

@@ -690,11 +690,14 @@ async def _five_opens(
     sockets = [_FakeSocket() for _ in range(5)]
     _ = _connector(monkeypatch, *sockets)
     terminals: list[_TerminalMock] = []
+    # Each bridge relays on a thread of its own; all five must be relaying, where a
+    # stop reaches them, before the test goes on.
+    relaying = threading.Barrier(6)
     for _ in range(5):
         finished, drained = asyncio.Event(), asyncio.Event()
         terminal, _ = _terminal(monkeypatch, status=143)
         terminal.output.return_value = _held_output(finished, drained)
-        terminal.wait.side_effect = functools.partial(_terminal_status, finished)
+        terminal.wait.side_effect = functools.partial(_relayed, relaying, finished)
         terminal.terminate.side_effect = finished.set
         terminals.append(terminal)
     monkeypatch.setattr(terminal_serving, "Terminal", Mock(side_effect=terminals))
@@ -707,11 +710,14 @@ async def _five_opens(
         client=client,
     )
     daemon.start(_HOST, _INSTANCE)
-    for _ in range(500):
-        await asyncio.sleep(0.002)
-        if all(terminal.__aenter__.await_count == 1 for terminal in terminals):
-            break
+    _ = await asyncio.to_thread(relaying.wait, 10)
     return daemon, client, sockets, terminals
+
+
+async def _relayed(relaying: threading.Barrier, finished: asyncio.Event) -> int:
+    """Count the bridge at ``relaying``, then wait for its shell to finish."""
+    _ = await asyncio.to_thread(relaying.wait, 10)
+    return await _terminal_status(finished)
 
 
 async def test_a_daemon_serves_five_terminals_at_once_and_refuses_none(
@@ -791,7 +797,8 @@ async def test_shutdown_cannot_join_a_bridge_before_its_thread_starts(
     try:
         assert await asyncio.to_thread(arrived.wait, 2)
         stopping = asyncio.create_task(asyncio.to_thread(daemon.stop))
-        await asyncio.sleep(0.01)
+        # Stop sets its flag, then waits on the lock the paused start holds.
+        assert await asyncio.to_thread(daemon._stop.wait, 2)
         resume.set()
         await asyncio.wait_for(asyncio.gather(opening, stopping), 2)
     finally:

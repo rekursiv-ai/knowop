@@ -1446,7 +1446,8 @@ def _compactions(rig: _Rig, verb: str) -> list[Compaction]:
             _ = await rig.driver.command(verb, "")
         else:
             await rig.driver.send_line("go")
-        await asyncio.sleep(0.05)
+        # Lets the fake app-server answer; the driver signals no reply.
+        await asyncio.sleep(0.05)  # house-ignore[sleep] -- See above.
         await rig.driver.stop()
         return await _collect(rig.driver.events())
 

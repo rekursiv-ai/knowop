@@ -2096,7 +2096,8 @@ def _wind_down(
     if runs is not None:
         runs.close()
     # Let the drain thread finish pending reads before stopping it.
-    time.sleep(config.quiesce_seconds)
+    # The drain has no idle signal; quiesce_seconds bounds its last reads.
+    time.sleep(config.quiesce_seconds)  # house-ignore[sleep] -- See above.
     stop.set()
     # One deadline for the whole teardown: the workers normally stop well
     # inside it, so a slow drain (a retrying server POST) finishes rather than
@@ -4078,7 +4079,8 @@ async def _follow_session_files(
         rearming = True
         # Before ``until``, only a failure returns. Back off so a persistent
         # refusal is not a hot retry loop.
-        await asyncio.sleep(_WATCH_REARM_SEC)
+        # Re-arm backoff after a refused watch.
+        await asyncio.sleep(_WATCH_REARM_SEC)  # house-ignore[sleep] -- See above.
 
 
 # The baseline excludes old files; the adapter identifies transcripts; the scope

@@ -2360,7 +2360,9 @@ class _FlakyEmitSink(_RecordingSink):
 
     @override
     def emit(self, adapter_name: str, event: Event) -> None:
-        self.attempts += 1
+        with self.changed:
+            self.attempts += 1
+            self.changed.notify_all()
         if self.attempts == 1:
             raise RuntimeError("sink write failed")
         super().emit(adapter_name, event)
@@ -2403,9 +2405,8 @@ class TestDrainSurvivesSinkError:
             log.write_bytes(b"boom\n")
             # The failed emit records no event; its attempt is the handshake
             # that the next line is a LATER write, not the same batch.
-            deadline = time.monotonic() + 3.0
-            while sink.attempts < 1 and time.monotonic() < deadline:
-                time.sleep(0.005)
+            with sink.changed:
+                _ = sink.changed.wait_for(lambda: sink.attempts >= 1, timeout=3.0)
             with log.open("ab") as handle:
                 _ = handle.write(b"survived\n")
             _wait_for_events(sink, 1)
@@ -4719,7 +4720,8 @@ def _sleeping_drain(
     del args, kwargs
     recorded.append(threading.current_thread())
     armed.set()
-    time.sleep(0.002)
+    # Models a drain thread that stays alive briefly.
+    time.sleep(0.002)  # house-ignore[sleep] -- See above.
 
 
 class TestSpawnWorktreeDiffWiring:
@@ -5876,9 +5878,8 @@ class TestInboundIsWaitDriven:
         )
         worker.start()
         try:
-            deadline = time.monotonic() + 3.0
-            while client.attempts < 3 and time.monotonic() < deadline:
-                time.sleep(0.005)
+            with client.changed:
+                _ = client.changed.wait_for(lambda: client.attempts >= 3, timeout=3.0)
         finally:
             stop.set()
             worker.join(timeout=5.0)
@@ -6015,7 +6016,9 @@ class _ClickClient:
         self.waits.append(wait_sec)
         if self._relay.submitted or len(self.waits) > 2_000:
             self._stop.set()
-        time.sleep(0.001)
+        # A long-poll holds before answering empty; without a hold the loop spins
+        # its 2,000 drains before the clicked command's process ends.
+        time.sleep(0.001)  # house-ignore[sleep] -- See above.
         items = self._items
         self._items = []
         return items
@@ -6047,9 +6050,7 @@ class TestInboundBatchSurvivesOneBadMessage:
         )
         worker.start()
         try:
-            deadline = time.monotonic() + 3.0
-            while len(relay.submitted) < 2 and time.monotonic() < deadline:
-                time.sleep(0.01)
+            relay.wait_submitted(2)
         finally:
             stop.set()
             worker.join(timeout=5.0)
@@ -6224,9 +6225,7 @@ class TestInboundSurvivesACaptureDegrade:
         )
         worker.start()
         try:
-            deadline = time.monotonic() + 3.0
-            while not relay.submitted and time.monotonic() < deadline:
-                time.sleep(0.01)
+            relay.wait_submitted(1)
         finally:
             stop.set()
             worker.join(timeout=5.0)
@@ -6333,6 +6332,7 @@ class _FailingClient:
 
     def __init__(self) -> None:
         self.attempts = 0
+        self.changed = threading.Condition()
 
     def drain_inbound(
         self,
@@ -6343,7 +6343,9 @@ class _FailingClient:
     ) -> list[InboundDrainItem]:
         del where
         del session_id, wait_sec
-        self.attempts += 1
+        with self.changed:
+            self.attempts += 1
+            self.changed.notify_all()
         raise RuntimeError("back-channel down")
 
 
@@ -7207,7 +7209,8 @@ def _wait_for_records(records: Sized, count: int) -> None:
     """Block until ``records`` holds ``count`` records, or give up after 3s."""
     deadline = time.monotonic() + 3.0
     while len(records) < count and time.monotonic() < deadline:
-        time.sleep(0.005)
+        # Events arrive from other threads; nothing signals the count.
+        time.sleep(0.005)  # house-ignore[sleep] -- See above.
 
 
 class _PermissionHook:
