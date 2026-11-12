@@ -108,6 +108,9 @@ _RESUME_WINDOW_SEC: Final = 120.0
 
 _STOP_TIMEOUT_SEC: Final = 60.0
 
+_SCROLLBACK: Final = "scrollback.log"
+"""The file in a host's directory that holds every byte its CLI wrote."""
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class HostRecord:
@@ -182,7 +185,19 @@ def launch(
 
     """
     paths = _paths(name)
-    previous = _read_record(paths)
+    try:
+        previous = _read_record(paths)
+    except _UnreadableRecordError as error:
+        # With no record to say where the host listens, its own sockets are asked.
+        # Nothing answering, the directory is replaced as one with no record is.
+        if accepts(socket_address(paths / "host.sock")) or accepts(
+            socket_address(paths / "control.sock"),
+        ):
+            raise SystemExit(
+                f"{PROGRAM}: host {name!r} is running, but {error}; "
+                "stop it with the knowop that started it",
+            ) from None
+        previous = None
     resume = "" if previous is None else _replace(name, previous, command=command)
     shutil.rmtree(paths, ignore_errors=True)
     paths.mkdir(parents=True, mode=0o700)
@@ -331,14 +346,21 @@ def stop_all() -> int:
     return status
 
 
+# A record this version cannot read is skipped too, and said on stderr: left out
+# silently, a host still running reads as no host at all.
 def _records() -> list[HostRecord]:
     """Return every host's record, by name; a directory with none is skipped."""
     hosts = state_dir() / "rekursiv-ai" / "trax" / "run" / "hosts"
-    found = (
-        _read_record(directory)
-        for directory in sorted(hosts.iterdir() if hosts.is_dir() else ())
-    )
-    return [record for record in found if record is not None]
+    records: list[HostRecord] = []
+    for directory in sorted(hosts.iterdir() if hosts.is_dir() else ()):
+        try:
+            record = _read_record(directory)
+        except _UnreadableRecordError as error:
+            sys.stderr.write(f"[{PROGRAM}] skipped {directory.name}: {error}\n")
+            continue
+        if record is not None:
+            records.append(record)
+    return records
 
 
 def _ls(*, every: bool) -> int:
@@ -406,7 +428,7 @@ def _attach(name: str) -> int:
 def _log(name: str, *, follow: bool) -> int:
     """Print the host's scrollback; with ``follow``, until the host exits."""
     record = _require_record(name)
-    scrollback = _paths(name) / "scrollback.log"
+    scrollback = _paths(name) / _SCROLLBACK
     if not scrollback.exists():
         return 0
     out = sys.stdout.buffer
@@ -523,8 +545,11 @@ def _recent(record: HostRecord, *, now: datetime) -> bool:
 
 
 def _require_record(name: str) -> HostRecord:
-    """Return ``name``'s record, or exit naming the missing host."""
-    record = _read_record(_paths(name))
+    """Return ``name``'s record, or exit naming the missing or unreadable host."""
+    try:
+        record = _read_record(_paths(name))
+    except _UnreadableRecordError as error:
+        raise SystemExit(f"{PROGRAM}: host {name!r}: {error}") from None
     if record is None:
         raise SystemExit(
             f"{PROGRAM}: no host named {name!r}; see {PROGRAM} ls --all",
@@ -586,12 +611,35 @@ def _reach(record: HostRecord, call: Callable[[Path], Reply]) -> Reply | None:
         return None
 
 
+# A record there but unreadable is not "no record": a launch of its name deletes the
+# directory of a host with none, and the host may still be running in it.
 def _read_record(paths: Path) -> HostRecord | None:
-    """Return the host's record, or None when it has none (or none readable)."""
+    """Return the host's record, or None when it has none."""
+    path = paths / "host.json"
     try:
-        text = (paths / "host.json").read_text()
+        # pragma: no mutate start -- the default filesystem is case-insensitive here,
+        # so a re-cased path finds the same file and no test can tell them apart.
+        text = path.read_text()
+        # pragma: no mutate end
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as error:
+        raise _UnreadableRecordError(f"{path} cannot be read: {error}") from error
+    try:
         return json_loads(text, HostRecord)
-    except (OSError, ValueError, TypeError):
+    except (ValueError, TypeError) as error:
+        raise _UnreadableRecordError(
+            f"{path} is no record this version reads: {error}",
+        ) from error
+
+
+# The host wrote this record itself; one damaged under it is written over on its way
+# out, not a reason to fail there.
+def _own_record(paths: Path) -> HostRecord | None:
+    """Return the record the host wrote, or None when it is gone or unreadable."""
+    try:
+        return _read_record(paths)
+    except _UnreadableRecordError:
         return None
 
 
@@ -741,7 +789,7 @@ def _detach(
         status = start(
             HeadlessSpec(
                 address=address,
-                scrollback=paths / "scrollback.log",
+                scrollback=paths / _SCROLLBACK,
                 on_listening=partial(_listening, paths, record, readiness),
                 control=control,
                 resume=resume,
@@ -760,7 +808,7 @@ def _detach(
         _write_record(
             paths,
             replace(
-                _read_record(paths) or record,
+                _own_record(paths) or record,
                 state="exited",
                 exit_code=status,
                 ended=_now(),
@@ -786,7 +834,7 @@ def _exit_status(code: object) -> int:
 
 def _taken_over(paths: Path, session: str) -> None:
     """Record the CLI session a person took the host over on."""
-    record = _read_record(paths)
+    record = _own_record(paths)
     if record is not None:
         _write_record(paths, replace(record, session=session))
 
@@ -795,3 +843,7 @@ def _listening(paths: Path, record: HostRecord, readiness: Readiness) -> None:
     """Record the host as running, then release the launcher."""
     _write_record(paths, replace(record, state="running"))
     readiness.accept()
+
+
+class _UnreadableRecordError(Exception):
+    """A host's ``host.json`` is there, but this version cannot read it as a record."""
