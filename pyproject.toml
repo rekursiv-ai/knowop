@@ -33,6 +33,8 @@ dependencies = [
     # 0.1.12 ships `trackinizer.sagent`, where the session records now live.
     # The tool pipe the tool host serves on (`client/tool_bridge.py`,
     # `wire/wire_tools.py`) is unreleased; until it is, `can_serve` turns tools off.
+    # `lib/posix/hostname.py`, which names this computer, is unreleased too, and
+    # knowop imports it: a knowop release needs a trackinizer that ships it.
     "trackinizer>=0.1.12",
     # the agent: the tool host serves sagent's remote tools through sagent's own tool
     # server. `Server.adopt`, which serves a pipe the relay dialed, is unreleased;

@@ -11,6 +11,7 @@ import io
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
+from trackinizer.lib.posix import hostname
 from trackinizer.wire.wire_hosts import (
     MAX_HOW_CHARS,
     NAME_PATTERN,
@@ -535,24 +536,37 @@ def test_a_value_may_still_be_spelled_like_the_flag() -> None:
 
 
 @pytest.mark.parametrize(
-    ("hostname", "name"),
+    ("full", "name"),
     [("gx10", "gx10"), ("Dev_Box.local", "dev-box"), ("-Lab_PC-.corp", "lab-pc")],
 )
 def test_host_name_is_the_short_hostname_as_a_host_name(
     monkeypatch: pytest.MonkeyPatch,
-    hostname: str,
+    full: str,
     name: str,
 ) -> None:
     """The rule a run reuses to say which host it is on, as connect names it."""
-    monkeypatch.setattr("socket.gethostname", lambda: hostname)
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: full)
 
     assert hosts.host_name() == name
+
+
+def test_host_name_ignores_the_name_a_network_gives_this_computer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Mac enrolled once must not enroll again under the name a router gave it."""
+    monkeypatch.setattr(
+        "socket.gethostname",
+        lambda: "unknown9626d97ae742.attlocal.net",
+    )
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "Ada-MacBook")
+
+    assert hosts.host_name() == "ada-macbook"
 
 
 def test_a_hostname_that_is_not_a_host_name_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("socket.gethostname", lambda: "init")
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "init")
 
     with pytest.raises(ClientError, match="reserved"):
         _ = hosts.host_name()
@@ -561,7 +575,7 @@ def test_a_hostname_that_is_not_a_host_name_is_refused(
 def test_a_hostname_of_only_punctuation_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("socket.gethostname", lambda: "___")
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "___")
 
     with pytest.raises(ClientError, match="invalid host name ''"):
         _ = hosts.host_name()

@@ -47,7 +47,7 @@ from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.agent.sessions import claude, codex
 from trackinizer.lib.agent.sessions.tail import Tail
-from trackinizer.lib.posix import follow
+from trackinizer.lib.posix import follow, hostname
 from trackinizer.lib.posix.follow import follow_tree
 from trackinizer.lib.posix.host import HostSpec
 from trackinizer.lib.posix.relay import ThreadedRelay
@@ -1304,16 +1304,16 @@ class TestARunSaysWhereItIs:
         assert capsys.readouterr().err.count("inbound delivery failed") == 1
 
     @pytest.mark.parametrize(
-        ("hostname", "host"),
+        ("full", "host"),
         [("GX10.lan", "gx10"), ("init", None), ("...", None)],
     )
     def test_a_hostname_names_the_host_only_as_connect_would(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        hostname: str,
+        full: str,
         host: str | None,
     ) -> None:
-        monkeypatch.setattr("socket.gethostname", lambda: hostname)
+        monkeypatch.setattr(hostname, "stable_hostname", lambda: full)
 
         assert session._host_name() == host
 
@@ -5250,7 +5250,7 @@ class TestSpawnWiring:
     ) -> None:
         client = _NoServer()
         sink = _RecordingSink()
-        monkeypatch.setattr("socket.gethostname", lambda: "gx10.lan")
+        monkeypatch.setattr(hostname, "stable_hostname", lambda: "gx10.lan")
         _at_home(monkeypatch, tmp_path.parent)
         monkeypatch.chdir(tmp_path)
         config = RunConfig(cli_name=cli, cli_args=("cat",), client=client)
@@ -7415,7 +7415,7 @@ class TestATrustCardHoldsTheRun:
     ) -> None:
         monkeypatch.delenv("CLAUDE_CODE_SANDBOXED")
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
-        monkeypatch.setattr("socket.gethostname", lambda: "gx10.lan")
+        monkeypatch.setattr(hostname, "stable_hostname", lambda: "gx10.lan")
         wiring, _ = _wire(
             monkeypatch,
             tmp_path,
