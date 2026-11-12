@@ -492,7 +492,11 @@ class CodexAppDriver:
             case "thread/status/changed":
                 status = _tree(params, "status")
                 self._run.active = _text(status, "type") == "active"
-                flags = from_plain(status.get("activeFlags"), list[str], default=[])
+                flags = from_plain(
+                    status.get("activeFlags"),
+                    list[str],
+                    default=list[str](),
+                )
                 self._run.waiting = len(flags) > 0
                 self._refresh()
             case "turn/started":
@@ -615,7 +619,11 @@ def _command_ask(ask_id: str, params: _Tree) -> tuple[Ask, dict[str, PlainTree]]
         "cwd": cwd,
     }
     options, decisions = _approval_options(
-        from_plain(params.get("availableDecisions"), list[PlainTree], default=[]),
+        from_plain(
+            params.get("availableDecisions"),
+            list[PlainTree],
+            default=list[PlainTree](),
+        ),
     )
     ask = Ask(
         id=ask_id,
@@ -682,7 +690,11 @@ def _question_ask(ask_id: str, params: _Tree) -> tuple[Ask, dict[str, PlainTree]
         kind="question",
         tool="request_user_input",
         tool_call_id=_text(params, "itemId"),
-        questions=from_plain(params.get("questions"), list[PlainTree], default=[]),
+        questions=from_plain(
+            params.get("questions"),
+            list[PlainTree],
+            default=list[PlainTree](),
+        ),
         options=(Option(id="answer", label="Send answers", kind="allow_once"),),
     )
     return ask, {}
@@ -792,7 +804,7 @@ def _answers(
     supplied = from_plain(
         None if updated is None else updated.get("answers"),
         dict[str, str | list[str]],
-        default={},
+        default=dict[str, str | list[str]](),
     )
     ids: dict[str, str] = {}
     for each in questions:
@@ -812,7 +824,11 @@ def _answers(
 def _diff(item: _Tree) -> str:
     """Return a file-change item's edits as text: one block per file."""
     blocks: list[str] = []
-    for each in from_plain(item.get("changes"), list[PlainTree], default=[]):
+    for each in from_plain(
+        item.get("changes"),
+        list[PlainTree],
+        default=list[PlainTree](),
+    ):
         change = from_plain(each, _Tree)
         kind = _text(_tree(change, "kind"), "type")
         blocks.append(f"{_text(change, 'path')} ({kind})\n{_text(change, 'diff')}")
@@ -832,7 +848,7 @@ def _text(tree: Mapping[str, PlainTree], key: str) -> str:
 
 
 def _tree(tree: Mapping[str, PlainTree], key: str) -> _Tree:
-    return from_plain(tree.get(key), _Tree, default={})
+    return from_plain(tree.get(key), _Tree, default=_Tree())
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

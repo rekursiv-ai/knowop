@@ -242,7 +242,11 @@ class ClaudeWire:
 
     def _request(self, frame: Mapping[str, PlainTree]) -> Reading:
         request_id = _text(frame, "request_id")
-        request = from_plain(frame.get("request"), dict[str, PlainTree], default={})
+        request = from_plain(
+            frame.get("request"),
+            dict[str, PlainTree],
+            default=dict[str, PlainTree](),
+        )
         if not request_id or request_id in self._open:
             return Reading()
         subtype = _text(request, "subtype")
@@ -285,7 +289,11 @@ class ClaudeWire:
 
     def _tool(self, request_id: str, request: Mapping[str, PlainTree]) -> _Open:
         tool = _text(request, "tool_name")
-        tool_input = from_plain(request.get("input"), dict[str, PlainTree], default={})
+        tool_input = from_plain(
+            request.get("input"),
+            dict[str, PlainTree],
+            default=dict[str, PlainTree](),
+        )
         base = Ask(
             id=request_id,
             provider="claude",
@@ -302,7 +310,7 @@ class ClaudeWire:
                 questions = from_plain(
                     tool_input.get("questions"),
                     list[PlainTree],
-                    default=[],
+                    default=list[PlainTree](),
                 )
                 return _Open(
                     ask=replace(
@@ -646,7 +654,11 @@ class ClaudeStreamDriver:
             )
         else:
             waiting.set_result(
-                from_plain(response.get("response"), dict[str, PlainTree], default={}),
+                from_plain(
+                    response.get("response"),
+                    dict[str, PlainTree],
+                    default=dict[str, PlainTree](),
+                ),
             )
 
 
@@ -734,7 +746,7 @@ def _grants(request: Mapping[str, PlainTree]) -> list[tuple[str, str, PlainTree]
     for each in from_plain(
         request.get("permission_suggestions"),
         list[PlainTree],
-        default=[],
+        default=list[PlainTree](),
     ):
         update = from_plain(each, dict[str, PlainTree])
         label = (
@@ -752,7 +764,11 @@ def _label(update: Mapping[str, PlainTree], *, broad: bool) -> str:
     """Return the words for a suggestion, or ``""`` when it is not an allow to offer."""
     kind = _text(update, "type")
     if kind == "addRules" and not broad and _text(update, "behavior") == "allow":
-        rules = from_plain(update.get("rules"), list[dict[str, PlainTree]], default=[])
+        rules = from_plain(
+            update.get("rules"),
+            list[dict[str, PlainTree]],
+            default=list[dict[str, PlainTree]](),
+        )
         named = [
             f"{_text(rule, 'toolName')}({content})"
             if (content := _text(rule, "ruleContent"))
@@ -762,7 +778,7 @@ def _label(update: Mapping[str, PlainTree], *, broad: bool) -> str:
         return f"Allow {', '.join(named)} for this session" if named else ""
     if kind == "addDirectories":
         folders = ", ".join(
-            from_plain(update.get("directories"), list[str], default=[]),
+            from_plain(update.get("directories"), list[str], default=list[str]()),
         )
         return f"Allow access to {folders} for this session" if folders else ""
     if kind == "setMode" and _text(update, "mode") in _SESSION_MODES:

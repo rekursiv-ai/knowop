@@ -512,7 +512,7 @@ class PullRequestWatch:
             )
             new["fixer"] = fixer
             if fixer == str(session):
-                told = from_plain(kept.get("told"), list[str], default=[])
+                told = from_plain(kept.get("told"), list[str], default=list[str]())
                 due = self._due(pull_request, told=told) if failing else ()
                 head = f"{pull_request.head_sha}:"
                 resolve = conflicted and f"{head}{CONFLICT}" not in told

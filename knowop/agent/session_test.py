@@ -190,7 +190,7 @@ from knowop.connect import daemon
 from knowop.lib.testing.posix import poll_fsevents
 
 
-_THIS: Final = Path(__file__).resolve()
+_THIS: Final[Path] = Path(__file__).resolve()
 
 
 if TYPE_CHECKING:
@@ -9169,7 +9169,9 @@ class _PostRecorder(_NoServer):
 
     @override
     def post(self, path: str, *, body: object = None) -> dict[str, str]:
-        self.posted.append((path, from_plain(body, dict[str, object], default={})))
+        self.posted.append(
+            (path, from_plain(body, dict[str, object], default=dict[str, object]())),
+        )
         if path.endswith("/place"):
             return {"workspace_id": _WORKSPACE, "canvas_id": _CANVAS}
         return {}

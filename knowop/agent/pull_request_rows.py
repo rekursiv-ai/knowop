@@ -174,8 +174,16 @@ class Stored:
     @property
     def pr(self) -> dict[str, object]:
         """The row's ``app.knowop.pr``, empty for none."""
-        knowop = from_plain(self.app.get("knowop"), dict[str, object], default={})
-        return from_plain(knowop.get("pr"), dict[str, object], default={})
+        knowop = from_plain(
+            self.app.get("knowop"),
+            dict[str, object],
+            default=dict[str, object](),
+        )
+        return from_plain(
+            knowop.get("pr"),
+            dict[str, object],
+            default=dict[str, object](),
+        )
 
 
 class PullRequestRows:
@@ -318,8 +326,16 @@ class PullRequestRows:
         """
         app, tried = stored.app, 0
         while True:
-            knowop = from_plain(app.get("knowop"), dict[str, object], default={})
-            kept = from_plain(knowop.get("pr"), dict[str, object], default={})
+            knowop = from_plain(
+                app.get("knowop"),
+                dict[str, object],
+                default=dict[str, object](),
+            )
+            kept = from_plain(
+                knowop.get("pr"),
+                dict[str, object],
+                default=dict[str, object](),
+            )
             pr, made = change(kept)
             if pr == kept:
                 return pr, made

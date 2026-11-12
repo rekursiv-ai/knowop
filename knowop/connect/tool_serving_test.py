@@ -82,7 +82,7 @@ from knowop.connect.wake import Wake
 from knowop.lib.testing.import_graph import Counted, import_graph
 
 
-_THIS: Final = Path(__file__).resolve()
+_THIS: Final[Path] = Path(__file__).resolve()
 _CWD: Final = _THIS.parent
 
 if TYPE_CHECKING:

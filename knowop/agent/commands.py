@@ -169,7 +169,7 @@ class GoalWatch:
                 state = from_plain(
                     record.extra.get("attachment"),
                     dict[str, PlainTree],
-                    default={},
+                    default=dict[str, PlainTree](),
                 )
                 if state.get("met") is True or state.get("failed") is True:
                     self._open.clear()
@@ -179,7 +179,7 @@ class GoalWatch:
                 goal = from_plain(
                     record.payload.get("goal"),
                     dict[str, PlainTree],
-                    default={},
+                    default=dict[str, PlainTree](),
                 )
                 status = from_plain(goal.get("status"), str, default="")
                 if status in _CODEX_OPEN:

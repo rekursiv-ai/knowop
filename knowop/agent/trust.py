@@ -133,7 +133,7 @@ def codex_trusted(cwd: Path, *, environ: Mapping[str, str], home: Path) -> bool:
         projects = from_plain(
             tomllib.loads(config.read_text(encoding="utf-8")).get("projects"),
             dict[str, dict[str, PlainTree]],
-            default={},
+            default=dict[str, dict[str, PlainTree]](),
         )
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, ValueError):
         return False
@@ -372,7 +372,7 @@ def _claude_projects(
                 "projects",
             ),
             dict[str, dict[str, PlainTree]],
-            default={},
+            default=dict[str, dict[str, PlainTree]](),
         )
     except (OSError, UnicodeDecodeError, ValueError):
         return {}

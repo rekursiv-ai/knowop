@@ -383,7 +383,7 @@ def _uncut(record: TraxRecord) -> RecordBody:
     )
 
 
-_THIS: Final = Path(__file__).resolve()
+_THIS: Final[Path] = Path(__file__).resolve()
 
 
 type _Event = DriverEvent
@@ -392,7 +392,7 @@ type _Frame = _Tree | str
 type _Frames = Mapping[str, Sequence[_Frame]]
 
 
-_FAKE: Final = _THIS.with_name("codex_app_fake.py")
+_FAKE: Final[Path] = _THIS.with_name("codex_app_fake.py")
 _THREAD: Final = "thr_1"
 _TURN: Final = "turn_1"
 
@@ -1333,7 +1333,7 @@ def _line_records(stream: TextIO) -> Iterator[SessionRecord]:
 def _document_records(stream: TextIO) -> Iterator[SessionRecord]:
     """Every message a whole document holds, re-read from its start."""
     obj = json_loads(stream.read(), dict[str, object])
-    for text in from_plain(obj.get("messages"), list[str], default=[]):
+    for text in from_plain(obj.get("messages"), list[str], default=list[str]()):
         yield UserMessage(content=text)
 
 

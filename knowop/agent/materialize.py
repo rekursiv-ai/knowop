@@ -394,7 +394,11 @@ def _codex_declared(record: TurnContext, session_id: UUID) -> TurnContext:
     captured = {
         key: value
         for key, value in mutable(
-            from_plain(extra.get("payload"), dict[str, object], default={}),
+            from_plain(
+                extra.get("payload"),
+                dict[str, object],
+                default=dict[str, object](),
+            ),
         ).items()
         # The thread this session forked FROM is not being materialized, so
         # naming it would point the CLI at a rollout the host may not hold.

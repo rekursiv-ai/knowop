@@ -139,7 +139,11 @@ def chat_placement(
             client.get("/api/sessions", params={"days": 1}),
             dict[str, object],
         )
-        rows = from_plain(answer.get("sessions"), list[dict[str, object]], default=[])
+        rows = from_plain(
+            answer.get("sessions"),
+            list[dict[str, object]],
+            default=list[dict[str, object]](),
+        )
         return next(
             (
                 SessionPlacement.model_validate(row)

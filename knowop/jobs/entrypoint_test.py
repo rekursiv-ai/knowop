@@ -19,7 +19,7 @@ import sys
 import pytest
 
 
-_CWD: Final = Path(__file__).resolve().parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
 
 
 def test_entry_point_is_a_polyglot_executable() -> None:
