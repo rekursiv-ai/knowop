@@ -12,6 +12,12 @@ All notable knowop changes are documented here. This project follows
   charge, `resume` wakes it, and `knowop host NAME del` ends it, VM and all. A server
   that rents none says so. Bare `knowop host` lists your KnowHosts after the
   registry.
+- `knowop canvas capture [PATH]` saves the canvas as its owner's open page shows
+  it, to PATH or else a new temporary file, readable by you alone, and prints
+  where, its size, the red boxes on it, the visuals left blank and each visual's
+  place as the X,Y fractions `knowop canvas mark` takes. An agent on a canvas then
+  reads the file to see what the person sees. It fails when no page of the canvas
+  is open; the picture is kept nowhere else.
 
 ### Changed
 
