@@ -5,7 +5,8 @@ writer role, and changing the registry needs the admin role. A KnowHost, a host 
 server rents you, is one more host here: ``host start`` rents one, ``host NAME pause``
 and ``resume`` stop and wake it, and ``host NAME del`` ends it, through the server's
 KnowHost API (``/api/addons/knowhost``). ``knowop connect`` names this computer by
-:func:`host_name` and checks a name it is given with :func:`check_name`.
+:func:`host_name` and checks a name it is given with :func:`check_name`; a hostname
+recorded elsewhere reads as a host name through :func:`short_name`.
 """
 
 from __future__ import annotations
@@ -15,10 +16,10 @@ from typing import TYPE_CHECKING, Final, NotRequired, TypedDict, cast, override
 
 import argparse
 import re
-import socket
 import sys
 
 from trackinizer.client.errors import ClientError
+from trackinizer.lib.posix import hostname
 from trackinizer.trax.commands import Command, HelpPage
 from trackinizer.trax.context import cwd
 from trackinizer.trax.render import echo
@@ -37,7 +38,7 @@ else:
     wire_hosts = lazy_import("trackinizer.wire.wire_hosts")
 
 
-__all__ = ["HOST_WORD", "Hosts", "check_name", "host_name"]
+__all__ = ["HOST_WORD", "Hosts", "check_name", "host_name", "short_name"]
 
 HOST_WORD: Final = "host"
 """The verb that selects this command, in matching, help, usage and confirmations."""
@@ -302,21 +303,36 @@ def run_del(client_factory: Callable[[], Client], name: str) -> None:
 def host_name() -> str:
     """Return this computer's short hostname as a host name.
 
-    The command that connects this computer enrolls it under this name, and an agent
-    run says it runs on the host of that name.
+    The command that connects this computer enrolls it under this name, an agent
+    run says it runs on the host of that name, and a detached run records it. It is
+    the :func:`~trackinizer.lib.posix.hostname.stable_hostname`, which a Mac keeps on every
+    network: one named by the network would enroll as a new host on each.
 
     Returns:
-      name: The hostname's first label, lowercased, each character a host name
-        may not hold made ``-``, trimmed of ``-`` and cut to 63.
+      name: The hostname's :func:`short_name`.
 
     Raises:
       ClientError: The result is reserved or still not a host name.
 
     """
-    name = re.sub(r"[^a-z0-9-]", "-", socket.gethostname().split(".")[0].lower())
-    name = name.strip("-")[:63]
+    name = short_name(hostname.stable_hostname())
     check_name(name)
     return name
+
+
+def short_name(full: str) -> str:
+    """Return a hostname as the host name it makes, unchecked.
+
+    Args:
+      full: A hostname, as this computer or a record names it.
+
+    Returns:
+      name: Its first label, lowercased, each character a host name may not hold
+        made ``-``, trimmed of ``-`` and cut to 63.
+
+    """
+    name = re.sub(r"[^a-z0-9-]", "-", full.split(".", maxsplit=1)[0].lower())
+    return name.strip("-")[:63]
 
 
 def check_name(name: str) -> None:

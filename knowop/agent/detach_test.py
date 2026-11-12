@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 
+from trackinizer.lib.posix import hostname
 from trackinizer.lib.posix.detached import Readiness, await_ready
 from trackinizer.lib.posix.sockets import UNIX_SOCKET_PATH_MAX_BYTES, socket_address
 from treekle import from_plain, json_loads, to_plain
@@ -133,8 +134,13 @@ class _Hosts:
 
 @pytest.fixture(autouse=True)
 def hosts(monkeypatch: pytest.MonkeyPatch) -> _Hosts:
-    """Replace liveness, socket calls and polling time with the host table."""
+    """Replace liveness, socket calls and polling time with the host table.
+
+    The computer is named ``Ada-MacBook``, on a network that names it otherwise.
+    """
     table = _Hosts()
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "Ada-MacBook")
+    monkeypatch.setattr(socket, "gethostname", lambda: _NETWORK_NAME)
     monkeypatch.setattr(detach, "accepts", table.accepts)
     monkeypatch.setattr(detach, "running", table.running)
     monkeypatch.setattr(detach, "time", table.clock)
@@ -629,7 +635,7 @@ class TestCommands:
         ]
 
     def test_the_live_hosts_are_this_computers_hosts_still_there(self) -> None:
-        here = socket.gethostname()
+        here = _HERE
         for name, state, host in (
             ("alpha", "exited", here),
             ("beta", "starting", here),
@@ -644,6 +650,37 @@ class TestCommands:
             )
 
         assert [detached.name for detached in detach.live_hosts()] == ["beta", "delta"]
+
+    def test_a_run_recorded_under_another_name_of_this_computer_is_live_here(
+        self,
+        hosts: _Hosts,
+    ) -> None:
+        """Its full hostname, or a network's name for it, while the run answers here."""
+        with hosts.listen(detach._paths("beta") / "host.sock") as answering:
+            for name, host, address in (
+                ("alpha", "Ada-MacBook.local", None),
+                ("beta", _PAST_NETWORK_NAME, answering),
+                ("gamma", _PAST_NETWORK_NAME, None),
+            ):
+                root = detach._paths(name)
+                # Beta's is there already: its long socket path made an alias to it.
+                root.mkdir(parents=True, exist_ok=True)
+                detach._write_record(
+                    root,
+                    _record(
+                        root,
+                        name=name,
+                        state="starting",
+                        pid=os.getpid(),
+                        address=address,
+                        host=host,
+                    ),
+                )
+            live = [detached.name for detached in detach.live_hosts()]
+
+        # Gamma's pid is a process here, yet nothing of its run answers: another
+        # computer's run, whose pid happens to be taken here too.
+        assert live == ["alpha", "beta"]
 
     @pytest.mark.parametrize(("failed", "status"), [(set[str](), 0), ({"beta"}, 1)])
     def test_stop_all_stops_each_live_host_and_fails_when_one_did_not_stop(
@@ -918,7 +955,7 @@ class TestAHeadlessHostIsRecordedAndFound:
         assert launch("iota", command="sh", start=_say_the_spec) == 0
         record = detach._read_record(detach._paths("iota"))
         assert record is not None
-        assert record.host == socket.gethostname()
+        assert record.host == _HERE
         assert record.control == str(
             socket_address(detach._paths("iota") / "control.sock"),
         )
@@ -1052,21 +1089,12 @@ class TestTakingAHeadlessRunOver:
     def test_a_host_of_another_host_is_refused_with_its_name(
         self,
         tmp_path: Path,
-        hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         steps: list[str] = []
-        with (
-            _headless(
-                hosts,
-                tmp_path,
-                monkeypatch,
-                steps,
-                Reply(ok=True),
-                host="elsewhere",
-            ),
-            pytest.raises(SystemExit) as refused,
-        ):
+        _fake_attach(monkeypatch, steps, status=None)
+        _elsewhere(tmp_path)
+        with pytest.raises(SystemExit) as refused:
             _ = main(["attach", "kappa"])
         said = str(refused.value)
         assert "runs on elsewhere" in said
@@ -1078,22 +1106,30 @@ class TestTakingAHeadlessRunOver:
         self,
         command: str,
         tmp_path: Path,
+    ) -> None:
+        argv = [command, "kappa", *(["hi"] if command == "send" else [])]
+        _elsewhere(tmp_path)
+        with pytest.raises(SystemExit, match="runs on elsewhere"):
+            _ = main(argv)
+
+    def test_a_run_recorded_under_a_past_network_name_is_attached_here(
+        self,
+        tmp_path: Path,
         hosts: _Hosts,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        argv = [command, "kappa", *(["hi"] if command == "send" else [])]
-        with (
-            _headless(
-                hosts,
-                tmp_path,
-                monkeypatch,
-                [],
-                Reply(ok=True),
-                host="elsewhere",
-            ),
-            pytest.raises(SystemExit, match="runs on elsewhere"),
+        """A Mac's hostname follows its network; a run it started on another answers."""
+        steps: list[str] = []
+        with _headless(
+            hosts,
+            tmp_path,
+            monkeypatch,
+            steps,
+            Reply(ok=True),
+            host=_PAST_NETWORK_NAME,
         ):
-            _ = main(argv)
+            assert main(["attach", "kappa"]) == 0
+        assert steps == ["takeover", "attach"]
 
     def test_a_record_that_names_no_host_is_attached_anywhere(
         self,
@@ -1577,7 +1613,14 @@ def _say_the_spec(spec: HostSpec) -> int:
     return 0
 
 
-_HERE = socket.gethostname()
+_HERE: Final = "ada-macbook"
+"""This computer's host name: its stable hostname ``Ada-MacBook``, as a host name."""
+
+_NETWORK_NAME: Final = "unknown9626d97ae742.attlocal.net"
+"""What a router named the computer, as its kernel hostname reads on that network."""
+
+_PAST_NETWORK_NAME: Final = "dhcp-10-0-0-7.corp.example"
+"""What another network named the computer when one of its runs started."""
 
 
 class _Control:
@@ -1646,6 +1689,24 @@ def _headless(
             ),
         )
         yield control
+
+
+# Its run is live on that computer, so its pid may well name a process here too; its
+# sockets, which only that computer's processes answer, do not answer here.
+def _elsewhere(tmp_path: Path) -> None:
+    """Record a host named ``kappa`` that another computer, ``elsewhere``, runs."""
+    root = detach._paths("kappa")
+    root.mkdir(parents=True)
+    detach._write_record(
+        root,
+        _record(
+            root,
+            name="kappa",
+            pid=os.getpid(),
+            host="elsewhere",
+            control=socket_address(tmp_path / "c"),
+        ),
+    )
 
 
 def _accept_then_end(spec: HostSpec) -> int:

@@ -37,11 +37,11 @@ import logging
 import os
 import re
 import shutil
-import socket
 import sys
 import tempfile
 import time
 
+from trackinizer.lib.posix import hostname
 from trackinizer.lib.posix.attach import attach, stop, submit
 from trackinizer.lib.posix.detached import (
     Readiness,
@@ -59,6 +59,7 @@ from treekle import json_dumps, json_loads
 from knowop.agent import headless
 from knowop.agent.custom_types import HostRequest, RunRequest
 from knowop.agent.program import PROGRAM
+from knowop.hosts import short_name
 
 
 if TYPE_CHECKING:
@@ -132,8 +133,9 @@ class HostRecord:
     exit_code: int | None = None
     ended: str | None = None
     host: str = ""
-    """The computer the host runs on, which alone can attach to it; empty in a record
-    from before hosts named theirs."""
+    """The host name of the computer the host runs on, which alone can attach to it: a
+    full hostname in a record from before records took the host name, and empty in one
+    from before hosts named their computer."""
 
     control: str = ""
     """The socket a chat's headless run listens on for attach, send and stop, recorded
@@ -305,11 +307,11 @@ def live_hosts() -> list[HostRecord]:
         sharing this home directory runs is not one.
 
     """
-    here = socket.gethostname()
+    here = _here()
     return [
         record
         for record in _records()
-        if (not record.host or record.host == here) and _state(record) in _LIVE
+        if _local(record, here=here) and _state(record) in _LIVE
     ]
 
 
@@ -535,13 +537,31 @@ def _require_record(name: str) -> HostRecord:
 def _require_local(name: str) -> HostRecord:
     """Return ``name``'s record, or exit when the host runs on another computer."""
     record = _require_record(name)
-    here = socket.gethostname()
-    if record.host and record.host != here:
+    here = _here()
+    if not _local(record, here=here):
         raise SystemExit(
             f"{PROGRAM}: host {name!r} runs on {record.host}, not on this "
             f"host ({here}); run this command there",
         )
     return record
+
+
+def _here() -> str:
+    """Return this computer's host name, as its hosts record it."""
+    return short_name(hostname.stable_hostname())
+
+
+# A record names the computer as it was named when the run started: by the hostname a
+# Mac took from the network it was on then, before records took the stable host name,
+# or by a name the computer has since been renamed from. Such a run is still this
+# computer's when it answers here, since a Unix socket connects only to a process on
+# the same kernel. A live pid would not do: another computer's run may share its pid
+# with a process here, and ``stop --all`` would then stop a run that is not this one's.
+def _local(record: HostRecord, *, here: str) -> bool:
+    """Whether ``record``'s run is on this computer, whose host name is ``here``."""
+    if not record.host or short_name(record.host) == here:
+        return True
+    return _state(record) == "running"
 
 
 # A host with a terminal of its own, or one from before runs were headless, records no
@@ -711,7 +731,7 @@ def _detach(
         pid=os.getpid(),
         address=str(address),
         started=_now(),
-        host=socket.gethostname(),
+        host=_here(),
         control=str(control),
     )
     _write_record(paths, record)

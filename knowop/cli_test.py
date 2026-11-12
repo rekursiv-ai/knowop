@@ -17,11 +17,11 @@ import io
 import os
 import select
 import signal
-import socket
 import sys
 import time
 
 from trackinizer.client.errors import ClientError
+from trackinizer.lib.posix import hostname
 from trackinizer.lib.userdirs import config_dir, state_dir
 from trackinizer.trax.profile import (
     Profile,
@@ -460,7 +460,7 @@ def server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Server:
         monkeypatch.delenv(name, raising=False)
     (tmp_path / "home").mkdir()
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    monkeypatch.setattr(socket, "gethostname", lambda: "Ada_Mac.local")
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "Ada_Mac.local")
     # A person at a terminal pipes no token; a test that does sets its own stdin.
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     # The real host serves until Ctrl-C, and the real runners start an agent or a job.

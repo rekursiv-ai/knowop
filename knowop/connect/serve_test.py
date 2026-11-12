@@ -20,6 +20,7 @@ import uuid
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
+from trackinizer.lib.posix import hostname
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.trax.connection import server_dir
 from trackinizer.trax.profile import Profile, list_profiles, save_profile
@@ -258,7 +259,7 @@ def _home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("TRACKINIZER_PROFILE", raising=False)
     monkeypatch.setenv("TRAX_HOST_TERMINAL_DIRECT", "0")
-    monkeypatch.setattr("socket.gethostname", lambda: "Dev_box.local")
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "Dev_box.local")
 
 
 def _stdin(monkeypatch: pytest.MonkeyPatch, text: str) -> None:
