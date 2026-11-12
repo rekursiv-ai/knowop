@@ -48,6 +48,25 @@ if TYPE_CHECKING:
 # bind its socket ("File name too long"), and then some.
 _LONG_NAME = "nightly-regression-sweep-shards-20260101-0900-" + "x" * 80
 
+_RECORDED: Final = {
+    "name": "delta",
+    "command": "sh",
+    "cwd": "/srv/work",
+    "pid": 42,
+    "address": "/var/run/host.sock",
+    "started": "2026-11-11T00:00:00+00:00",
+    "state": "running",
+}
+# A record with a field this version does not know, as the next rename of one writes.
+_FROM_A_LATER_VERSION: Final = json.dumps({**_RECORDED, "computer": "ada-mac"})
+# As knowop 0.1.6 wrote it, before #2107 named the computer ``host``.
+_FROM_KNOWOP_0_1_6: Final = json.dumps({**_RECORDED, "machine": "ada-mac"})
+_UNKNOWN_FIELD: Final = (
+    "HostRecord: unknown field(s) ['computer']; valid: ['address', 'command', "
+    "'control', 'cwd', 'ended', 'exit_code', 'host', 'name', 'pid', 'session', "
+    "'started', 'state']"
+)
+
 
 class _Clock:
     def __init__(self) -> None:
@@ -236,9 +255,43 @@ class TestRecords:
             session="session-1",
         )
 
-    def test_an_unreadable_record_is_absent(self, tmp_path: Path) -> None:
-        (tmp_path / "host.json").write_text("{not json")
+    def test_a_host_with_no_record_has_none(self, tmp_path: Path) -> None:
         assert detach._read_record(tmp_path) is None
+        assert detach._read_record(tmp_path / "no-such-host") is None
+
+    @pytest.mark.parametrize(
+        "text",
+        ["{not json", '{"name": "h"}', _FROM_A_LATER_VERSION, _FROM_KNOWOP_0_1_6],
+        ids=["not-json", "missing-fields", "unknown-field", "machine"],
+    )
+    def test_an_unreadable_record_is_not_taken_for_none(
+        self,
+        tmp_path: Path,
+        text: str,
+    ) -> None:
+        """Taken for none, a launch of its name deletes the directory it is in."""
+        (tmp_path / "host.json").write_text(text)
+        with pytest.raises(detach._UnreadableRecordError) as unreadable:
+            _ = detach._read_record(tmp_path)
+        assert str(unreadable.value).startswith(
+            f"{tmp_path / 'host.json'} is no record this version reads: ",
+        )
+
+    def test_a_record_that_cannot_be_opened_is_unreadable(self, tmp_path: Path) -> None:
+        (tmp_path / "host.json").mkdir()
+        with pytest.raises(detach._UnreadableRecordError) as unreadable:
+            _ = detach._read_record(tmp_path)
+        assert str(unreadable.value).startswith(
+            f"{tmp_path / 'host.json'} cannot be read: ",
+        )
+
+    def test_the_host_reads_its_own_damaged_record_as_none(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """It writes its own record over it on its way out, rather than fail there."""
+        (tmp_path / "host.json").write_text("{not json")
+        assert detach._own_record(tmp_path) is None
 
     def test_the_record_is_json(self, tmp_path: Path) -> None:
         detach._write_record(tmp_path, _record(tmp_path))
@@ -485,15 +538,14 @@ def _run_request(name: str) -> RunRequest:
 
 
 def _spawn_refused(
-    spawned: list[tuple[HostRequest, Path]],
+    spawned: list[tuple[HostRequest, int, Path]],
     request: HostRequest,
     *,
     ready: int,
     log: Path,
 ) -> None:
     """Note what a spawn was asked for, then fail as an exec would."""
-    del ready
-    spawned.append((request, log))
+    spawned.append((request, ready, log))
     raise OSError("cannot exec")
 
 
@@ -580,6 +632,62 @@ class TestTheHost:
         # The next launch of the name measures its resume window from this end.
         assert detach._recent(record, now=datetime.now(UTC))
         assert logged in capsys.readouterr().err + caplog.text
+        assert [each.getMessage() for each in caplog.records] == (
+            [logged] if how == "fails" else []
+        )
+
+    def test_the_cli_starts_once_the_host_is_recorded_without_the_launchers_pipe(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Held open by the CLI, the pipe would keep a launcher waiting past its host."""
+        monkeypatch.setattr(detach, "redirect_stdio", Mock())
+        paths = detach._paths("upsilon")
+        paths.mkdir(parents=True)
+        address = socket_address(paths / "host.sock")
+        read_fd, write_fd = os.pipe()
+        # As the launcher's spawn passed it.
+        os.set_inheritable(write_fd, True)
+        seen: list[tuple[bool, HostRecord | None, Path]] = []
+
+        def start(spec: HostSpec) -> int:
+            seen.append(
+                (
+                    os.get_inheritable(write_fd),
+                    detach._read_record(paths),
+                    spec.address,
+                ),
+            )
+            return 0
+
+        try:
+            _ = detach._detach(
+                paths,
+                address=address,
+                control=socket_address(paths / "control.sock"),
+                resume="",
+                command="sh -- true",
+                ready=write_fd,
+                start=start,
+            )
+        finally:
+            os.close(read_fd)
+
+        [(inherited, record, told)] = seen
+        assert not inherited
+        assert record is not None
+        assert (record.state, record.address) == ("starting", str(address))
+        assert told == address
+
+    def test_the_host_keeps_the_scrollback_that_log_prints(
+        self,
+        capfdbinary: pytest.CaptureFixture[bytes],
+    ) -> None:
+        assert launch("chi", command="sh", start=_write_scrollback_then_end) == 0
+        _ = capfdbinary.readouterr()
+
+        assert main(["log", "chi"]) == 0
+        assert capfdbinary.readouterr().out == b"hello\r\n"
 
     def test_listening_records_the_host_running_and_releases_the_launcher(
         self,
@@ -881,16 +989,18 @@ class TestCommands:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        spawned: list[tuple[HostRequest, Path]] = []
+        spawned: list[tuple[HostRequest, int, Path]] = []
         monkeypatch.setattr(detach, "_spawn", partial(_spawn_refused, spawned))
 
         with pytest.raises(OSError, match="cannot exec"):
             _ = detach.launch("lambda", command="sh", request=_run_request("lambda"))
 
         paths = detach._paths("lambda")
-        [(request, log)] = spawned
+        [(request, ready, log)] = spawned
         assert stat.S_IMODE(paths.stat().st_mode) == 0o700
         assert request["address"] == str(socket_address(paths / "host.sock"))
+        # The host reads the descriptor to release the launcher on from its request.
+        assert request["ready"] == ready
         assert log == paths / "host.log"
 
     def test_a_host_silent_past_the_wait_is_reported_not_killed(
@@ -924,6 +1034,105 @@ class TestCommands:
                 "knowop run: host 'delta' is running; "
                 "stop it (knowop run stop delta) or choose another --name"
             )
+
+    def test_launch_refuses_a_running_name_whose_record_it_cannot_read(
+        self,
+        hosts: _Hosts,
+    ) -> None:
+        """Its directory is not deleted under it; the refusal says why it is unread."""
+        root = detach._paths("delta")
+        root.mkdir(parents=True)
+        (root / "host.json").write_text(_FROM_A_LATER_VERSION)
+        with hosts.listen(root / "host.sock"), pytest.raises(SystemExit) as refused:
+            _ = launch("delta", command="sh", start=_never)
+        assert str(refused.value) == (
+            f"knowop run: host 'delta' is running, but {root / 'host.json'} is no "
+            f"record this version reads: {_UNKNOWN_FIELD}; "
+            "stop it with the knowop that started it"
+        )
+        assert (root / "host.json").read_text() == _FROM_A_LATER_VERSION
+
+    def test_a_headless_run_whose_record_cannot_be_read_is_running_too(
+        self,
+        hosts: _Hosts,
+    ) -> None:
+        """A chat's run answers on its control socket alone."""
+        root = detach._paths("delta")
+        root.mkdir(parents=True)
+        (root / "host.json").write_text(_FROM_A_LATER_VERSION)
+        with (
+            hosts.serve(root / "control.sock", Reply(ok=True, state="running")),
+            pytest.raises(SystemExit, match="host 'delta' is running, but"),
+        ):
+            _ = launch("delta", command="sh", start=_never)
+        assert (root / "host.json").read_text() == _FROM_A_LATER_VERSION
+
+    @pytest.mark.parametrize("text", ["", "{not json", _FROM_A_LATER_VERSION])
+    def test_a_name_whose_unread_host_is_gone_is_launched_again(
+        self,
+        text: str,
+    ) -> None:
+        """Chat reattaches a chat by its name; a record left damaged must not block it."""
+        root = detach._paths("delta")
+        root.mkdir(parents=True)
+        (root / "host.json").write_text(text)
+
+        assert launch("delta", command="sh", start=_say_then_accept) == 0
+
+        record = detach._read_record(root)
+        assert record is not None
+        assert record.state == "exited"
+
+    @pytest.mark.parametrize("command", ["attach", "log", "send", "stop"])
+    def test_a_host_whose_record_cannot_be_read_is_named_as_such(
+        self,
+        command: str,
+    ) -> None:
+        """Not "no host named": the host is there, and may be running."""
+        root = detach._paths("gamma")
+        root.mkdir(parents=True)
+        (root / "host.json").write_text(_FROM_A_LATER_VERSION)
+        argv = [command, "gamma", *(["two", "words"] if command == "send" else [])]
+        with pytest.raises(SystemExit) as refused:
+            _ = main(argv)
+        assert str(refused.value) == (
+            f"knowop run: host 'gamma': {root / 'host.json'} is no record this "
+            f"version reads: {_UNKNOWN_FIELD}"
+        )
+
+    def test_ls_says_which_hosts_it_could_not_read(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The hosts after it are still listed."""
+        unread = detach._paths("alpha")
+        unread.mkdir(parents=True)
+        (unread / "host.json").write_text(_FROM_A_LATER_VERSION)
+        read = detach._paths("beta")
+        read.mkdir(parents=True)
+        detach._write_record(
+            read,
+            _record(read, name="beta", state="exited", exit_code=0),
+        )
+
+        assert main(["ls", "--all"]) == 0
+
+        out, err = capsys.readouterr()
+        assert [line.split()[0] for line in out.splitlines()] == ["NAME", "beta"]
+        assert err == (
+            f"[knowop run] skipped alpha: {unread / 'host.json'} is no record this "
+            f"version reads: {_UNKNOWN_FIELD}\n"
+        )
+
+    def test_a_host_whose_record_is_damaged_while_it_runs_still_records_its_end(
+        self,
+    ) -> None:
+        """It writes its own record over the damaged one rather than fail on its way out."""
+        assert launch("omega", command="sh", start=_damage_the_record_then_end) == 0
+
+        record = detach._read_record(detach._paths("omega"))
+        assert record is not None
+        assert (record.state, record.exit_code) == ("exited", 0)
 
     def test_launch_repeats_what_the_host_said_before_it_accepted(
         self,
@@ -1593,6 +1802,22 @@ def _take_over_then_end(spec: HostSpec) -> int:
     assert spec.on_listening is not None
     spec.on_listening()
     spec.on_takeover("sess-5")
+    return 0
+
+
+def _write_scrollback_then_end(spec: HostSpec) -> int:
+    """Accept, write a line where the host keeps its scrollback, and end."""
+    assert spec.on_listening is not None
+    spec.on_listening()
+    _ = spec.scrollback.write_bytes(b"hello\r\n")
+    return 0
+
+
+def _damage_the_record_then_end(spec: HostSpec) -> int:
+    """Accept, then find the host's record damaged under it, and end."""
+    assert spec.on_listening is not None
+    spec.on_listening()
+    _ = (spec.scrollback.parent / "host.json").write_text("{not json")
     return 0
 
 
