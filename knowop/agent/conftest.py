@@ -1005,8 +1005,7 @@ class _HeadlessRig:
 
 # Captured transcripts, kept beside the readers that parse them. trackinizer's wheel
 # leaves them out, so the public export carries copies beside this module instead.
-_CWD: Final = Path(__file__).resolve().parent
-_TESTDATA: Final = _CWD / "testdata" / "sessions"
+_TESTDATA: Final = _THIS.parent / "testdata" / "sessions"
 
 
 # Fed a line at a time through :class:`Tail`, which is what capture does: the reader
