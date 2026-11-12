@@ -220,7 +220,7 @@ class PromptBridge:
         tool_input = from_plain(
             event.get("tool_input"),
             dict[str, PlainTree],
-            default={},
+            default=dict[str, PlainTree](),
         )
         grants = _grants(event.get("permission_suggestions"))
         with self._lock:
@@ -268,7 +268,7 @@ class PromptBridge:
                     input=from_plain(
                         event.get("tool_input"),
                         dict[str, PlainTree],
-                        default={},
+                        default=dict[str, PlainTree](),
                     ),
                 )
                 while len(self._calls) > _CALLS_REMEMBERED:
@@ -467,7 +467,11 @@ def _ask(
         else "permission"
     )
     questions = (
-        from_plain(tool_input.get("questions"), list[PlainTree], default=[])
+        from_plain(
+            tool_input.get("questions"),
+            list[PlainTree],
+            default=list[PlainTree](),
+        )
         if kind == "question"
         else None
     )
@@ -540,7 +544,11 @@ def _options(
 def _grants(suggested: PlainTree) -> tuple[dict[str, PlainTree], ...]:
     """Return the suggestions in ``suggested`` that are safe to echo back as a grant."""
     try:
-        entries = from_plain(suggested, list[dict[str, PlainTree]], default=[])
+        entries = from_plain(
+            suggested,
+            list[dict[str, PlainTree]],
+            default=list[dict[str, PlainTree]](),
+        )
     except ValueError:
         return ()
     return tuple(

@@ -209,7 +209,11 @@ def settings_json(
             # ``UserPromptSubmit`` has the box hook already, when the run has boxes.
             ours.setdefault(event, []).append(_hook_entry(bridged, timeout=timeout))
     kept = dict(user or {})
-    theirs = from_plain(kept.get("hooks"), dict[str, list[PlainTree]], default={})
+    theirs = from_plain(
+        kept.get("hooks"),
+        dict[str, list[PlainTree]],
+        default=dict[str, list[PlainTree]](),
+    )
     kept["hooks"] = {
         **theirs,
         **{
@@ -235,7 +239,11 @@ def render_boxes(state: dict[str, PlainTree], *, after: int) -> tuple[str, int]:
       newest: The newest box number seen, ``after`` when there is none.
 
     """
-    labels = from_plain(state.get("record_labels"), dict[str, str], default={})
+    labels = from_plain(
+        state.get("record_labels"),
+        dict[str, str],
+        default=dict[str, str](),
+    )
     visuals = {
         from_plain(v.get("id"), str, default=""): from_plain(
             v.get("type"),
@@ -245,7 +253,7 @@ def render_boxes(state: dict[str, PlainTree], *, after: int) -> tuple[str, int]:
         for v in from_plain(
             state.get("visuals"),
             list[dict[str, PlainTree]],
-            default=[],
+            default=list[dict[str, PlainTree]](),
         )
     }
     marks = [
@@ -253,7 +261,7 @@ def render_boxes(state: dict[str, PlainTree], *, after: int) -> tuple[str, int]:
         for mark in from_plain(
             state.get("marks"),
             list[dict[str, PlainTree]],
-            default=[],
+            default=list[dict[str, PlainTree]](),
         )
         if from_plain(mark.get("seq"), int, default=0) > after
     ]
@@ -263,7 +271,11 @@ def render_boxes(state: dict[str, PlainTree], *, after: int) -> tuple[str, int]:
         tile = from_plain(mark.get("tile"), str, default="")
         if tile and tile not in visuals:
             continue
-        covers = from_plain(mark.get("covers"), dict[str, list[str]], default={})
+        covers = from_plain(
+            mark.get("covers"),
+            dict[str, list[str]],
+            default=dict[str, list[str]](),
+        )
         # A label is a title people wrote, so it is quoted as data.
         named = [
             json.dumps(labels[r]) for r in covers.get("records", []) if r in labels

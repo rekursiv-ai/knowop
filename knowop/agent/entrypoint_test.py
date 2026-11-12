@@ -21,7 +21,7 @@ import pytest
 from knowop.agent import cli
 
 
-_CWD: Final = Path(__file__).resolve().parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
 
 _ENTRIES: Final = {
     "claude": (

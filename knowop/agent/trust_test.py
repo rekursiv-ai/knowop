@@ -31,7 +31,7 @@ from knowop.agent.trust import (
 )
 
 
-_CWD: Final = Path(__file__).resolve().parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
 
 if TYPE_CHECKING:
     from trackinizer.sagent.session.types import SystemMessage

@@ -20,7 +20,7 @@ from knowop.jobs.job import JOB_WORD, Job
 from knowop.lib.testing.import_graph import Counted, import_graph
 
 
-_CWD: Final = Path(__file__).resolve().parent
+_CWD: Final[Path] = Path(__file__).resolve().parent
 
 if TYPE_CHECKING:
     from collections.abc import Callable
