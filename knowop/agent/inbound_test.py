@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 
+from trackinizer.server.preferences import ASSISTANT_KEYS
 from trackinizer.wire.wire_science_chat import RUN_COMMAND_CHARS
 from trackinizer.wire.wire_sessions import (
     CanvasMessageContext,
@@ -389,6 +390,12 @@ class TestSettingsFromPayload:
     def test_a_field_of_the_wrong_type_is_refused(self) -> None:
         with pytest.raises(ValueError, match="model"):
             _ = settings_from_payload({"model": 3})
+
+
+def test_the_skill_names_every_setting_an_agent_may_change_for_the_person() -> None:
+    skill = using_knowop()
+    assert "knowop canvas KEY to VALUE" in skill
+    assert [key for key in sorted(ASSISTANT_KEYS) if f"`{key}`" not in skill] == []
 
 
 if __name__ == "__main__":

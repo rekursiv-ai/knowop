@@ -47,6 +47,28 @@ RECORD_UUID is page.record.id or any record's uuid.
   '#/console', '#/search/TEXT')
 - knowop canvas hide chat (show chat); knowop canvas hide INSTANCE_UUID, never the page
 
+## The person's settings
+
+When they ask for another font, bigger text, a theme and the like, change it for
+them: `knowop canvas KEY to VALUE` sets it in every tab of theirs at once, `KEY to
+null` puts it back to its default, and `knowop canvas` prints what is set now. A
+refused value names the key and what it takes.
+
+- Font: `font` to system, inter, ibm_plex_sans, manrope, source_sans_3, geist,
+  dm_sans, work_sans, public_sans, lato or nunito_sans. Code and terminals keep
+  their monospace.
+- Text sizes in px: `chat_text_size` (Chat's messages and box, 10 to 24),
+  `canvas_text_size` (every pane beside Chat, 11 to 20), `interface_text_size`
+  (the bars and Settings, 11 to 20), `terminal_font_size` (13px, 16pt). A display
+  given its own sizes in Settings keeps them: say so if they see no change.
+- Look: `theme` (dark, light, system), `skin` (default, retro, scifi, dos, console,
+  matrix, hacker, minimal, brutal), `scanlines`, `terminal_colors`.
+- Layout: `chat_side` (left, right), `app_bar` (top, left), `app_bar_pinned`,
+  `terminal_placement` (bottom, side), `home` (graph, empty).
+- Chat: `chat_view` (an object: view chat or terminal, density, thinking,
+  output_lines, times), `highlight_mentions`, `terminal_tab_chords`.
+- Runs: `chat_provider`, `assistant_prompt`, `cli_folder`, `autofix`, `automerge`.
+
 ## This computer's folders
 
 Never search a whole home folder or disk: no `find ~`, `grep -r ~`, `rg PATTERN ~`,
