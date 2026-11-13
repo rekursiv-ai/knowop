@@ -7,6 +7,7 @@ readers do, so a cut that only looked right in memory cannot pass.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from io import StringIO
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
@@ -19,6 +20,7 @@ from trackinizer.runs.refusal import stand_in
 from trackinizer.sagent.scripts.convert_session import claude
 from trackinizer.sagent.session.types import (
     CONCRETE_TYPES,
+    AgentToAgentMessage,
     Attachment,
     BashResult,
     ContextClear,
@@ -32,7 +34,7 @@ from trackinizer.sagent.session.types import (
 from trackinizer.types.session_records import SessionRecordRow, search_text
 from trackinizer.types.streams import Stderr, Stdin, Stdout
 from trackinizer.wire.wire_session_ir import RecordBody
-from treekle import immutable, json_dumps, json_loads
+from treekle import immutable, json_dumps, json_loads, mutable
 
 import httpx2
 import pytest
@@ -41,6 +43,8 @@ from knowop.agent.truncate import (
     MAX_RECORD_BYTES,
     MAX_TOOL_RESULT_BYTES,
     NOTE,
+    _cut_text,
+    _named_media,
     _shrunk,
     bounded,
     bounded_payload,
@@ -162,6 +166,9 @@ class TestAnEventPayload:
         payload = {"py/object": "ModelResponsePartial", "text": "hi"}
 
         assert bounded_payload(payload, max_bytes=1 << 10) is payload
+        # As the client sends it: compact, non-ASCII kept raw.
+        exact = len(json.dumps(payload, separators=(",", ":")).encode())
+        assert bounded_payload(payload, max_bytes=exact) is payload
 
     def test_a_long_string_keeps_its_beginning_and_end_within_the_bound(self) -> None:
         text = _LOG * 2_000
@@ -174,6 +181,46 @@ class TestAnEventPayload:
         kept = cut["text"]
         assert isinstance(kept, str)
         _assert_cut_from(text, kept)
+
+
+class TestACutString:
+    """One string cut: its beginning, the marker, its end, in the share it was given."""
+
+    def test_it_takes_its_share_to_the_byte(self) -> None:
+        """The marker's count has as many digits as the length, so nothing is left over."""
+        assert len(_cut_text("a" * 20_000, cap=1_000, omitted=[]).encode()) == 1_000
+
+    def test_one_its_share_s_length_is_kept_whole(self) -> None:
+        assert _cut_text("a" * 1_000, cap=1_000, omitted=[]) == "a" * 1_000
+
+    @pytest.mark.parametrize("unit", ["é", "€", "\U0001f600"])
+    @pytest.mark.parametrize("offset", range(4))
+    def test_a_cut_through_wide_characters_keeps_within_its_share(
+        self,
+        unit: str,
+        offset: int,
+    ) -> None:
+        """Each end moves to a character's start away from the cut, never past it."""
+        text = "a" * offset + unit * 2_000
+
+        cut = _cut_text(text, cap=1_000, omitted=[])
+
+        assert len(cut.encode()) <= 1_000
+        _assert_cut_from(text, cut)
+
+    def test_a_media_block_its_share_s_length_is_kept_and_one_byte_longer_named(
+        self,
+    ) -> None:
+        image = _image(3_000)
+        source = image["source"]
+        assert isinstance(source, dict)
+        data = source["data"]
+        assert isinstance(data, str)
+
+        block = mutable(image)
+
+        assert _named_media(block, cap=len(data), omitted=[]) is None
+        assert _named_media(block, cap=len(data) - 1, omitted=[]) is not None
 
 
 class TestARecordThatFitsIsUntouched:
@@ -197,6 +244,30 @@ class TestARecordThatFitsIsUntouched:
         assert MAX_TOOL_RESULT_BYTES < encoded_size(body) < MAX_RECORD_BYTES
 
         assert _wire(bounded(body)) == _wire(body)
+
+
+class TestEachBudgetIsExact:
+    """A record its budget's size exactly is kept; one byte more is cut."""
+
+    def test_a_body_within_the_tool_budget_is_not_read(self) -> None:
+        """A kind this client cannot decode passes as it came, up to the byte."""
+        unknown = _sized(
+            RecordBody(idx=3, kind="Nope", payload={"x": ""}),
+            MAX_TOOL_RESULT_BYTES,
+        )
+
+        assert bounded(unknown) is unknown
+        with pytest.raises(ValueError, match="unknown session record kind 'Nope'"):
+            _ = bounded(_sized(unknown, MAX_TOOL_RESULT_BYTES + 1))
+
+    def test_a_message_its_budget_s_size_is_kept_and_one_byte_more_is_cut(self) -> None:
+        words = _body(UserMessage(content="w" * (MAX_RECORD_BYTES // 3)))
+        kept = _sized(words, MAX_RECORD_BYTES)
+
+        assert bounded(kept) is kept
+        cut = bounded(_sized(words, MAX_RECORD_BYTES + 1))
+        assert encoded_size(cut) <= MAX_RECORD_BYTES
+        assert was_truncated(_read(cut))
 
 
 class TestAnOversizedToolResult:
@@ -302,6 +373,86 @@ class TestWhatIsNeverCut:
         assert was_truncated(cut)
 
 
+class TestBytesTakeNoShareOfTheBudget:
+    """What no cut shrinks is not what the budget bounds: the words beside it are."""
+
+    def test_a_line_s_words_beside_a_large_picture_are_stored_whole(self) -> None:
+        picture = Attachment(mime_descriptor="image/png", data=_bytes(1_400_000))
+        words = "w" * (4 << 10)
+        body = _body(
+            AgentToAgentMessage(content=words, attachments=(picture,), sender="a@x.y"),
+        )
+        assert encoded_size(body) > MAX_RECORD_BYTES
+
+        assert bounded(body) is body
+
+    def test_a_tool_result_s_text_beside_its_picture_is_stored_whole(self) -> None:
+        picture = Attachment(mime_descriptor="image/png", data=_bytes(300_000))
+        result = ToolResult(
+            call_id="c",
+            state="done",
+            stdout=("x" * (10 << 10), picture),
+            result=UncategorizedToolResult(),
+        )
+        body = _body(result)
+        assert encoded_size(body) > MAX_TOOL_RESULT_BYTES
+
+        assert bounded(body) is body
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            pytest.param(
+                Thinking(content="w" * (4 << 10), encrypted="s" * (1_100_000)),
+                id="its-own-seal",
+            ),
+            pytest.param(
+                ContextClear(
+                    history=(
+                        Thinking(content="why", encrypted="s" * 1_100_000),
+                        UserMessage(content="w" * (4 << 10)),
+                    ),
+                ),
+                id="a-seal-in-its-history",
+            ),
+        ],
+    )
+    def test_words_beside_a_seal_are_stored_whole(self, record: TraxRecord) -> None:
+        body = _body(record)
+        assert encoded_size(body) > MAX_RECORD_BYTES
+
+        assert bounded(body) is body
+
+    def test_a_line_s_words_before_a_large_text_file_are_kept(self) -> None:
+        """A text file rides the line as prose, so the budget bounds it; the words lead."""
+        words = "w" * (4 << 10)
+        text = _LOG * 14_000
+        record = _read(bounded(_body(UserMessage(content=f"{words}\n\n{text}"))))
+
+        assert isinstance(record, UserMessage)
+        assert record.content is not None
+        assert record.content.startswith(words)
+        assert was_truncated(record)
+
+    def test_words_past_the_budget_are_still_cut_to_it_and_the_picture_kept(
+        self,
+    ) -> None:
+        data = _bytes(300_000)
+        picture = Attachment(mime_descriptor="image/png", data=data)
+        words = _LOG * 10_000
+        body = _body(UserMessage(content=words, attachments=(picture,)))
+
+        cut = bounded(body)
+
+        sent = len(json_dumps({"py/b64": base64.b64encode(data).decode()}).encode())
+        assert encoded_size(cut) <= MAX_RECORD_BYTES + sent
+        record = _read(cut)
+        assert isinstance(record, UserMessage)
+        assert record.attachments == (picture,)
+        assert record.content is not None
+        _assert_cut_from(words, record.content)
+
+
 class TestAnImageIsKeptWholeOrNamed:
     """Half a base64 string is neither the image nor text, and the API refuses it."""
 
@@ -372,8 +523,10 @@ class TestEveryKindHasABackstop:
     def test_a_seal_in_a_nested_history_is_kept_whole(self) -> None:
         """A provider refuses a seal cut short, so a compaction's thought keeps it."""
         seal = base64.b64encode(b"s" * 450_000).decode()
+        # Two long messages: the share each string keeps falls below the seal's length.
         history = (
             Thinking(content="why", encrypted=seal),
+            UserMessage(content=_LOG * 10_000),
             UserMessage(content=_LOG * 10_000),
         )
 
@@ -479,6 +632,23 @@ def test_the_size_is_what_the_http_client_sends() -> None:
     sent = httpx2.Request("POST", "http://server/", json=body.model_dump(mode="json"))
 
     assert encoded_size(body) == len(sent.content)
+
+
+def _sized(body: RecordBody, size: int) -> RecordBody:
+    """Return ``body`` padded in its payload's ``extra``, which is not searched, to ``size``."""
+    payload = dict(body.payload)
+    extra = payload.get("extra")
+    padded = {**(dict(extra) if isinstance(extra, Mapping) else {}), "pad": ""}
+    unpadded = encoded_size(
+        body.model_copy(update={"payload": {**payload, "extra": padded}}),
+    )
+    padded["pad"] = "p" * (size - unpadded)
+    return body.model_copy(update={"payload": {**payload, "extra": padded}})
+
+
+def _bytes(size: int) -> bytes:
+    """Return ``size`` bytes, as a picture's are to a cut: none of them text."""
+    return bytes(range(256)) * (size // 256) + bytes(size % 256)
 
 
 def _body(record: TraxRecord) -> RecordBody:

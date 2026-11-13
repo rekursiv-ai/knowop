@@ -83,7 +83,9 @@ def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
     ``extra`` names the canvas it was sent from (``canvas_id``, a UUID) tells the
     agent so after its words, behind ``CONTEXT_TRAILER``, with the command that reads
     and changes it; Chat names it only when it has not told this session's agent that
-    canvas yet.
+    canvas yet. A line's ``extra.files``, the name, kind and size of each file Chat
+    attached to it, is kept in the message's, which Chat draws the stored line's files
+    from without reading their bytes.
 
     Args:
       sent: An input, as the server handed it down.
@@ -98,12 +100,14 @@ def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
     match sent.kind:
         case "UserMessage":
             said = stored_record(sent.payload, UserMessage)
+            files = said.extra.get("files")
             return AgentToAgentMessage(
                 content=_told(said),
                 attachments=said.attachments,
                 sender=sent.author,
                 recipient=sent.recipient or None,
-                extra={"author": sent.author, "input": str(sent.id)},
+                extra={"author": sent.author, "input": str(sent.id)}
+                | ({} if files is None else {"files": files}),
             )
         case "Halt":
             return stored_record(sent.payload, Halt, classes=CLASSES)

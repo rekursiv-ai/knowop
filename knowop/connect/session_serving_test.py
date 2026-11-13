@@ -17,15 +17,15 @@ from unittest.mock import Mock
 import asyncio
 import os
 import queue
+import shutil
 import signal
-import stat
 import sys
 import threading
 import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix.detached import spawn_detached
-from trackinizer.lib.userdirs import state_dir
+from trackinizer.lib.userdirs import cache_dir, state_dir
 from trackinizer.server.session_relay import SessionRelay
 from trackinizer.wire.wire_session_relay import (
     MAX_REASON_CHARS,
@@ -64,13 +64,24 @@ _REVOKED: Final = ClientError("-> 410", status_code=410)
 
 _STUB: Final = (
     "import json, os, stat, sys, time;"
-    "print(json.dumps({'cwd': os.getcwd(), 'mode': stat.S_IMODE(os.stat('.').st_mode),"
-    " 'env': dict(os.environ), 'argv': sys.argv[2:], 'stdin': sys.stdin.read(),"
-    " 'pid': os.getpid(), 'session': os.getsid(0)}), flush=True);"
-    "time.sleep(60) if sys.argv[1] == 'hold' else None;"
-    "raise SystemExit(int(sys.argv[1]))"
+    "stdin = sys.stdin.read();"
+    "process = json.loads(stdin)['process_id'];"
+    "state = os.environ.get('XDG_STATE_HOME');"
+    "log = state and os.path.join(state, 'rekursiv-ai', 'knowop', 'processes', process);"
+    "said = json.dumps({'cwd': os.getcwd(), 'mode': stat.S_IMODE(os.stat('.').st_mode),"
+    " 'env': dict(os.environ), 'argv': sys.argv[3:], 'stdin': stdin,"
+    " 'pid': os.getpid(), 'session': os.getsid(0),"
+    " 'log': log and [stat.S_IMODE(os.stat(log).st_mode),"
+    " stat.S_IMODE(os.stat(os.path.join(log, 'output.log')).st_mode),"
+    " sorted(os.listdir(log))]});"
+    "open(os.path.join(sys.argv[1], process), 'w').write(said);"
+    "print(said, flush=True);"
+    "time.sleep(60) if sys.argv[2] == 'hold' else None;"
+    "raise SystemExit(int(sys.argv[2]))"
 )
-"""``knowop run --serve`` as a stub: what it was handed, then the exit it is given."""
+"""``knowop run --serve`` as a stub: what it was handed, and its output's folder as it
+runs when it can find it, said on its output and in a file of the test's, which
+outlives that folder; then the exit it is given."""
 
 _PYTHON_ADDS: Final = frozenset({"__CF_USER_TEXT_ENCODING", "LC_CTYPE"})
 """What a Python child sets in its own environment on macOS, whatever it was handed."""
@@ -90,6 +101,9 @@ class _Said(TypedDict):
     stdin: str
     pid: int
     session: int
+    log: tuple[int, int, list[str]] | None
+    """Its output's folder's mode, the output's mode and the folder's names, as it
+    runs; ``None`` with no ``XDG_STATE_HOME`` to find them by."""
 
 
 # Pytest says a thread's error as a warning, which this suite makes an error: one said
@@ -289,7 +303,8 @@ def _serving(
         place=place,
         retry_sec=retry_sec,
         wait_sec=wait_sec,
-        command=command or (sys.executable, "-I", "-S", "-c", _STUB, exit_with),
+        command=command
+        or (sys.executable, "-I", "-S", "-c", _STUB, _said_in(), exit_with),
         run=run,
         wake=wake,
     )
@@ -334,11 +349,19 @@ def _confined(serve: ServeSession) -> Place:
     )
 
 
+def _said_in() -> str:
+    """Return the folder each stub says what it was handed in, made for this test."""
+    folder = cache_dir() / "rekursiv-ai" / "stub-said"
+    folder.mkdir(parents=True, exist_ok=True)
+    return str(folder)
+
+
 def _said(start: ServeSession) -> _Said:
-    """Return what the stub of ``start``'s process printed first."""
-    processes = state_dir() / "rekursiv-ai" / "knowop" / "processes"
-    printed = (processes / str(start.process_id) / "output.log").read_text()
-    return json_loads(printed.splitlines()[0], _Said)
+    """Return what the stub of ``start``'s process said it was handed."""
+    return json_loads(
+        (cache_dir() / "rekursiv-ai" / "stub-said" / str(start.process_id)).read_text(),
+        _Said,
+    )
 
 
 def _env(said: _Said) -> dict[str, str]:
@@ -397,7 +420,7 @@ def test_by_default_it_serves_its_own_account_asks_the_longest_hold_and_rests_5_
         _URL,
         credential=_CREDENTIAL,
         client_for=client,
-        command=(sys.executable, "-I", "-S", "-c", _STUB, "0"),
+        command=(sys.executable, "-I", "-S", "-c", _STUB, _said_in(), "0"),
         run=_no_systemd,
     )
     start = _start(cwd=str(tmp_path), args=("--model", "opus"))
@@ -671,36 +694,39 @@ def test_the_child_has_the_daemons_environment_less_trackinizers_and_traxs(
     assert env["XDG_STATE_HOME"] == os.environ["XDG_STATE_HOME"]
 
 
-def test_the_output_is_kept_private_under_the_process(tmp_path: Path) -> None:
+def test_the_output_is_kept_private_under_the_process_and_deleted_with_it(
+    tmp_path: Path,
+) -> None:
     start = _start(cwd=str(tmp_path))
 
     said, _ = _served(start)
 
+    # As it ran: a folder of its own, its output and its lock in it, both private.
+    assert said["log"] == (0o700, 0o600, ["output.log", "process.json"])
     knowop = state_dir() / "rekursiv-ai" / "knowop"
-    folder = knowop / "processes" / str(start.process_id)
     # Names as listed: macOS's file system opens a path under any casing of it.
     assert [each.name for each in state_dir().iterdir()] == ["rekursiv-ai"]
     assert [each.name for each in knowop.parent.iterdir()] == ["knowop"]
     assert [each.name for each in knowop.iterdir()] == ["processes"]
-    assert [each.name for each in folder.iterdir()] == ["output.log"]
-    assert stat.S_IMODE((folder / "output.log").stat().st_mode) == 0o600
-    assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+    # Once it ended, its output was reported and its folder is gone.
+    assert list((knowop / "processes").iterdir()) == []
     # It leads a session of its own, so the daemon's terminal signals nothing to it.
     assert said["pid"] == said["session"]
 
 
 @pytest.mark.parametrize(
-    ("printed", "reason"),
+    ("printed", "output"),
     [
         # Trimmed, and a byte that is no character is said as the replacement one.
         (r"b'\xffbye\n'", "�bye"),
         (f"b'x' * {MAX_REASON_CHARS} + b'END'", "x" * (MAX_REASON_CHARS - 3) + "END"),
     ],
 )
-def test_an_exit_is_reported_with_its_code_and_the_end_of_its_output(
+def test_an_exit_is_reported_by_its_code_with_the_end_of_its_output_apart(
     printed: str,
-    reason: str,
+    output: str,
 ) -> None:
+    """Every reader of the session reads the reason; only a writer the output."""
     start = _start()
     shout = f"import sys; sys.stdout.buffer.write({printed}); raise SystemExit(7)"
 
@@ -709,7 +735,8 @@ def test_an_exit_is_reported_with_its_code_and_the_end_of_its_output(
     assert ended == ProcessEnded(
         process_id=start.process_id,
         exit_code=7,
-        reason=reason,
+        reason="exited with code 7",
+        output=output,
     )
 
 
@@ -779,7 +806,11 @@ def test_a_child_whose_output_is_gone_is_still_reported(
 
     [ended] = _ends(start)
 
-    assert ended == ProcessEnded(process_id=start.process_id, exit_code=0, reason="")
+    assert ended == ProcessEnded(
+        process_id=start.process_id,
+        exit_code=0,
+        reason="exited with code 0",
+    )
 
 
 def test_an_end_the_server_will_not_take_is_said_and_dropped(echoes: _Echoes) -> None:
@@ -897,7 +928,11 @@ def test_a_child_that_deleted_its_own_folder_is_still_reported() -> None:
         command=(sys.executable, "-I", "-S", "-c", gone),
     )
 
-    assert ended == ProcessEnded(process_id=start.process_id, exit_code=0, reason="")
+    assert ended == ProcessEnded(
+        process_id=start.process_id,
+        exit_code=0,
+        reason="exited with code 0",
+    )
 
 
 def _refusing(serve: ServeSession) -> Place:
@@ -1225,15 +1260,15 @@ def test_a_new_daemon_reports_the_end_of_a_process_an_earlier_one_started(
     finally:
         serving.stop()
 
-    assert (ended.process_id, ended.exit_code) == (start.process_id, None)
+    assert (ended.process_id, ended.exit_code, ended.reason) == (
+        start.process_id,
+        None,
+        "it ended while its daemon was away",
+    )
     assert not owned.exists()
+    # Its output's folder, its lock in it, goes too.
     assert not (
-        state_dir()
-        / "rekursiv-ai"
-        / "knowop"
-        / "processes"
-        / str(start.process_id)
-        / "process.json"
+        state_dir() / "rekursiv-ai" / "knowop" / "processes" / str(start.process_id)
     ).exists()
 
 
@@ -1294,20 +1329,64 @@ def test_a_record_gone_before_it_is_read_is_passed_over(tmp_path: Path) -> None:
     assert client.ended.empty()
 
 
-def test_a_start_that_cannot_run_leaves_no_record_behind(tmp_path: Path) -> None:
+def test_a_start_that_cannot_run_leaves_no_folder_behind(tmp_path: Path) -> None:
     start = _start()
 
     [ended] = _ends(start, command=(str(tmp_path / "missing"),))
 
     assert ended.exit_code is None
-    assert not (
-        state_dir()
-        / "rekursiv-ai"
-        / "knowop"
-        / "processes"
-        / str(start.process_id)
-        / "process.json"
-    ).exists()
+    assert list((state_dir() / "rekursiv-ai" / "knowop" / "processes").iterdir()) == []
+
+
+def test_a_child_that_deleted_its_output_folder_is_still_reported() -> None:
+    start = _start()
+    gone = f"import shutil; shutil.rmtree({str(state_dir() / 'rekursiv-ai' / 'knowop' / 'processes' / str(start.process_id))!r})"
+
+    [ended] = _ends(start, command=(sys.executable, "-I", "-S", "-c", gone))
+
+    assert (ended.exit_code, ended.reason, ended.output) == (
+        0,
+        "exited with code 0",
+        "",
+    )
+
+
+class _FolderGone:
+    """Stands in for ``spawn_detached``: the output's folder goes, then the spawn fails."""
+
+    def __call__(self, argv: Sequence[str], *, log: Path, **kwargs: object) -> int:
+        del argv, kwargs
+        shutil.rmtree(log.parent)
+        raise OSError("no such program")
+
+
+def test_a_start_whose_folder_is_gone_when_it_fails_is_still_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session_serving, "spawn_detached", _FolderGone())
+    start = _start()
+
+    [ended] = _ends(start)
+
+    assert (ended.exit_code, ended.reason) == (None, "no such program")
+
+
+def test_a_start_whose_folder_another_process_holds_leaves_it_alone() -> None:
+    """The server hands each start once; a folder there already is not this one's."""
+    start = _start()
+    folder = (
+        state_dir() / "rekursiv-ai" / "knowop" / "processes" / str(start.process_id)
+    )
+    folder.mkdir(parents=True)
+    (folder / "output.log").write_text("theirs")
+
+    [ended] = _ends(start)
+
+    assert (ended.exit_code, ended.reason) == (
+        None,
+        f"[Errno 17] File exists: '{folder}'",
+    )
+    assert (folder / "output.log").read_text() == "theirs"
 
 
 class _SeesRecord:
