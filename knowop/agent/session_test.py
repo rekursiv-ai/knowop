@@ -45,8 +45,6 @@ import uuid
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.agent.sessions import claude, codex
-from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.lib.posix import follow, hostname
 from trackinizer.lib.posix.follow import follow_tree
 from trackinizer.lib.posix.host import HostSpec
@@ -60,6 +58,8 @@ from trackinizer.runs.adapters.gemini import GeminiAdapter
 from trackinizer.runs.adapters.iostream import IOStreamAdapter
 from trackinizer.runs.adapters.sagent import SagentAdapter
 from trackinizer.runs.asks import Answer, Ask
+from trackinizer.sagent.scripts.convert_session import claude, codex
+from trackinizer.sagent.scripts.convert_session.tail import Tail
 from trackinizer.sagent.session.jsonl import record_line
 from trackinizer.sagent.session.projects import project_dir
 from trackinizer.sagent.session.types import (

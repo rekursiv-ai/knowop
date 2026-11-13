@@ -65,9 +65,9 @@ from knowop.agent.worktree_diff import WORKTREE_DIFF_PART
 
 
 if TYPE_CHECKING:
-    from trackinizer.lib.agent.sessions.tail import Tail
     from trackinizer.runs.adapters.custom_types import Adapter
     from trackinizer.runs.redact import Redactor
+    from trackinizer.sagent.scripts.convert_session.tail import Tail
     from trackinizer.types.streams import TraxRecord
     from trackinizer.wire.wire_session_ir import AppendRecordsResponse
     from trackinizer.wire.wire_sessions import (

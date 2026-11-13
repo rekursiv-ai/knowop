@@ -37,13 +37,13 @@ import json
 import shutil
 import subprocess
 
-from trackinizer.lib.agent.sessions import (
+from trackinizer.runs.adapters.claude import ClaudeAdapter
+from trackinizer.runs.adapters.codex import CodexAdapter
+from trackinizer.sagent.scripts.convert_session import (
     claude,
     codex,
     sagent,
 )
-from trackinizer.runs.adapters.claude import ClaudeAdapter
-from trackinizer.runs.adapters.codex import CodexAdapter
 from trackinizer.sagent.session.projects import project_dir
 from trackinizer.sagent.session.types import (
     IncompleteRecord,

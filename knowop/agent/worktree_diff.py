@@ -31,7 +31,7 @@ import os
 import stat
 import subprocess
 
-from trackinizer.lib.agent.sessions.udiff import parse_udiff
+from trackinizer.sagent.scripts.convert_session.udiff import parse_udiff
 from trackinizer.sagent.session.types import EditResult, Splice, ToolResult, WriteResult
 
 

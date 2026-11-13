@@ -22,8 +22,8 @@ from knowop.agent.subagents import SubagentSinks
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
-    from trackinizer.lib.agent.sessions.tail import Tail
     from trackinizer.runs.adapters.custom_types import Adapter
+    from trackinizer.sagent.scripts.convert_session.tail import Tail
     from trackinizer.types.streams import TraxRecord
 
     from knowop.agent.worktree_diff import FileDiff

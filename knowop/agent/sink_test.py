@@ -94,7 +94,7 @@ from knowop.agent.worktree_diff import WORKTREE_DIFF_PART
 
 
 if TYPE_CHECKING:
-    from trackinizer.lib.agent.sessions.tail import Tail
+    from trackinizer.sagent.scripts.convert_session.tail import Tail
     from trackinizer.types.streams import TraxRecord
 
     from knowop.agent.worktree_diff import FileDiff

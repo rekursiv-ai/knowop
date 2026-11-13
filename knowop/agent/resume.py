@@ -30,7 +30,7 @@ from trackinizer.client.conversation import (
     read_part,
     read_segments,
 )
-from trackinizer.lib.agent.sessions import (
+from trackinizer.sagent.scripts.convert_session import (
     claude,
     codex,
     sagent,
@@ -60,7 +60,7 @@ from knowop.agent.truncate import was_truncated, without_note
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
-    from trackinizer.lib.agent.sessions.convert import _Adapter
+    from trackinizer.sagent.scripts.convert_session.convert import _Adapter
     from trackinizer.wire.wire_session_ir import PartBody
 
     from knowop.agent.custom_types import ResumeClient
