@@ -68,9 +68,8 @@ def _records() -> list[SessionRecord]:
         return list(claude.normalize(handle))
 
 
-# The LAST context stating one: the escaping convention is a majority over the lines
-# read, so the reader restates it as it moves and the final statement is the one in
-# force for the whole file.
+# The LAST context stating one: the reader restates it as escaped lines arrive, so the
+# final statement is the one in force for the whole file.
 def _encoding() -> Mapping[str, PlainTree]:
     """How that fixture spells its bytes, which the rewrite needs verbatim."""
     return next(

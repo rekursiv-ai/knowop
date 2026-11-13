@@ -974,16 +974,14 @@ class TrackinizerSink(Sink):
         # makes a retry a no-op.
         self._slash = []
 
-    # Not decoration, and not derivable server-side: claude's ascii-escaping convention
-    # (a majority flag plus its exception bitmap) rides on the ``TurnContext`` in force,
-    # and a rewrite without it writes raw UTF-8 where the CLI wrote ``\\u00e9``. Every
-    # record still matches, so nothing downstream notices -- but the bytes differ, and a
-    # provider handed a transcript it did not write is entitled to reject it.
+    # Not decoration, and not derivable server-side: which claude lines spelled their
+    # Unicode as ``\\u00e9`` rides on the ``TurnContext`` in force, and a rewrite without
+    # it writes raw UTF-8 there. Every record still matches, so nothing downstream
+    # notices -- but the bytes differ.
     #
-    # Read from the per-file reader at FLUSH time rather than captured once:
-    # ``ascii_escaped`` is a majority over the lines consumed, so the value correct for
-    # one batch may be wrong for the next, and the reader restates it when it moves.
-    # That is the same reason the manifest is re-sent per batch at all.
+    # Read from the per-file reader at FLUSH time rather than captured once: the reader
+    # restates it as escaped lines arrive, so the value correct for one batch may be
+    # short for the next. That is the same reason the manifest is re-sent per batch.
     #
     # A path with no reader yet -- a body replayed into a degraded sink, which carries
     # positions but no reader -- declares nothing, which the empty default already says.
