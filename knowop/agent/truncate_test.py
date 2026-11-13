@@ -15,6 +15,7 @@ import base64
 import json
 import re
 
+from trackinizer.runs.refusal import stand_in
 from trackinizer.sagent.scripts.convert_session import claude
 from trackinizer.sagent.session.types import (
     CONCRETE_TYPES,
@@ -22,6 +23,7 @@ from trackinizer.sagent.session.types import (
     BashResult,
     ContextClear,
     IncompleteRecord,
+    Thinking,
     ToolResult,
     UncategorizedRecord,
     UncategorizedToolResult,
@@ -39,7 +41,9 @@ from knowop.agent.truncate import (
     MAX_RECORD_BYTES,
     MAX_TOOL_RESULT_BYTES,
     NOTE,
+    _shrunk,
     bounded,
+    bounded_payload,
     encoded_size,
     was_truncated,
     without_note,
@@ -149,6 +153,27 @@ def _base64_sources(tree: MutablePlainTree) -> Iterator[str]:
             yield data
         for item in tree.values():
             yield from _base64_sources(item)
+
+
+class TestAnEventPayload:
+    """An event's plain data is cut as a record's strings are, to the bound given."""
+
+    def test_one_that_fits_is_returned_as_it_is(self) -> None:
+        payload = {"py/object": "ModelResponsePartial", "text": "hi"}
+
+        assert bounded_payload(payload, max_bytes=1 << 10) is payload
+
+    def test_a_long_string_keeps_its_beginning_and_end_within_the_bound(self) -> None:
+        text = _LOG * 2_000
+        payload = {"py/object": "ModelResponsePartial", "text": text}
+
+        cut = bounded_payload(payload, max_bytes=64 << 10)
+
+        assert len(json_dumps(cut).encode()) <= 64 << 10
+        assert cut["py/object"] == "ModelResponsePartial"
+        kept = cut["text"]
+        assert isinstance(kept, str)
+        _assert_cut_from(text, kept)
 
 
 class TestARecordThatFitsIsUntouched:
@@ -344,6 +369,22 @@ class TestEveryKindHasABackstop:
 
         assert encoded_size(bounded(body)) <= MAX_RECORD_BYTES
 
+    def test_a_seal_in_a_nested_history_is_kept_whole(self) -> None:
+        """A provider refuses a seal cut short, so a compaction's thought keeps it."""
+        seal = base64.b64encode(b"s" * 450_000).decode()
+        history = (
+            Thinking(content="why", encrypted=seal),
+            UserMessage(content=_LOG * 10_000),
+        )
+
+        record = _read(bounded(_body(ContextClear(history=history))))
+
+        assert isinstance(record, ContextClear)
+        thought = record.history[0]
+        assert isinstance(thought, Thinking)
+        assert thought.encrypted == seal
+        assert was_truncated(record)
+
 
 class TestTheLossyNote:
     """A cut record says so wherever the record can hold it."""
@@ -368,6 +409,12 @@ class TestTheLossyNote:
     def test_a_record_that_fits_reports_nothing(self) -> None:
         assert not was_truncated(_read(bounded(_body(_shell("short")))))
 
+    def test_a_stand_in_for_a_refused_record_is_one_cut(self) -> None:
+        """The server refused the record whole, so its place holds none of it."""
+        refused = stand_in(_body(UserMessage(content="\x00")), reason="NUL byte")
+
+        assert was_truncated(_read(refused))
+
     @pytest.mark.parametrize(
         "record",
         [
@@ -390,6 +437,31 @@ class TestTheLossyNote:
 
         assert NOTE not in stored
         assert "Trackinizer capture truncated" in stored
+
+
+class TestTheSharedLengthShrinks:
+    """The length each string may keep, tried in turn until what is cut fits."""
+
+    def test_a_cut_that_exactly_fits_is_taken(self) -> None:
+        tried: list[int] = []
+
+        def cut(cap: int) -> int:
+            tried.append(cap)
+            return cap
+
+        assert _shrunk(4_096, cut=cut, size=lambda made: made) == 4_096
+        assert tried == [4_096]
+
+    def test_the_next_length_is_in_proportion_with_an_eighth_to_spare(self) -> None:
+        """Twice over at 8192 bytes: half of it, less an eighth, is 3584."""
+        tried: list[int] = []
+
+        def cut(cap: int) -> int:
+            tried.append(cap)
+            return cap
+
+        assert _shrunk(8_192, cut=cut, size=lambda made: 2 * made) == 3_584
+        assert tried == [8_192, 3_584]
 
 
 def test_the_size_is_what_the_http_client_sends() -> None:

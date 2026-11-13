@@ -7,6 +7,32 @@ All notable knowop changes are documented here. This project follows
 
 ### Added
 
+- A daemon that starts takes up the agent processes an earlier one started on its
+  host and left running: one that ended meanwhile is reported ended, and the folder
+  it owned deleted; one still running is reported when it ends. Each process holds
+  a lock on its record beside its log, `process.json`, for its whole life.
+- A `knowop run` agent messages another session's agent, on any host, with AgentSend
+  to `label#412`: the agent's label, then the session's number or id. The process
+  posts it to the server as `trax send lead#412` does, after the turn's tool call
+  returns, in the order sent; the other agent reads it from `label#<this session's
+  number>` and answers that name. An ask is owed a reply and a reply settles it,
+  across sessions as within one. A message that reaches no one, or is still waiting
+  as the process ends, is told to its sender as a note, `Your message to lead#412
+  was not delivered: <why>`, never as a message from lead#412. A
+  line from Chat or `trax send` that names an agent of the session reaches that
+  agent.
+- `knowop run --stop ID` stops session ID's agent, on whichever host it runs, and
+  prints `stopped ID on HOST`; a session that never ran an agent, or one the server
+  will not let you stop, exits 1 with the reason.
+- `knowop run --time TIME` ends the agent TIME after it starts, as a stop does,
+  and exits 0; TIME is Slurm's `--time` (`120`, `2:00:00`, `1-0`). With `--on`, on
+  the host it starts on.
+- `knowop upload PATH...` sends finished Claude Code, Codex and sagent sessions,
+  files or folders searched for them (Codex's compressed `.jsonl.zst` rollouts
+  included), each as an AgentSession under the CLI's own id,
+  with each sub-agent as its own AgentSession linked to the session that spawned it.
+  A new session is private unless `--public`; uploading again sends only what the
+  server lacks, and a session the server holds keeps its audience.
 - `knowop host start` rents a KnowHost: a host the server starts and bills to your
   account, which joins as one of your hosts. `knowop host NAME pause` stops its
   charge, `resume` wakes it, and `knowop host NAME del` ends it, VM and all. A server
@@ -36,6 +62,32 @@ All notable knowop changes are documented here. This project follows
   `knowop connect` builds from a copy of its Python, so permission dialogs name
   KnowOp, not `python3.14`. An app that will not start falls back to the command
   as before.
+- `knowop status` lists, and `knowop disconnect` and `knowop logout` stop, the agent
+  processes on a host: those its connect started, and those started at a terminal
+  there.
+
+### Removed
+
+- **Breaking:** the agent runner that wrapped a CLI on a pty is gone, and with it
+  `knowop run claude`, `knowop run codex`, `knowop run sagent`, `knowop run resume`,
+  `knowop run ls`, `attach`, `log`, `send` and `stop`, and the flags `--detach` and
+  `--no-sync`. `knowop run` is sagent's own agent, in-process and live in Chat;
+  `knowop run --session ID` continues a stored sagent session, and a session's agent
+  stops through the server (`DELETE /api/sessions/ID/process`). A session another
+  CLI wrote stays readable.
+- A terminal the server opens is always a shell: `knowop connect` starts no
+  detached run for one, and its facts no longer list the agent CLIs it finds
+  (`clis`).
+- `knowop status` no longer lists detached runs here, and `knowop disconnect` no
+  longer stops them first.
+- The pull request watch, the session's git diff, the Run button's commands, the
+  permission cards and the canvas box hook went with the runner that carried them.
+- **Breaking:** the `files` terminal. `knowop connect` answers no file requests on a
+  terminal, and its facts no longer say `files`: the file explorer reads a host's
+  files with sagent's `List`, `Read` and `Grep`, served as an agent's are, each
+  read a call the server logs, so it needs `knowop connect` serving tools (not
+  `--no-exec`). `connect/files_channel.py` and `connect/files_search.py` are gone,
+  and with them the vendored `knowop.lib.files.grep` and the `rignore` dependency.
 
 ## 0.1.6 - 2026-11-05
 

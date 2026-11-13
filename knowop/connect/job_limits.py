@@ -127,7 +127,6 @@ def cap_problem(run: Run = run) -> str | None:
     """
     code, out = run(
         scope_argv(
-            unit="",
             memory_mb=_PROBE_MB,
             argv=(
                 "sh",
@@ -146,17 +145,18 @@ def cap_problem(run: Run = run) -> str | None:
 
 def scope_argv(
     *,
-    unit: str,
-    memory_mb: int,
+    unit: str = "",
+    memory_mb: int | None,
     argv: Sequence[str],
     runtime_sec: float | None = None,
     run: Run = run,
 ) -> list[str]:
-    """Return the ``systemd-run`` command that runs ``argv`` in a capped scope.
+    """Return the ``systemd-run`` command that runs ``argv`` in a scope of its own.
 
     Args:
       unit: The scope's name, ``NAME.scope``; empty lets systemd choose one.
-      memory_mb: The cap, in MiB.
+      memory_mb: The cap, in MiB, with no swap beside it; ``None`` for no cap, which
+        leaves swap as systemd's default too.
       argv: The command to run in it, which reaches it as written.
       runtime_sec: Kill the entire scope at this deadline, even without its daemon.
       run: Runs ``systemd-run --version`` when ``argv`` holds a ``$``.
@@ -172,10 +172,11 @@ def scope_argv(
         "--quiet",
         *(["--expand-environment=no"] if _expands(argv, run=run) else []),
         *(["--unit", unit] if unit else []),
-        "-p",
-        f"MemoryMax={memory_mb}M",
-        "-p",
-        "MemorySwapMax=0",
+        *(
+            []
+            if memory_mb is None
+            else ["-p", f"MemoryMax={memory_mb}M", "-p", "MemorySwapMax=0"]
+        ),
         *(
             []
             if runtime_sec is None

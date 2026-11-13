@@ -10,9 +10,10 @@ only by the account it was saved for, which then asks for no token. A piped toke
 an admin's for the host and names no person, so its credential is the host's
 own.
 
-Once joined the daemon serves terminals (``terminal_serving.py``) and sagent's tools
-(``tool_serving.py``), in the foreground, until the host is revoked, a newer connect
-of it takes over, or Ctrl-C releases it.
+Once joined the daemon serves terminals (``terminal_serving.py``), sagent's tools
+(``tool_serving.py``) and the agent processes the server starts here
+(``session_serving.py``), in the foreground, until the host is revoked, a newer
+connect of it takes over, or Ctrl-C releases it.
 
 With ``jobs`` it also runs the jobs its account submits with ``knowop job submit
 --host`` (``job_serving.py``). That needs a memory cap systemd enforces, which is
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
         job_limits,
         job_repo,
         job_serving,
+        session_serving,
         terminal_direct_aiortc,
         terminal_serving,
         tool_serving,
@@ -71,6 +73,7 @@ else:
     job_limits = lazy_import("knowop.connect.job_limits")
     job_repo = lazy_import("knowop.connect.job_repo")
     daemon = lazy_import("knowop.connect.daemon")
+    session_serving = lazy_import("knowop.connect.session_serving")
     terminal_direct_aiortc = lazy_import(
         "knowop.connect.terminal_direct_aiortc",
     )
@@ -113,8 +116,9 @@ def connect_host(
       signed_in: Returns a client that holds a key for ``server``, or ``None`` when
         no saved profile does.
       sandbox: Whether this connect declares the computer a disposable sandbox.
-      serve_tools: Whether the daemon serves sagent's tools to the assistant, which an
-        install without them cannot, and says so.
+      serve_tools: Whether the daemon runs anything here for the server: sagent's
+        tools, which an install without them cannot serve, and says so, and the agent
+        processes the server starts here.
       sleep: Waits the given seconds between polls and heartbeats.
       token: A one-use enrollment token for ``name`` the caller already holds, as a
         login that enrolled the host returns; used before any other.
@@ -126,20 +130,19 @@ def connect_host(
 
     Raises:
       ClientError: The login was denied or expired, the token was refused, the
-        server answered something a retry cannot change, or ``jobs`` was asked for
-        where no memory cap holds or no account is signed in.
+        server answered something a retry cannot change, or ``jobs`` was asked
+        for where no memory cap holds or no account is signed in.
 
     """
     offer = _job_offer() if jobs else None
     tools = serve_tools and tool_serving.can_serve()
-    direct = None
     wake = Wake()
+    terminals = functools.partial(_terminal_serving, name, server, wake=wake)
     if not join_only:
-        direct = _direct_link()
+        terminals = functools.partial(terminals, direct=_direct_link())
         wake.start()
-        echo(
-            f"serving: host {name} at {server} ({_what_is_served(tools, jobs=jobs)})",
-        )
+        served = _what_is_served(tools, jobs=jobs, sessions=serve_tools)
+        echo(f"serving: host {name} at {server} ({served})")
     account, read_token = _token_source(
         name,
         server=server,
@@ -169,13 +172,7 @@ def connect_host(
             credential_client=lambda key: Client(server, api_key=key),
             read_token=read_token,
             sleep=sleep,
-            joined_terminals=lambda joined: _terminal_serving(
-                name,
-                server,
-                joined,
-                direct=direct,
-                wake=wake,
-            ),
+            joined_terminals=terminals,
             tools_for=(
                 (lambda joined: _tool_serving(name, server, joined, wake=wake))
                 if tools
@@ -183,6 +180,11 @@ def connect_host(
             ),
             jobs_for=jobs_for,
             job_facts=None if offer is None else offer.facts,
+            sessions_for=(
+                (lambda joined: _session_serving(server, joined, wake=wake))
+                if serve_tools
+                else None
+            ),
             sandbox=sandbox,
             account=account,
             join_only=join_only,
@@ -267,6 +269,21 @@ def _tool_serving(
     )
 
 
+def _session_serving(
+    url: str,
+    joined: JoinResponse,
+    *,
+    wake: Wake,
+) -> session_serving.SessionServing:
+    """Make the agent process starter for a joined host; each process gets ``url``."""
+    return session_serving.SessionServing(
+        url,
+        credential=joined.credential,
+        client_for=lambda key: Client(url, api_key=key),
+        wake=wake,
+    )
+
+
 def _direct_link() -> PeerFactory | None:
     """Return the peer factory for a direct terminal link, and say which way it is."""
     if env("TRAX_HOST_TERMINAL_DIRECT") == "0":
@@ -283,12 +300,13 @@ def _direct_link() -> PeerFactory | None:
     return factory
 
 
-def _what_is_served(tools: bool, *, jobs: bool) -> str:
+def _what_is_served(tools: bool, *, jobs: bool, sessions: bool) -> str:
     """Return the words that say what this daemon serves."""
     served = [
         "terminals",
         *(["tools"] if tools else []),
         *(["jobs"] if jobs else []),
+        *(["agents"] if sessions else []),
     ]
     if len(served) == 1:
         return served[0]

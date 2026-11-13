@@ -1,16 +1,18 @@
-"""How a ``knowop run`` session finds its canvas and tells the child CLI about it.
+"""How a ``knowop run`` session finds its canvas: the server places it at start.
 
 The server decides the placement (``POST /api/sessions/{id}/place``); this reads the
 two things only the client knows, the canvas the run was started from and its git
-checkout, and turns the answer into the child's environment. A chat's session is
-never placed: it sits on its chat's canvas, which the caller's session list names.
+checkout, and turns the answer into the variables the run's tools read it from. Git is
+asked so it changes nothing: no optional lock, no prompt, bounded in time and output.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
-from uuid import UUID
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Final, Protocol
 
+import os
+import subprocess
 import sys
 
 from trackinizer.client.errors import ClientError
@@ -21,19 +23,53 @@ from trackinizer.wire.wire_sessions import (
     SessionPlacement,
     session_place_path,
 )
-from treekle import from_plain
 
 from knowop.agent.program import PROGRAM
-from knowop.agent.worktree_diff import run_git
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
+    from uuid import UUID
 
     from treekle import PlainTree
 
-    from knowop.agent.worktree_diff import Runner
+
+__all__ = [
+    "GIT_SEC",
+    "Output",
+    "PlacementClient",
+    "Runner",
+    "git_ref",
+    "place_run",
+    "placement_env",
+    "run_git",
+]
+
+
+GIT_SEC: Final = 20.0
+"""Seconds one git command may run before it is killed."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Output:
+    """What one git command printed, and how it ended.
+
+    Attributes:
+      returncode: Its exit status; ``-1`` when it ran out of time or could not
+        start.
+      stdout: What it printed, at most the byte bound it was read to.
+      cut: Whether the output reached that bound and was truncated.
+
+    """
+
+    returncode: int
+    stdout: bytes
+    cut: bool
+
+
+type Runner = Callable[[Sequence[str], int], Output]
+"""Runs one git command ``argv``, its output kept to ``max_bytes``."""
 
 
 class PlacementClient(Protocol):
@@ -44,17 +80,41 @@ class PlacementClient(Protocol):
         ...
 
 
-class SessionLister(Protocol):
-    """What finding a chat's canvas needs of a client: ``Client``, or a narrower one."""
+def run_git(argv: Sequence[str], max_bytes: int) -> Output:
+    """Run one git command, read-only, bounded in time and output.
 
-    def get(
-        self,
-        path: str,
-        *,
-        params: Mapping[str, object] | None = None,
-    ) -> PlainTree:
-        """GET ``path`` with ``params``; return the decoded answer."""
-        ...
+    Args:
+      argv: The full command, ``git`` first.
+      max_bytes: Where its output is cut.
+
+    Returns:
+      output: What it printed and how it ended.
+
+    """
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        done = subprocess.run(  # noqa: S603 -- fixed argv, no shell.
+            list(argv),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=GIT_SEC,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, bytes) else b""
+        return Output(
+            returncode=-1,
+            stdout=stdout[:max_bytes],
+            cut=len(stdout) > max_bytes,
+        )
+    except OSError:
+        return Output(returncode=-1, stdout=b"", cut=False)
+    return Output(
+        returncode=done.returncode,
+        stdout=done.stdout[:max_bytes],
+        cut=len(done.stdout) > max_bytes,
+    )
 
 
 def git_ref(cwd: Path, *, run: Runner = run_git) -> GitRef | None:
@@ -112,56 +172,8 @@ def place_run(
         return None
 
 
-# The path is written out: ``SESSIONS_PATH`` is newer than trackinizer 0.1.10, the
-# release knowop's wheel requires, so naming it would fail the import on such an
-# install. Activity over one day suffices: the list keeps every open session, and the
-# run's attach has just reopened this one. A listed session names its canvas and that
-# canvas's workspace by a placement's field names, beside fields a placement ignores.
-def chat_placement(
-    client: SessionLister,
-    *,
-    session_id: UUID,
-) -> SessionPlacement | None:
-    """Return the canvas a chat's session sits on, as the session list names it.
-
-    Args:
-      client: The run's client.
-      session_id: The chat's session, which the run attached to.
-
-    Returns:
-      placement: The canvas and its workspace, each ``None`` for a session on no
-        canvas; ``None`` when the list leaves the session out, or on a refusal, which
-        it warns of once.
-
-    """
-    try:
-        answer = from_plain(
-            client.get("/api/sessions", params={"days": 1}),
-            dict[str, object],
-        )
-        rows = from_plain(
-            answer.get("sessions"),
-            list[dict[str, object]],
-            default=list[dict[str, object]](),
-        )
-        return next(
-            (
-                SessionPlacement.model_validate(row)
-                for row in rows
-                if from_plain(row.get("id"), UUID) == session_id
-            ),
-            None,
-        )
-    except (ClientError, ValueError) as error:
-        sys.stderr.write(
-            f"[{PROGRAM}] could not find this chat's canvas ({error}); "
-            "running unplaced\n",
-        )
-        return None
-
-
 def placement_env(placement: SessionPlacement | None) -> dict[str, str]:
-    """Return the variables that tell the child CLI where it was placed.
+    """Return the variables that tell a run's tools where its session was placed.
 
     Args:
       placement: The server's answer, or ``None`` for a run that was not placed.

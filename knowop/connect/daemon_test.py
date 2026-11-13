@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Final
 import getpass
 import os
 import platform
-import shutil
 import stat
 import uuid
 
@@ -22,12 +21,12 @@ from trackinizer.wire.wire_daemon import (
     JoinRequest,
     JoinResponse,
 )
+from trackinizer.wire.wire_session_relay import REMOTE_AGENTS_FACT, SESSIONS_FACT
 
 import pytest
 
 from knowop.connect import daemon
 from knowop.connect.daemon import (
-    HOST_CLIS,
     connect,
     host_facts,
     is_sandbox,
@@ -436,10 +435,11 @@ def test_a_wake_from_a_pause_heartbeats_at_once_and_ends_with_the_daemon(
     fake = _FakeServer(beats=(None, answer, _TAKEN))
     wall = [1_000.0]
     wake = Wake(wall=lambda: wall[0], clock=lambda: 0.0)
+    slept: list[float] = []
 
     def paused(seconds: float) -> None:
         # The heartbeat's sleep spans a pause: the wall clock leaps, the monotonic not.
-        del seconds
+        slept.append(seconds)
         wall[0] += 30.0
         assert wake.check()
 
@@ -455,6 +455,11 @@ def test_a_wake_from_a_pause_heartbeats_at_once_and_ends_with_the_daemon(
     assert wake.check()
 
     assert [call[-1] for call in fake.calls] == ["take", "keep", "keep"]
+    # Each heartbeat, the wake's too, names the same host, instance and version.
+    assert {call[1:4] for call in fake.calls} == {fake.calls[0][1:4]}
+    assert fake.calls[0][1] == _HOST_ID
+    # The wake's heartbeat took the answer within the one pause; the next ended it.
+    assert slept == [HEARTBEAT_SEC]
 
 
 def test_lost_contact_is_retried_sooner_at_first_and_never_ends_the_daemon(
@@ -783,16 +788,14 @@ def test_daemon_facts_fit_the_join_contract() -> None:
         "cpus",
         "memory_mb",
         "user",
-        "clis",
         "pid",
         "started_at",
         "knowop_version",
     }
-    cpus, memory_mb, clis = facts["cpus"], facts["memory_mb"], facts["clis"]
+    cpus, memory_mb = facts["cpus"], facts["memory_mb"]
     assert isinstance(cpus, int)
     assert isinstance(memory_mb, int)
-    assert isinstance(clis, list)
-    assert (cpus > 0, memory_mb > 0, set(clis) <= set(HOST_CLIS)) == (True,) * 3
+    assert (cpus > 0, memory_mb > 0) == (True, True)
     joined = JoinRequest(
         name="box-1",
         token=_TOKEN,
@@ -811,15 +814,11 @@ def test_daemon_facts_report_what_the_daemon_says_about_itself(
     def fake_sysconf(name: str) -> int:
         return sysconf[name]
 
-    def which(cli: str) -> str | None:
-        return "/bin/" + cli if cli in {"sagent", "git", "uv"} else None
-
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(platform, "machine", lambda: "aarch64")
     monkeypatch.setattr(os, "cpu_count", lambda: None)
     monkeypatch.setattr(os, "sysconf", fake_sysconf)
     monkeypatch.setattr(getpass, "getuser", lambda: "ada")
-    monkeypatch.setattr(shutil, "which", which)
     monkeypatch.setattr(os, "getpid", lambda: 4242)
     installed = {"knowop": "0.1.6"}
     monkeypatch.setattr(
@@ -836,17 +835,15 @@ def test_daemon_facts_report_what_the_daemon_says_about_itself(
         "cpus": 0,
         "memory_mb": 4096,
         "user": "ada",
-        "clis": ["sagent", "git", "uv"],
         "pid": 4242,
         "started_at": facts["started_at"],
         "knowop_version": "0.1.6",
     }
     assert host_facts(terminal=True)["terminal"] is True
-    assert host_facts(terminal=True)["files"] is True
+    assert "files" not in host_facts(terminal=True)
     assert host_facts(tools=True)["tools"] is True
     assert set(host_facts(terminal=True, tools=True)) - set(host_facts()) == {
         "terminal",
-        "files",
         "tools",
     }
 
@@ -1065,6 +1062,73 @@ def test_a_daemon_that_runs_jobs_says_what_it_offers_and_stops_them_first() -> N
     }
 
 
+def test_a_daemon_that_starts_agents_says_so_and_stops_that_first() -> None:
+    _save()
+    fake = _FakeServer(beats=[None, _REVOKED])
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        credential_client=fake,
+        read_token=_no_token,
+        sleep=lambda _: None,
+        tools_for=lambda _joined: _Terminals(fake.calls, "tools"),
+        sessions_for=lambda _joined: _Terminals(fake.calls, "sessions"),
+    )
+
+    assert [call[0] for call in fake.calls] == [
+        "beat",
+        "tools-start",
+        "sessions-start",
+        "beat",
+        "sessions-stop",
+        "tools-stop",
+    ]
+    assert fake.calls[0][4] == {**host_facts(tools=True), "sessions": True}
+    assert fake.calls[2][1:] == fake.calls[1][1:]
+
+
+@pytest.mark.parametrize(
+    ("sessions", "remote_agents", "said"),
+    [
+        (True, True, {"sessions": True, "remote_agents": True}),
+        (True, False, {"sessions": True}),
+        # Nothing to confine where no agent is started.
+        (False, True, {}),
+    ],
+)
+def test_a_daemon_says_it_runs_remote_agents_only_beside_the_agents_it_confines(
+    *,
+    sessions: bool,
+    remote_agents: bool,
+    said: dict[str, bool],
+) -> None:
+    _save()
+    fake = _FakeServer()
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        credential_client=fake,
+        read_token=_no_token,
+        sleep=lambda _: None,
+        sessions_for=(
+            (lambda _joined: _Terminals(fake.calls, "sessions")) if sessions else None
+        ),
+        remote_agents=remote_agents,
+    )
+
+    assert fake.calls[0][4] == {**host_facts(), **said}
+
+
+def test_the_session_facts_are_the_wires() -> None:
+    assert host_facts(sessions=True)[SESSIONS_FACT] is True
+    assert host_facts(sessions=True, remote_agents=True)[REMOTE_AGENTS_FACT] is True
+    assert {SESSIONS_FACT, REMOTE_AGENTS_FACT}.isdisjoint(
+        host_facts(tools=True, jobs={}),
+    )
+
+
 def test_a_daemon_that_runs_no_jobs_says_nothing_of_them() -> None:
     _save()
     fake = _FakeServer()
@@ -1193,8 +1257,9 @@ def test_ctrl_c_releases_the_host_once_then_stops_terminals_and_goes_on(
         )
 
     beat, _, release, stop = fake.calls
-    assert (beat[5], release[5]) == ("take", "release")
-    assert release[2] == beat[2]
+    # The same host, instance and version as every heartbeat, and no facts.
+    assert beat[:2] == ("beat", _HOST_ID)
+    assert release == (*beat[:4], None, "release")
     assert stop == ("terminals-stop",)
     assert fake.closed == 1
 
@@ -1249,6 +1314,28 @@ def test_the_daemon_reports_the_installed_trackinizer_version_or_none(
     )
 
     assert [call[3] for call in fake.calls] == [reported, reported]
+    # A first connect's join names it too.
+    joining = _FakeServer()
+    _ = _connect_as("box-2", joining)
+    assert [call[4 if call[0] == "join" else 3] for call in joining.calls] == [
+        reported,
+    ] * 3
+
+
+def test_a_daemon_that_runs_jobs_with_nothing_to_offer_says_jobs_alone() -> None:
+    _save()
+    fake = _FakeServer()
+
+    connect(
+        "box-1",
+        server=_SERVER,
+        credential_client=fake,
+        read_token=_no_token,
+        sleep=lambda _: None,
+        jobs_for=lambda _joined: _Terminals(fake.calls, "jobs"),
+    )
+
+    assert fake.calls[0][4] == {**host_facts(), "jobs": True}
 
 
 def test_a_server_url_with_no_daemon_is_refused() -> None:

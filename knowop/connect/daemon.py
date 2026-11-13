@@ -25,11 +25,11 @@ calling process rather than in traxd.
 
 A daemon serves terminals (``terminal_serving.py``) and sagent's tools (``tool_serving.py``) for
 as long as it stays connected. When the host is revoked it kills every shell and ends
-every running tool call; what a tool left running in the background goes on.
+every running tool call; what a tool left running in the background goes on. It also
+starts agent processes (``session_serving.py``), which outlive it.
 
 Each connect also records whether the person declared this computer a sandbox, a
-disposable computer where agents may act freely (:func:`is_sandbox`). ``knowop run``
-reads the record when it starts an agent.
+disposable computer where agents may act freely (:func:`is_sandbox`).
 """
 
 from __future__ import annotations
@@ -38,12 +38,11 @@ from contextlib import ExitStack, closing, suppress
 from datetime import UTC, datetime
 from functools import cache, partial
 from importlib import metadata
-from typing import TYPE_CHECKING, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import getpass
 import os
 import platform
-import shutil
 import uuid
 
 from trackinizer.client.errors import ClientError
@@ -52,6 +51,7 @@ from trackinizer.trax.connection import server_dir
 from trackinizer.trax.render import echo
 from trackinizer.wire.wire_daemon import HEARTBEAT_SEC, JoinResponse
 from trackinizer.wire.wire_host_job import JOBS_FACT
+from trackinizer.wire.wire_session_relay import REMOTE_AGENTS_FACT, SESSIONS_FACT
 
 from knowop.service import knowop_version
 
@@ -74,7 +74,6 @@ else:
 
 
 __all__ = [
-    "HOST_CLIS",
     "DaemonClient",
     "Serving",
     "connect",
@@ -82,9 +81,6 @@ __all__ = [
     "is_sandbox",
     "set_sandbox",
 ]
-
-HOST_CLIS: Final = ("claude", "codex", "sagent", "knowop", "gemini", "git", "uv")
-"""The commands a daemon reports when it finds them on ``PATH``."""
 
 
 class DaemonClient(Protocol):
@@ -142,6 +138,8 @@ def connect(
     tools_for: Callable[[JoinResponse], Serving] | None = None,
     jobs_for: Callable[[JoinResponse], Serving] | None = None,
     job_facts: Mapping[str, FactValue] | None = None,
+    sessions_for: Callable[[JoinResponse], Serving] | None = None,
+    remote_agents: bool = False,
     sandbox: bool = False,
     account: str | None = None,
     join_only: bool = False,
@@ -167,6 +165,11 @@ def connect(
         do not say ``jobs``.
       job_facts: What JobServing offers jobs (its GPUs and memory), reported beside
         ``jobs: true`` when ``jobs_for`` is given.
+      sessions_for: Makes SessionServing the same way; ``None`` starts no agent
+        process, and the facts do not say ``sessions``.
+      remote_agents: Whether it is a remote agent service: the agent processes it
+        starts are for accounts other than its own, each confined; the facts say
+        ``remote_agents`` beside ``sessions``.
       sandbox: Whether this connect declares the computer a sandbox. Every connect
         records its own answer once it holds a credential, so ``False`` withdraws
         an earlier declaration.
@@ -193,6 +196,8 @@ def connect(
         terminal=joined_terminals is not None,
         tools=tools_for is not None,
         jobs=None if jobs_for is None else {} if job_facts is None else job_facts,
+        sessions=sessions_for is not None,
+        remote_agents=remote_agents and sessions_for is not None,
     )
     join = partial(
         _join,
@@ -212,7 +217,7 @@ def connect(
         instance=instance,
         version=version,
         sleep=sleep,
-        makers=(joined_terminals, tools_for, jobs_for),
+        makers=(joined_terminals, tools_for, jobs_for, sessions_for),
         wake=wake,
     )
     who = "" if account is None else f" as {account.lower()}"
@@ -234,7 +239,7 @@ def connect(
         _forget(path, refused=saved)
         saved = _rejoin(join, name=name, server=server, account=account)
         echo(f"rejoined: host {name}{who}; the server refused its saved credential")
-        ending = daemon(saved, facts=None, rejoin=False)
+        ending = daemon(saved, facts=None)
     if ending == "revoked":
         _forget(path, refused=saved)
         echo(f"revoked: host {name}")
@@ -245,35 +250,41 @@ def host_facts(
     terminal: bool = False,
     tools: bool = False,
     jobs: Mapping[str, FactValue] | None = None,
+    sessions: bool = False,
+    remote_agents: bool = False,
 ) -> Facts:
     """Return what this daemon reports about itself.
 
     Args:
-      terminal: Whether this daemon serves terminals, and with them a ``files``
-        terminal, which the facts then say.
-      tools: Whether this daemon serves sagent's tools to the assistant, which the facts
-        then say.
+      terminal: Whether this daemon serves terminals, which the facts then say.
+      tools: Whether this daemon serves sagent's tools, to an agent and to its owner's
+        file explorer, which the facts then say.
       jobs: What this daemon offers jobs, when it runs them; the facts then say
         ``jobs: true`` beside it.
+      sessions: Whether this daemon starts agent processes, which the facts then say.
+      remote_agents: Whether it confines each, as a remote agent service, so it may
+        start them for other accounts, which the facts then say.
 
     Returns:
       facts: Its OS and architecture, CPU count, memory in MB, the user it runs
-        as, which of :data:`HOST_CLIS` are on ``PATH``, its process id, when it
-        started and its knowop version, ``terminal: true`` and ``files: true`` when
-        it serves terminals, ``tools: true`` when it serves tools, and ``jobs: true``
-        with what it offers jobs when it runs them.
+        as, its process id, when it
+        started and its knowop version, ``terminal: true`` when it serves
+        terminals, ``tools: true`` when it serves tools, ``jobs: true``
+        with what it offers jobs when it runs them, ``sessions: true`` when it starts
+        agent processes and ``remote_agents: true`` when it confines them.
 
     """
     return {
-        **({"terminal": True, "files": True} if terminal else {}),
+        **({"terminal": True} if terminal else {}),
         **({"tools": True} if tools else {}),
         **({JOBS_FACT: True, **jobs} if jobs is not None else {}),
+        **({SESSIONS_FACT: True} if sessions else {}),
+        **({REMOTE_AGENTS_FACT: True} if remote_agents else {}),
         "os": platform.system().lower(),
         "arch": platform.machine(),
         "cpus": os.cpu_count() or 0,
         "memory_mb": os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 2**20,
         "user": getpass.getuser(),
-        "clis": [cli for cli in HOST_CLIS if shutil.which(cli) is not None],
         "pid": os.getpid(),
         "started_at": _started_at(),
         "knowop_version": knowop_version(),
@@ -319,8 +330,8 @@ def _daemon(
     facts: Facts | None,
     sleep: Callable[[float], None],
     makers: Sequence[Callable[[JoinResponse], Serving] | None],
-    rejoin: bool,
     wake: Wake | None,
+    rejoin: bool = False,
 ) -> _Ending:
     """Serve with ``joined``'s credential until it ends; Ctrl-C releases the host."""
     with (

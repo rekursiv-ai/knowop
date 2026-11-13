@@ -1,115 +1,72 @@
 ---
 name: knowop-run
-description: ALWAYS invoke this skill before running sagent, Claude Code or Codex recorded with knowop run, detaching a run, attaching to one, sending it a message, stopping it, or resuming a stored session. Do not start or reach an agent run, or tell a person which command reaches it, from memory -- invoke this skill first.
+description: ALWAYS invoke this skill before running sagent with knowop run, starting it on a host, or continuing a stored session. Do not start an agent run, or tell a person which command reaches it, from memory -- invoke this skill first.
 ---
 
-# knowop run -- recorded agent runs
+# knowop run -- sagent, live in Chat
 
-`knowop run` runs sagent in the current folder, `knowop run claude` runs Claude
-Code and `knowop run codex` runs Codex. Each run is recorded as an AgentSession on
-the server knowop is logged in to, and a message sent to it from Chat reaches it. A
-first run logs in when knowop has no login. `trax run` moved out of trax.
+`knowop run` runs sagent's own agent in this process, with sagent's screen at a
+terminal and headless elsewhere. Its session is live in Chat: each event goes up as
+it happens, its journal is stored as records, and a line sent from Chat reaches the
+agent as one typed at its screen. A first run logs in when knowop has no login.
 
-`knowop run sagent --help` is the source of truth for the flags; if this skill
-disagrees, trust the help.
+`knowop run --help` is the source of truth for the flags; if this skill disagrees,
+trust the help.
 
 ## Run
 
 ```bash
-knowop run                                     # sagent here, recorded
-knowop run claude                              # Claude Code here, recorded
-knowop run codex                               # Codex here, recorded
-knowop run claude --as scientist --room lab -- --model opus
-knowop run -- --resume 3f2a                    # after -- everything goes to the CLI
+knowop run                          # sagent here, live in Chat
+knowop run --headless               # the same, with no screen
+knowop run --session ID             # continue session ID here
+knowop run --on lab --cwd ~/work    # start it on your host lab, through its daemon
+knowop run --stop ID                # stop session ID's agent, wherever it runs
+knowop run --time 2:00:00           # end 2 h after it starts, as a stop does
+knowop run --model opus             # any other flag is sagent's own
 ```
 
-- Chat's Stop halts sagent with Ctrl-C, and claude and codex with Escape.
+- The first line a run prints on stdout is its session's id.
+- Every sagent flag works but those that pick a journal (`--resume`, `--continue`,
+  `--ephemeral` and their kin): knowop keeps the session's journal.
+- `--on NAME` asks the host's daemon (`knowop connect` there) to start the agent,
+  waits for it to attach, prints the session's id and exits. With no name, the
+  server's own host runs it.
+- A run says so when this computer is not connected; a connected computer also
+  opens its terminal in Chat.
+- Exit codes: 0 after a stop or a quit; 1 for a start error, a refused key or a
+  session that is gone; 3 when another process holds the session; 4 when a headless
+  run went 10 minutes without its socket; 130 on Ctrl-C.
 
-- `--as NAME` names the session. Other agents and the web app address it as
-  `@NAME`. It defaults to `$AGENTNAME`, else `Agent`, and the server makes it
-  unique among live sessions (`scientist#2`).
-- `--room ROOM` (repeatable) joins a room; address the session as
-  `@NAME:ROOM`.
-- `--private` starts the session hidden: only its owner, staff and admins read
-  it. A server that will not hide it stops the run before the CLI starts.
-- `--diff` shows the session's live `git diff` on its page.
-- `--no-sync` or `--out PATH` records to a local JSONL file and uses no
-  network. `--dry-run` replays existing session files and spawns nothing.
-- `knowop run gemini` and `knowop run sh -- CMD` still wrap gemini and any
-  command; `sh` records the command's input and output as one terminal.
-- A run that starts an agent says so when this computer is not connected, so
-  Chat cannot open its terminal: run `knowop connect` in another terminal.
+## Reach it
 
-A missing `sagent`, `claude` or `codex` binary stops the run and prints the
-install command.
+- Chat sends it lines, and its Stop halts the turn; a slash line such as
+  `/model opus` does what it does at sagent's screen.
+- `knowop run --stop ID` stops the agent of session ID, on whichever host it
+  runs, and prints `stopped ID on HOST`.
+- `knowop run --time TIME` ends the agent TIME after it starts, as a stop does: it
+  halts the turn and uploads its journal. TIME is Slurm's `--time`: `120`,
+  `2:00:00` or `1-0`. With `--on`, the process on that host keeps the time.
+- Its agents are `LABEL#N`: an agent's label (the root's is `--name`, `Agent` by
+  default), then `N`, the session's number or the id the run printed. Another
+  session's agent sends one with `AgentSend(to="lead#412", ...)`, on any host; a
+  shell sends the same with `trax send lead#412 TEXT`. A message shows who sent it,
+  as `worker#415`, and is answered by AgentSend to that name. No list of these
+  names is shown: an agent learns one by being told it, or by a message from it.
+  A message that reaches no one comes back as `[message refused] ...`.
+- Over HTTP, with a key: `POST /api/sessions/ID/inputs` sends a line,
+  `DELETE /api/sessions/ID/process` stops the agent, and
+  `GET /api/sessions/ID/lines` follows it.
+- `knowop status` lists each host's live sessions.
 
-## Detach, then reach it by name
+## Continue a stored session
 
-```bash
-knowop run --detach --name lead --as lead
-knowop run ls                    # live hosts; --all adds exited and lost ones
-knowop run attach lead           # drive it here; Ctrl-\ detaches
-knowop run log lead --follow     # scrollback, then live output
-knowop run send lead "status?"   # type a line in and press Enter
-knowop run stop lead             # stop it; waits until it has exited
-```
-
-- A detached run is hosted in a background process no terminal owns, so closing
-  the shell or dropping ssh leaves it running. It records and takes messages
-  exactly as a foreground run does.
-- `--name` defaults to the `--as` name, else the CLI. A name belongs to one
-  live host at a time.
-- A host can be attached only on the computer it runs on. `ls`, `attach`,
-  `log`, `send` and `stop` reach every CLI's host alike, and need no login.
-- A Chat run has no terminal until someone attaches. Attaching takes it over;
-  Chat gets it back with Reattach in the chat.
-- To tell a person how to reach a Chat run, give `knowop run attach NAME` with
-  the name Chat shows, on the computer Chat names.
-
-## Resume a stored session
-
-```bash
-trax agentsession 42                            # its id, among the row's fields
-knowop run resume SESSION_UUID                  # re-enter it as sagent
-knowop run claude resume SESSION_UUID           # re-enter it as claude
-knowop run codex resume SESSION_UUID --lossy    # resume as codex
-```
-
-The target CLI is chosen here, not by whatever captured the session, so a
-codex-captured session resumes as claude or sagent. The run writes into the session it
-resumes as a new part. `--lossy` accepts a conversion that drops records the CLI
-cannot express; without it such a resume is refused. `trax agentsession N run`
-moved out of trax.
-
-## What is recorded
-
-- Every turn, tool call and result of the CLI's own session log, as records of
-  one AgentSession, synced as they happen. The row and its transcript are read
-  with `trax agentsession N` and `trax agentsession N records`.
-- Secrets named in `$TRAX_REDACT_NAMES` are replaced by `[redacted:NAME]`
-  before anything leaves the process.
-- The permission, question and trust prompts of a synced run reach Chat as
-  cards, and Chat's answers come back.
-- Messages sent to the session (`trax send @NAME ...`, or Chat) are typed into
-  the CLI once it is ready for them.
-- A shell command the agent wrote that the chat's starter clicks Run on in Chat
-  runs on the run's computer, in its folder, with the CLI's environment, in the
-  background. Its start and end are `run` records Chat draws under the block, and
-  a line from `knowop-run` tells the CLI how it ended. The whole output stays in
-  the user state directory under `rekursiv-ai/knowop/runs/`.
-- A run placed on a canvas gets `$TRAX_CANVAS`, `$TRAX_WORKSPACE` and
-  `$TRAX_ACTOR`, and is told its canvas is the canvas's; a run attached to a
-  chat (`--attach SESSION`) gets those of the canvas its chat sits on.
-  `knowop canvas` reads and changes the canvas with the grammar of
-  `trax canvas`; the rows are `trax`'s to read and write (see the trax skill).
-- A sandbox computer (`knowop connect --sandbox`) starts agents with
-  no permission prompts, unless the person passed the CLI's own permission
-  flags.
+`knowop run --session ID` continues it here: in this host's own journal of its
+newest part when this host holds it whole, else in a new journal restored from the
+stored parts. A part another agent than sagent wrote is not continued; it stays
+readable with `trax agentsession N records`.
 
 ## Rules
 
-- Run an agent under `knowop run`, `knowop run claude` or `knowop run codex`, not
-  bare `claude` or `codex`, when the work should be recorded or reachable from
-  Chat.
-- Do not put a secret on the command line; the CLI's own arguments are recorded
-  in the host list.
+- Run an agent under `knowop run`, not bare `sagent`, when the work should be
+  recorded or reachable from Chat.
+- Do not put a secret on the command line; the agent's arguments are recorded.

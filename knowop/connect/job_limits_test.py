@@ -102,6 +102,22 @@ def test_a_scope_caps_memory_with_no_swap_and_runs_the_command() -> None:
     ]
 
 
+def test_a_scope_with_no_cap_sets_no_memory_property_and_runs_the_command() -> None:
+    argv = scope_argv(unit="knowop-process-1", memory_mb=None, argv=["python", "-V"])
+
+    assert argv == [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--unit",
+        "knowop-process-1",
+        "--",
+        "python",
+        "-V",
+    ]
+
+
 @pytest.mark.parametrize(
     ("version", "verbatim"),
     [
@@ -165,26 +181,33 @@ def test_the_cap_holds_when_a_probe_scope_reads_its_own_cap() -> None:
     # The probe's command reads its cgroup through ``$(...)``, so it asks the version.
     version, argv = fake.seen
     assert version == ["systemd-run", "--version"]
-    assert "--expand-environment=no" in argv
-    assert argv[:4] == ["systemd-run", "--user", "--scope", "--quiet"]
-    assert "--unit" not in argv
-    assert argv[argv.index("--") + 1 :][:2] == ["sh", "-c"]
-    assert "MemoryMax=64M" in argv
+    assert argv == [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--expand-environment=no",
+        "-p",
+        "MemoryMax=64M",
+        "-p",
+        "MemorySwapMax=0",
+        "--",
+        "sh",
+        "-c",
+        'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"',
+    ]
 
 
 @pytest.mark.parametrize(
     ("answer", "problem"),
     [
-        ((127, ""), "could not start a capped scope"),
-        ((1, ""), "could not start a capped scope"),
-        ((0, "max\n"), "read its cap as 'max'"),
+        ((127, ""), "systemd-run --user could not start a capped scope"),
+        ((1, ""), "systemd-run --user could not start a capped scope"),
+        ((0, "max\n"), "a 64M scope read its cap as 'max'"),
     ],
 )
 def test_no_cap_is_said_plainly(answer: tuple[int, str], problem: str) -> None:
-    found = cap_problem(_Run(systemd_run=answer))
-
-    assert found is not None
-    assert problem in found
+    assert cap_problem(_Run(systemd_run=answer)) == problem
 
 
 def test_gpus_are_read_from_nvidia_smi_and_none_without_it() -> None:

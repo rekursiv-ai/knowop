@@ -1,6 +1,6 @@
 """The ``knowop`` command, against a scripted server and a clock that never waits.
 
-The daemon, the agent runners and the job runner are stood in for: each test
+The daemon, the agent process and the job runner are stood in for: each test
 reads what knowop handed them.
 """
 
@@ -19,6 +19,7 @@ import select
 import signal
 import sys
 import time
+import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix import hostname
@@ -45,15 +46,10 @@ from treekle import json_loads
 import httpx2
 import pytest
 
-from knowop import cli, menubar, service
-from knowop.agent import (
-    cli as agent_cli,
-    detach,
-)
-from knowop.agent.detach import HostRecord
+from knowop import cli, menubar, service, upload
 from knowop.connect import serve
-from knowop.connect.daemon import host_facts
 from knowop.jobs import cli as jobs_cli
+from knowop.process import main
 from knowop.service import Connect, Services
 
 
@@ -99,8 +95,6 @@ class _Server:
         """Each host disconnected, in order."""
         self.logged_out: list[str] = []
         """Each host logged out, in order."""
-        self.stopped: list[str] = []
-        """Each run stopped through its host, as ``HOST/SESSION``."""
         self.lingering: set[str] = set()
         """Hosts that still read online once disconnected."""
         self.key_host: str | None = None
@@ -134,12 +128,7 @@ class _Server:
             ],
             key=lambda host: str(host["name"]),
         )
-        # The CLIs a host finds as it starts: those on this computer's PATH.
-        self.facts[name] = {
-            "pid": pid,
-            "knowop_version": version,
-            "clis": host_facts()["clis"],
-        }
+        self.facts[name] = {"pid": pid, "knowop_version": version}
 
     def server_status(self, name: str) -> str:
         """Return the status the server lists ``name`` with."""
@@ -209,11 +198,6 @@ class _Server:
                 return httpx2.Response(200, json=detail)
             if route == ("GET", f"/api/hosts/{name}/runs"):
                 return httpx2.Response(200, json={"runs": self.runs.get(name, [])})
-            for run in self.runs.get(name, []):
-                session = run["session_id"]
-                if route == ("POST", f"/api/hosts/{name}/runs/{session}/stop"):
-                    self.stopped.append(f"{name}/{session}")
-                    return httpx2.Response(204)
             if route == ("POST", f"/api/hosts/{name}/disconnect"):
                 self.disconnected.append(name)
                 if name not in self.lingering:
@@ -414,7 +398,7 @@ class _Terminal(io.TextIOWrapper):
 
 
 class _Runner:
-    """Stands in for an entry point knowop hands off to: records argv, exits ``code``."""
+    """Stands in for the job runner knowop hands off to: records argv, exits ``code``."""
 
     def __init__(self, *, code: int = 0) -> None:
         self.code = code
@@ -426,21 +410,30 @@ class _Runner:
         return self.code
 
 
+class _AgentProcess:
+    """Stands in for the agent process ``run`` hands off to; exits ``code``."""
+
+    def __init__(self, *, code: int = 0) -> None:
+        self.code = code
+        self.calls: list[tuple[list[str], str | None]] = []
+        """Each hand-off: its arguments, and its profile's server or ``None``."""
+
+    def __call__(self, argv: Sequence[str], *, profile: Profile | None) -> int:
+        self.calls.append((list(argv), None if profile is None else profile.url))
+        return self.code
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Runners:
-    """The four runners ``run`` and ``job`` hand off to."""
+    """The two runners ``run`` and ``job`` hand off to."""
 
-    sagent: _Runner
-    claude: _Runner
-    codex: _Runner
+    process: _AgentProcess
     job: _Runner
 
     def calls(self) -> list[tuple[str, list[str]]]:
-        """Return every hand-off, each with the runner that took it."""
+        """Return every hand-off, each with the verb that made it."""
         return [
-            *(("sagent", argv) for argv in self.sagent.calls),
-            *(("claude", argv) for argv in self.claude.calls),
-            *(("codex", argv) for argv in self.codex.calls),
+            *(("run", argv) for argv, _ in self.process.calls),
             *(("job", argv) for argv in self.job.calls),
         ]
 
@@ -465,9 +458,7 @@ def server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _Server:
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     # The real host serves until Ctrl-C, and the real runners start an agent or a job.
     monkeypatch.setattr(serve, "connect_host", _never_runs("connect_host"))
-    monkeypatch.setattr(agent_cli, "sagent_main", _never_runs("the sagent runner"))
-    monkeypatch.setattr(agent_cli, "main", _never_runs("the claude runner"))
-    monkeypatch.setattr(agent_cli, "codex_main", _never_runs("the codex runner"))
+    monkeypatch.setattr(main, "main", _never_runs("the agent process"))
     monkeypatch.setattr(jobs_cli, "main", _never_runs("the job runner"))
     return scripted
 
@@ -505,15 +496,8 @@ def host(monkeypatch: pytest.MonkeyPatch) -> _Host:
 
 @pytest.fixture
 def runners(monkeypatch: pytest.MonkeyPatch) -> _Runners:
-    stand_ins = _Runners(
-        sagent=_Runner(),
-        claude=_Runner(),
-        codex=_Runner(),
-        job=_Runner(),
-    )
-    monkeypatch.setattr(agent_cli, "sagent_main", stand_ins.sagent)
-    monkeypatch.setattr(agent_cli, "main", stand_ins.claude)
-    monkeypatch.setattr(agent_cli, "codex_main", stand_ins.codex)
+    stand_ins = _Runners(process=_AgentProcess(), job=_Runner())
+    monkeypatch.setattr(main, "main", stand_ins.process)
     monkeypatch.setattr(jobs_cli, "main", stand_ins.job)
     return stand_ins
 
@@ -676,7 +660,7 @@ def test_every_verb_reaches_knowops_server_while_trax_points_at_another(
     for argv in (
         ["status"],
         ["connect"],
-        ["run", "claude"],
+        ["run"],
         ["job", "logs", "7"],
         ["host"],
         ["canvas", _CANVAS],
@@ -689,10 +673,8 @@ def test_every_verb_reaches_knowops_server_while_trax_points_at_another(
     assert [(served.server, served.token) for served in host.connects] == [
         ("https://acme.knowop.ai", _ENROLL_TOKEN),
     ]
-    assert runners.calls() == [
-        ("claude", ["--profile", "acme.knowop.ai"]),
-        ("job", ["--profile", "acme.knowop.ai", "logs", "7"]),
-    ]
+    assert runners.process.calls == [([], _ACME)]
+    assert runners.job.calls == [["--profile", "acme.knowop.ai", "logs", "7"]]
     assert list_profiles() == [("prod", _PROD)]
     assert current_profile() == "prod"
 
@@ -715,17 +697,11 @@ def test_status_names_the_profile_server_account_role_and_the_accounts_hosts(
     ]
 
 
-def test_status_lists_each_hosts_runs_and_the_runs_here_it_names_on_none(
+def test_status_lists_each_hosts_runs(
     server: _Server,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     server.runs["gpu1"] = [_run("chat-1a2b3c4d")]
-    monkeypatch.setattr(
-        detach,
-        "live_hosts",
-        lambda: [_detached("chat-1a2b3c4d"), _detached("scratch")],
-    )
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
@@ -735,8 +711,44 @@ def test_status_lists_each_hosts_runs_and_the_runs_here_it_names_on_none(
         "host: ada-mac online (this computer)",
         "host: gpu1 offline, 1 run live",
         "  run:   chat-1a2b3c4d  claude  ~/work",
-        "here:    scratch  claude",
     ]
+
+
+def test_status_counts_a_hosts_runs_and_shows_one_with_no_folder(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.runs["gpu1"] = [_run("chat-1a2b3c4d"), {**_run("nightly"), "cwd": None}]
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("status") == 0
+
+    assert capsys.readouterr().out.splitlines()[5:] == [
+        "host: gpu1 offline, 2 runs live",
+        "  run:   chat-1a2b3c4d  claude  ~/work",
+        "  run:   nightly  claude  ",
+    ]
+
+
+def test_status_without_a_service_manager_lists_no_service_and_no_menu_bar(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(service, "here", lambda: None)
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("status") == 0
+    assert _knowop("status", "--json") == 0
+
+    out = capsys.readouterr().out
+    text, printed = out.split("{", 1)
+    assert text.splitlines()[-1] == "host: gpu1 offline"
+    # Indented by two, for a person reading it too.
+    assert printed.startswith('\n  "logins": [')
+    report = json_loads("{" + printed, dict[str, object])
+    assert (report["services"], report["menubar"]) == ([], None)
 
 
 def test_status_without_a_login_exits_1_with_one_line(
@@ -930,26 +942,17 @@ def test_logout_without_a_login_exits_1(server: _Server) -> None:
     assert server.requests == []
 
 
-def test_disconnect_stops_the_runs_here_before_it_disconnects_this_computer(
+def test_disconnect_disconnects_this_computer_and_names_the_runs_the_server_stopped(
     server: _Server,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     server.runs["ada-mac"] = [_run("chat-1a2b3c4d")]
     assert _knowop("login", "acme") == 0
-    asked: list[int] = []
-
-    def stop_all() -> int:
-        asked.append(len(server.requests))
-        return 0
-
-    monkeypatch.setattr(detach, "stop_all", stop_all)
-    before = len(server.requests)
     capsys.readouterr()
 
     assert _knowop("disconnect") == 0
 
-    assert (asked, server.disconnected) == ([before], ["ada-mac"])
+    assert server.disconnected == ["ada-mac"]
     assert capsys.readouterr().out.splitlines() == [
         "stopped: run chat-1a2b3c4d (claude)",
         (
@@ -959,30 +962,12 @@ def test_disconnect_stops_the_runs_here_before_it_disconnects_this_computer(
     ]
 
 
-def test_disconnect_of_another_host_leaves_the_runs_here(
-    server: _Server,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(detach, "stop_all", _never_runs("stop_all"))
+def test_disconnect_of_another_host_disconnects_that_host(server: _Server) -> None:
     assert _knowop("login", "acme") == 0
 
     assert _knowop("disconnect", "gpu1") == 0
 
     assert server.disconnected == ["gpu1"]
-
-
-def test_disconnect_stops_short_of_the_server_when_a_run_here_does_not_stop(
-    server: _Server,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setattr(detach, "stop_all", lambda: 1)
-    assert _knowop("login", "acme") == 0
-
-    assert _knowop("disconnect") == 1
-
-    assert server.disconnected == []
-    assert "a run here did not stop" in capsys.readouterr().err
 
 
 def test_connect_without_a_login_enrolls_this_computer_in_the_same_approval(
@@ -1164,24 +1149,6 @@ def test_ctrl_c_stops_connect_with_130(monkeypatch: pytest.MonkeyPatch) -> None:
     assert _knowop("connect") == 130
 
 
-def test_ctrl_c_names_the_runs_it_leaves_reaching_the_server(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The host reads offline once its connect lets go; a detached run does not."""
-    monkeypatch.setattr(serve, "connect_host", _Host(ending=KeyboardInterrupt()))
-    monkeypatch.setattr(detach, "live_hosts", lambda: [_detached("chat-1a2b3c4d")])
-    assert _knowop("login", "acme") == 0
-    capsys.readouterr()
-
-    assert _knowop("connect") == 130
-
-    assert capsys.readouterr().err == (
-        "knowop: still reaching the server from here: chat-1a2b3c4d; stop them with "
-        "knowop run stop --all, or everything with knowop disconnect\n"
-    )
-
-
 @pytest.mark.parametrize("ending", [signal.SIGTERM, signal.SIGHUP])
 def test_a_stop_or_a_hangup_ends_connect_like_ctrl_c_and_is_then_forgotten(
     monkeypatch: pytest.MonkeyPatch,
@@ -1216,57 +1183,56 @@ def test_connect_leaves_no_client_open_for_a_later_command(
 
 
 @pytest.mark.parametrize(
-    ("argv", "runner", "handed"),
+    "argv",
     [
-        (["claude", "--as", "ada", "--", "--model", "opus"], "claude", 1),
-        (["codex", "--private"], "codex", 1),
-        (["sagent", "resume", "00000000-0000-0000-0000-000000000009"], "sagent", 1),
-        ([], "sagent", 0),
-        (["attach", "claude"], "sagent", 0),
-        (["resume", "00000000-0000-0000-0000-000000000009"], "sagent", 0),
-        (["--detach", "--name", "nightly"], "sagent", 0),
+        [],
+        ["--headless", "--model", "opus"],
+        ["--session", "00000000-0000-0000-0000-000000000009"],
+        ["--on", "lab", "--", "--name", "nightly"],
+        ["--", "--help"],
     ],
+    ids=["bare", "sagents-flags", "a-session", "on-a-host", "help-after-the-dashes"],
 )
-def test_run_hands_the_agent_runner_knowops_profile_and_the_rest(
+def test_run_is_the_agent_process_with_knowops_profile(
     runners: _Runners,
     argv: list[str],
-    runner: str,
-    handed: int,
 ) -> None:
     assert _knowop("login", "acme") == 0
 
     assert _knowop("run", *argv) == 0
 
-    assert runners.calls() == [
-        (runner, ["--profile", "acme.knowop.ai", *argv[handed:]]),
-    ]
+    assert runners.calls() == [("run", argv)]
+    assert runners.process.calls == [(argv, _ACME)]
 
 
-def test_run_help_is_knowops_and_a_runners_help_is_the_runners(
-    runners: _Runners,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    with pytest.raises(SystemExit) as exited:
-        _knowop("run", "--help")
-
-    assert exited.value.code == 0
-    assert capsys.readouterr().out.startswith("usage: knowop run ")
-    assert runners.calls() == []
-    assert _knowop("login", "acme") == 0
-    assert _knowop("run", "claude", "--help") == 0
-    assert runners.calls() == [("claude", ["--profile", "acme.knowop.ai", "--help"])]
-
-
-@pytest.mark.parametrize("argv", [["run", "codex"], ["job", "logs", "7"]])
-def test_a_hand_off_exits_with_the_runners_status(
+@pytest.mark.parametrize(
+    "argv",
+    [["--help"], ["-h"], ["--headless", "--help"], ["-h", "--", "x"]],
+    ids=["help", "h", "after-a-flag", "before-the-dashes"],
+)
+def test_run_help_is_the_agent_processs_needs_no_login_and_asks_the_server_nothing(
+    server: _Server,
     runners: _Runners,
     argv: list[str],
 ) -> None:
-    runners.codex.code = 3
-    runners.job.code = 3
+    assert _knowop("run", *argv) == 0
+
+    assert runners.process.calls == [(argv, None)]
+    assert server.requests == []
+    assert list_profiles() == []
+
+
+@pytest.mark.parametrize(("argv", "code"), [(["run"], 3), (["job", "logs", "7"], 4)])
+def test_a_hand_off_exits_with_the_runners_status(
+    runners: _Runners,
+    argv: list[str],
+    code: int,
+) -> None:
+    runners.process.code = 3
+    runners.job.code = 4
     assert _knowop("login", "acme") == 0
 
-    assert _knowop(*argv) == 3
+    assert _knowop(*argv) == code
 
 
 def test_job_refuses_without_a_login_before_any_request(
@@ -1342,6 +1308,16 @@ def test_host_help_needs_no_login_and_asks_the_server_nothing(
     assert server.requests == []
 
 
+def test_canvas_help_names_its_own_verb_and_needs_no_login(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("canvas", "--help") == 0
+
+    assert capsys.readouterr().out.startswith("Usage: knowop canvas CANVAS_UUID")
+    assert server.requests == []
+
+
 def test_canvas_shows_a_visual_on_the_runs_canvas_on_knowops_server(
     server: _Server,
     monkeypatch: pytest.MonkeyPatch,
@@ -1388,6 +1364,356 @@ def test_canvas_refuses_without_a_login_before_any_request(
     assert capsys.readouterr().err == "knowop: not logged in; run knowop login\n"
 
 
+@dataclass(slots=True, kw_only=True)
+class _Uploads:
+    """Stands for the upload itself: what it was asked, and a session it fails."""
+
+    calls: list[tuple[list[str], str, bool, int, bool]] = field(
+        default_factory=list[tuple[list[str], str, bool, int, bool]],
+    )
+    """Each call's session ids, server, privacy, jobs, and whether it masks."""
+
+    failing: frozenset[str] = frozenset()
+    keys: list[str | None] = field(default_factory=list[str | None])
+    """The API key each call's client signs in with."""
+
+    def __call__(
+        self,
+        sessions: Sequence[upload.Session],
+        *,
+        connect: Callable[[], Client],
+        private: bool,
+        jobs: int,
+        redactor: object,
+    ) -> list[upload.Uploaded]:
+        with connect() as client:
+            server = client.base_url
+            self.keys.append(client.api_key)
+        self.calls.append(
+            (
+                [f"{s.format} {s.id}" for s in sessions],
+                server,
+                private,
+                jobs,
+                redactor is not None,
+            ),
+        )
+        return [
+            upload.Uploaded(session=session, error="refused")
+            if session.id in self.failing
+            else upload.Uploaded(
+                session=session,
+                agent_session=uuid.UUID(int=index + 1),
+                sent=7,
+                held=index,
+                refused=index,
+                audience="private" if private else "open",
+            )
+            for index, session in enumerate(sessions)
+        ]
+
+
+@pytest.fixture
+def uploads(monkeypatch: pytest.MonkeyPatch) -> _Uploads:
+    stand_in = _Uploads()
+    monkeypatch.setattr(upload, "upload", stand_in)
+    return stand_in
+
+
+def _transcripts(folder: Path) -> Path:
+    """Write a claude session with a sub-agent, and one whose spawner is not here."""
+    for name in (
+        "s1.jsonl",
+        "s1/subagents/agent-a1.jsonl",
+        "s2/subagents/agent-b1.jsonl",
+    ):
+        path = folder / "-w" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"type": "user", "sessionId": "s1", "uuid": "u1"}\n')
+    return folder
+
+
+_JOBS: Final = min(8, os.cpu_count() or 1)
+"""How many sessions ``upload`` sends side by side unless told."""
+
+_CLAUDE: Final = ["claude s1", "claude s1/agent-a1", "claude s2/agent-b1"]
+"""The sessions ``_transcripts`` writes, as the upload is handed them."""
+
+
+def test_upload_sends_each_session_to_knowops_server_and_totals_them(
+    uploads: _Uploads,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    folder = _transcripts(tmp_path / "copy")
+    capsys.readouterr()
+
+    assert _knowop("upload", str(folder)) == 0
+
+    assert uploads.calls == [(_CLAUDE, _ACME, True, _JOBS, False)]
+    assert uploads.keys == [_KEY]
+    one, two, three = (uuid.UUID(int=n) for n in (1, 2, 3))
+    assert capsys.readouterr().out.splitlines() == [
+        f"uploading 3 sessions to {_ACME}",
+        f"claude s1: AgentSession {one} (private), sent 7, held 0, 1 sub-agent",
+        (
+            f"claude s1/agent-a1: AgentSession {two} (private), sent 7, held 1, 1 refused, "
+            "0 sub-agents, spawned by s1"
+        ),
+        (
+            f"claude s2/agent-b1: AgentSession {three} (private), sent 7, held 2, 2 refused, "
+            "0 sub-agents, spawned by s2, whose file is not here"
+        ),
+        "uploaded 3 sessions: 21 records sent, 3 already there",
+    ]
+
+
+def test_upload_flags_reach_the_upload(
+    uploads: _Uploads,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRAX_REDACT_NAMES", "SECRET")
+    monkeypatch.setenv("SECRET", "hunter2-hunter2")
+    assert _knowop("login", "acme") == 0
+    folder = _transcripts(tmp_path)
+
+    assert _knowop("upload", str(folder / "-w"), "--public", "--no-subagents") == 0
+    assert _knowop("upload", str(folder), "--private", "--jobs", "1") == 0
+    assert _knowop("upload", str(folder), "--format", "codex") == 0
+
+    assert [call[0] for call in uploads.calls] == [
+        ["claude s1", "claude s2/agent-b1"],
+        _CLAUDE,
+        ["codex agent-a1", "codex s1", "codex agent-b1"],
+    ]
+    assert [call[2:] for call in uploads.calls] == [
+        (False, _JOBS, True),
+        (True, 1, True),
+        (True, _JOBS, True),
+    ]
+
+
+@pytest.mark.parametrize("jobs", ["0", "-1", "two"])
+def test_upload_refuses_a_count_of_jobs_below_one(
+    jobs: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        _ = _knowop("upload", str(tmp_path), "--jobs", jobs)
+
+    assert f"argument --jobs: {jobs!r} is not a number of 1 or more" in (
+        capsys.readouterr().err
+    )
+
+
+def test_upload_sends_one_at_a_time_where_the_cpus_cannot_be_counted(
+    uploads: _Uploads,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "cpu_count", lambda: None)
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("upload", str(_transcripts(tmp_path))) == 0
+
+    assert [call[3] for call in uploads.calls] == [1]
+
+
+@pytest.mark.parametrize("read_as", ["claude", "codex", "sagent"])
+def test_upload_reads_every_file_as_the_format_named(
+    read_as: str,
+    uploads: _Uploads,
+    tmp_path: Path,
+) -> None:
+    assert _knowop("login", "acme") == 0
+    folder = _transcripts(tmp_path)
+    # A sagent session is its folder's ``session.jsonl``, whatever it is read as.
+    (folder / "j1").mkdir()
+    (folder / "j1" / "session.jsonl").write_text('{"kind": "meta"}\n')
+
+    assert _knowop("upload", str(folder), "--format", read_as) == 0
+
+    assert {name.split()[0] for name in uploads.calls[0][0]} == {read_as}
+
+
+def test_upload_refuses_a_format_it_does_not_send(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        _ = _knowop("upload", str(tmp_path), "--format", "gemini")
+
+    assert "argument --format: invalid choice: 'gemini'" in capsys.readouterr().err
+
+
+def test_upload_help_names_each_flag_and_what_it_does(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        _ = _knowop("upload", "--help")
+
+    said = " ".join(capsys.readouterr().out.split())
+    for part in (
+        "[--private | --public]",
+        "[--server ORG|URL]",
+        "[--format {claude,codex,sagent}]",
+        "[--jobs N]",
+        "PATH [PATH ...]",
+        "--private open a new session to you and those who oversee (default)",
+        "--public open a new session to the organization",
+        "sends only what the server lacks, and leaves it to the readers it has.",
+    ):
+        assert part in said
+
+
+def test_upload_to_another_server_uses_knowops_saved_login_for_it(
+    uploads: _Uploads,
+    tmp_path: Path,
+) -> None:
+    assert _knowop("login", "acme") == 0
+    assert _knowop("login", "https://staging.example/") == 0
+    folder = _transcripts(tmp_path)
+
+    assert _knowop("upload", str(folder), "--server", "acme") == 0
+    assert _knowop("upload", str(folder), "--server", "https://staging.example/") == 0
+
+    assert [call[1] for call in uploads.calls] == [_ACME, "https://staging.example"]
+
+
+def test_upload_with_a_profile_named_before_it_goes_to_that_login(
+    uploads: _Uploads,
+    tmp_path: Path,
+) -> None:
+    save_profile("staging", Profile(url="https://staging.example", api_key=_KEY))
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("--profile", "staging", "upload", str(_transcripts(tmp_path))) == 0
+
+    assert [call[1] for call in uploads.calls] == ["https://staging.example"]
+
+
+def test_upload_with_a_profile_named_looks_for_another_server_in_that_login_alone(
+    uploads: _Uploads,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    save_profile("staging", Profile(url="https://staging.example", api_key=_KEY))
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+    folder = str(_transcripts(tmp_path))
+
+    assert _knowop("--profile", "staging", "upload", folder, "--server", "acme") == 1
+
+    assert capsys.readouterr().err == (
+        f"knowop: not logged in to {_ACME}; run knowop login acme\n"
+    )
+    assert uploads.calls == []
+
+
+def test_upload_to_a_server_with_no_saved_login_says_to_log_in_and_starts_none(
+    server: _Server,
+    uploads: _Uploads,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    server.requests.clear()
+    capsys.readouterr()
+
+    assert _knowop("upload", str(_transcripts(tmp_path)), "--server", "lab") == 1
+
+    assert capsys.readouterr().err == (
+        "knowop: not logged in to https://lab.knowop.ai; run knowop login lab\n"
+    )
+    assert server.requests == []
+    assert uploads.calls == []
+
+
+def test_upload_without_a_login_refuses(uploads: _Uploads, tmp_path: Path) -> None:
+    assert _knowop("upload", str(_transcripts(tmp_path))) == 1
+
+    assert uploads.calls == []
+
+
+def test_upload_says_each_failed_session_and_exits_1(
+    uploads: _Uploads,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    uploads.failing = frozenset({"s1/agent-a1"})
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("upload", str(_transcripts(tmp_path))) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines()[2:] == [
+        "claude s1/agent-a1: failed: refused",
+        (
+            f"claude s2/agent-b1: AgentSession {uuid.UUID(int=3)} (private), sent 7, held 2, "
+            "2 refused, 0 sub-agents, spawned by s2, whose file is not here"
+        ),
+        "uploaded 2 sessions: 14 records sent, 2 already there",
+    ]
+    assert captured.err == "knowop: 1 session failed\n"
+
+
+def test_upload_dry_run_lists_each_session_and_asks_no_server(
+    server: _Server,
+    uploads: _Uploads,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    folder = _transcripts(tmp_path)
+
+    assert _knowop("upload", str(folder / "-w" / "s1.jsonl"), "--dry-run") == 0
+
+    root = folder / "-w"
+    assert capsys.readouterr().out.splitlines() == [
+        f"claude s1  {root / 's1.jsonl'}, 1 sub-agent",
+        (
+            f"claude s1/agent-a1  {root / 's1/subagents/agent-a1.jsonl'}, 0 sub-agents, "
+            "spawned by s1"
+        ),
+        "would upload 2 sessions; --dry-run sent none",
+    ]
+    assert server.requests == []
+    assert uploads.calls == []
+
+
+def test_upload_of_a_path_not_there_names_it(
+    uploads: _Uploads,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("upload", str(tmp_path), str(tmp_path / "gone")) == 1
+    assert _knowop("upload", str(tmp_path / "gone"), str(tmp_path / "lost")) == 1
+
+    assert capsys.readouterr().err == (
+        f"knowop: no such file or folder: {tmp_path / 'gone'}\n"
+        f"knowop: no such file or folder: {tmp_path / 'gone'}, {tmp_path / 'lost'}\n"
+    )
+    assert uploads.calls == []
+
+
+def test_upload_of_a_folder_holding_no_session_says_so(
+    uploads: _Uploads,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (tmp_path / "history.jsonl").write_text('{"display": "hi", "sessionId": "s"}\n')
+
+    assert _knowop("upload", str(tmp_path)) == 1
+
+    assert capsys.readouterr().err == (
+        "knowop: no Claude Code, Codex or sagent session found there\n"
+    )
+    assert uploads.calls == []
+
+
 @pytest.mark.parametrize("argv", [["--help"], ["help"], ["show", "-h"]])
 def test_canvas_help_is_knowops_needs_no_login_and_asks_the_server_nothing(
     server: _Server,
@@ -1419,7 +1745,23 @@ def test_knowops_help_lists_host_among_its_verbs(
         _knowop("--help")
 
     assert exited.value.code == 0
-    assert "    host " in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "    host " in out
+    # The module's docstring is the page, its first line after the usage.
+    assert out.splitlines()[2] == (
+        "Log in to KnowOp, connect this computer, and run recorded agents and GPU jobs."
+    )
+
+
+def test_knowop_reads_its_verb_from_the_command_line(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["knowop", "status"])
+
+    assert cli.main() == 1
+
+    assert capsys.readouterr().err == "knowop: not logged in; run knowop login\n"
 
 
 def test_knowops_help_lists_canvas_among_its_verbs(
@@ -1437,7 +1779,7 @@ def test_a_first_run_logs_in_to_the_default_server_then_runs(
     runners: _Runners,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert _knowop("run", "claude", "--as", "ada") == 0
+    assert _knowop("run", "--headless") == 0
 
     assert server.netlocs() == {"alpha.knowop.ai"}
     assert json_loads(server.requests[0].content, dict[str, object]) == {
@@ -1445,9 +1787,7 @@ def test_a_first_run_logs_in_to_the_default_server_then_runs(
         "hostname": "Ada_Mac",
         "host": None,
     }
-    assert runners.calls() == [
-        ("claude", ["--profile", "alpha.knowop.ai", "--as", "ada"]),
-    ]
+    assert runners.process.calls == [(["--headless"], "https://alpha.knowop.ai")]
     assert "logged in: profile alpha.knowop.ai (writer)" in capsys.readouterr().out
 
 
@@ -1469,14 +1809,14 @@ def test_a_run_says_to_connect_when_this_computer_is_not_online(
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
-    assert _knowop("run", "codex") == 0
+    assert _knowop("run") == 0
 
     hint = (
         "knowop: this computer (ada-mac) is not connected; run knowop connect in "
         "another terminal to open its terminal from Chat\n"
     )
     assert capsys.readouterr().err == (hint if said else "")
-    assert [runner for runner, _ in runners.calls()] == ["codex"]
+    assert runners.calls() == [("run", [])]
 
 
 def test_a_run_says_nothing_of_connecting_when_the_hosts_cannot_be_listed(
@@ -1488,44 +1828,10 @@ def test_a_run_says_nothing_of_connecting_when_the_hosts_cannot_be_listed(
     capsys.readouterr()
     server.refuse["/api/hosts"] = 403
 
-    assert _knowop("run", "codex") == 0
+    assert _knowop("run") == 0
 
     assert capsys.readouterr().err == ""
-    assert [runner for runner, _ in runners.calls()] == ["codex"]
-
-
-@pytest.mark.parametrize(
-    "argv",
-    [["attach", "nightly"], ["ls"], ["claude", "--help"], ["-h", "--", "x"]],
-)
-def test_help_and_a_host_command_need_no_login_and_ask_the_server_nothing(
-    server: _Server,
-    runners: _Runners,
-    argv: list[str],
-) -> None:
-    assert _knowop("run", *argv) == 0
-
-    assert server.requests == []
-    assert runners.calls() == [
-        ("claude", argv[1:]) if argv[0] == "claude" else ("sagent", argv),
-    ]
-
-
-def test_a_host_command_still_names_knowops_profile_once_logged_in(
-    server: _Server,
-    runners: _Runners,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(detach, "live_hosts", lambda: [_detached("nightly")])
-    assert _knowop("login", "acme") == 0
-    asked = len(server.requests)
-
-    assert _knowop("run", "stop", "nightly") == 0
-
-    assert len(server.requests) == asked
-    assert runners.calls() == [
-        ("sagent", ["--profile", "acme.knowop.ai", "stop", "nightly"]),
-    ]
+    assert runners.calls() == [("run", [])]
 
 
 def test_connect_with_a_piped_token_joins_without_a_login(
@@ -1547,6 +1853,8 @@ def test_connect_with_a_piped_token_joins_without_a_login(
             sandbox=True,
         ),
     ]
+    # No login to sign in with: the token alone joins.
+    assert [served.signed_in_to for served in host.connects] == [""]
     assert list_profiles() == []
 
 
@@ -1579,12 +1887,14 @@ def test_a_piped_token_is_left_to_the_host_when_knowop_is_logged_in_there(
     assert [served.token for served in host.connects] == [_ENROLL_TOKEN]
 
 
+@pytest.mark.parametrize("flag", ["--help", "-h"])
 def test_job_help_is_knowops(
     runners: _Runners,
     capsys: pytest.CaptureFixture[str],
+    flag: str,
 ) -> None:
     with pytest.raises(SystemExit) as exited:
-        _knowop("job", "--help")
+        _knowop("job", flag)
 
     assert exited.value.code == 0
     assert capsys.readouterr().out.startswith("usage: knowop job ")
@@ -1744,6 +2054,37 @@ def test_connect_at_a_terminal_returns_once_its_service_serves_the_host(
     assert launchd.menubar[-1] == "bootstrap"
 
 
+@pytest.mark.usefixtures("host", "launchd")
+@pytest.mark.parametrize(
+    ("given", "flags"),
+    [
+        ((), ()),
+        (("--no-exec",), ("--no-exec",)),
+        (("--sandbox", "--no-exec"), ("--sandbox", "--no-exec")),
+        (("--jobs",), ("--jobs", "--job-results-max", "256M")),
+        (
+            ("--jobs", "--job-results-max", "1G"),
+            ("--jobs", "--job-results-max", "1G"),
+        ),
+        (("--job-results-max", "1G"), ()),
+    ],
+    ids=["none", "no-exec", "sandbox no-exec", "jobs", "jobs max", "max alone"],
+)
+def test_the_service_serves_with_the_flags_connect_was_given(
+    agents: Services,
+    monkeypatch: pytest.MonkeyPatch,
+    given: tuple[str, ...],
+    flags: tuple[str, ...],
+) -> None:
+    """Each flag reaches the service's own run as given; a size alone asks for no jobs."""
+    _ = _at_terminal(monkeypatch)
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("connect", *given) == 0
+
+    assert agents.every() == [Connect(name="ada-mac", server=_ACME, flags=flags)]
+
+
 @pytest.mark.parametrize(("platform", "code"), [("darwin", 0), ("linux", 1)])
 def test_the_menu_bar_runs_on_macos_alone(
     monkeypatch: pytest.MonkeyPatch,
@@ -1850,23 +2191,16 @@ def test_connect_with_other_flags_reloads_its_service(
     assert terminal.lines()[-3] == _CONNECTED.replace("4243", "4244")
 
 
-@pytest.mark.parametrize(
-    ("fact", "running"),
-    [("knowop_version", "0.0.1"), ("clis", ["gone"])],
-    ids=["knowop upgraded since", "CLI installed since"],
-)
 @pytest.mark.usefixtures("host")
-def test_connect_restarts_a_service_whose_host_would_now_report_otherwise(
+def test_connect_restarts_a_service_whose_knowop_was_upgraded_since(
     server: _Server,
     launchd: _Launchd,
     monkeypatch: pytest.MonkeyPatch,
-    fact: str,
-    running: object,
 ) -> None:
     terminal = _at_terminal(monkeypatch)
     assert _knowop("login", "acme") == 0
     assert _knowop("connect") == 0
-    server.facts["ada-mac"][fact] = running
+    server.facts["ada-mac"]["knowop_version"] = "0.0.1"
 
     assert _knowop("connect") == 0
 
@@ -2105,10 +2439,12 @@ def test_the_services_own_run_rotates_its_log_while_it_serves(
 @pytest.mark.parametrize(
     ("status", "code"),
     [
+        (400, 0),
         (401, 0),
         (403, 0),
         (404, 0),
         (410, 0),
+        (499, 0),
         (408, 1),
         (429, 1),
         (500, 1),
@@ -2127,12 +2463,16 @@ def test_the_services_own_run_exits_0_on_a_refusal_no_restart_can_change(
     monkeypatch.setattr(serve, "connect_host", _Host(ending=refused))
     assert _knowop("login", "acme") == 0
     log = str(tmp_path / "ada-mac.log")
+    capsys.readouterr()
 
     assert _knowop("connect", _ACME, "--name", "ada-mac", "--log-file", log) == code
+    # The service's run says why it stopped, or main does as it exits 1.
+    assert capsys.readouterr().err == (
+        "knowop: POST /heartbeat -> refused\n"
+        + ("knowop: stopped; knowop connect starts it again\n" if code == 0 else "")
+    )
     # Outside a service, every refusal still exits 1.
     assert _knowop("connect") == 1
-
-    assert capsys.readouterr().err.count("knowop: stopped;") == 1 - code
 
 
 def test_the_services_own_run_never_logs_in(
@@ -2245,6 +2585,224 @@ def test_logout_keeps_knowops_login_to_another_server_and_says_it_is_in_use(
     )
 
 
+def test_a_profile_named_before_the_verb_is_the_login_that_verb_uses(
+    server: _Server,
+    runners: _Runners,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    save_profile("staging", Profile(url="https://staging.example", api_key=_KEY))
+    save_profile("prod", _PROD)
+    # Every connected shell sets it; knowop reads it never.
+    monkeypatch.setenv("TRACKINIZER_PROFILE", "prod")
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("--profile", "staging", "status") == 0
+    assert _knowop("--profile=staging", "run", "--headless") == 0
+    # One named after the verb is the runner's own, which reads the last.
+    assert _knowop("--profile", "staging", "job", "logs", "--profile", "other") == 0
+
+    assert capsys.readouterr().out.splitlines()[:2] == [
+        "profile: staging",
+        "server:  https://staging.example",
+    ]
+    assert runners.process.calls == [(["--headless"], "https://staging.example")]
+    assert runners.job.calls == [
+        ["--profile", "staging", "logs", "--profile", "other"],
+    ]
+    assert server.netlocs() == {"acme.knowop.ai", "staging.example"}
+    # Without the flag, knowop uses the login it remembered, as before.
+    assert _saved_logins() == ["acme.knowop.ai"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["disconnect", "gpu1"],
+        ["logout"],
+        ["run"],
+        ["host"],
+        ["canvas", _CANVAS],
+    ],
+    ids=["next step", "disconnect", "logout", "run", "host", "canvas"],
+)
+@pytest.mark.usefixtures("runners")
+def test_every_verb_asks_the_server_of_the_profile_named_before_it(
+    server: _Server,
+    argv: list[str],
+) -> None:
+    save_profile("staging", Profile(url="https://staging.example", api_key=_KEY))
+    assert _knowop("login", "acme") == 0
+    server.requests.clear()
+
+    _ = _knowop("--profile", "staging", *argv)
+
+    assert server.netlocs() == {"staging.example"}
+
+
+def test_logs_reads_the_log_of_the_profile_named_before_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    save_profile("staging", Profile(url="https://staging.example", api_key=_KEY))
+    assert _knowop("login", "acme") == 0
+    _ = _connect_log("ada-mac")
+    capsys.readouterr()
+
+    assert _knowop("--profile", "staging", "logs") == 1
+
+    assert capsys.readouterr().err.startswith(
+        "knowop: no log of host ada-mac on this computer",
+    )
+
+
+def test_a_first_run_under_a_named_profile_logs_in_as_it(
+    server: _Server,
+    runners: _Runners,
+) -> None:
+    """A login knowop keeps already is not the named profile's."""
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("--profile", "fresh", "run") == 0
+
+    assert [name for name, _ in list_profiles()] == ["acme.knowop.ai", "fresh"]
+    assert server.paths().count(DEVICE_CODE_PATH) == 2
+    assert runners.process.calls == [([], read_profile("fresh").url)]
+
+
+def test_a_connect_under_a_named_profile_logs_in_and_saves_it_under_that_name(
+    host: _Host,
+) -> None:
+    assert _knowop("--profile", "svc", "connect") == 0
+
+    assert [name for name, _ in list_profiles()] == ["svc"]
+    assert read_profile("svc").url == "https://alpha.knowop.ai"
+    assert [(served.server, served.token) for served in host.connects] == [
+        ("https://alpha.knowop.ai", _LOGIN_TOKEN),
+    ]
+
+
+def test_a_profile_that_is_not_saved_is_no_login(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("--profile", "nope", "status") == 1
+
+    assert capsys.readouterr().err == (
+        "knowop: not logged in; run knowop --profile nope login\n"
+    )
+    assert server.paths().count("/api/me/profile") == 0
+
+
+def test_a_login_under_a_named_profile_saves_it_under_that_name_and_uses_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("--profile", "mine", "login", "acme") == 0
+
+    assert [name for name, _ in list_profiles()] == ["mine"]
+    assert read_profile("mine").url == _ACME
+    assert _saved_logins() == ["mine"]
+    assert "logged in: profile mine (writer)\n" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("flag", ["--host", "--port"])
+def test_traxs_other_connection_flags_are_refused_before_the_verb(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+    flag: str,
+) -> None:
+    assert _knowop(flag, "8765", "status") == 1
+
+    assert capsys.readouterr().err == (
+        "knowop: knowop reads --profile alone before its verb; --host and --port "
+        "are trax's\n"
+    )
+    assert server.requests == []
+
+
+def test_a_bad_flag_before_the_verb_is_refused_as_knowops(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        _knowop("--port", "x", "status")
+
+    assert exited.value.code == 2
+    assert capsys.readouterr().err.splitlines()[-1] == (
+        "knowop: error: argument --port: invalid int value: 'x'"
+    )
+    assert server.requests == []
+
+
+def test_run_serve_hands_the_agent_process_its_arguments_and_no_profile(
+    server: _Server,
+    runners: _Runners,
+) -> None:
+    runners.process.code = 4
+
+    argv = ["--serve", "https://know.example", "--model", "opus"]
+    assert _knowop("--profile", "staging", "run", *argv) == 4
+
+    assert runners.process.calls == [(argv, None)]
+    assert server.requests == []
+    assert runners.job.calls == []
+
+
+def test_connect_starts_no_agents_for_other_accounts(
+    host: _Host,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A person's knowop serves their own computer; remote agents are no flag of it."""
+    with pytest.raises(SystemExit) as exited:
+        _knowop("connect", "--shared")
+
+    assert exited.value.code == 2
+    assert "unrecognized arguments: --shared" in capsys.readouterr().err
+    assert host.connects == []
+
+
+_CONNECT_HELP: Final = """\
+usage: knowop connect [-h] [--name NAME] [--no-exec] [--sandbox] [--jobs] [--job-results-max SIZE] [--foreground] [--follow] [ORG|URL]
+
+Connect this computer and serve its terminals, and its tools to the server's assistant. At a terminal, join here, then serve it from a user service (launchd on macOS, systemd on Linux) that keeps running in the background and starts again at login; knowop logs -f follows it and knowop disconnect stops it. Elsewhere, and with --foreground, serve here until Ctrl-C. When knowop is not logged in to
+the server, log in first: the same approval enrolls and confirms this computer. An enrollment token piped to stdin joins instead, with no login, in the foreground.
+
+positional arguments:
+  ORG|URL               as for login; default the server knowop is logged in to, else https://alpha.knowop.ai
+
+options:
+  -h, --help            show this help message and exit
+  --name NAME           the host's name; default this computer's short host name
+  --no-exec             serve terminals only: run no tool and start no agent here for the server
+  --sandbox             record that this computer is disposable
+  --jobs                also run the jobs your account sends here with knowop job submit --host NAME, each in a fresh worktree of its pushed commit under a memory cap; needs systemd's user manager
+  --job-results-max SIZE
+                        with --jobs: the most result bytes one job sends back (default 256M); larger results stay on this computer
+  --foreground          serve in this terminal until Ctrl-C, installing no service
+  --follow              once the service runs, follow its log until Ctrl-C
+"""
+"""``knowop connect --help`` on a terminal wide enough to wrap none of it."""
+
+
+def test_connect_help_names_each_flag_and_what_it_does(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("COLUMNS", "400")
+    # Python 3.14's argparse colours its help where the environment asks it to.
+    monkeypatch.setenv("PYTHON_COLORS", "0")
+
+    with pytest.raises(SystemExit) as exited:
+        _knowop("connect", "--help")
+
+    assert exited.value.code == 0
+    assert capsys.readouterr().out == _CONNECT_HELP
+
+
 def _saved_logins() -> list[str]:
     """Return the profiles knowop records as its logins, the one in use first."""
     return (config_dir() / "rekursiv-ai" / "knowop" / "profile").read_text().split()
@@ -2345,7 +2903,8 @@ def test_status_lists_this_computers_services_and_one_turned_off(
     agents: Services,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    agents.start(Connect(name="ada-mac", server=_ACME, flags=("--sandbox",)))
+    flags = ("--sandbox", "--no-exec")
+    agents.start(Connect(name="ada-mac", server=_ACME, flags=flags))
     agents.start(Connect(name="gpu1", server=_ACME))
     gpu1 = f"ai.rekursiv.knowop.connect.gpu1.{service.server_tag(_ACME)}"
     launchd.answers["print_disabled"] = (0, f'\t"{gpu1}" => disabled\n')
@@ -2355,7 +2914,7 @@ def test_status_lists_this_computers_services_and_one_turned_off(
     assert _knowop("status") == 0
 
     assert capsys.readouterr().out.splitlines()[-2:] == [
-        f"service: ada-mac {_ACME} --sandbox",
+        f"service: ada-mac {_ACME} --sandbox --no-exec",
         (
             f"service: gpu1 {_ACME}; turned off in Login Items: turn it on in System "
             "Settings > General > Login Items & Extensions"
@@ -2384,10 +2943,9 @@ def test_status_names_how_systemd_turns_a_disabled_service_on(
     )
 
 
-def test_status_json_holds_each_login_the_runs_here_and_the_services(
+def test_status_json_holds_each_login_and_the_services(
     server: _Server,
     agents: Services,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     agents.start(Connect(name="ada-mac", server=_ACME, flags=("--sandbox",)))
@@ -2398,7 +2956,6 @@ def test_status_json_holds_each_login_the_runs_here_and_the_services(
         "started_at": started,
     }
     server.runs["gpu1"] = [_run("chat-1a2b3c4d")]
-    monkeypatch.setattr(detach, "live_hosts", lambda: [_detached("scratch")])
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
@@ -2440,9 +2997,6 @@ def test_status_json_holds_each_login_the_runs_here_and_the_services(
                 ],
             },
         ],
-        "here": [
-            {"run": "scratch", "cli": "claude", "cwd": "/work", "session_id": None},
-        ],
         "services": [
             {"name": "ada-mac", "server": _ACME, "flags": ["--sandbox"]},
         ],
@@ -2461,56 +3015,6 @@ def test_status_shows_a_run_without_a_name_by_its_short_session(
     assert _knowop("status") == 0
 
     assert "  run:   11111111  claude  ~/work" in capsys.readouterr().out.splitlines()
-
-
-@pytest.mark.parametrize("named", ["chat-1a2b3c4d", "11111111"])
-def test_run_stop_stops_a_run_of_yours_on_another_host_through_the_server(
-    server: _Server,
-    runners: _Runners,
-    capsys: pytest.CaptureFixture[str],
-    named: str,
-) -> None:
-    server.runs["gpu1"] = [_run("chat-1a2b3c4d")]
-    assert _knowop("login", "acme") == 0
-    capsys.readouterr()
-
-    assert _knowop("run", "stop", named) == 0
-
-    assert server.stopped == ["gpu1/11111111-1111-1111-1111-111111111111"]
-    assert runners.calls() == []
-    assert capsys.readouterr().out == "stopped: run chat-1a2b3c4d (claude) on gpu1\n"
-
-
-def test_run_stop_lists_the_runs_a_name_matches_and_stops_none(
-    server: _Server,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    other = {
-        **_run("chat-1a2b3c4d"),
-        "session_id": "22222222-2222-2222-2222-222222222222",
-    }
-    server.runs = {"ada-mac": [other], "gpu1": [_run("chat-1a2b3c4d")]}
-    assert _knowop("login", "acme") == 0
-    capsys.readouterr()
-
-    assert _knowop("run", "stop", "chat-1a2b3c4d") == 1
-
-    assert server.stopped == []
-    assert capsys.readouterr().err.splitlines() == [
-        "knowop: chat-1a2b3c4d names 2 live sessions; stop one by its session:",
-        "  ada-mac  chat-1a2b3c4d  22222222-2222-2222-2222-222222222222  claude  ~/work",
-        "  gpu1  chat-1a2b3c4d  11111111-1111-1111-1111-111111111111  claude  ~/work",
-    ]
-
-
-def test_run_stop_of_a_run_nowhere_says_so(capsys: pytest.CaptureFixture[str]) -> None:
-    assert _knowop("login", "acme") == 0
-
-    assert _knowop("run", "stop", "nightly") == 1
-
-    assert capsys.readouterr().err == (
-        "knowop: no live session nightly here or on your hosts\n"
-    )
 
 
 def test_logout_of_one_host_keeps_this_computers_login(
@@ -2603,10 +3107,8 @@ def test_disconnect_removes_this_computers_service_once_the_server_lets_go(
     server: _Server,
     launchd: _Launchd,
     agents: Services,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(detach, "stop_all", lambda: 0)
     agents.start(Connect(name="ada-mac", server=_ACME))
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
@@ -2689,19 +3191,6 @@ def _run(name: str) -> dict[str, object]:
         "cwd": "~/work",
         "state": "idle",
     }
-
-
-def _detached(name: str) -> HostRecord:
-    """Return the record of a detached claude run on this computer."""
-    return HostRecord(
-        name=name,
-        command="claude --model opus",
-        cwd="/work",
-        pid=1,
-        address="/run/host.sock",
-        started="2026-10-24T12:00:00+00:00",
-        state="running",
-    )
 
 
 def _server_transport(server: _Server) -> Callable[..., httpx2.MockTransport]:

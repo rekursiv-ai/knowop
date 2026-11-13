@@ -20,6 +20,9 @@ from __future__ import annotations
 from dataclasses import fields, is_dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, cast
+from uuid import UUID
+
+import json
 
 from sagent.model import types as model_types
 from sagent.runtime import types as runtime_types
@@ -34,6 +37,8 @@ from sagent.session.types import (
 from sagent.tui.render import error_text
 from sagent.tui.types import CommandOutput
 from trackinizer.wire.wire_session_relay import Command
+from trackinizer.wire.wire_sessions import CONTEXT_TRAILER
+from treekle import from_plain
 
 
 if TYPE_CHECKING:
@@ -73,7 +78,12 @@ def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
 
     A line reaches the agent as sagent's own message between agents, so the model
     reads who sent it. Its sender is the author the server set, whatever the payload
-    says.
+    says: a person's email, or ``label#number`` for another session's agent. Its
+    recipient is the agent the input names; ``None``, for the root. A line whose
+    ``extra`` names the canvas it was sent from (``canvas_id``, a UUID) tells the
+    agent so after its words, behind ``CONTEXT_TRAILER``, with the command that reads
+    and changes it; Chat names it only when it has not told this session's agent that
+    canvas yet.
 
     Args:
       sent: An input, as the server handed it down.
@@ -89,15 +99,30 @@ def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
         case "UserMessage":
             said = stored_record(sent.payload, UserMessage)
             return AgentToAgentMessage(
-                content=said.content,
+                content=_told(said),
                 attachments=said.attachments,
                 sender=sent.author,
+                recipient=sent.recipient or None,
                 extra={"author": sent.author, "input": str(sent.id)},
             )
         case "Halt":
             return stored_record(sent.payload, Halt, classes=CLASSES)
         case "Command":
             return Command.model_validate(sent.payload)
+
+
+# The canvas is a hint from the sender's page: one that is no UUID is left out, and
+# the line goes as typed.
+def _told(said: UserMessage) -> str | None:
+    """Return ``said``'s words, then the canvas it names, if it names one."""
+    try:
+        canvas = UUID(from_plain(said.extra.get("canvas_id"), str))
+    except ValueError:
+        return said.content
+    context = json.dumps({"canvas_id": str(canvas)})
+    # ``knowop``, not ``trax``: a host's ``trax`` may be a wrapper that wants a profile.
+    how = f"Read or change it with `knowop canvas {canvas}`; `knowop canvas --help` says how."
+    return f"{said.content or ''}{CONTEXT_TRAILER}{context}\n{how}"
 
 
 # Treekle writes plain data, which an exception is not. An event holds the one that

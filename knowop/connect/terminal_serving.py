@@ -1,9 +1,7 @@
 """Serve terminals on this host: wait for an open, then bridge a shell to the server.
 
 A daemon (``knowop connect``) holds a request on the server for the next terminal to
-open. Each open runs one bridge: a login shell on a pty (or, when the open names a CLI,
-a detached ``knowop run`` of it, which outlives the pty; or, for a ``files`` open, the
-answers to file requests of ``files_channel.py``), and a WebSocket the daemon dials
+open. Each open runs one bridge: a login shell on a pty, and a WebSocket the daemon dials
 out to the server, which relays it to the owner's browser. The daemon listens on nothing,
 except that a browser may offer it a direct link (``terminal_direct.py``) when a WebRTC
 library is installed.
@@ -24,7 +22,6 @@ import contextlib
 import logging
 import os
 import pwd
-import sys
 import threading
 import uuid
 
@@ -38,9 +35,7 @@ from trackinizer.wire import wire_terminals
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake, InvalidStatus
 
-from knowop.connect.files_channel import FilesChannel
 from knowop.connect.terminal_direct import DirectRouter
-from knowop.connect.trax_context import inherited_trax_context
 from knowop.connect.wake import Listener, Wake
 
 
@@ -52,7 +47,7 @@ if TYPE_CHECKING:
     from knowop.connect.terminal_direct import PeerFactory
 
 
-__all__ = ["TerminalClient", "TerminalServing"]
+__all__ = ["TerminalClient", "TerminalServing", "start_folder"]
 
 _logger = logging.getLogger(__name__)
 
@@ -210,7 +205,7 @@ class TerminalServing:
             self.serve(opened, host_id=host_id, instance=instance)
         finally:
             with self._lock:
-                self._bridges.pop(opened.terminal_id, None)
+                _ = self._bridges.pop(opened.terminal_id)
 
     def serve(
         self,
@@ -257,7 +252,7 @@ class TerminalServing:
             stopped.cancel()
             await asyncio.gather(work, stopped, return_exceptions=True)
             with self._lock:
-                self._loops.pop(opened.terminal_id, None)
+                _ = self._loops.pop(opened.terminal_id)
 
     async def _connect(
         self,
@@ -350,10 +345,7 @@ class TerminalServing:
         status: int | None = None
         try:
             await socket.send(encode_frame(Frame.ACK))
-            if opened.kind == "files":
-                status = await self._serve_files(opened, socket, ended)
-                return
-            folder = await asyncio.to_thread(_start_folder, opened.cwd)
+            folder = await asyncio.to_thread(start_folder, opened.cwd)
             if folder is None:
                 await _end_with_line(
                     socket,
@@ -361,12 +353,13 @@ class TerminalServing:
                 )
                 status = 1
                 return
+            # Always a shell: a daemon names no CLI in its facts, so the server opens it
+            # no terminal that runs one.
             async with Terminal(
-                self._argv(opened),
+                self._shell or [pwd.getpwuid(os.getuid()).pw_shell, "-l"],
                 cwd=folder,
                 env=self._env(opened),
-                clean_env=opened.command is None,
-                drop_env=() if opened.command is None else inherited_trax_context(),
+                clean_env=True,
                 terminate_grace_sec=2.0,
                 winsize=(opened.rows, opened.cols),
             ) as terminal:
@@ -377,10 +370,6 @@ class TerminalServing:
                     ice_servers=tuple(opened.ice_servers),
                 )
                 try:
-                    if opened.command is not None:
-                        await router.output(
-                            f"knowop: started in {folder}\r\n".encode(),
-                        )
                     status = await self._relay(terminal, socket, ended, router)
                 finally:
                     await router.close()
@@ -422,64 +411,7 @@ class TerminalServing:
             await router.exit(status)
         return status
 
-    async def _serve_files(
-        self,
-        opened: TerminalWait,
-        socket: ClientConnection,
-        ended: asyncio.Event,
-    ) -> int:
-        """Answer file requests until the server stops the terminal or the socket closes."""
-        files = FilesChannel()
-        router = DirectRouter(
-            relay=socket.send,
-            shell=files,
-            factory=self.direct,
-            ice_servers=tuple(opened.ice_servers),
-        )
-        serving = asyncio.create_task(files.serve(router.output))
-        reader = asyncio.create_task(_read(router, socket))
-        stopped = asyncio.create_task(ended.wait())
-        try:
-            await asyncio.wait(
-                {serving, reader, stopped},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if serving.done():
-                await serving
-        finally:
-            for task in (serving, reader, stopped):
-                task.cancel()
-            await asyncio.gather(serving, reader, stopped, return_exceptions=True)
-            await router.close()
-        with contextlib.suppress(ConnectionClosed):
-            await router.exit(0)
-        return 0
-
-    def _argv(self, opened: TerminalWait) -> list[str]:
-        """Return a detached ``knowop run`` of the CLI asked for, else a shell."""
-        if opened.command is None:
-            return self._shell or [pwd.getpwuid(os.getuid()).pw_shell, "-l"]
-        assert isinstance(opened.run_name, str)
-        attach = [] if opened.attach is None else ["--attach", str(opened.attach)]
-        # This daemon is knowop, so the same install runs the CLI: ``PATH`` may hold
-        # another knowop, or none. The package is named from this module because the
-        # published one is named differently.
-        return [
-            sys.executable,
-            "-m",
-            __name__.rsplit(".", 2)[0],
-            "run",
-            opened.command,
-            "--detach",
-            "--name",
-            opened.run_name,
-            *attach,
-        ]
-
-    # A shell starts clean, so this and the essentials are all it has. A run inherits
-    # the daemon's environment like a ``knowop run`` typed where ``knowop connect``
-    # was started, and this replaces the trax context it inherited (see
-    # :func:`inherited_trax_context`).
+    # A shell starts clean, so this and the essentials are all it has.
     def _env(self, opened: TerminalWait) -> dict[str, str]:
         """Return the environment laid over the child's; no secret in it."""
         env = {
@@ -517,14 +449,33 @@ class TerminalServing:
             terminal_id=opened.terminal_id,
             opener=opened.opener,
             requested_by=opened.requested_by,
-            kind=opened.kind,
             status=status,
         )
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as file:
             _ = file.write(line.model_dump_json() + "\n")
         if event == "open":
-            echo(f"{opened.kind or 'terminal'} opened by {opened.opener}")
+            echo(f"terminal opened by {opened.opener}")
+
+
+def start_folder(cwd: str | None) -> Path | None:
+    """Return the folder a run starts in on this host, or ``None`` when it is none.
+
+    Args:
+      cwd: As the server sends it: absolute or ``~``-relative; ``None`` for home.
+
+    Returns:
+      folder: The folder, ``~`` resolved; ``None`` when ``cwd`` names no folder here.
+
+    """
+    if cwd is None:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    try:
+        folder = Path(cwd).expanduser()
+    except RuntimeError:
+        # ``~name`` names a user this host does not have: no home to resolve against.
+        return None
+    return folder if folder.is_dir() else None
 
 
 async def _pump(terminal: Terminal, router: DirectRouter) -> None:
@@ -561,18 +512,6 @@ def _decode(message: str | bytes) -> tuple[Frame, bytes] | None:
         return None
 
 
-def _start_folder(cwd: str | None) -> Path | None:
-    """Return the folder a terminal starts in, or ``None`` when ``cwd`` is not one."""
-    if cwd is None:
-        return Path(pwd.getpwuid(os.getuid()).pw_dir)
-    try:
-        folder = Path(cwd).expanduser()
-    except RuntimeError:
-        # ``~name`` names a user this host does not have: no home to resolve against.
-        return None
-    return folder if folder.is_dir() else None
-
-
 class _Socket(Protocol):
     """The one send a refusal makes on the daemon's socket."""
 
@@ -600,5 +539,4 @@ class _LogLine(BaseModel):
     terminal_id: uuid.UUID
     opener: str
     requested_by: str | None = None
-    kind: str | None = None
     status: int | None = None

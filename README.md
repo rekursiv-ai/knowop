@@ -22,21 +22,20 @@ See [Install](#install) for additional details.
 ```bash
 knowop connect          # this computer: log in, enroll, serve it in the background
 knowop logs -f          # follow this computer's connect
-knowop run              # sagent in this folder, recorded, reachable from Chat
-knowop run claude       # the same for Claude Code
-knowop run codex        # the same for Codex
-knowop run stop NAME    # stop a run of yours, here or on another of your hosts
+knowop run              # sagent in this folder, live in Chat
+knowop run --on lab-box # sagent on your computer lab-box, through its connect
 knowop job submit -- python train.py   # a job on a GPU node, from this repository
 knowop job submit --host lab-box -- python train.py   # on your computer lab-box
+knowop upload ~/.claude # your finished Claude Code sessions, sub-agents and all
 knowop status           # server, account, your hosts, their runs, this computer's services
-knowop disconnect       # stop this computer's runs and connect, then disconnect it
+knowop disconnect       # disconnect this computer and stop its agent processes
 ```
 
-A run reaches Chat with your account's key, not through `knowop connect`: it keeps
-running after Ctrl-C ends the connect, which then names the runs it leaves. The web
-app shows a host connected while one of its runs is live. `knowop run stop --all`
-stops the runs on this computer; `knowop disconnect` also revokes its connect and
-stops every run of yours that names it, wherever it runs.
+A run at a terminal reaches Chat with your account's key, not through `knowop
+connect`, and Chat's Stop halts its turn. A run Chat or `knowop run --on` starts on a
+host is started by that host's connect, and keeps running when the connect stops.
+`knowop disconnect` revokes a host's connect and stops every agent process on it: those
+its connect started, and those started at a terminal there.
 
 A job can also run on a computer of your own: start it with `knowop connect --jobs`
 there, push your branch, and `knowop job submit --host NAME -- CMD` from the
@@ -67,7 +66,7 @@ on macOS, a `systemd --user` unit on Linux. It runs in the background, starts ag
 at login and after a crash, and returns once the server shows the computer online.
 `knowop logs -f` follows its log, `knowop status` lists it with its flags, and
 `knowop disconnect` stops and removes it. Running `knowop connect` again restarts it
-only when its flags, its environment, its knowop or the CLIs it finds changed. The
+only when its flags, its environment or its knowop changed. The
 service runs the knowop that installed it: an installed one in place, so after `uv
 tool upgrade knowop` run `knowop connect` again, and one `uvx` ran as `uvx
 knowop@VERSION`, which `uv cache clean` cannot take away; `uvx knowop@latest
@@ -143,7 +142,7 @@ docker logs -f knowop   # approve the code it prints, then Ctrl-C
 ```
 
 Its terminals open a shell in the container, as root, and its agents and jobs run
-there: start from an image that has the tools they need (`git`, `claude`, `codex`).
+there: start from an image that has the tools they need (`git`, at least).
 Docker starts it again after a disconnect from the web app; `docker stop knowop`
 keeps it stopped.
 
@@ -179,33 +178,32 @@ sudo systemctl enable --now knowop-connect
 journalctl -u knowop-connect -f
 ```
 
-`PATH` names where your agents' CLIs are. `knowop status` shows the host, not the
-unit, and `knowop logs` reads only a user service's log: use `journalctl`. `sudo
-systemctl disable --now knowop-connect` stops it.
+`PATH` names where the tools your agents and jobs call are. `knowop status` shows the
+host, not the unit, and `knowop logs` reads only a user service's log: use
+`journalctl`. `sudo systemctl disable --now knowop-connect` stops it.
 
 ## Commands
 
 | Command | Does |
 |---|---|
 | `knowop login [ORG\|URL]` | Logs in with a code approved in a browser and saves the key. |
-| `knowop connect [ORG\|URL] [--name N] [--no-exec] [--sandbox] [--jobs [--job-results-max SIZE]] [--foreground] [--follow]` | Logs in first unless knowop is logged in to that server or a token is piped in, enrolling and confirming this computer in the same approval; then serves its terminal, and the assistant's commands unless `--no-exec`. At a terminal it serves from a user service that starts again at login, and `--follow` then follows its log; elsewhere, and with `--foreground`, until Ctrl-C. No server means knowop's own, else `https://alpha.knowop.ai`. `--sandbox` declares a disposable computer where agents act without asking. `--jobs` also runs your account's `knowop job submit --host` jobs, each under a memory cap; it needs systemd's user manager. |
+| `knowop connect [ORG\|URL] [--name N] [--no-exec] [--sandbox] [--jobs [--job-results-max SIZE]] [--foreground] [--follow]` | Logs in first unless knowop is logged in to that server or a token is piped in, enrolling and confirming this computer in the same approval; then serves its terminal, and the assistant's commands unless `--no-exec`. At a terminal it serves from a user service that starts again at login, and `--follow` then follows its log; elsewhere, and with `--foreground`, until Ctrl-C. No server means knowop's own, else `https://alpha.knowop.ai`. `--sandbox` records that the computer is disposable. `--jobs` also runs your account's `knowop job submit --host` jobs, each under a memory cap; it needs systemd's user manager. |
 | `knowop menubar` | Shows the knowop mark in the macOS menu bar until Quit; `knowop connect` starts it at login. |
 | `knowop logs [NAME] [-f] [-n N]` | Prints the log of NAME's connect service on this computer (default this computer's name), its last N lines, or follows it until Ctrl-C. A host connected from another computer keeps its log there. |
-| `knowop status [--json]` | Prints, for each server knowop is logged in to (the one its commands use first), the profile, the server, your account and role, your computers with whether each is online, the knowop version and process serving each one online, and the runs live on each; the runs here that name no host of yours; and this computer's connect services with their flags, and whether each is turned off (macOS Login Items). On macOS, the menu bar: running, stopped, or failing with its exit code and its last log line. `--json` prints the same as one JSON object, one entry per login. Exits 1 when not logged in, or when a server refuses its login's key. |
-| `knowop disconnect [NAME]` | Stops this computer's runs when NAME is this computer (the default), then disconnects NAME on the server: its connect is revoked and every run of yours that names it stops. Removes NAME's connect service on this computer, and waits until the server shows NAME offline. `knowop connect` joins it again with no login. |
-| `knowop logout [NAME\|--all]` | Logs this computer's host out on the server (its connect revoked, its runs stopped, the keys its logins made revoked), revokes knowop's key if that left it, removes this computer's connect services of that server, and deletes the saved login; knowop then uses its login to another server, if it has one, and says which. `--all` logs every host of yours out first. NAME logs that one host out alone, as the Hosts page does, and keeps this computer's login. |
-| `knowop run [sagent\|claude\|codex] [ARGS]` | Runs sagent (when no agent is named), Claude Code or Codex in this folder, recorded and reachable from Chat. Says to run `knowop connect` when this computer is not connected. |
-| `knowop run attach\|ls\|log\|send\|stop NAME` | Reaches a run started with `--detach`. `knowop run stop --all` stops every one on this computer. `knowop run stop RUN` stops any live session of yours another host runs, by its name or session (its first 8 characters will do); a RUN that names several lists them. |
-| `knowop run [sagent\|claude\|codex] resume SESSION` | Re-enters a stored session. |
+| `knowop status [--json]` | Prints, for each server knowop is logged in to (the one its commands use first), the profile, the server, your account and role, your computers with whether each is online, the knowop version and process serving each one online, and the agent processes live on each; and this computer's connect services with their flags, and whether each is turned off (macOS Login Items). On macOS, the menu bar: running, stopped, or failing with its exit code and its last log line. `--json` prints the same as one JSON object, one entry per login. Exits 1 when not logged in, or when a server refuses its login's key. |
+| `knowop disconnect [NAME]` | Disconnects NAME (default this computer) on the server: its connect is revoked and every agent process on it stops. Removes NAME's connect service on this computer, and waits until the server shows NAME offline. `knowop connect` joins it again with no login. |
+| `knowop logout [NAME\|--all]` | Logs this computer's host out on the server (its connect revoked, its agent processes stopped, the keys its logins made revoked), revokes knowop's key if that left it, removes this computer's connect services of that server, and deletes the saved login; knowop then uses its login to another server, if it has one, and says which. `--all` logs every host of yours out first. NAME logs that one host out alone, as the Hosts page does, and keeps this computer's login. |
+| `knowop run [--headless] [--session ID] [--on NAME [--cwd DIR]] [SAGENT FLAGS]` | Runs sagent's own agent in this process, live in Chat: sagent's screen at a terminal, else headless. `--session` continues a stored session; `--on` starts the agent on host NAME through its connect. Says to run `knowop connect` when this computer is not connected. |
 | `knowop job submit\|logs\|results ...` | Runs a job on a GPU node from this repository, or with `--host NAME` on a computer of yours, and reads its log and results. |
 | `knowop job status [JOB]\|cancel JOB\|secrets\|secret NAME set\|del` | Lists your jobs or shows one, stops one, and keeps the secrets a job may use. |
 | `knowop host [NAME ...]` | Lists, shows, sets, labels and deletes the hosts campaigns may run on, then lists your KnowHosts. |
 | `knowop host start\|NAME pause\|NAME resume\|NAME del` | Rents a KnowHost, billed to your account, that joins as one of your hosts; it pauses after 30 minutes unused, `resume` wakes it, and `del` ends it. On a server that runs KnowHost. |
-| `knowop canvas [CANVAS_UUID] [show TYPE\|navigate ROUTE\|highlight UUID,...\|hide ID\|KEY to VALUE ...]` | Reads and changes a canvas with the grammar of `trax canvas`. In a run that `knowop run` placed on a canvas, `$TRAX_CANVAS` names it, so an agent drives the person's canvas with knowop alone. |
+| `knowop canvas [CANVAS_UUID] [show TYPE\|navigate ROUTE\|highlight UUID,...\|hide ID\|KEY to VALUE ...]` | Reads and changes a canvas with the grammar of `trax canvas`. Where `$TRAX_CANVAS` names a canvas, an agent drives the person's canvas with knowop alone. |
+| `knowop upload PATH... [--public] [--server ORG\|URL] [--format claude\|codex\|sagent] [--no-subagents] [--jobs N] [--dry-run]` | Sends finished Claude Code, Codex and sagent sessions, files or folders searched for them (`~/.claude`, `~/.codex/sessions`, sagent's projects, or a copy of any; Codex's compressed `.jsonl.zst` rollouts too), each as an AgentSession under the CLI's own id, started and ended when it was. Each sub-agent, a workflow's agents included, goes as an AgentSession of its own, in its spawner's audience, linked to it (`produced_by`). A new session is private unless `--public`; uploading again sends only the records the server lacks, and lands on the same AgentSession when the same login sends it. A session the server holds keeps the audience it has, whichever flag is given. `--server` uses knowop's saved login for that server; `--dry-run` lists what would go and contacts no server. Records are masked as a run's are (`TRAX_REDACT_NAMES`). Exits 1 when a session fails. |
 | `knowop --version` | Prints the version; `unknown` from a checkout. |
 
-Every command takes `--help`; `knowop run sagent --help` and `knowop job submit
---help` show the runner's own.
+Every command takes `--help`; `knowop run --help` and `knowop job submit --help`
+show the runner's own.
 
 knowop keeps a login per server it logs in or connects to, and every command uses
 the last one; `knowop status` shows each. A connect service signs in with its own
@@ -224,11 +222,13 @@ computer. Terminals use the server relay when a direct link is unavailable.
 |---|---|
 | `cli.py` | The `knowop` command. |
 | `service.py` | The user service `knowop connect` installs: launchd's or systemd's. |
-| `shell/` | The daemon `knowop connect` runs: terminals, sagent's tools for the assistant, and with `--jobs` your jobs (`job_serving.py`). |
-| `agent/` | The agent runner `knowop run` hands to. Its `__main__.py` and `codex.py` run it by module, on trax's connection, for unattended plumbing. |
+| `connect/` | The daemon `knowop connect` runs: terminals, sagent's tools for the assistant, the agent processes the server asks for (`session_serving.py`), and with `--jobs` your jobs (`job_serving.py`). |
+| `process/` | The agent process `knowop run` runs: sagent in-process, live in Chat. |
+| `agent/` | What the agent process needs to continue a stored session here. |
 | `jobs/` | The job runner `knowop job` hands to. |
 | `hosts.py` | `knowop host`: the host registry, and KnowHosts through the server's KnowHost API. |
 | `canvas.py` | `knowop canvas`: trax's canvas command, named as knowop's. |
+| `upload.py` | `knowop upload`: finds session files and sends each as an AgentSession. |
 | `skills/` | Each package's instructions for agents. |
 
 knowop calls the server through trackinizer's `Client`, as trax does, and never runs

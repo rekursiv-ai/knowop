@@ -31,6 +31,7 @@ from sagent.session.types import (
 from sagent.tui.render import error_text
 from sagent.tui.types import CommandOutput
 from trackinizer.wire.wire_session_relay import Command, Input
+from trackinizer.wire.wire_sessions import CONTEXT_TRAILER
 
 import pytest
 
@@ -130,6 +131,63 @@ def test_a_person_s_line_becomes_a_message_named_by_its_author() -> None:
             "input": "00000000-0000-0000-0000-000000000007",
         },
     )
+
+
+def test_a_line_names_the_agent_it_is_for() -> None:
+    sent = _input("UserMessage", {"py/object": "UserMessage", "content": "status?"})
+
+    message = input_message(sent.model_copy(update={"recipient": "lead"}))
+
+    assert isinstance(message, AgentToAgentMessage)
+    assert message.recipient == "lead"
+
+
+def test_a_line_that_names_its_canvas_tells_the_agent_after_its_words() -> None:
+    canvas = "c5286865-67b6-4bd8-ab51-e06e10c326c5"
+    said = UserMessage(content="what is this?", extra={"canvas_id": canvas})
+
+    assert input_message(
+        _input("UserMessage", event_payload(said)),
+    ) == AgentToAgentMessage(
+        content=(
+            f'what is this?{CONTEXT_TRAILER}{{"canvas_id": "{canvas}"}}\n'
+            f"Read or change it with `knowop canvas {canvas}`; "
+            "`knowop canvas --help` says how."
+        ),
+        sender="dan@example.com",
+        extra={
+            "author": "dan@example.com",
+            "input": "00000000-0000-0000-0000-000000000007",
+        },
+    )
+
+
+def test_a_line_of_no_words_that_names_its_canvas_tells_only_the_canvas() -> None:
+    canvas = "c5286865-67b6-4bd8-ab51-e06e10c326c5"
+    said = UserMessage(
+        attachments=(Attachment(mime_descriptor="image/png", data=b"a"),),
+        extra={"canvas_id": canvas},
+    )
+
+    message = input_message(_input("UserMessage", event_payload(said)))
+
+    assert isinstance(message, AgentToAgentMessage)
+    assert (message.content or "").startswith(
+        f'{CONTEXT_TRAILER}{{"canvas_id": "{canvas}"}}\n',
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"canvas_id": ""}, {"canvas_id": "c5286865"}, {"canvas_id": 7}],
+)
+def test_a_line_naming_no_canvas_reads_as_it_was_typed(extra: dict[str, JSON]) -> None:
+    said = UserMessage(content="hi", extra=extra)
+
+    message = input_message(_input("UserMessage", event_payload(said)))
+
+    assert isinstance(message, AgentToAgentMessage)
+    assert message.content == "hi"
 
 
 def test_a_halt_reads_as_a_halt() -> None:
