@@ -3,6 +3,7 @@
 ``knowop login`` signs in with a code a person approves in a browser and saves the
 key as a trax profile. knowop records that profile as its own, and every verb uses
 it, never trax's current profile, so knowop acts only on the server it logged in to.
+``knowop --profile NAME VERB`` runs a verb with another saved profile instead.
 
 At a terminal, ``knowop connect`` serves this computer from a user service (launchd's
 or systemd's) that starts again at login; ``knowop logs -f`` follows it and ``knowop
@@ -11,18 +12,20 @@ disconnect`` stops it.
 Examples:
   knowop connect          log in if needed, then connect this computer
   knowop login acme       log in to https://acme.knowop.ai, without connecting
-  knowop run              sagent in this folder, recorded, reachable from Chat
-  knowop run claude       Claude Code, the same way
-  knowop run stop NAME    stop a run of yours, here or on another host
+  knowop run              sagent in this folder, live in Chat
+  knowop run --on lab     sagent on your host lab, live in Chat
   knowop job submit -- python train.py
                           run a job on a GPU node from this repository
   knowop job status       list your jobs
   knowop host             list your hosts, where campaigns may run, and KnowHosts
   knowop host start       rent a KnowHost that joins as one of your hosts
   knowop canvas           read the canvas a run sits on; --help shows how to change it
+  knowop upload ~/.claude send finished Claude Code, Codex and sagent sessions
   knowop status           profile, server, account, hosts, their runs, services
   knowop logs -f          follow this computer's connect
-  knowop disconnect       stop this computer's runs and connect, everywhere
+  knowop disconnect       stop this computer's connect and its runs, everywhere
+  knowop --profile staging status
+                          any verb, with another saved profile
 
 """
 
@@ -47,7 +50,7 @@ from trackinizer.client.client import Client, server_url
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import config_dir, state_dir
 from trackinizer.trax.client_cache import close_clients
-from trackinizer.trax.connection import connect
+from trackinizer.trax.connection import connect, connect_flags
 from trackinizer.trax.profile import Profile, del_profile, read_profile
 from trackinizer.trax.render import echo
 from treekle import from_plain, json_dumps
@@ -66,36 +69,33 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from types import FrameType
 
+    from trackinizer.runs import redact
     from trackinizer.trax import login
     from trackinizer.wire.wire_hosts import HostDetail
 
-    from knowop import canvas
-    from knowop.agent import (
-        cli as agent_cli,
-        detach,
-    )
-    from knowop.connect import daemon, job_limits
+    from knowop import canvas, upload
+    from knowop.connect import job_limits
     from knowop.jobs import cli as jobs_cli
+    from knowop.process import main as process_main
 else:
     from wrapt import lazy_import
 
     # Only ``login``, ``connect`` and a first ``run`` reach the login, and only ``run``
     # and ``job`` the runners. Their imports cost ~100 ms or more that ``status`` would
     # pay at every start. Only ``canvas`` reaches trax's verbs, ~20 ms more.
-    agent_cli = lazy_import("knowop.agent.cli")
     canvas = lazy_import("knowop.canvas")
-    detach = lazy_import("knowop.agent.detach")
     jobs_cli = lazy_import("knowop.jobs.cli")
     job_limits = lazy_import("knowop.connect.job_limits")
-    daemon = lazy_import("knowop.connect.daemon")
     login = lazy_import("trackinizer.trax.login")
+    # The agent process ``run`` hands to; it brings sagent.
+    process_main = lazy_import("knowop.process.main")
+    # ``upload`` alone reads transcripts; it brings every CLI's session reader.
+    upload = lazy_import("knowop.upload")
+    redact = lazy_import("trackinizer.runs.redact")
 
 
 _DEFAULT_SERVER: Final = "https://alpha.knowop.ai"
 """The server ``login``, ``connect`` and a first ``run`` log in to when none is named."""
-
-_HOST_WORDS: Final = frozenset({"attach", "ls", "log", "send", "stop"})
-"""The ``run`` words that reach a detached run on this computer instead of starting one."""
 
 _CANVAS_WORD: Final = "canvas"
 """The verb trax's canvas command runs under, on knowop's login."""
@@ -126,16 +126,17 @@ def main(
         sys.stdout.reconfigure(line_buffering=True)
     args = list(sys.argv[1:] if argv is None else argv)
     try:
+        named, args = _peeled(args)
         if not args:
-            _next_step()
+            _next_step(named)
             return 0
         # Everything after ``run`` or ``job`` belongs to the runner, ``--help`` and
         # every other flag included; argparse would read them as knowop's own. Every
-        # ``host`` and ``canvas`` form is that verb's, its help pages too.
-        if args[:1] in ([HOST_WORD], [_CANVAS_WORD]) or (
-            args[:1] in (["run"], ["job"]) and args[1:] not in (["-h"], ["--help"])
+        # ``run``, ``host`` and ``canvas`` form is that verb's, its help pages too.
+        if args[:1] in (["run"], [HOST_WORD], [_CANVAS_WORD]) or (
+            args[:1] == ["job"] and args[1:] not in (["-h"], ["--help"])
         ):
-            return _hand_off(args[0], args[1:], sleep=sleep, clock=clock)
+            return _hand_off(args[0], args[1:], named=named, sleep=sleep, clock=clock)
         parser = argparse.ArgumentParser(
             prog="knowop",
             description=(__doc__ or "").strip(),
@@ -143,7 +144,7 @@ def main(
         )
         _add_arguments(parser)
         flags = cast(Flags, parser.parse_args(args))
-        _run(flags, sleep=sleep, clock=clock)
+        _run(flags, named=named, sleep=sleep, clock=clock)
     except ClientError as error:
         echo(f"knowop: {error}", err=True)
         return 1
@@ -171,6 +172,45 @@ class Flags(Protocol):
     json: bool
     all: bool
     lines: int | None
+
+
+class _UploadFlags(Protocol):
+    """The flags of ``upload``, whose ``--jobs`` is a count, unlike ``connect``'s."""
+
+    paths: list[Path]
+    public: bool
+    server: str | None
+    read_as: str | None
+    no_subagents: bool
+    jobs: int
+    dry_run: bool
+
+
+class _TopFlags(Protocol):
+    """The flags read before the verb: ``connect_flags``'s, and what follows them."""
+
+    profile: str | None
+    host: str | None
+    port: int | None
+    rest: list[str]
+
+
+# Read before the verb, as ``trax --profile`` is: a flag after the verb is the verb's
+# own, and ``run`` and ``job`` hand theirs to the runner, which reads ``--profile`` too.
+def _peeled(args: list[str]) -> tuple[str, list[str]]:
+    """Return the profile named before the verb, or empty, and the rest of ``args``."""
+    parser = argparse.ArgumentParser(prog="knowop", add_help=False)
+    connect_flags(parser)
+    parser.add_argument("rest", nargs=argparse.REMAINDER)
+    parsed, unknown = parser.parse_known_args(args)
+    top = cast(_TopFlags, parsed)
+    # knowop's own verbs reach the server a profile names, never one a flag rewrites.
+    if top.host is not None or top.port is not None:
+        raise ClientError(
+            "knowop reads --profile alone before its verb; --host and --port are "
+            "trax's",
+        )
+    return top.profile or "", [*unknown, *top.rest]
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -270,14 +310,13 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     verbs.add_parser(
         "disconnect",
-        help="stop this computer's runs, then disconnect its host on the server",
+        help="disconnect a host of yours on the server, stopping its runs",
         description=(
-            "Stop every detached run on this computer, then disconnect the host on "
-            "the server: its connect is revoked, and every run of yours that names it "
-            "is stopped, here or anywhere. Its connect service on this computer is "
-            "removed, and it waits until the server shows the host offline. "
-            "knowop connect joins it again, with no login; knowop logout also "
-            "revokes this computer's key."
+            "Disconnect the host on the server: its connect is revoked, and every run "
+            "of yours that names it is stopped, here or anywhere. Its connect service "
+            "on this computer is removed, and it waits until the server shows the "
+            "host offline. knowop connect joins it again, with no login; knowop "
+            "logout also revokes this computer's key."
         ),
     ).add_argument(
         "name",
@@ -302,19 +341,10 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             ),
         ),
     )
+    # Only listed here: ``main`` hands every ``run`` form to the agent process.
     verbs.add_parser(
         "run",
-        help="run an agent here, recorded: sagent, claude, codex, attach NAME",
-        description=(
-            "Run sagent (when no agent is named), Claude Code or Codex in this "
-            "folder as knowop's account, recorded and reachable from Chat; its "
-            "arguments pass to the runner unchanged. Logs in first when knowop is "
-            "not logged in."
-        ),
-    ).add_argument(
-        "args",
-        nargs=argparse.REMAINDER,
-        metavar="sagent|claude|codex|attach|ls|log|send|stop|resume ...",
+        help="run sagent's agent here, or with --on on a host, live in Chat",
     )
     verbs.add_parser(
         "job",
@@ -339,6 +369,20 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         _CANVAS_WORD,
         help="read and change the canvas an agent run sits on, as trax canvas does",
     )
+    _add_upload_arguments(
+        verbs.add_parser(
+            "upload",
+            help="send finished Claude Code, Codex and sagent sessions to the server",
+            description=(
+                "Send finished Claude Code, Codex and sagent sessions to the server, "
+                "each as an AgentSession under the CLI's own id for it, started and "
+                "ended when it was. A folder is searched for session files; a "
+                "session's sub-agents go too, each linked to the session that spawned "
+                "it. Uploading a session again sends only what the server lacks, and "
+                "leaves it to the readers it has."
+            ),
+        ),
+    )
 
 
 def _add_connect_arguments(parser: argparse.ArgumentParser) -> None:
@@ -361,15 +405,12 @@ def _add_connect_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--no-exec",
         action="store_true",
-        help=(
-            "serve terminals only: serve no tools to the server's assistant, which "
-            "otherwise runs them here, as you"
-        ),
+        help="serve terminals only: run no tool and start no agent here for the server",
     )
     parser.add_argument(
         "--sandbox",
         action="store_true",
-        help="declare a disposable computer, where agents act without asking",
+        help="record that this computer is disposable",
     )
     parser.add_argument(
         "--jobs",
@@ -404,42 +445,193 @@ def _add_connect_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--log-file", default="", help=argparse.SUPPRESS)
 
 
+def _add_upload_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register the flags of ``upload`` on ``parser``."""
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        type=Path,
+        metavar="PATH",
+        help="a session file, or a folder searched for them, such as ~/.claude",
+    )
+    audience = parser.add_mutually_exclusive_group()
+    # Said to be told apart from ``--public`` in a script; nothing reads it.
+    audience.add_argument(
+        "--private",
+        action="store_true",
+        help="open a new session to you and those who oversee (default)",
+    )
+    audience.add_argument(
+        "--public",
+        action="store_true",
+        help="open a new session to the organization",
+    )
+    parser.add_argument(
+        "--server",
+        metavar="ORG|URL",
+        help="send to this server, as knowop login names one, with its saved login",
+    )
+    parser.add_argument(
+        "--format",
+        dest="read_as",
+        choices=("claude", "codex", "sagent"),
+        help="read every file as this format instead of from its content",
+    )
+    parser.add_argument(
+        "--no-subagents",
+        action="store_true",
+        help="leave the sessions of sub-agents",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=_count,
+        default=min(8, os.cpu_count() or 1),
+        metavar="N",
+        help="sessions sent side by side (default: this computer's CPUs, at most 8)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list each session that would go up, and contact no server",
+    )
+
+
+def _count(text: str) -> int:
+    """Return the positive number ``text`` spells, or refuse it as argparse does."""
+    if not text.isdigit() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number of 1 or more")
+    return int(text)
+
+
 def _run(
     flags: Flags,
     *,
+    named: str,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
 ) -> None:
-    """Run the verb ``flags`` names."""
+    """Run the verb ``flags`` names; ``named`` is the profile ``--profile`` named."""
     match flags.verb:
         case "login":
-            _log_in(flags.target, sleep=sleep, clock=clock)
+            _log_in(flags.target, named=named, sleep=sleep, clock=clock)
         case "logout":
-            _log_out(flags.name, every=flags.all)
+            _log_out(flags.name, every=flags.all, named=named)
         case "status":
-            _status(as_json=flags.json)
+            _status(as_json=flags.json, named=named)
         case "logs":
-            _logs(flags.name, follow=flags.follow, lines=flags.lines, sleep=sleep)
+            _logs(
+                flags.name,
+                named=named,
+                follow=flags.follow,
+                lines=flags.lines,
+                sleep=sleep,
+            )
         case "disconnect":
-            _disconnect(flags.name, sleep=sleep)
+            _disconnect(flags.name, named=named, sleep=sleep)
         case "menubar":
             if sys.platform != "darwin":
                 raise ClientError("knowop menubar runs on macOS alone")
             menubar.run()
+        case "upload":
+            _upload(cast(_UploadFlags, flags), named=named)
         case _:
             # ``connect``: ``main`` hands ``run`` and ``job`` off before parsing, and
             # argparse refuses any other word.
-            _connect(flags, sleep=sleep, clock=clock)
+            _connect(flags, named=named, sleep=sleep, clock=clock)
+
+
+# A session that fails is said on its line, and the batch goes on; then the command
+# fails. ``upload`` starts no login: a server knowop holds none for is refused.
+def _upload(flags: _UploadFlags, *, named: str) -> None:
+    """Send the sessions ``flags.paths`` name, one line each and a total; or list them."""
+    if missing := [str(path) for path in flags.paths if not path.expanduser().exists()]:
+        raise ClientError(f"no such file or folder: {', '.join(missing)}")
+    sessions = upload.plan(
+        [path.expanduser() for path in flags.paths],
+        read_as=flags.read_as or "",
+        subagents=not flags.no_subagents,
+    )
+    if not sessions:
+        raise ClientError("no Claude Code, Codex or sagent session found there")
+    if flags.dry_run:
+        for session in sessions:
+            echo(f"{session.format} {session.id}  {session.path}{_kin(session)}")
+        echo(f"would upload {_sessions(len(sessions))}; --dry-run sent none")
+        return
+    profile = _login_to(flags.server, named=named)
+    redactor = redact.redactor_from_environ(os.environ)
+    echo(f"uploading {_sessions(len(sessions))} to {profile.url}")
+    results = upload.upload(
+        sessions,
+        connect=functools.partial(Client, profile.url, api_key=profile.api_key),
+        private=not flags.public,
+        jobs=flags.jobs,
+        redactor=redactor,
+    )
+    for result in results:
+        echo(f"{result.session.format} {result.session.id}: {_outcome(result)}")
+    failed = sum(1 for result in results if result.error)
+    echo(
+        f"uploaded {_sessions(len(results) - failed)}: "
+        f"{sum(result.sent for result in results)} records sent, "
+        f"{sum(result.held for result in results)} already there",
+    )
+    if failed:
+        raise ClientError(f"{_sessions(failed)} failed")
+
+
+def _login_to(server: str | None, *, named: str) -> Profile:
+    """Return knowop's login, or its saved login for ``server``; refuse when it has none."""
+    if server is None:
+        return _profile(named)[1]
+    url = _server(server).removesuffix("/")
+    found = next((each for _, each in _logins(named) if each.url == url), None)
+    if found is None:
+        raise ClientError(f"not logged in to {url}; run knowop login {server}")
+    return found
+
+
+def _kin(session: upload.Session) -> str:
+    """Return what ``session``'s line says of its sub-agents and its spawner."""
+    said = f", {session.subagents} sub-agent{'' if session.subagents == 1 else 's'}"
+    if session.linked:
+        return f"{said}, spawned by {session.spawned_by}"
+    if session.spawned_by:
+        return f"{said}, spawned by {session.spawned_by}, whose file is not here"
+    return said
+
+
+def _outcome(result: upload.Uploaded) -> str:
+    """Return what became of one session, as its line says it."""
+    if result.error:
+        return f"failed: {result.error}"
+    refused = f", {result.refused} refused" if result.refused else ""
+    return (
+        f"AgentSession {result.agent_session} ({result.audience}), sent "
+        f"{result.sent}, held {result.held}{refused}{_kin(result.session)}"
+    )
+
+
+def _sessions(count: int) -> str:
+    """Return ``count`` sessions, in words."""
+    return f"{count} session{'' if count == 1 else 's'}"
 
 
 def _log_in(
-    target: str,
+    target: str = "",
     *,
+    named: str,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
 ) -> None:
     """Log in to the server ``target`` names, and make its profile knowop's."""
-    result = login.login(_server(target), client="knowop", sleep=sleep, clock=clock)
+    result = login.login(
+        _server(target),
+        profile=named,
+        client="knowop",
+        sleep=sleep,
+        clock=clock,
+    )
     _remember(result.profile)
     echo(f"logged in: profile {result.profile} ({result.role})")
 
@@ -460,9 +652,9 @@ def _server(target: str) -> str:
 # Logging this computer out also revokes knowop's key, deletes its profile and removes
 # this computer's connect services of that server, none of which could start again
 # without the login.
-def _log_out(name: str, *, every: bool) -> None:
+def _log_out(name: str, *, every: bool, named: str) -> None:
     """Log ``name`` out; else this computer, and with ``every`` all of yours, first."""
-    profile_name, profile = _profile()
+    profile_name, profile = _profile(named)
     services = service.here()
     with Client(profile.url, api_key=profile.api_key) as http:
         if name:
@@ -503,10 +695,10 @@ def _log_out(name: str, *, every: bool) -> None:
     if pin.exists() and pin.read_text().strip() == profile_name:
         pin.unlink()
     del_profile(profile_name)
-    _keep_logins([each for each, _ in _logins()])
+    _keep_logins([each for each, _ in _kept_logins()])
     revoked = "revoked its key" if caller is not None else "its key was revoked already"
     echo(f"logged out: {revoked}; deleted profile {profile_name}")
-    if (left := _saved()) is not None:
+    if (left := next(iter(_kept_logins()), None)) is not None:
         echo(f"knowop now uses: profile {left[0]} ({left[1].url})")
 
 
@@ -534,12 +726,11 @@ class _Run:
     """A live session, as ``knowop status`` shows it."""
 
     run: str | None
-    """Its detached host's name; ``None`` for a run in a terminal of its own."""
+    """Its name, as the server lists it; ``None`` for a run it names none."""
 
     cli: str
     cwd: str | None
-    session_id: str | None
-    """The session it drains; ``None`` for a run here the server places nowhere."""
+    session_id: str
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -578,35 +769,19 @@ class _Status:
     logins: list[_Login]
     """Each server knowop is logged in to, the one its verbs use first."""
 
-    here: list[_Run]
-    """Live detached runs here that name no host of the accounts'."""
-
     services: list[service.Connect]
     menubar: str | None
     """How the menu bar agent here is; ``None`` where none is installed."""
 
 
 # A refused login is shown with the others, and then fails the command.
-def _status(*, as_json: bool) -> None:
+def _status(*, as_json: bool, named: str) -> None:
     """Print each of knowop's logins with its account's hosts, and services here."""
-    _profile()
-    logins = [_login(name, profile) for name, profile in _logins()]
+    _profile(named)
+    logins = [_login(name, profile) for name, profile in _logins(named)]
     services = service.here()
-    # A run the server places on no host of these accounts' still runs here.
-    listed = {run.run for each in logins for m in each.hosts or [] for run in m.runs}
     report = _Status(
         logins=logins,
-        here=[
-            _Run(
-                run=host.name,
-                cli=" ".join(host.command.split()[:1]),
-                cwd=host.cwd,
-                session_id=None,
-            )
-            for host in detach.live_hosts()
-            if any(each.hosts is not None for each in logins)
-            and host.name not in listed
-        ],
         services=[] if services is None else services.every(),
         menubar=None if services is None else services.menu_bar(),
     )
@@ -682,8 +857,6 @@ def _say_status(report: _Status, *, manager: str | None) -> None:
         if index:
             echo("")
         _say_login(login)
-    for run in report.here:
-        echo(f"here:    {run.run}  {run.cli}")
     for each in report.services:
         flags = "".join(f" {flag}" for flag in each.flags)
         off = (
@@ -719,13 +892,14 @@ def _say_login(login: _Login) -> None:
         mark = " (this computer)" if host.this_computer else ""
         echo(f"host: {host.name} {host.status}{served}{count}{mark}")
         for run in host.runs:
-            short = (run.session_id or "")[:8]
-            echo(f"  run:   {run.run or short}  {run.cli}  {run.cwd or ''}")
+            echo(
+                f"  run:   {run.run or run.session_id[:8]}  {run.cli}  {run.cwd or ''}",
+            )
 
 
-def _next_step() -> None:
+def _next_step(named: str) -> None:
     """Print the next setup step for this computer, without starting a login."""
-    saved = _saved()
+    saved = _saved(named)
     if saved is None:
         echo("Not connected. Run:  knowop connect")
         return
@@ -743,16 +917,13 @@ def _next_step() -> None:
         echo("Not connected. Run:  knowop connect")
 
 
-# This computer's runs first: once the server stops them, each is already ending,
-# and a stop here would race its exit. Its service goes too, which would otherwise join
-# the host again when it next starts.
-def _disconnect(name: str, *, sleep: Callable[[float], None]) -> None:
-    """Stop this computer's runs when it is the host, then disconnect the host."""
+# Its service here goes too, which would otherwise join the host again when it next
+# starts.
+def _disconnect(name: str, *, named: str, sleep: Callable[[float], None]) -> None:
+    """Disconnect the host on the server, which stops its runs, and its service here."""
     host = name or host_name()
     check_name(host)
-    _, profile = _profile()
-    if host == host_name() and detach.stop_all() != 0:
-        raise ClientError("a run here did not stop; see knowop run ls")
+    _, profile = _profile(named)
     with Client(profile.url, api_key=profile.api_key) as http:
         for run in http.disconnect_host(host):
             echo(f"stopped: run {run.run or run.session_id} ({run.cli})")
@@ -770,6 +941,7 @@ def _disconnect(name: str, *, sleep: Callable[[float], None]) -> None:
 def _connect(
     flags: Flags,
     *,
+    named: str,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
 ) -> None:
@@ -782,7 +954,7 @@ def _connect(
             "knowop connect would install a service of root, which serves root's "
             "shells; run it as your own user, or with --foreground",
         )
-    saved = _saved()
+    saved = _saved(named)
     server = (
         saved[1].url
         if saved is not None and not flags.target
@@ -791,7 +963,7 @@ def _connect(
     # A saved login the server now refuses (its host was logged out elsewhere) is
     # no login: at a terminal connect logs in again, and a service's run says so.
     found = next(
-        (each for each in _logins() if each[1].url == server.rstrip("/")),
+        (each for each in _logins(named) if each[1].url == server.rstrip("/")),
         None,
     )
     if found is not None and _accepted(found[1]):
@@ -815,6 +987,7 @@ def _connect(
         # its one-use token: one step for the person, and no second login.
         result = login.login(
             server,
+            profile=named,
             host=name,
             client="knowop",
             sleep=sleep,
@@ -881,14 +1054,12 @@ def _connect_service(
                 "knowop connect again to serve it from one",
             )
             return
-        # Restarted when its definition, its knowop or the CLIs it would find changed
-        # (a host looks for them as it starts); else left running.
+        # Restarted when its definition or its knowop changed; else left running.
         current = (
             pid is not None
             and services.unchanged(unit)
             and before is not None
             and before.facts.get("knowop_version") == service.knowop_version()
-            and before.facts.get("clis") == daemon.host_facts()["clis"]
         )
         if not current:
             _serve(
@@ -990,9 +1161,6 @@ def _serve(
             echo("knowop: stopped; knowop connect starts it again", err=True)
             return
         raise
-    except KeyboardInterrupt:
-        _say_runs_left()
-        raise
     finally:
         for sig, handler in before.items():
             signal.signal(sig, handler)
@@ -1007,6 +1175,7 @@ def _rotating(log: Path, sleep: Callable[[float], None], seconds: float) -> None
 def _logs(
     name: str,
     *,
+    named: str,
     follow: bool,
     lines: int | None,
     sleep: Callable[[float], None],
@@ -1014,7 +1183,7 @@ def _logs(
     """Print the log of ``name``'s connect service here; with ``follow``, follow it."""
     host = name or host_name()
     check_name(host)
-    _, profile = _profile()
+    _, profile = _profile(named)
     log = (
         state_dir()
         / "rekursiv-ai"
@@ -1059,20 +1228,6 @@ def _print_log(
             text = source.read()
 
 
-# The host reads offline once its connect lets go, but a detached run reaches the
-# server with the account's key, not the host's: it is not stopped with the connect.
-def _say_runs_left() -> None:
-    """Name the detached runs still live on this computer, and how to stop them."""
-    hosts = detach.live_hosts()
-    if hosts:
-        names = ", ".join(host.name for host in hosts)
-        echo(
-            f"knowop: still reaching the server from here: {names}; stop them with "
-            "knowop run stop --all, or everything with knowop disconnect",
-            err=True,
-        )
-
-
 def _size(text: str) -> int:
     """Return the bytes ``--job-results-max`` names, or refuse it plainly."""
     try:
@@ -1091,6 +1246,7 @@ def _hand_off(
     verb: str,
     args: list[str],
     *,
+    named: str,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
 ) -> int:
@@ -1099,57 +1255,38 @@ def _hand_off(
         # The login is read only when a form asks the server: help needs none.
         command = Hosts if verb == HOST_WORD else canvas.Canvas
         command.dispatch(
-            verb,
+            # Neither command reads the verb it is run under (each has one name, and
+            # ``del``s it), so a mutant that hands it none is this same call.
+            verb,  # pragma: no mutate
             args,
-            lambda: connect(argparse.Namespace(profile=_profile()[0])),
+            lambda: connect(argparse.Namespace(profile=_profile(named)[0])),
         )
         return 0
     if verb == "job":
-        name, _ = _profile()
+        name, _ = _profile(named)
         return jobs_cli.main(["--profile", name, *args])
-    if (
-        len(args) == 2
-        and args[0] == "stop"
-        and not args[1].startswith("-")
-        and args[1] not in {host.name for host in detach.live_hosts()}
-    ):
-        _stop_run(args[1])
-        return 0
-    if _starts_an_agent(args):
-        if _saved() is None:
-            _log_in("", sleep=sleep, clock=clock)
-        name, profile = _profile()
-        _say_whether_connected(profile)
-    else:
-        # A help page and the commands that reach a detached run on this computer ask
-        # the server nothing, so they need no login.
-        name = saved[0] if (saved := _saved()) is not None else ""
-    # The runner reads a leading ``--profile``, and of two the last wins: one the caller
-    # names first (``knowop run claude --profile other``) overrides knowop's.
-    leading = ["--profile", name] if name else []
-    match args[:1]:
-        case ["codex"]:
-            return agent_cli.codex_main([*leading, *args[1:]])
-        case ["claude"]:
-            return agent_cli.main([*leading, *args[1:]])
-        case ["sagent"]:
-            return agent_cli.sagent_main([*leading, *args[1:]])
-        case _:
-            # A bare ``knowop run`` runs sagent, and ``attach``, ``ls``, ``log``, ``send``,
-            # ``stop``, ``resume`` and the runner's own flags are the sagent runner's words.
-            return agent_cli.sagent_main([*leading, *args])
+    if args[:1] == ["--serve"] or not _starts_an_agent(args):
+        # A daemon started it, and hands it the server's address and a key of its own
+        # on stdin; a help page asks the server nothing. Neither reads a profile, and
+        # neither logs in.
+        return process_main.main(args, profile=None)
+    if _saved(named) is None:
+        _log_in(named=named, sleep=sleep, clock=clock)
+    _, profile = _profile(named)
+    _say_whether_connected(profile)
+    # Sagent's own agent, in this process, live in Trackinizer; its flags are sagent's,
+    # and knowop's own.
+    return process_main.main(args, profile=profile)
 
 
 def _starts_an_agent(args: Sequence[str]) -> bool:
-    """Whether ``knowop run ARGS`` starts an agent, not a help page or a host command."""
+    """Whether ``knowop run ARGS`` starts an agent, not a help page."""
     head = args[: args.index("--")] if "--" in args else args
-    return not (head[:1] and head[0] in _HOST_WORDS) and not {"-h", "--help"} & set(
-        head,
-    )
+    return not {"-h", "--help"} & set(head)
 
 
 # A run reaches Chat without this computer being connected; a connected one also opens
-# its terminal there, which is how a person takes the run over from a browser.
+# its terminal there.
 def _say_whether_connected(profile: Profile) -> None:
     """Say to run ``knowop connect`` when this computer is not an online host."""
     try:
@@ -1164,38 +1301,6 @@ def _say_whether_connected(profile: Profile) -> None:
             "in another terminal to open its terminal from Chat",
             err=True,
         )
-
-
-# A run here stops through its own socket, as ever; any other live session of the account
-# stops through the server, on whichever host it says it runs.
-def _stop_run(run: str) -> None:
-    """Stop the live session of yours ``run`` names: its name, its session or its first 8."""
-    _, profile = _profile()
-    with Client(profile.url, api_key=profile.api_key) as http:
-        email = from_plain(_signed_in(http).get("email"), str)
-        found = [
-            (host.name, each)
-            for host in http.list_hosts()
-            if host.owner == email
-            for each in http.host_runs(host.name)
-            if run in {each.run, str(each.session_id), str(each.session_id)[:8]}
-        ]
-        if len(found) > 1:
-            listed = "".join(
-                f"\n  {host}  {each.run or '-'}  {each.session_id}  {each.cli}  "
-                f"{each.cwd or ''}"
-                for host, each in found
-            )
-            raise ClientError(
-                f"{run} names {len(found)} live sessions; stop one by its session:{listed}",
-            )
-        if not found:
-            raise ClientError(f"no live session {run} here or on your hosts")
-        [(host, stopped)] = found
-        http.stop_host_run(host, stopped.session_id)
-    echo(
-        f"stopped: run {stopped.run or stopped.session_id} ({stopped.cli}) on {host}",
-    )
 
 
 def _detail(http: Client, name: str) -> HostDetail | None:
@@ -1258,21 +1363,27 @@ def _caller(http: Client) -> dict[str, object] | None:
         raise
 
 
-def _profile() -> tuple[str, Profile]:
-    """Return knowop's profile, or refuse when knowop is not logged in."""
-    if (saved := _saved()) is None:
-        raise ClientError("not logged in; run knowop login")
+def _profile(named: str) -> tuple[str, Profile]:
+    """Return knowop's profile, or ``named``, or refuse when it is not logged in."""
+    if (saved := _saved(named)) is None:
+        flag = f" --profile {named}" if named else ""
+        raise ClientError(f"not logged in; run knowop{flag} login")
     return saved
 
 
-def _saved() -> tuple[str, Profile] | None:
-    """Return the name and contents of knowop's profile; ``None`` before a login."""
-    return next(iter(_logins()), None)
+def _saved(named: str) -> tuple[str, Profile] | None:
+    """Return the name and contents of knowop's profile, or of ``named``, if saved."""
+    return next(iter(_logins(named)), None)
+
+
+def _logins(named: str) -> list[tuple[str, Profile]]:
+    """Return the login of the profile ``--profile`` named, else knowop's own logins."""
+    return _found_logins([named]) if named else _kept_logins()
 
 
 # Knowop keeps a login per server it connected to, one profile name a line: the first is
 # the one every verb uses, and a connect service of another server signs in with its own.
-def _logins() -> list[tuple[str, Profile]]:
+def _kept_logins() -> list[tuple[str, Profile]]:
     """Return knowop's logins, the one its verbs use first; a deleted profile is none."""
     try:
         names = (
@@ -1280,6 +1391,11 @@ def _logins() -> list[tuple[str, Profile]]:
         )
     except FileNotFoundError:
         return []
+    return _found_logins(names)
+
+
+def _found_logins(names: Sequence[str]) -> list[tuple[str, Profile]]:
+    """Return each of ``names`` once, with its saved profile; one not saved is left out."""
     logins: list[tuple[str, Profile]] = []
     for name in dict.fromkeys(names):
         try:
@@ -1291,7 +1407,7 @@ def _logins() -> list[tuple[str, Profile]]:
 
 def _remember(profile: str) -> None:
     """Make ``profile`` the one every knowop verb uses, keeping knowop's other logins."""
-    _keep_logins([profile, *(name for name, _ in _logins() if name != profile)])
+    _keep_logins([profile, *(name for name, _ in _kept_logins() if name != profile)])
 
 
 def _keep_logins(names: list[str]) -> None:

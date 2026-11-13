@@ -1,993 +1,184 @@
-"""Writing a stored session back out as a file a CLI can resume."""
+"""Writing a stored sagent session back out as a journal this host continues."""
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import TYPE_CHECKING, Final
-from unittest.mock import patch
-from uuid import uuid4
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 import re
-import subprocess
+import stat
 
-from trackinizer.runs.adapters.claude import ClaudeAdapter
-from trackinizer.runs.adapters.codex import CodexAdapter
-from trackinizer.runs.adapters.sagent import SagentAdapter
-from trackinizer.sagent.scripts.convert_session import claude, codex, sagent
-from trackinizer.sagent.scripts.convert_session.convert import detect_format
-from trackinizer.sagent.scripts.convert_session.tail import Tail
-from trackinizer.sagent.session.projects import find_sessions, project_dir
+from trackinizer.sagent.scripts.convert_session import sagent
+from trackinizer.sagent.session.jsonl import record_line
 from trackinizer.sagent.session.types import (
     AssistantMessage,
     IncompleteRecord,
     SessionRecord,
     Thinking,
-    TurnContext,
-    UncategorizedRecord,
     UserMessage,
 )
-from trackinizer.trax.forward import RUN_CLIS
-from trackinizer.types.session_records import SessionRecordRow
-from trackinizer.types.streams import Stderr, Stdin, Stdout, TraxRecord
-from treekle import PlainTree, from_plain, immutable, json_loads
 
 import pytest
 
-from knowop.agent.conftest import _TESTDATA
-from knowop.agent.errors import (
-    CiphertextDroppedError,
-    NotResumableError,
-)
-from knowop.agent.materialize import (
-    RESUMABLE_TARGETS,
-    _codex_cli_version,
-    _stamped,
-    materialize,
-)
+from knowop.agent.errors import CiphertextDroppedError
+from knowop.agent.materialize import materialize
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from pathlib import Path
 
 
-pytestmark: Final = pytest.mark.usefixtures("local_session_dirs")
+class TestTheJournal:
+    """A journal in a folder of its own, holding the records it was given."""
 
-
-_FIXTURE: Final = _TESTDATA / "claude_sidechain.jsonl"
-
-
-# Real rather than synthetic: claude's writer reconstructs LINES from the provider-
-# native envelope each record carries in ``extra`` (``uuid``, ``parentUuid``, the key
-# order), so hand-built records with no envelope merge into one line and the rewrite
-# proves nothing about a real replay.
-def _records() -> list[SessionRecord]:
-    """Return a real captured transcript's records."""
-    with _FIXTURE.open(encoding="utf-8") as handle:
-        return list(claude.normalize(handle))
-
-
-# The LAST context stating one: the reader restates it as escaped lines arrive, so the
-# final statement is the one in force for the whole file.
-def _encoding() -> Mapping[str, PlainTree]:
-    """How that fixture spells its bytes, which the rewrite needs verbatim."""
-    return next(
-        record.encoding
-        for record in reversed(_records())
-        if isinstance(record, TurnContext) and record.encoding
-    )
-
-
-# The session id is what materializing rewrites, so a record that differs only there is
-# a record that survived.
-def _without_session_id(records: Sequence[TraxRecord]) -> list[TraxRecord]:
-    """Each record with any ``sessionId`` dropped from its residual."""
-    out: list[TraxRecord] = []
-    for record in records:
-        if (
-            isinstance(
-                record,
-                (IncompleteRecord, UncategorizedRecord, Stdin, Stdout, Stderr),
-            )
-            or "sessionId" not in record.extra
-        ):
-            out.append(record)
-            continue
-        out.append(
-            replace(
-                record,
-                extra=immutable(
-                    {k: v for k, v in record.extra.items() if k != "sessionId"},
-                ),
-            ),
-        )
-    return out
-
-
-class TestTheFileIsThisHostsOwn:
-    """Three things make the written file resumable HERE, not where captured."""
-
-    def test_the_session_id_is_minted_fresh(self) -> None:
-        """Reusing the captured id would collide with the original locally.
-
-        And for a codex capture it would name an id claude never issued, so
-        the CLI would refuse a session it has no record of.
-        """
-        first = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=_records(),
-            encoding=_encoding(),
-        )
-        second = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=_records(),
-            encoding=_encoding(),
-        )
-
-        assert first.cli_session_id != second.cli_session_id
-
-    def test_the_file_is_named_for_the_minted_id(self) -> None:
-        """``--resume <uuid>`` finds the file by that name, so they must agree."""
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=_records(),
-            encoding=_encoding(),
-        )
-
-        assert written.path.stem == written.cli_session_id
-        assert written.path.suffix == ".jsonl"
-
-    def test_a_claude_with_no_project_folder_for_here_is_refused(self) -> None:
-        with (
-            patch.object(ClaudeAdapter, "session_scope", return_value=None),
-            pytest.raises(ValueError, match="always derives a project directory"),
-        ):
-            _ = materialize(
-                attach=uuid4(),
-                target="claude",
-                records=_records(),
-                encoding=_encoding(),
-            )
-
-    def test_the_id_inside_the_file_is_rewritten(self) -> None:
-        """The contents must agree with the name, or the CLI reads a stranger.
-
-        Claude repeats ``sessionId`` on every line; a file whose lines still
-        name the CAPTURED session is one the CLI will not associate with the
-        id it was asked to resume.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=_records(),
-            encoding=_encoding(),
-        )
-
-        declared = {
-            json_loads(line, dict[str, object])["sessionId"]
-            for line in written.path.read_text(encoding="utf-8").splitlines()
-        }
-        assert declared == {written.cli_session_id}
-
-    def test_a_record_stating_no_id_is_still_named_by_the_file(self) -> None:
-        """``_renamed`` rewrites an id a record HAS; the writer fills one it lacks.
-
-        The writer's fallback is ``_FOREIGN_SEED`` -- a fixed namespace uuid --
-        so a record carrying no ``sessionId`` lands under
-        ``6ba7b811-9dad-11d1-80b4-00c04fd430c8`` rather than the file's own id.
-        Measured on a real resume: a materialized transcript declared two ids,
-        and claude, which filters its transcript by ``sessionId``, opened the
-        session showing NONE of the conversation.
-
-        Not every record carries one: the IR holds no identity, so a record the
-        server returned without a provider residual states nothing to rewrite.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=[UserMessage(content="hi"), AssistantMessage(content="hello")],
-            # A FOREIGN encoding, which is what makes the writer synthesize
-            # claude's identity keys at all: a codex-captured session states
-            # one, and that is the crossing this whole path exists for.
-            encoding=immutable({"newline_terminated": True}),
-        )
-
-        declared = {
-            json_loads(line, dict[str, object]).get("sessionId")
-            for line in written.path.read_text(encoding="utf-8").splitlines()
-        }
-        assert declared == {written.cli_session_id}
-
-    def test_the_path_derives_from_the_local_cwd(self, tmp_path: Path) -> None:
-        """Claude encodes the working directory in its project directory name.
-
-        Resuming in a different directory is expected: the file lands in the
-        project THIS cwd names, which is where the CLI will look for it.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=_records(),
-            encoding=_encoding(),
-        )
-
-        assert written.path.parent.parent == tmp_path / "claude" / "projects"
-
-
-class TestTheRewriteIsReadableBack:
-    """What is written must normalize back to what went in."""
-
-    def test_the_records_survive_the_round_trip(self) -> None:
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=_records(),
-            encoding=_encoding(),
-        )
-
-        with written.path.open(encoding="utf-8") as handle:
-            reread = list(claude.normalize(handle))
-
-        before = [r.content for r in _records() if isinstance(r, UserMessage)]
-        after = [r.content for r in reread if isinstance(r, UserMessage)]
-        assert before, "the fixture carries no user turns to compare"
-        assert after == before, "the rewrite lost a turn"
-
-    def test_every_record_survives_the_round_trip_but_the_session_id(self) -> None:
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=_records(),
-            encoding=_encoding(),
-        )
-
-        with written.path.open(encoding="utf-8") as handle:
-            reread = list(claude.normalize(handle))
-
-        assert _without_session_id(reread) == _without_session_id(_records())
-
-    def test_a_codex_capture_materializes_as_claude(self) -> None:
-        """The provider that captured a session need not resume it."""
-        reader = Tail(codex.normalize)
-        captured: list[TraxRecord] = []
-        for line in (
-            (
-                '{"timestamp":"2026-01-01T00:00:00Z","type":"response_item",'
-                '"payload":{"type":"message","role":"user",'
-                '"content":[{"type":"input_text","text":"hi"}]}}\n'
-            ),
-            (
-                '{"timestamp":"2026-01-01T00:00:01Z","type":"response_item",'
-                '"payload":{"type":"reasoning","summary":[],"encrypted_content":"sealed"}}\n'
-            ),
-            (
-                '{"timestamp":"2026-01-01T00:00:02Z","type":"response_item",'
-                '"payload":{"type":"message","role":"assistant",'
-                '"content":[{"type":"output_text","text":"hello"}]}}\n'
-            ),
-            "{",
-        ):
-            captured.extend(reader.feed(line))
-        captured.extend(reader.close())
-        # As the store hands them to a resume: the sealed half split off each row.
-        rows = [
-            SessionRecordRow.of(session_id=uuid4(), part=0, idx=idx, record=record)
-            for idx, record in enumerate(captured)
-        ]
-        records: list[SessionRecord] = []
-        for row in rows:
-            record = row.record()
-            assert not isinstance(record, Stdin | Stdout | Stderr), row.kind
-            records.append(record)
-
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=records,
-            encoding=immutable(reader.encoding),
-            sealed=[row.ciphertext for row in rows],
-        )
-
-        with written.path.open(encoding="utf-8") as handle:
-            reread = list(claude.normalize(handle))
-        assert reread, "a codex capture materialized to an empty transcript"
-        assert [
-            record.content
-            for record in reread
-            if isinstance(record, UserMessage | AssistantMessage)
-        ] == ["hi", "hello"]
-        assert [
-            record.encrypted for record in reread if isinstance(record, Thinking)
-        ] == [
-            "sealed",
-        ]
-
-    def test_the_reread_file_declares_the_minted_id(self) -> None:
-        """The reader reads back the id the rewrite stamped in.
-
-        Read off the records themselves: identity is not in the IR, so the id
-        is only where claude states it -- the ``sessionId`` each line carries
-        in its own residual.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=_records(),
-            encoding=_encoding(),
-        )
-
-        with written.path.open(encoding="utf-8") as handle:
-            declared = {
-                from_plain(getattr(record, "extra", None) or {}, dict[str, object]).get(
-                    "sessionId",
-                )
-                for record in claude.normalize(handle)
-            }
-
-        assert declared - {None} == {written.cli_session_id}
-
-
-class TestCiphertext:
-    """Sealed reasoning is spliced at materialization, or the replay refuses."""
-
-    def test_ciphertext_is_spliced_back_into_its_record(self) -> None:
-        """The bytes live in another table; the file needs them inline."""
-        sealed = "c2VhbGVkLXJlYXNvbmluZw=="
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=[Thinking(encrypted="")],
-            encoding=immutable({}),
-            sealed=[sealed],
-        )
-
-        assert sealed in written.path.read_text(encoding="utf-8")
-
-    def test_a_dropped_ciphertext_refuses_rather_than_writing_a_hollow_file(
-        self,
-    ) -> None:
-        """Retention can drop the bytes; a hollow transcript fails at the CLI.
-
-        Raising names the cause. Writing an empty ``encrypted`` would fail
-        inside the provider with nothing pointing back at retention.
-        """
-        with pytest.raises(CiphertextDroppedError, match="no longer stored"):
-            materialize(
-                attach=uuid4(),
-                target="claude",
-                records=[Thinking(encrypted="")],
-                encoding=immutable({}),
-                sealed=[None],
-            )
-
-    def test_nothing_is_written_when_the_ciphertext_is_missing(
+    def test_the_journal_sits_in_a_new_folder_its_id_names(
         self,
         tmp_path: Path,
     ) -> None:
-        """A half-written file would be captured as this run's own transcript."""
-        with pytest.raises(CiphertextDroppedError):
-            materialize(
-                attach=uuid4(),
-                target="claude",
-                records=[UserMessage(content="a"), Thinking(encrypted="")],
-                encoding=immutable({}),
-                sealed=[None, None],
-            )
-
-        assert not list((tmp_path / "claude" / "projects").rglob("*.jsonl"))
-
-    @pytest.mark.parametrize("source", ["claude", "codex"])
-    def test_unsealed_summary_and_foreign_dropped_seal_resume(
-        self,
-        source: str,
-    ) -> None:
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=[
-                Thinking(
-                    summary="summary",
-                    encrypted="" if source == "codex" else None,
-                ),
-            ],
-            encoding=immutable({}),
-            source=source,
-        )
-        assert "summary" in written.path.read_text(encoding="utf-8")
-
-    def test_readable_thinking_needs_no_ciphertext(self) -> None:
-        """A summarized reasoning block was never sealed, so it replays fine."""
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=[Thinking(content="visible reasoning")],
-            encoding=immutable({}),
-            sealed=[None],
-        )
-
-        assert "visible reasoning" in written.path.read_text(encoding="utf-8")
-
-
-class TestResumableTargets:
-    """A target is resumable when it names a session by a stable id."""
-
-    def test_trax_names_exactly_the_clis_that_can_resume(self) -> None:
-        """``trax agentsession N run CLI`` accepts exactly the resumable CLIs."""
-        assert RUN_CLIS == RESUMABLE_TARGETS
-
-    def test_claude_is_resumable(self) -> None:
-        assert "claude" in RESUMABLE_TARGETS
-
-    def test_codex_is_resumable(self) -> None:
-        """``codex resume <SESSION_ID>`` takes a uuid, and the rollout has one.
-
-        Measured against the installed CLI (``codex resume --help``: "Session
-        id (UUID) or session name") and a captured rollout, whose filename
-        ends in the same uuid its launch line states as ``payload.id``. The
-        earlier refusal cited ``session_id_from_path`` returning ``None`` --
-        which was this adapter declining to parse a name it could read, not a
-        property of codex.
-        """
-        assert "codex" in RESUMABLE_TARGETS
-
-    def test_gemini_and_sh_are_not(self) -> None:
-        """Neither names a session to re-enter.
-
-        Gemini rewrites one document in place, and a scrape has no native log
-        at all -- so there is no id to hand back, whatever the writer can
-        produce.
-        """
-        assert not {"gemini", "sh"} & RESUMABLE_TARGETS
-
-
-class TestMaterializingCodex:
-    """A stored session written back as a rollout the codex CLI resumes."""
-
-    def test_the_file_is_named_by_the_id_codex_resumes(self) -> None:
-        """``codex resume`` finds a rollout by the uuid in its FILENAME.
-
-        The whole stem, not just the uuid: codex globs ``rollout-*`` and the
-        adapter's own ``matches_session_file`` requires that prefix, so a file
-        named by the bare id is invisible to both.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        assert written.path.name.startswith("rollout-")
-        assert written.cli_session_id in written.path.name
-        assert CodexAdapter().matches_session_file(written.path)
-
-    def test_the_rollout_reads_back_as_codex(self) -> None:
-        """Written in codex's own dialect, not claude's under a codex name."""
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        assert detect_format(written.path.read_text(encoding="utf-8")) == "codex"
-
-    def test_the_declared_id_matches_the_filename(self) -> None:
-        """A rollout states its own id; the CLI rejects one that disagrees.
-
-        The same rule claude's ``_renamed`` enforces, for the same reason: a
-        transcript naming the session it came from, under a filename naming a
-        fresh one, resumes a session the local host does not have.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        declared = json_loads(
-            written.path.read_text(encoding="utf-8").splitlines()[0],
-            dict[str, object],
-        )
-        payload = from_plain(declared["payload"], dict[str, object])
-        assert payload["id"] == written.cli_session_id
-
-    def test_the_launch_payload_is_one_codex_will_load(self) -> None:
-        """A rollout declaring only its id is refused by the CLI.
-
-        Measured against the installed binary: a materialized rollout whose
-        ``session_meta`` payload held ``{id, session_id}`` answered "No saved
-        session found", while the same file with a real declaration -- cwd,
-        originator, cli_version, source, thread_source, model_provider, and a
-        top-level ``ordinal`` -- resumed. The payload is not decoration; it is
-        what codex validates a session by.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        declared = json_loads(
-            written.path.read_text(encoding="utf-8").splitlines()[0],
-            dict[str, object],
-        )
-        payload = from_plain(declared["payload"], dict[str, object])
-        assert declared["ordinal"] == 0
-        assert set(payload) >= {
-            "cli_version",
-            "cwd",
-            "id",
-            "model_provider",
-            "originator",
-            "session_id",
-            "source",
-            "thread_source",
-            "timestamp",
-        }
-        assert payload["cwd"] == str(Path.cwd())
-        assert payload["cli_version"] == "0.999.0"
-
-    def test_a_record_with_no_timestamp_field_still_materializes(self) -> None:
-        """Two members of the union declare no fields the others share.
-
-        ``IncompleteRecord`` is a raw line the reader could not parse -- it
-        holds ``text`` and nothing else, no ``timestamp`` and no ``extra`` --
-        and a real session carried one, so stamping crashed the resume with
-        ``AttributeError: 'IncompleteRecord' object has no attribute
-        'timestamp'`` before anything reached disk. ``_renamed`` already reads
-        its residual through ``getattr`` for the same reason.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[IncompleteRecord(text="{"), UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        assert written.path.exists()
-
-    def test_another_providers_ciphertext_is_not_replayed(self) -> None:
-        """Reasoning bytes are sealed BY the provider that issued them.
-
-        Claude's signature crossed into codex's ``encrypted_content`` and the
-        resumed session failed on its first request: ``invalid_encrypted_content
-        -- The encrypted content CAIS...AQ== could not be verified``. OpenAI
-        cannot decrypt an Anthropic seal, so the bytes are not portable; the
-        readable summary is, and it is what survives the crossing.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[
-                Thinking(summary="weighing it", encrypted="CAISsgIKpgEIERgCKkBjy88X"),
-                UserMessage(content="hi"),
-            ],
-            encoding=immutable({}),
-            # A claude-captured session, which is the only case that carries a
-            # seal codex did not issue.
-            source="claude",
-        )
-
-        assert "CAISsgIKpgEIERgCKkBjy88X" not in written.path.read_text(
-            encoding="utf-8",
-        )
-
-    def test_an_unparsed_line_is_not_replayed_into_another_format(self) -> None:
-        """``IncompleteRecord`` holds one provider's bytes, verbatim.
-
-        Written into a codex rollout it landed mid-file with no newline and no
-        outer envelope, so the line held THREE concatenated objects and no JSON
-        reader could parse it. It replays only into the format it was read
-        from; crossing, it is a drop the loss gate counts.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[
-                UserMessage(content="hi"),
-                IncompleteRecord(text='{"type":"cost-state"}{"type":"atis-latch"}'),
-            ],
-            encoding=immutable({}),
-            source="claude",
-        )
-
-        for line in written.path.read_text(encoding="utf-8").splitlines():
-            _ = json_loads(line)
-
-    def test_an_unparsed_record_holding_several_lines_is_dropped(self) -> None:
-        """One record is one line, whatever format wrote it.
-
-        A real capture stored 4498 characters -- a ``cost-state``, an
-        ``atis-latch`` and a ``turn_context`` concatenated, no separators, no
-        trailing newline -- under a single :class:`IncompleteRecord`, and no
-        crossing was involved: the part's own format was codex, so a per-part
-        rule replayed it verbatim and the rollout carried a line that parsed as
-        none.
-
-        Verbatim replay is what makes a same-format rewrite byte-exact, so a
-        record that IS one line still replays whatever it says, valid or not.
-        Only a record that cannot BE a line is dropped.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[
-                UserMessage(content="hi"),
-                IncompleteRecord(text='{"type":"cost-state"}{"type":"atis-latch"}'),
-            ],
-            encoding=immutable({}),
-            # NOT a crossing: the format that captured it is the one written.
-            source="codex",
-        )
-
-        for line in written.path.read_text(encoding="utf-8").splitlines():
-            _ = json_loads(line)
-
-    def test_an_unparsed_record_spanning_lines_is_dropped(self) -> None:
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[
-                UserMessage(content="hi"),
-                IncompleteRecord(text='{"type":"cost-state"}\n{"type":"atis-latch"}'),
-            ],
-            encoding=immutable({}),
-            source="codex",
-        )
-
-        assert "cost-state" not in written.path.read_text(encoding="utf-8")
-
-    def test_the_launch_line_carries_the_stamp_not_just_the_payload(self) -> None:
-        """The OUTER ``timestamp``, which is the one that decides resumability.
-
-        Measured against the installed binary on two copies of one rollout
-        differing in this field alone: ``"timestamp":null`` answered "No saved
-        session found", the ISO string resumed. Codex indexes a session by the
-        stamp on the line, not the one inside the declaration, so the writer
-        must be given the record's own field -- setting it in ``extra`` alone
-        left the emitted line null.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        declared = json_loads(
-            written.path.read_text(encoding="utf-8").splitlines()[0],
-            dict[str, object],
-        )
-        timestamp = declared["timestamp"]
-        assert isinstance(timestamp, str)
-        assert timestamp.endswith("Z")
-
-    def test_every_line_is_stamped_not_only_the_launch(self) -> None:
-        """An unstamped transcript line is one codex does NOT replay.
-
-        Measured against the installed binary on three rollouts of one
-        conversation: stamping only the launch line resumed the session but
-        answered "Unknown" when asked what the transcript said, while stamping
-        every line answered from it. The session opens either way, so this is
-        invisible to a check that only asks whether the CLI started.
-
-        A record crossed in from another CLI may carry no stamp of its own --
-        claude's transcript stamps its lines, but the IR does not require one --
-        so the stamp is supplied here rather than assumed.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[UserMessage(content="hi"), AssistantMessage(content="hello")],
-            encoding=immutable({}),
-        )
-
-        lines = [
-            json_loads(line, dict[str, object])
-            for line in written.path.read_text(encoding="utf-8").splitlines()
-        ]
-        assert all(isinstance(line.get("timestamp"), str) for line in lines)
-
-    def test_a_captured_declaration_keeps_its_own_fields(self) -> None:
-        """A codex capture already declares itself; only identity is restated.
-
-        The synthesized payload is for a session crossed in from another CLI.
-        Overwriting a real declaration would discard the cwd and provider the
-        rollout was actually recorded under.
-        """
-        captured = TurnContext(
-            extra=immutable(
-                {
-                    "payload": {
-                        "id": "old",
-                        "session_id": "old",
-                        "cwd": "/elsewhere",
-                        "originator": "codex-tui",
-                        "cli_version": "0.150.1",
-                        "source": "cli",
-                        "thread_source": "user",
-                        "model_provider": "openai",
-                        "timestamp": "2026-01-01T00:00:00.000Z",
-                    },
-                },
-            ),
-        )
-
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[captured, UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        payload = from_plain(
-            json_loads(
-                written.path.read_text(encoding="utf-8").splitlines()[0],
-                dict[str, object],
-            )["payload"],
-            dict[str, object],
-        )
-        assert payload["cwd"] == "/elsewhere"
-        assert payload["id"] == written.cli_session_id
-
-    def test_the_session_is_added_to_the_index_codex_resumes_from(self) -> None:
-        """``codex resume <id>`` looks the session up in an INDEX.
-
-        Measured: a rollout sitting in ``sessions/`` with no
-        ``session_index.jsonl`` entry answers "No saved session found", and a
-        real rollout resumes in a fresh ``CODEX_HOME`` given only its index
-        line. Writing the file is half the job.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        index = next(iter(CodexAdapter().session_dirs())).parent / "session_index.jsonl"
-        entries = [
-            json_loads(line, dict[str, object])
-            for line in index.read_text(encoding="utf-8").splitlines()
-        ]
-        assert [entry["id"] for entry in entries] == [written.cli_session_id]
-
-    def test_the_index_is_appended_never_rewritten(self) -> None:
-        """The operator's other sessions must survive a materialization."""
-        index = next(iter(CodexAdapter().session_dirs())).parent / "session_index.jsonl"
-        index.parent.mkdir(parents=True, exist_ok=True)
-        _ = index.write_text(
-            '{"id":"kept","thread_name":"prior","updated_at":"2026-01-01T00:00:00Z"}\n',
-            encoding="utf-8",
-        )
-
-        written = materialize(
-            attach=uuid4(),
-            target="codex",
-            records=[UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        ids = [
-            json_loads(line, dict[str, object])["id"]
-            for line in index.read_text(encoding="utf-8").splitlines()
-        ]
-        assert ids == ["kept", written.cli_session_id]
-
-    def test_an_unknown_target_is_refused(self) -> None:
-        """Naming a target with no writer is a caller error, not an empty file."""
-        with pytest.raises(NotResumableError, match="gemini"):
-            _ = materialize(
-                attach=uuid4(),
-                target="gemini",
-                records=[UserMessage(content="hi")],
-                encoding=immutable({}),
-            )
-
-
-class TestCodexCliVersion:
-    """Version discovery is independent of the serialization tests' installed CLI."""
-
-    @pytest.mark.parametrize(
-        ("stdout", "returncode", "expected"),
-        [
-            ("codex-cli 0.123.0\n", 0, "0.123.0"),
-            ("", 0, "0.150.1"),
-            ("codex-cli 0.123.0\n", 1, "0.150.1"),
-        ],
-    )
-    def test_the_installed_binary_reports_its_version(
-        self,
-        stdout: str,
-        returncode: int,
-        expected: str,
-    ) -> None:
-        with (
-            patch("shutil.which", return_value="/test/bin/codex"),
-            patch(
-                "subprocess.run",
-                return_value=subprocess.CompletedProcess(
-                    args=["/test/bin/codex", "--version"],
-                    returncode=returncode,
-                    stdout=stdout,
-                ),
-            ) as run,
-        ):
-            assert _codex_cli_version() == expected
-        run.assert_called_once_with(
-            ["/test/bin/codex", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-
-    def test_an_absent_binary_uses_the_verified_floor(self) -> None:
-        with patch("shutil.which", return_value=None), patch("subprocess.run") as run:
-            assert _codex_cli_version() == "0.150.1"
-        run.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "error",
-        [OSError(), subprocess.TimeoutExpired("codex", 10)],
-    )
-    def test_an_unavailable_binary_uses_the_verified_floor(
-        self,
-        error: Exception,
-    ) -> None:
-        with (
-            patch("shutil.which", return_value="/test/bin/codex"),
-            patch("subprocess.run", side_effect=error),
-        ):
-            assert _codex_cli_version() == "0.150.1"
-
-
-class TestACrossingIsStampedAndLinked:
-    """A session crossed in from another CLI is a file claude can link and answer from."""
-
-    @pytest.mark.parametrize("target", ["claude", "codex"])
-    def test_a_sagent_payload_never_reaches_the_target_file(self, target: str) -> None:
-        """The bot's kinds are bare, like claude's own, so no writer can tell them apart."""
-        written = materialize(
-            attach=uuid4(),
-            target=target,
-            records=[
-                UncategorizedRecord(
-                    kind="tool_state",
-                    payload=immutable({"state": "from bot"}),
-                ),
-                UserMessage(content="hi"),
-            ],
-            encoding=immutable({}),
-            source="sagent",
-        )
-
-        assert "from bot" not in written.path.read_text(encoding="utf-8")
-
-    def test_a_sagent_session_is_linked_as_claude_reads_it(self) -> None:
-        """A sagent part states no encoding, and claude then wrote unlinked lines.
-
-        Each line names its predecessor, and every line carries a timestamp and this
-        host's cwd: claude finds the project by the cwd, and refuses a line with no
-        timestamp.
-        """
-        written = materialize(
-            attach=uuid4(),
-            target="claude",
-            records=[UserMessage(content="hi"), AssistantMessage(content="hello")],
-            encoding=immutable({}),
-            source="sagent",
-        )
-
-        found = [
-            json_loads(line, dict[str, object])
-            for line in written.path.read_text(encoding="utf-8").splitlines()
-        ]
-        turns = [line for line in found if line.get("type") in {"user", "assistant"}]
-        first, second = turns
-        assert first["parentUuid"] is None
-        assert second["parentUuid"] == first["uuid"]
-        assert all(isinstance(turn["timestamp"], str) for turn in turns)
-        assert all(turn["cwd"] == str(Path.cwd()) for turn in turns)
-
-    def test_an_unstamped_record_takes_the_stamp_before_it(self) -> None:
-        """Only the records with no stamp are given one; the others keep their own.
-
-        A raw line the reader could not parse has no stamp field at all, so it passes
-        through as it is.
-        """
-        stamped = _stamped(
-            [
-                UserMessage(timestamp="2026-01-01T00:00:00Z", content="a"),
-                IncompleteRecord(text="{"),
-                UserMessage(content="b"),
-                UserMessage(timestamp="", content="c"),
-            ],
-        )
-
-        first, middle, second, third = stamped
-        assert middle == IncompleteRecord(text="{")
-        for record in (first, second, third):
-            assert isinstance(record, UserMessage)
-            assert record.timestamp == "2026-01-01T00:00:00Z"
-
-    def test_a_leading_unstamped_record_is_stamped_now(self) -> None:
-        """Now, to the millisecond in UTC, in the form codex writes on its launch line."""
-        before = datetime.now(UTC)
-
-        [first] = _stamped([UserMessage(content="a")])
-
-        assert isinstance(first, UserMessage)
-        assert first.timestamp is not None
-        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", first.timestamp)
-        stamped = datetime.fromisoformat(first.timestamp)
-        assert abs(stamped - before).total_seconds() < 5
-
-
-class TestMaterializingSagent:
-    """A stored session written back as a journal ``sagent --resume`` re-enters."""
-
-    def test_the_journal_sits_in_the_folder_its_id_names(self) -> None:
         """Sagent names a session by its journal's folder, and resumes by that name."""
-        written = materialize(
-            attach=uuid4(),
-            target="sagent",
-            records=[UserMessage(content="hi")],
-            encoding=immutable({}),
+        # Not made yet, as a session's journals folder is not before its first restore.
+        folder = tmp_path / "journals" / "session"
+
+        path = materialize([UserMessage(content="hi")], sealed=[None], folder=folder)
+
+        assert path == folder / path.parent.name / "session.jsonl"
+        assert UUID(hex=path.parent.name).hex == path.parent.name
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+    def test_each_write_takes_a_folder_of_its_own(self, tmp_path: Path) -> None:
+        first = materialize([UserMessage(content="a")], sealed=[], folder=tmp_path)
+        second = materialize([UserMessage(content="b")], sealed=[], folder=tmp_path)
+
+        assert first.parent != second.parent
+        assert sorted(each.name for each in tmp_path.iterdir()) == sorted(
+            [first.parent.name, second.parent.name],
         )
 
-        assert written.path.name == "session.jsonl"
-        assert written.path.parent.parent == project_dir(Path.cwd())
-        assert written.path.parent.name == written.cli_session_id
-        assert SagentAdapter().session_id_from_path(written.path) == (
-            written.cli_session_id
-        )
-
-    def test_sagent_finds_the_journal_by_the_id_it_resumes(self) -> None:
-        written = materialize(
-            attach=uuid4(),
-            target="sagent",
-            records=[UserMessage(content="hi")],
-            encoding=immutable({}),
-        )
-
-        assert [each.path for each in find_sessions(written.cli_session_id)] == [
-            written.path,
-        ]
-
-    def test_the_journal_reads_back_as_the_records_it_was_given(self) -> None:
-        """A crossing from claude keeps every turn: sagent journals the IR itself."""
+    def test_the_journal_is_the_records_it_was_given_line_for_line(
+        self,
+        tmp_path: Path,
+    ) -> None:
         records = [
             UserMessage(content="what is 2+2?"),
             AssistantMessage(content="4"),
         ]
 
-        written = materialize(
-            attach=uuid4(),
-            target="sagent",
-            records=records,
-            encoding=immutable({}),
-            source="claude",
+        path = materialize(records, sealed=[None, None], folder=tmp_path)
+
+        assert path.read_bytes() == b"".join(map(record_line, records))
+        with path.open(encoding="utf-8") as handle:
+            assert list(sagent.normalize(handle)) == records
+
+
+class TestCiphertext:
+    """Sealed reasoning is spliced at materialization, or the replay refuses."""
+
+    def test_ciphertext_is_spliced_back_into_its_record(self, tmp_path: Path) -> None:
+        """The bytes live in another table; the journal needs them inline."""
+        sealed = "c2VhbGVkLXJlYXNvbmluZw=="
+
+        path = materialize(
+            [
+                UserMessage(content="a"),
+                Thinking(encrypted=""),
+                UserMessage(content="b"),
+            ],
+            sealed=[None, sealed, None],
+            folder=tmp_path,
         )
 
-        with written.path.open(encoding="utf-8") as handle:
-            read = [
-                record
-                for record in sagent.normalize(handle)
-                if not isinstance(record, TurnContext)
-            ]
-        assert [type(r) for r in read] == [UserMessage, AssistantMessage]
-        assert [
-            r.content for r in read if isinstance(r, UserMessage | AssistantMessage)
-        ] == ["what is 2+2?", "4"]
-        assert written.prefix_bytes == written.path.stat().st_size
+        assert _read(path) == [
+            UserMessage(content="a"),
+            Thinking(encrypted=sealed),
+            UserMessage(content="b"),
+        ]
+
+    def test_a_dropped_ciphertext_refuses_and_writes_nothing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Retention can drop the bytes; a hollow transcript fails at the provider.
+
+        Raising names the cause. Writing an empty ``encrypted`` would fail inside
+        the provider with nothing pointing back at retention, and a half-written
+        journal would be a session this host appears to hold.
+        """
+        with pytest.raises(
+            CiphertextDroppedError,
+            match=re.escape(
+                "record 1 is sealed reasoning whose ciphertext is no longer stored; "
+                "the provider rejects a transcript with an empty 'encrypted' field, "
+                "so this session cannot be resumed",
+            ),
+        ):
+            _ = materialize(
+                [UserMessage(content="a"), Thinking(encrypted="")],
+                sealed=[None],
+                folder=tmp_path,
+            )
+
+        assert list(tmp_path.iterdir()) == []
+
+    def test_reasoning_never_sealed_or_readable_needs_no_ciphertext(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        records = [
+            Thinking(summary="summary", encrypted=None),
+            Thinking(content="visible reasoning", encrypted=""),
+        ]
+
+        path = materialize(records, sealed=[None, None], folder=tmp_path)
+
+        assert _read(path) == records
+
+
+class TestAnUnparsedRecord:
+    """A record read torn replays verbatim, but only as one line."""
+
+    @pytest.mark.parametrize(
+        "text",
+        ['{"py/object": "UserMessage", "cont', '{"py/object": "Unknown"} \n'],
+        ids=["torn", "one-value-and-its-newline"],
+    )
+    def test_a_line_replays_byte_for_byte(self, tmp_path: Path, text: str) -> None:
+        path = materialize(
+            [UserMessage(content="hi"), IncompleteRecord(text=text)],
+            sealed=[],
+            folder=tmp_path,
+        )
+
+        assert path.read_bytes() == (
+            record_line(UserMessage(content="hi")) + text.encode()
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"type":"cost-state"}{"type":"atis-latch"}',
+            '{"type":"cost-state"}\n{"type":"atis-latch"}',
+        ],
+        ids=["several-values", "several-lines"],
+    )
+    def test_a_record_that_cannot_be_one_line_is_dropped(
+        self,
+        tmp_path: Path,
+        text: str,
+    ) -> None:
+        """A real capture stored three objects, no separator, under one record."""
+        path = materialize(
+            [UserMessage(content="hi"), IncompleteRecord(text=text)],
+            sealed=[],
+            folder=tmp_path,
+        )
+
+        assert path.read_bytes() == record_line(UserMessage(content="hi"))
+
+
+def _read(path: Path) -> list[SessionRecord]:
+    """Return the records a journal holds, as sagent reads them."""
+    with path.open(encoding="utf-8") as handle:
+        return list(sagent.normalize(handle))
 
 
 if __name__ == "__main__":

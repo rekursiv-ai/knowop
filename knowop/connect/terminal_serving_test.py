@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, cast, override
+from typing import TYPE_CHECKING, Literal, Self, cast, override
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call
 
 import asyncio
@@ -12,9 +13,7 @@ import functools
 import logging
 import os
 import pwd
-import shutil
 import stat
-import sys
 import threading
 import uuid
 
@@ -37,9 +36,7 @@ from knowop.connect.conftest import (
     _Client,
     _connect,
     _connector,
-    _fail_files,
     _FakeSocket,
-    _finish_files,
     _Messages,
     _opened,
     _ScriptedPeer,
@@ -48,7 +45,6 @@ from knowop.connect.conftest import (
     _terminal_run,
     _terminal_serving,
 )
-from knowop.connect.files_channel import FilesChannel, Info
 from knowop.connect.terminal_direct import DirectRouter
 from knowop.connect.terminal_serving import (
     TerminalServing,
@@ -61,7 +57,7 @@ from knowop.connect.wake import Wake
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Coroutine
 
     from trackinizer.mock_test_support import AsyncMockProtocol, MockProtocol
     from trackinizer.wire.wire_terminals import TerminalWait
@@ -97,8 +93,9 @@ async def test_a_shells_output_and_exit_status_arrive(
     assert launch.call_args.args == (["/bin/sh", "-c", "printf ok; exit 3"],)
 
 
-async def test_startup_retries_handshake_timeouts_and_launches_the_cli_once(
+async def test_startup_retries_handshake_timeouts_and_launches_the_shell_once(
     monkeypatch: pytest.MonkeyPatch,
+    startup_clock: _StartupClock,
 ) -> None:
     monkeypatch.setattr(
         TerminalServing,
@@ -112,10 +109,13 @@ async def test_startup_retries_handshake_timeouts_and_launches_the_cli_once(
     socket = _FakeSocket()
     connector = _connector(monkeypatch, TimeoutError(), TimeoutError(), socket)
     _, launch = _terminal(monkeypatch, b"ready")
-    opened = _opened(command="claude", run_name="chat-retry")
+    opened = _opened()
 
     await asyncio.wait_for(
-        _terminal_run(_terminal_serving("http://box.invalid"), opened),
+        _terminal_run(
+            _terminal_serving("http://box.invalid", "/bin/sh", "-c", "printf ready"),
+            opened,
+        ),
         3,
     )
 
@@ -128,15 +128,17 @@ async def test_startup_retries_handshake_timeouts_and_launches_the_cli_once(
         == [f"ws://box.invalid{path}?instance={_INSTANCE}&ready=true"] * 3
     )
     assert len(connector.calls) == 3
+    # Each timeout waits its retry before the next try.
+    assert len(startup_clock.pauses) == 2
+    assert sum(startup_clock.pauses) == pytest.approx(0.002)
     assert all(
         0 < cast(float, kwargs["open_timeout"]) <= 0.02 for kwargs in connector.calls
     )
     launch.assert_called_once_with(
-        [sys.executable, *_KNOWOP, "claude", "--detach", "--name", "chat-retry"],
+        ["/bin/sh", "-c", "printf ready"],
         cwd=ANY,
         env=ANY,
-        clean_env=False,
-        drop_env=ANY,
+        clean_env=True,
         terminate_grace_sec=2.0,
         winsize=(24, 80),
     )
@@ -150,7 +152,7 @@ async def test_startup_retries_handshake_timeouts_and_launches_the_cli_once(
     assert socket.closed
 
 
-async def test_a_refused_startup_never_launches_the_cli_and_reports_one_error(
+async def test_a_refused_startup_never_launches_the_shell_and_reports_one_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -160,10 +162,7 @@ async def test_a_refused_startup_never_launches_the_cli_and_reports_one_error(
     )
     _, launch = _terminal(monkeypatch)
 
-    await _terminal_run(
-        _terminal_serving("http://box.invalid"),
-        _opened(command="claude", run_name="chat-refused"),
-    )
+    await _terminal_run(_terminal_serving("http://box.invalid"), _opened())
 
     launch.assert_not_called()
     error = capsys.readouterr().err
@@ -178,9 +177,7 @@ async def test_stop_cancels_startup_while_waiting_for_the_server_acknowledgement
     _ = _connector(monkeypatch, socket)
     _, launch = _terminal(monkeypatch)
     daemon = _terminal_serving("http://box.invalid")
-    running = asyncio.create_task(
-        _terminal_run(daemon, _opened(command="claude", run_name="chat-stopped")),
-    )
+    running = asyncio.create_task(_terminal_run(daemon, _opened()))
     try:
         assert await asyncio.wait_for(asyncio.to_thread(socket.received.wait, 2), 2)
         await asyncio.to_thread(daemon.stop)
@@ -258,7 +255,6 @@ async def test_stop_and_a_closed_socket_each_terminate_and_reap_the_terminal(
             cwd=ANY,
             env=ANY,
             clean_env=True,
-            drop_env=(),
             terminate_grace_sec=2.0,
             winsize=(24, 80),
         )
@@ -376,7 +372,9 @@ async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
     await _terminal_run(daemon, _opened(canvas=canvas, workspace=workspace))
 
     assert launch.call_args.kwargs["clean_env"] is True
-    assert launch.call_args.kwargs["drop_env"] == ()
+    assert "drop_env" not in launch.call_args.kwargs
+    # Named by the daemon, not left to whatever the child would inherit.
+    assert launch.call_args.kwargs["env"]["TERM"] == "xterm-256color"
     lines = set(_result(socket)[0].decode().split())
     assert {
         "TERM=xterm-256color",
@@ -392,66 +390,9 @@ async def test_the_shell_starts_clean_with_the_trax_context_and_no_secret(
     assert not [line for line in lines if "sentinel" in line]
 
 
-async def _run_env(
-    monkeypatch: pytest.MonkeyPatch,
-    trax_env: dict[str, str],
-    canvas: uuid.UUID,
-) -> set[str]:
-    """Return the real child's environment without spawning the process."""
-    socket = _FakeSocket()
-    _ = _connector(monkeypatch, socket)
-    launch = _environment(monkeypatch)
-    daemon = _terminal_serving("http://box.invalid", trax_env=trax_env)
-    await _terminal_run(
-        daemon,
-        _opened(command="claude", run_name="run-1a2b3c4d", canvas=canvas),
-    )
-    assert launch.call_args.kwargs["clean_env"] is False
-    return set(_result(socket)[0].decode().split())
-
-
-async def test_a_run_inherits_the_daemon_environment_like_a_typed_knowop_run(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1/bus")
-    monkeypatch.setenv("SENTINEL_FROM_DAEMON", "kept")
-    canvas = uuid.uuid4()
-    lines = await _run_env(
-        monkeypatch,
-        {"TRACKINIZER_PROFILE": "hosted"},
-        canvas,
-    )
-    assert {
-        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1/bus",
-        "SENTINEL_FROM_DAEMON=kept",
-        "TRACKINIZER_PROFILE=hosted",
-        f"TRAX_CANVAS={canvas}",
-    } <= lines
-
-
-async def test_the_canvases_trax_context_replaces_any_the_daemon_inherited(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("TRACKINIZER_URL", "http://elsewhere.invalid")
-    monkeypatch.setenv("TRACKINIZER_TOKEN", "sentinel-token")
-    monkeypatch.setenv("TRACKINIZER_PROFILE", "elsewhere")
-    monkeypatch.setenv("TRAX_ACTOR", "sentinel-actor")
-    monkeypatch.setenv("LC_TRAX_CANVAS", "sentinel-canvas")
-    canvas = uuid.uuid4()
-    lines = await _run_env(
-        monkeypatch,
-        {"TRACKINIZER_PROFILE": "hosted"},
-        canvas,
-    )
-    assert {
-        "TRACKINIZER_PROFILE=hosted",
-        f"LC_TRAX_CANVAS={canvas}",
-    } <= lines
-    assert not [line for line in lines if "sentinel" in line or "elsewhere" in line]
-
-
 async def test_each_open_and_close_is_logged_once_for_this_user_only(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _ = _connector(monkeypatch, _FakeSocket())
     _, launch = _terminal(monkeypatch, status=5)
@@ -464,12 +405,17 @@ async def test_each_open_and_close_is_logged_once_for_this_user_only(
     launch.assert_called_once()
     path = state_dir() / "rekursiv-ai" / "trax" / "hosts" / "box.terminals.log"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     first, second = path.read_text().splitlines()
     assert f'"event":"open","terminal_id":"{opened.terminal_id}"' in first
     assert '"opener":"ada@x.y"' in first
     assert '"requested_by":"helper-1"' in first
     assert '"event":"close"' in second
     assert '"status":5' in second
+    # Each line says when, in UTC.
+    assert _LogLine.model_validate_json(first).at.utcoffset() == timedelta(0)
+    # The open, not the close, is said where the user runs the daemon.
+    assert capsys.readouterr().out == "terminal opened by ada@x.y\n"
 
 
 async def test_a_terminal_without_a_folder_starts_in_the_home_directory(
@@ -490,7 +436,7 @@ async def test_a_terminal_without_a_folder_starts_in_the_home_directory(
     assert launch.call_args.kwargs["cwd"] == Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
-async def test_a_run_starts_in_the_folder_it_names_and_says_so_on_its_first_line(
+async def test_a_terminal_starts_in_the_folder_it_names(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -502,15 +448,11 @@ async def test_a_run_starts_in_the_folder_it_names_and_says_so_on_its_first_line
     _, launch = _terminal(monkeypatch, f"{physical}\r\n".encode())
 
     await _terminal_run(
-        _terminal_serving("http://box.invalid"),
-        _opened(command="claude", run_name="run-1a2b3c4d", cwd=str(folder)),
+        _terminal_serving("http://box.invalid", "/bin/sh", "-c", "pwd -P"),
+        _opened(cwd=str(folder)),
     )
 
-    output, status = _result(socket)
-    first, _, shell = output.partition(b"\r\n")
-    assert status == 0
-    assert first == f"knowop: started in {folder}".encode()
-    assert shell.split() == [str(physical).encode()]
+    assert _result(socket) == (f"{physical}\r\n".encode(), 0)
     assert launch.call_args.kwargs["cwd"] == folder
 
 
@@ -527,31 +469,12 @@ async def test_a_tilde_folder_is_resolved_against_the_home_directory(
     _, launch = _terminal(monkeypatch, f"{physical}\r\n".encode())
 
     await _terminal_run(
-        _terminal_serving("http://box.invalid"),
-        _opened(command="claude", run_name="run-1a2b3c4d", cwd="~/project"),
+        _terminal_serving("http://box.invalid", "/bin/sh", "-c", "pwd -P"),
+        _opened(cwd="~/project"),
     )
 
-    first, _, shell = _result(socket)[0].partition(b"\r\n")
-    assert first == f"knowop: started in {home / 'project'}".encode()
-    assert shell.split() == [str(physical).encode()]
+    assert _result(socket) == (f"{physical}\r\n".encode(), 0)
     assert launch.call_args.kwargs["cwd"] == home / "project"
-
-
-async def test_a_run_without_a_folder_says_it_starts_in_the_home_directory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    socket = _FakeSocket()
-    _ = _connector(monkeypatch, socket)
-    _, launch = _terminal(monkeypatch)
-
-    await _terminal_run(
-        _terminal_serving("http://box.invalid"),
-        _opened(command="codex", run_name="run-1a2b3c4d"),
-    )
-
-    home = pwd.getpwuid(os.getuid()).pw_dir
-    assert _result(socket) == (f"knowop: started in {home}\r\n".encode(), 0)
-    assert launch.call_args.kwargs["cwd"] == Path(home)
 
 
 async def test_a_folder_that_is_missing_or_a_file_ends_the_terminal_and_runs_nothing(
@@ -591,65 +514,6 @@ async def test_a_folder_that_is_missing_or_a_file_ends_the_terminal_and_runs_not
     ]
     assert len(closes) == 3
     assert all('"status":1' in line for line in closes)
-
-
-async def test_a_files_open_answers_requests_and_starts_no_shell(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    (tmp_path / "a.txt").write_text("a")
-    marker = tmp_path / "shell-ran"
-    request = f'{{"id": 1, "op": "info", "path": "{tmp_path}"}}\n'
-    socket = _FakeSocket(
-        messages=(encode_frame(Frame.INPUT, request.encode()),),
-        end_after_output=True,
-    )
-    _ = _connector(monkeypatch, socket)
-    _, launch = _terminal(monkeypatch)
-
-    await _terminal_run(
-        _terminal_serving("http://box.invalid", "/bin/sh", "-c", f"touch {marker}"),
-        _opened(kind="files"),
-    )
-
-    output, status = _result(socket)
-    reply = Info.model_validate_json(output)
-    assert (reply.id, reply.kind) == (1, "dir")
-    assert reply.entries is not None
-    assert reply.entries[0].name == "a.txt"
-    assert status == 0
-    assert not marker.exists()
-    launch.assert_not_called()
-    path = state_dir() / "rekursiv-ai" / "trax" / "hosts" / "box.terminals.log"
-    assert '"kind":"files"' in path.read_text().splitlines()[0]
-
-
-async def test_a_completed_files_service_reports_a_successful_exit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(FilesChannel, "serve", _finish_files)
-    socket = _FakeSocket()
-    _ = _connector(monkeypatch, socket)
-
-    await _terminal_run(_terminal_serving("http://box.invalid"), _opened(kind="files"))
-
-    assert _result(socket) == (b"finished\n", 0)
-    assert socket.closed
-
-
-async def test_a_failed_files_service_propagates_its_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(FilesChannel, "serve", _fail_files)
-    socket = _FakeSocket()
-    _ = _connector(monkeypatch, socket)
-
-    with pytest.raises(RuntimeError, match="file service failed"):
-        await _terminal_run(
-            _terminal_serving("http://box.invalid"),
-            _opened(kind="files"),
-        )
-    assert socket.closed
 
 
 class _Socket:
@@ -821,6 +685,29 @@ async def test_a_closed_loop_in_the_shutdown_snapshot_does_not_skip_other_bridge
     await asyncio.wait_for(ended.wait(), 1)
 
 
+class _Waited(threading.Thread):
+    """A bridge that never runs: it keeps how long each wait for its end may take."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waits: list[float | None] = []
+
+    @override
+    def join(self, timeout: float | None = None) -> None:
+        self.waits.append(timeout)
+
+
+async def test_stop_waits_ten_seconds_for_each_bridge_and_no_longer() -> None:
+    """A bridge that will not end must not hold the daemon's exit for good."""
+    daemon = _terminal_serving("http://127.0.0.1:1")
+    bridges = [_Waited(), _Waited()]
+    daemon._bridges.update({uuid.uuid4(): bridge for bridge in bridges})
+
+    await asyncio.to_thread(daemon.stop)
+
+    assert [bridge.waits for bridge in bridges] == [[10], [10]]
+
+
 async def test_the_exit_is_reported_though_a_job_the_shell_left_still_holds_the_pty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -872,13 +759,20 @@ async def test_a_wait_that_fails_otherwise_is_said_and_waited_out_until_stopped(
 
 
 class _Held:
-    """A wait the server holds until the test lets it go, as one a pause cut is."""
+    """Answers ``answers`` in order, then holds the next wait until the test lets it go.
 
-    def __init__(self) -> None:
+    A held wait is one the server holds, or one a pause cut.
+    """
+
+    def __init__(self, *answers: TerminalWait | ClientError) -> None:
         self.asks = 0
         self.asked = threading.Event()
+        """Set once a wait is held."""
         self.release = threading.Event()
         self.closed = threading.Event()
+        self.threads: list[str] = []
+        """The thread each wait was asked on."""
+        self._answers = list(answers)
 
     def wait_terminals(
         self,
@@ -889,6 +783,12 @@ class _Held:
     ) -> TerminalWait | None:
         del host_id, instance, wait_sec
         self.asks += 1
+        self.threads.append(threading.current_thread().name)
+        if self._answers:
+            answer = self._answers.pop(0)
+            if isinstance(answer, ClientError):
+                raise answer
+            return answer
         self.asked.set()
         assert self.release.wait(10)
         return None
@@ -897,21 +797,83 @@ class _Held:
         self.closed.set()
 
 
-async def test_a_wake_from_a_pause_starts_a_new_wait_and_the_dead_one_ends_after() -> (
-    None
-):
-    dead, fresh = _Held(), _Held()
-    clients = [dead, fresh]
-    wall = [0.0]
-    wake = Wake(wall=lambda: wall[0], clock=lambda: 0.0)
+def _listening(
+    *clients: _Held,
+    wake: Wake | None = None,
+) -> tuple[TerminalServing, list[str]]:
+    """Return a daemon whose each listener takes the next client, and the keys given."""
+    keys: list[str] = []
+    waiting = list(clients)
+
+    def next_client(key: str) -> _Held:
+        keys.append(key)
+        return waiting.pop(0)
+
     daemon = TerminalServing(
         name="box",
         server_url="http://127.0.0.1:1",
         credential=_CREDENTIAL,
-        credential_client=lambda _key: clients.pop(0),
+        credential_client=next_client,
         trax_env={},
         wake=wake,
     )
+    return daemon, keys
+
+
+class _Stop(threading.Event):
+    """A daemon's stop that keeps each timed wait on it and waits none of them out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waited: list[float | None] = []
+
+    @override
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waited.append(timeout)
+        if timeout is None:
+            return super().wait()
+        return self.is_set()
+
+
+async def test_a_wait_that_fails_is_waited_out_five_seconds_then_asked_again() -> None:
+    client = _Held(ClientError("-> 503", status_code=503))
+    daemon, _ = _listening(client)
+    daemon._stop = stop = _Stop()
+    daemon.start(_HOST, _INSTANCE)
+
+    assert await asyncio.to_thread(client.asked.wait, 10)
+    daemon.stop()
+    client.release.set()
+    assert await asyncio.to_thread(client.closed.wait, 10)
+
+    assert (client.asks, stop.waited) == (2, [5.0])
+
+
+async def test_each_open_starts_a_bridge_for_this_host_and_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened = _opened()
+    client = _Held(opened)
+    daemon, _ = _listening(client)
+    started = Mock()
+    monkeypatch.setattr(daemon, "_start_bridge", started)
+    daemon.start(_HOST, _INSTANCE)
+
+    assert await asyncio.to_thread(client.asked.wait, 10)
+    daemon.stop()
+    client.release.set()
+    assert await asyncio.to_thread(client.closed.wait, 10)
+
+    started.assert_called_once_with(opened, host_id=_HOST, instance=_INSTANCE)
+
+
+async def test_a_wake_from_a_pause_starts_a_new_wait_and_the_dead_one_ends_after() -> (
+    None
+):
+    dead, fresh = _Held(), _Held()
+    wall = [0.0]
+    wake = Wake(wall=lambda: wall[0], clock=lambda: 0.0)
+    daemon, keys = _listening(dead, fresh, wake=wake)
     daemon.start(_HOST, _INSTANCE)
     assert await asyncio.to_thread(dead.asked.wait, 10)
 
@@ -926,7 +888,10 @@ async def test_a_wake_from_a_pause_starts_a_new_wait_and_the_dead_one_ends_after
     wall[0] += 30.0
     assert wake.check()
 
-    assert (dead.asks, clients) == (1, [])
+    assert dead.asks == 1
+    # Each listener asks with the host's own key, on a thread named for it.
+    assert keys == [_CREDENTIAL, _CREDENTIAL]
+    assert dead.threads == fresh.threads == ["terminal-listener"]
 
 
 async def test_an_open_that_arrives_once_the_daemon_stopped_starts_no_bridge() -> None:
@@ -1031,72 +996,15 @@ async def test_an_offer_is_answered_and_the_shells_output_then_goes_direct(
     assert relayed[-1] == (Frame.EXIT, (0).to_bytes(4))
 
 
-def _in_opt_bin(name: str) -> str | None:
-    """Stand in for ``shutil.which`` on a computer with every command in /opt/bin."""
-    return f"/opt/bin/{name}"
-
-
-def _login_shell() -> list[str]:
-    return [pwd.getpwuid(os.getuid()).pw_shell, "-l"]
-
-
-_KNOWOP = ("-m", "knowop", "run")
-"""What follows the interpreter in a run's command line: this install's ``knowop run``."""
-
-
-async def test_a_claude_run_starts_detached_and_attaches_its_chat_session() -> None:
-    session_id = uuid.UUID("9f1c2e3a-0000-4000-8000-000000000001")
-
-    argv = _terminal_serving("http://127.0.0.1:1")._argv(
-        _opened(command="claude", attach=session_id, run_name="chat-9f1c2e3a"),
-    )
-
-    assert argv == [
-        sys.executable,
-        *_KNOWOP,
-        "claude",
-        "--detach",
-        "--name",
-        "chat-9f1c2e3a",
-        "--attach",
-        str(session_id),
-    ]
-
-
-async def test_a_codex_run_without_a_session_attaches_nothing() -> None:
-    argv = _terminal_serving("http://127.0.0.1:1")._argv(
-        _opened(command="codex", run_name="run-1a2b3c4d"),
-    )
-
-    assert argv == [
-        sys.executable,
-        *_KNOWOP,
-        "codex",
-        "--detach",
-        "--name",
-        "run-1a2b3c4d",
-    ]
-
-
-async def test_a_run_is_started_by_this_install_whatever_path_holds(
+async def test_a_terminal_without_a_shell_of_its_own_runs_the_login_shell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Another knowop on ``PATH``, or a ``trax`` that forwards, never runs it."""
-    monkeypatch.setattr(shutil, "which", _in_opt_bin)
+    _ = _connector(monkeypatch, _FakeSocket())
+    _, launch = _terminal(monkeypatch)
 
-    argv = _terminal_serving("http://127.0.0.1:1")._argv(
-        _opened(command="claude", run_name="run-1a2b3c4d"),
-    )
+    await _terminal_run(_terminal_serving("http://box.invalid"), _opened())
 
-    assert argv[:5] == [sys.executable, *_KNOWOP, "claude"]
-
-
-async def test_a_terminal_without_a_command_runs_the_login_shell() -> None:
-    assert _terminal_serving("http://127.0.0.1:1")._argv(_opened()) == _login_shell()
-    shell = _terminal_serving("http://127.0.0.1:1", "/bin/sh", "-c", "true")._argv(
-        _opened(),
-    )
-    assert shell == ["/bin/sh", "-c", "true"]
+    assert launch.call_args.args == ([pwd.getpwuid(os.getuid()).pw_shell, "-l"],)
 
 
 @dataclass(slots=True, kw_only=True)
@@ -1220,11 +1128,13 @@ async def test_connect_names_an_error_without_a_message_by_its_type(
 async def test_connect_logs_each_retry_with_the_terminal_and_reason(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    startup_clock: _StartupClock,
 ) -> None:
     _ = _connector(monkeypatch, OSError("boom"), _FakeSocket())
     caplog.set_level(logging.DEBUG)
     opened = _opened()
     _ = await _connect(opened, retry_sec=0.001)
+    assert startup_clock.pauses == [0.001]
     retry = [r for r in caplog.records if "startup retry" in r.getMessage()]
     (record,) = retry
     assert record.levelno == logging.DEBUG
@@ -1287,6 +1197,255 @@ async def test_connect_closes_a_socket_when_cancelled_mid_handshake(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert socket.closed
+
+
+async def test_the_socket_dials_the_servers_own_host_over_wss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connector = _connector(monkeypatch, _FakeSocket())
+    _ = _terminal(monkeypatch)
+    opened = _opened()
+
+    # ``http`` twice, a trailing slash, and a last letter ``rstrip`` might take too.
+    await _terminal_run(_terminal_serving("https://http.boX/", "/bin/true"), opened)
+
+    path = wire_terminals.HOST_TERMINAL_WS_PATH.format(
+        host_id=_HOST,
+        terminal_id=opened.terminal_id,
+    )
+    assert connector.urls == [f"wss://http.boX{path}?instance={_INSTANCE}&ready=true"]
+
+
+async def test_output_drains_for_half_a_second_after_the_shell_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits = _Waits()
+    monkeypatch.setattr(asyncio, "wait", waits)
+    terminal, _ = _terminal(monkeypatch, b"done")
+    # Made with no drain of its own: the default is what is asserted.
+    daemon = TerminalServing(
+        name="box",
+        server_url="http://box.invalid",
+        credential=_CREDENTIAL,
+        credential_client=lambda _key: _Client([]),
+        trax_env={},
+    )
+
+    _ = await daemon._relay(
+        cast("Terminal", terminal),
+        cast("ClientConnection", _FakeSocket()),
+        asyncio.Event(),
+        AsyncMock(spec=DirectRouter),
+    )
+
+    # The first wait is for whatever ends first; the second, the drain.
+    assert waits.timeouts == [None, 0.5]
+
+
+class _Waits:
+    """``asyncio.wait``, keeping each timeout it was given."""
+
+    def __init__(self) -> None:
+        self.timeouts: list[float | None] = []
+        self._wait = asyncio.wait
+
+    # Not ``async``: it hands back ``asyncio.wait``'s own coroutine, as that is.
+    def __call__(
+        self,
+        tasks: set[asyncio.Task[object]],
+        *,
+        timeout: float | None = None,
+        return_when: str = asyncio.ALL_COMPLETED,
+    ) -> Coroutine[
+        None,
+        None,
+        tuple[set[asyncio.Task[object]], set[asyncio.Task[object]]],
+    ]:
+        self.timeouts.append(timeout)
+        return self._wait(tasks, timeout=timeout, return_when=return_when)
+
+
+class _SlowClose(_FakeSocket):
+    """A socket whose close waits until the test lets it finish, as a slow peer's."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closing = threading.Event()
+        self.release = asyncio.Event()
+
+    @override
+    async def close(self) -> None:
+        self.closing.set()
+        _ = await self.release.wait()
+        self.closed = True
+
+
+async def test_a_bridge_is_a_daemon_thread_whose_stop_waits_out_its_close(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    socket = _SlowClose()
+    connector = _connector(monkeypatch, socket)
+    terminal, _ = _terminal(monkeypatch)
+    finished = asyncio.Event()
+    relaying = threading.Barrier(2)
+    terminal.output.return_value = _held_output(asyncio.Event(), asyncio.Event())
+    terminal.wait.side_effect = functools.partial(_relayed, relaying, finished)
+    terminal.terminate.side_effect = finished.set
+    daemon = _terminal_serving("http://box.invalid", "/bin/sh", drain_sec=0)
+    opened = _opened()
+
+    daemon._start_bridge(opened, host_id=_HOST, instance=_INSTANCE)
+    [bridge] = [
+        thread
+        for thread in threading.enumerate()
+        if thread.name == f"terminal-{opened.terminal_id}"
+    ]
+    _ = await asyncio.to_thread(relaying.wait, 10)
+    # Said as the terminal opens, while its shell runs.
+    assert capsys.readouterr().out == "terminal opened by ada@x.y\n"
+    stopping = asyncio.ensure_future(asyncio.to_thread(daemon.stop))
+    assert await asyncio.to_thread(socket.closing.wait, 10)
+    assert not stopping.done()
+    loop, _ = daemon._loops[opened.terminal_id]
+    _ = loop.call_soon_threadsafe(socket.release.set)
+    await stopping
+
+    assert bridge.daemon
+    assert socket.closed
+    # Each bridge is forgotten once it ends.
+    assert (daemon._bridges, daemon._loops) == ({}, {})
+    path = wire_terminals.HOST_TERMINAL_WS_PATH.format(
+        host_id=_HOST,
+        terminal_id=opened.terminal_id,
+    )
+    assert connector.urls == [f"ws://box.invalid{path}?instance={_INSTANCE}&ready=true"]
+
+
+class _Unanswered:
+    """A dial no server answers: it yields until a timeout cancels it, or fails."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def __call__(self, url: str, **kwargs: object) -> _FakeSocket:
+        del url, kwargs
+        self.calls += 1
+        await _turns(100)
+        raise AssertionError("no timeout ended the dial")
+
+
+async def _turns(count: int) -> None:
+    """Let the loop run ``count`` times, with no clock: ``startup_clock`` stops one."""
+    loop = asyncio.get_running_loop()
+    for _ in range(count):
+        turn = loop.create_future()
+        _ = loop.call_soon(turn.set_result, None)
+        await turn
+
+
+async def _slow_to_end(*chunks: bytes, turns: int) -> AsyncIterator[bytes]:
+    """Yield ``chunks``, then hold; cancelled, it takes ``turns`` of the loop to end."""
+    try:
+        for chunk in chunks:
+            yield chunk
+        _ = await asyncio.Event().wait()
+    finally:
+        await _turns(turns)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _SlowToEndSocket:
+    """A server socket that sends nothing, and takes ``turns`` to stop being read."""
+
+    turns: int
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return _slow_to_end(turns=self.turns)
+
+
+class _SlowToEndStop(asyncio.Event):
+    """A stop never set, whose wait takes ``turns`` of the loop to end once cancelled."""
+
+    def __init__(self, *, turns: int) -> None:
+        super().__init__()
+        self._turns = turns
+
+    @override
+    async def wait(self) -> Literal[True]:
+        try:
+            return await super().wait()
+        finally:
+            await _turns(self._turns)
+
+
+class _SlowToEndEvent(_SlowToEndStop):
+    """``asyncio.Event`` as a bridge makes its own stop: slow to end once cancelled."""
+
+    def __init__(self) -> None:
+        super().__init__(turns=10)
+
+
+async def test_a_bridge_returns_with_nothing_of_its_own_left_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its stop's watcher, cancelled as the bridge ends, is done before it returns."""
+    # A dial refused for good: the work ends at once, and the watcher is left.
+    _ = _connector(monkeypatch, _status(404))
+    monkeypatch.setattr(asyncio, "Event", _SlowToEndEvent)
+    daemon = _terminal_serving("http://box.invalid")
+    before = asyncio.all_tasks()
+
+    await daemon._bridge(_opened(), host_id=_HOST, instance=_INSTANCE)
+
+    assert asyncio.all_tasks() - before - {asyncio.current_task()} == set()
+
+
+async def test_connect_times_out_each_dial_no_server_answers(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    startup_clock: _StartupClock,
+) -> None:
+    dial = _Unanswered()
+    monkeypatch.setattr(terminal_serving, "connect", dial)
+
+    assert (
+        await _connect(open_timeout_sec=0, startup_timeout_sec=0.002, retry_sec=0.001)
+        is None
+    )
+
+    assert dial.calls == 2
+    assert len(startup_clock.pauses) == 2
+    assert sum(startup_clock.pauses) == pytest.approx(0.002)
+    assert capsys.readouterr().err.endswith("): TimeoutError\n")
+
+
+@pytest.mark.parametrize("slow", ["output", "reader", "stop"])
+async def test_a_relay_returns_the_status_with_nothing_left_running(
+    monkeypatch: pytest.MonkeyPatch,
+    slow: str,
+) -> None:
+    """Its pump, reader and stop end before it returns, and a gone relay is no error."""
+    # Each still pending at the shell's exit; the slow one, not waited for, would still
+    # be running at the return, as the others end at once.
+    turns = {name: 10 if name == slow else 0 for name in ("output", "reader", "stop")}
+    terminal, _ = _terminal(monkeypatch, status=3)
+    terminal.output.return_value = _slow_to_end(b"17", turns=turns["output"])
+    exited = AsyncMock(side_effect=ConnectionClosed(None, None))
+    router = AsyncMock(spec=DirectRouter, exit=exited)
+    daemon = _terminal_serving("http://box.invalid", drain_sec=0)
+    before = asyncio.all_tasks()
+
+    status = await daemon._relay(
+        cast("Terminal", terminal),
+        cast("ClientConnection", _SlowToEndSocket(turns=turns["reader"])),
+        _SlowToEndStop(turns=turns["stop"]),
+        router,
+    )
+
+    assert status == 3
+    assert asyncio.all_tasks() - before - {asyncio.current_task()} == set()
+    exited.assert_awaited_once_with(3)
 
 
 class _ClosingSocket(_FakeSocket):

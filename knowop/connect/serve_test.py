@@ -39,6 +39,7 @@ from trackinizer.wire.wire_device import (
     IssuedKey,
 )
 from trackinizer.wire.wire_host_job import HOST_WORK_PATH
+from trackinizer.wire.wire_session_relay import HOST_SESSIONS_WAIT_PATH
 from treekle import json_loads
 from wrapt import lazy_import
 
@@ -48,11 +49,15 @@ import pytest
 from knowop.connect import (
     daemon,
     job_limits,
+    job_serving,
     serve,
+    session_serving,
     terminal_direct_aiortc,
+    terminal_serving,
     tool_serving,
 )
 from knowop.connect.terminal_direct_aiortc import AiortcPeer
+from knowop.connect.wake import Wake
 
 
 if TYPE_CHECKING:
@@ -180,6 +185,9 @@ class _Server:
         if path == HOST_WORK_PATH.format(host_id=_HOST_ID):
             self.over.wait(0.02)
             return httpx2.Response(200, json={"work": None})
+        if path == HOST_SESSIONS_WAIT_PATH.format(host_id=_HOST_ID):
+            self.over.wait(0.02)
+            return httpx2.Response(200, content=b"null")
         raise AssertionError(f"unexpected request {method} {path}")
 
     def asked(self, *suffixes: str) -> Callable[[float], bool]:
@@ -245,7 +253,7 @@ def _no_sagent_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         tool_serving,
         "sagent_server",
-        SimpleNamespace(HOST_COMMAND=(), Server=_NoToolServer),
+        SimpleNamespace(HOST_COMMAND=(), DEFAULT_TOOLS=(), Server=_NoToolServer),
     )
     monkeypatch.setattr(tool_serving, "strings", SimpleNamespace(ServeDirs=_Dirs))
     monkeypatch.setattr(tool_serving, "tool_bridge", SimpleNamespace(bridged=None))
@@ -369,7 +377,7 @@ def test_a_computer_that_runs_jobs_offers_its_capped_memory_and_its_own_gpus(
         "not bound, so no job is given it"
     ) in out
     assert "jobs: on, up to 61440 MiB together, GPUs: 1" in out
-    assert "(terminals, tools and jobs)" in out
+    assert "(terminals, tools, jobs and agents)" in out
 
 
 def test_jobs_where_no_memory_cap_holds_are_refused_before_anything_is_asked(
@@ -402,13 +410,7 @@ def test_a_computer_joined_by_a_piped_token_runs_no_ones_jobs(
     _cap(monkeypatch)
     _stdin(monkeypatch, f"{_ENROLLMENT}\n")
 
-    with pytest.raises(
-        ClientError,
-        match=(
-            r"^--jobs runs the jobs of a signed-in account; a computer joined by a "
-            r"piped token runs none$"
-        ),
-    ):
+    with pytest.raises(ClientError) as refused:
         serve.connect_host(
             "dev-box",
             server=_SERVER,
@@ -420,8 +422,95 @@ def test_a_computer_joined_by_a_piped_token_runs_no_ones_jobs(
             jobs=True,
         )
 
+    assert (str(refused.value), refused.value.status_code) == (
+        (
+            "--jobs runs the jobs of a signed-in account; a computer joined by a piped "
+            "token runs none"
+        ),
+        None,
+    )
     assert server.calls("/api/hosts/join") == []
     assert "(terminals and jobs)" in capsys.readouterr().out
+
+
+def test_each_serving_and_the_daemon_get_one_wake_the_host_and_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = _Server()
+    _on(server, monkeypatch)
+    _stdin(monkeypatch, "")
+    _cap(monkeypatch)
+    made = {
+        "terminals": Mock(wraps=terminal_serving.TerminalServing),
+        "tools": Mock(wraps=tool_serving.ToolServing),
+        "sessions": Mock(wraps=session_serving.SessionServing),
+        "jobs": Mock(wraps=job_serving.JobServing),
+    }
+    monkeypatch.setattr(terminal_serving, "TerminalServing", made["terminals"])
+    monkeypatch.setattr(tool_serving, "ToolServing", made["tools"])
+    monkeypatch.setattr(session_serving, "SessionServing", made["sessions"])
+    monkeypatch.setattr(job_serving, "JobServing", made["jobs"])
+    connected = Mock(wraps=daemon.connect)
+    monkeypatch.setattr(daemon, "connect", connected)
+
+    _connect(
+        _Waits(server.asked("/tools/wait", "/sessions/wait", "/work")),
+        signed_in=lambda: Client(_SERVER, api_key=_PROFILE_KEY),
+        jobs=True,
+    )
+
+    wake = cast(object, connected.call_args.kwargs["wake"])
+    assert isinstance(wake, Wake)
+    assert all(
+        made[each].call_args.kwargs["wake"] is wake
+        for each in ("terminals", "tools", "sessions")
+    )
+    terminals = made["terminals"].call_args.kwargs
+    assert (terminals["name"], terminals["server_url"]) == ("dev-box", _SERVER)
+    tools = made["tools"].call_args
+    assert (tools.args, tools.kwargs["name"]) == ((_SERVER,), "dev-box")
+    jobs = made["jobs"].call_args.kwargs
+    assert (jobs["name"], jobs["server_url"], jobs["account"]) == (
+        "dev-box",
+        _SERVER,
+        "ada@example.com",
+    )
+    assert jobs["results_max"] == 256 * 2**20
+
+
+def test_a_connect_that_runs_tools_here_starts_agents_here_too(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server = _Server()
+    _on(server, monkeypatch)
+    _stdin(monkeypatch, "")
+    made = Mock(wraps=session_serving.SessionServing)
+    monkeypatch.setattr(session_serving, "SessionServing", made)
+
+    _connect(_Waits(server.asked("/sessions/wait")))
+
+    [join] = server.calls("/api/hosts/join")
+    facts = join[3]["facts"]
+    assert isinstance(facts, dict)
+    assert facts["sessions"] is True
+    # A person's own connect runs their own agents: no remote agent service's.
+    assert "remote_agents" not in facts
+    assert {call[2] for call in server.calls("/sessions/wait")} == {
+        f"Bearer {_CREDENTIAL}",
+    }
+    # The process is handed the server's address, never a profile.
+    assert made.call_args.args == (_SERVER,)
+    made_with = made.call_args.kwargs
+    assert made_with["credential"] == _CREDENTIAL
+    # Each start runs where a person's own host runs it, the serving's default.
+    assert "place" not in made_with
+    # A wait held across a pause is started anew on the wake, as the tools' is.
+    assert isinstance(made_with["wake"], Wake)
+    assert (
+        f"serving: host dev-box at {_SERVER} (terminals, tools and agents)"
+        in capsys.readouterr().out.splitlines()
+    )
 
 
 def test_ctrl_c_releases_the_host_before_the_interrupt_goes_on(
@@ -707,8 +796,10 @@ def test_no_exec_serves_no_tools_and_does_not_say_it_does(
     assert isinstance(facts, dict)
     assert "exec" not in facts
     assert "tools" not in facts
+    assert "sessions" not in facts
     assert facts["terminal"] is True
     assert server.calls("/tools/wait") == []
+    assert server.calls("/sessions/wait") == []
     assert server.calls("/terminals/wait")
 
 
@@ -739,7 +830,8 @@ def test_an_install_without_what_tools_need_serves_none_and_does_not_say_it_does
     assert facts["terminal"] is True
     assert server.calls("/tools/wait") == []
     captured = capsys.readouterr()
-    assert "(terminals)" in captured.out
+    # An agent process is this install's own, which needs no sagent host.
+    assert "(terminals and agents)" in captured.out
     assert sum("tools: off" in line for line in captured.err.splitlines()) == 1
 
 
@@ -1042,7 +1134,8 @@ def test_a_join_only_connect_makes_its_terminals_with_no_direct_link(
     assert callable(made_for)
     _ = made_for(JoinResponse(host_id=_HOST_ID, credential=_CREDENTIAL))
 
-    assert made[0][2]["direct"] is None
+    # Here a direct link is a keyword a serving connect adds; a join-only one adds none.
+    assert "direct" not in made[0][2]
 
 
 def _noted(seen: dict[str, object], name: str, **kwargs: object) -> None:

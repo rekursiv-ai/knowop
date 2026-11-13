@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Final, Protocol
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import threading
 import time
@@ -42,7 +43,6 @@ from trackinizer.trax.render import echo
 from trackinizer.wire.wire_daemon import HEARTBEAT_SEC
 from websockets.asyncio.client import connect
 
-from knowop.agent.tool_server import BEARER_ENV
 from knowop.connect.wake import Listener, Wake
 
 
@@ -73,7 +73,14 @@ else:
     wire_tools = lazy_import("trackinizer.wire.wire_tools")
 
 
-__all__ = ["ToolClient", "ToolServing", "can_serve", "scrubbed_host", "tool_dirs"]
+__all__ = [
+    "ToolClient",
+    "ToolServing",
+    "can_serve",
+    "scrubbed_host",
+    "scrubbed_names",
+    "tool_dirs",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -100,6 +107,9 @@ _SAID_CHARS: Final = 200
 
 _SCRUBBED_PREFIXES: Final = ("TRACKINIZER_", "TRAX_", "LC_TRAX_")
 """What no tool inherits: any trackinizer or trax variable, named in a list or not."""
+
+_BEARER_ENV: Final = "KNOWOP_TOOLS_TOKEN"
+"""The variable a run handed its CLI its own tool server's bearer token in."""
 
 
 def can_serve() -> bool:
@@ -138,6 +148,22 @@ def tool_dirs(host: str, *, server: str) -> ServeDirs:
     return strings.ServeDirs(secrets=root / "secrets", state=root / "state")
 
 
+def scrubbed_names() -> list[str]:
+    """Return the variables no child the server asks this daemon for inherits.
+
+    Returns:
+      names: Every ``TRACKINIZER_*``, ``TRAX_*`` and ``LC_TRAX_*`` variable set here,
+        and a run's token, set or not; sorted.
+
+    """
+    return sorted(
+        {
+            *(name for name in os.environ if name.startswith(_SCRUBBED_PREFIXES)),
+            _BEARER_ENV,
+        },
+    )
+
+
 async def scrubbed_host(tools: Sequence[str], directory: Path) -> Host:
     """Start a session's child without a trackinizer or trax variable or a run's token.
 
@@ -149,13 +175,7 @@ async def scrubbed_host(tools: Sequence[str], directory: Path) -> Host:
       daemon: The child.
 
     """
-    names = sorted(
-        {
-            *(name for name in os.environ if name.startswith(_SCRUBBED_PREFIXES)),
-            BEARER_ENV,
-        },
-    )
-    unset = [word for name in names for word in ("-u", name)]
+    unset = [word for name in scrubbed_names() for word in ("-u", name)]
     return await sagent_server.child_host(
         tools,
         directory,
@@ -332,12 +352,22 @@ class ToolServing:
     async def _opened_server(self) -> Server | None:
         """Return the open tool server, waiting for its lock; ``None`` if it cannot open."""
         deadline = time.monotonic() + self._lock_wait_sec
-        told = False
         while not self._stop.is_set():
             server = sagent_server.Server(
                 self._dirs,
                 listen=[],
                 name=self._name,
+                # A remote agent is given no tool of its own that reaches past its
+                # process, so it searches the web and reads papers here.
+                tools=(
+                    *sagent_server.DEFAULT_TOOLS,
+                    "WebSearch",
+                    "WebFetch",
+                    "PaperSearch",
+                    "PaperDetails",
+                    "PaperAuthor",
+                    "PaperFetch",
+                ),
                 start_host=scrubbed_host,
             )
             try:
@@ -348,12 +378,13 @@ class ToolServing:
                 return None
             except ValueError as error:
                 # Another daemon holds the lock, and a slow one may yet let it go.
-                if not told and time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     echo(f"knowop: tools: off: {_said(error)}", err=True)
-                    told = True
+                    # Said once: no time reaches the deadline after this.
+                    deadline = math.inf
                 _ = await asyncio.to_thread(self._stop.wait, self._retry_sec)
             else:
-                if told:
+                if deadline == math.inf:
                     echo("knowop: tools: on: the lock came free", err=True)
                 return server
         return None
@@ -373,7 +404,8 @@ class ToolServing:
             echo(f"knowop: tools: off: {_said(error)}", err=True)
             self._stop.set()
             return
-        said = ""
+        # The failure last said while the waits keep failing, even one with no text.
+        said: str | None = None
         try:
             while not self._stop.is_set() and current():
                 asked = time.monotonic()
@@ -388,12 +420,12 @@ class ToolServing:
                         self._stop.set()
                         return
                     # A refusal that lasts would say so every few seconds.
-                    if _said(error) != said:
-                        said = _said(error)
-                        echo(f"knowop: tool wait failed: {said}", err=True)
+                    if str(error) != said:
+                        said = str(error)
+                        echo(f"knowop: tool wait failed: {_said(error)}", err=True)
                     _ = self._stop.wait(self._retry_sec)
                     continue
-                said = ""
+                said = None
                 if offer is not None:
                     # A loop closed meanwhile has stopped: the offer has no one to serve.
                     with contextlib.suppress(RuntimeError):

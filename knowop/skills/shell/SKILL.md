@@ -31,7 +31,7 @@ knowop logs -f                                # follow this computer's connect s
   again at login and after a crash, and returns once the host is online. `knowop
   logs -f` follows its log, `knowop status` lists it with its flags, and `knowop
   disconnect` stops and removes it. Running `knowop connect` again restarts it only
-  when its flags, its environment, its knowop or the CLIs it finds changed.
+  when its flags, its environment or its knowop changed.
 - Anywhere else (an agent's shell, a pipe, a box) and with `--foreground` it serves
   in the foreground until the host is revoked, a newer `knowop connect` of the
   same host takes over, or Ctrl-C. Ctrl-C, and the termination signal a service
@@ -81,10 +81,9 @@ knowop logs -f                                # follow this computer's connect s
   the CPU's memory (GB10) is given to no job, since no cap bounds what CUDA takes
   there. Jobs keep running when `knowop connect` stops; the next one adopts them.
   `--job-results-max SIZE` (default 256M) caps the results one job sends back.
-- **Sandbox.** `--sandbox` declares the computer disposable, so agents started
-  there by `knowop run` ask for no permissions. Every run records its answer, so a
-  run without the flag withdraws it. Never declare a computer that holds work or
-  keys you would mind losing.
+- **Sandbox.** `--sandbox` records that the computer is disposable. Every connect
+  records its answer, so a connect without the flag withdraws it. Never declare a
+  computer that holds work or keys you would mind losing.
 
 ## The registry of hosts
 

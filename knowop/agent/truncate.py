@@ -38,6 +38,7 @@ from uuid import UUID
 import json
 import re
 
+from trackinizer.runs.refusal import REFUSED_KIND
 from trackinizer.sagent.session.types import (
     IncompleteRecord,
     ToolResult,
@@ -53,10 +54,11 @@ from treekle import immutable, mutable
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from pydantic import BaseModel
     from trackinizer.types.streams import TraxRecord
+    from trackinizer.wire.json_types import JSON
     from trackinizer.wire.wire_session_ir import RecordBody
     from treekle import MutablePlainTree, PlainTree
 
@@ -66,6 +68,7 @@ __all__ = [
     "MAX_TOOL_RESULT_BYTES",
     "NOTE",
     "bounded",
+    "bounded_payload",
     "encoded_size",
     "was_truncated",
     "without_note",
@@ -125,15 +128,32 @@ def bounded(body: RecordBody) -> RecordBody:
     )
     if size <= max_bytes:
         return body
-    cap = max_bytes
-    while True:
-        cut = _cut(body, record, cap=cap)
-        size = encoded_size(cut)
-        if size <= max_bytes or cap == _MIN_KEPT_BYTES:
-            return cut
-        # Proportional, with an eighth to spare: escapes make a string's wire size
-        # a multiple of its UTF-8 size that no single cap predicts.
-        cap = max(_MIN_KEPT_BYTES, cap * max_bytes * 7 // (size * 8))
+    return _shrunk(
+        max_bytes,
+        cut=lambda cap: _cut(body, record, cap=cap),
+        size=encoded_size,
+    )
+
+
+def bounded_payload(payload: JSON, *, max_bytes: int) -> JSON:
+    """Return ``payload`` with its long strings cut as a record's are, until it fits.
+
+    Args:
+      payload: Plain data, such as an event as a viewer reads it.
+      max_bytes: The most its JSON may take, encoded as the client sends it.
+
+    Returns:
+      bounded: ``payload`` when it fits, else a copy with each string over one
+        shared length cut; still over when bytes or seals hold it up.
+
+    """
+    if _json_size(payload) <= max_bytes:
+        return payload
+    return _shrunk(
+        max_bytes,
+        cut=lambda cap: _cut_mapping(payload, cap=cap),
+        size=_json_size,
+    )
 
 
 def encoded_size(body: BaseModel) -> int:
@@ -149,14 +169,7 @@ def encoded_size(body: BaseModel) -> int:
       size: Its length in bytes, as the request carries it.
 
     """
-    return len(
-        json.dumps(
-            body.model_dump(mode="json"),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode(),
-    )
+    return _json_size(body.model_dump(mode="json"))
 
 
 def was_truncated(record: TraxRecord) -> bool:
@@ -166,14 +179,15 @@ def was_truncated(record: TraxRecord) -> bool:
       record: A record as stored, read back.
 
     Returns:
-      truncated: Whether it carries :data:`NOTE`, or, being bare text, the marker.
+      truncated: Whether it carries :data:`NOTE`, or, being bare text, the marker;
+        a stand-in for a record the server refused holds none of it, so is cut too.
 
     """
     match record:
         case IncompleteRecord() | Stdin() | Stdout() | Stderr():
             return _MARKER.search(record.text) is not None
         case UncategorizedRecord():
-            return NOTE in record.payload
+            return NOTE in record.payload or record.kind == REFUSED_KIND
         case _:
             return NOTE in record.extra
 
@@ -185,6 +199,43 @@ def without_note[R: TraxRecord](record: R) -> R:
     stripped = _with_note(record, None)
     assert isinstance(stripped, type(record))
     return stripped
+
+
+def _shrunk[T](
+    max_bytes: int,
+    *,
+    cut: Callable[[int], T],
+    size: Callable[[T], int],
+) -> T:
+    """Return what ``cut`` makes at the longest string length that fits ``max_bytes``."""
+    cap = max_bytes
+    while True:
+        shrunk = cut(cap)
+        measured = size(shrunk)
+        if measured <= max_bytes or cap == _MIN_KEPT_BYTES:
+            return shrunk
+        # Proportional, with an eighth to spare: escapes make a string's wire size
+        # a multiple of its UTF-8 size that no single cap predicts.
+        cap = max(_MIN_KEPT_BYTES, cap * max_bytes * 7 // (measured * 8))
+
+
+def _json_size(tree: object) -> int:
+    """Return the bytes ``tree`` takes as JSON, compact with non-ASCII kept raw."""
+    return len(
+        json.dumps(
+            tree,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode(),
+    )
+
+
+def _cut_mapping(payload: JSON, *, cap: int) -> JSON:
+    """Return ``payload`` with every string over ``cap`` bytes cut."""
+    cut = _cut_tree(mutable(payload), cap=cap, omitted=[])
+    assert isinstance(cut, dict)
+    return cut
 
 
 def _cut(body: RecordBody, record: TraxRecord, *, cap: int) -> RecordBody:
@@ -223,10 +274,14 @@ def _cut_tree(
     ):
         return named
     # The codec stores bytes as base64 under this tag: a cut would leave neither the
-    # bytes nor readable text.
+    # bytes nor readable text. A reasoning seal is the provider's, which refuses one
+    # cut short; the body's own was split out, but a compaction's history holds more.
     if isinstance(tree, dict) and "py/b64" not in tree:
         return {
-            key: _cut_tree(item, cap=cap, omitted=omitted) for key, item in tree.items()
+            key: item
+            if key == "encrypted"
+            else _cut_tree(item, cap=cap, omitted=omitted)
+            for key, item in tree.items()
         }
     return tree
 

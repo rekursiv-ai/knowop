@@ -32,8 +32,8 @@ _PACKAGE: Final = __name__.rpartition(".")[0]
 _ALLOWED: Final = (
     _PACKAGE,
     "trackinizer",
-    # The modules trackinizer's export carries: the session records the agent
-    # runner writes, their readers, the pty plumbing the hosts use, and the
+    # The modules trackinizer's export carries: the session records a stored
+    # session restores from, their readers, the pty plumbing the hosts use, and the
     # per-user folders.
     "trackinizer.sagent.session",
     "trackinizer.sagent.scripts.convert_session",
@@ -52,8 +52,6 @@ _ALLOWED: Final = (
     "wrapt",
     # Knowop's dependency for the direct terminal link.
     "aiortc",
-    # The vendored explorer search walks gitignore-aware trees.
-    "rignore",
     # Knowop's macOS dependency for the menu bar (pyobjc-framework-Cocoa).
     "AppKit",
     "PyObjCTools",

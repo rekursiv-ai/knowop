@@ -1,77 +1,34 @@
-"""What a `knowop run` session tells the server about where it started, and the child."""
+"""What a `knowop run` session tells the server about where it started."""
 
 from __future__ import annotations
 
 from functools import partial
+from subprocess import CompletedProcess, TimeoutExpired
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, call
 from uuid import UUID
 
-from trackinizer.client.errors import ClientError
+import os
+import subprocess
+
 from trackinizer.trax.canvas import canvas_from_env
-from trackinizer.wire.wire_sessions import SessionPlacement
+from trackinizer.wire.wire_sessions import GitRef, SessionPlacement
 
 import pytest
 
 from knowop.agent import placement
 from knowop.agent.conftest import _CANVAS, _SESSION, _Client
 from knowop.agent.placement import (
-    chat_placement,
+    Output,
     git_ref,
     place_run,
     placement_env,
+    run_git,
 )
-from knowop.agent.worktree_diff import Output
 
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
     from pathlib import Path
-
-    from treekle import PlainTree
-
-
-_WORKSPACE = UUID(int=2)
-
-
-class _Lister:
-    """A client whose session list holds ``sessions``, or that refuses to list."""
-
-    def __init__(self, sessions: list[dict[str, str | bool | None]] | None) -> None:
-        self.asked: list[tuple[str, object]] = []
-        self._sessions = sessions
-
-    def get(
-        self,
-        path: str,
-        *,
-        params: Mapping[str, object] | None = None,
-    ) -> PlainTree:
-        self.asked.append((path, params))
-        if self._sessions is None:
-            raise ClientError("404 Not Found")
-        listed: dict[str, PlainTree] = {
-            "sessions": self._sessions,
-            "issues": [],
-            "more": False,
-        }
-        return listed
-
-
-def _listed(
-    session_id: UUID,
-    *,
-    canvas: UUID | None,
-) -> dict[str, str | bool | None]:
-    """Return a session as the session list names it, with the fields it is read for."""
-    return {
-        "id": str(session_id),
-        "title": "chat",
-        "conversation_id": str(UUID(int=9)),
-        "canvas_id": None if canvas is None else str(canvas),
-        "workspace_id": None if canvas is None else str(_WORKSPACE),
-        "live": True,
-    }
 
 
 @pytest.fixture(autouse=True)
@@ -122,17 +79,21 @@ def test_no_ref_for_a_directory_that_is_not_a_checkout_on_a_branch(
     tmp_path: Path,
     git_commands: Mock,
 ) -> None:
+    # A failed command's output is never read, whatever it printed.
     git_commands.side_effect = [
         Output(returncode=128, stdout=b"", cut=False),
         Output(returncode=128, stdout=b"", cut=False),
         Output(returncode=0, stdout=b"main\n", cut=False),
-        Output(returncode=1, stdout=b"", cut=False),
-        Output(returncode=1, stdout=b"", cut=False),
+        Output(returncode=1, stdout=b"https://github.com/o/r.git\n", cut=False),
+        Output(returncode=1, stdout=b"main\n", cut=False),
+        Output(returncode=0, stdout=b"https://github.com/o/r.git\n", cut=False),
+        Output(returncode=0, stdout=b"\n", cut=False),
         Output(returncode=0, stdout=b"https://github.com/o/r.git\n", cut=False),
     ]
     assert git_ref(tmp_path, run=git_commands) is None
     assert git_ref(tmp_path, run=git_commands) is None  # No origin.
     assert git_ref(tmp_path, run=git_commands) is None  # Detached HEAD.
+    assert git_ref(tmp_path, run=git_commands) is None  # A branch with no name.
     assert (
         git_commands.call_args_list
         == [
@@ -145,8 +106,22 @@ def test_no_ref_for_a_directory_that_is_not_a_checkout_on_a_branch(
                 4096,
             ),
         ]
-        * 3
+        * 4
     )
+
+
+def test_a_name_git_printed_in_another_encoding_is_read_with_stand_ins(
+    tmp_path: Path,
+    git_commands: Mock,
+) -> None:
+    git_commands.side_effect = [
+        Output(returncode=0, stdout=b"na\xefve\n", cut=False),
+        Output(returncode=0, stdout=b"https://h\xe9.example/r.git\n", cut=False),
+    ]
+
+    ref = git_ref(tmp_path, run=git_commands)
+
+    assert ref == GitRef(origin="https://h\ufffd.example/r.git", branch="na\ufffdve")
 
 
 def test_a_run_asks_the_server_with_its_canvas_and_checkout(
@@ -203,43 +178,109 @@ def test_a_failed_ask_warns_and_leaves_the_run_unplaced(
     assert "running unplaced" in capsys.readouterr().err
 
 
-def test_a_chats_session_sits_on_the_canvas_its_session_list_names() -> None:
-    client = _Lister(
-        [
-            _listed(UUID(int=3), canvas=UUID(int=4)),
-            _listed(_SESSION, canvas=_CANVAS),
-        ],
-    )
+def test_a_placement_names_only_the_ids_the_server_gave() -> None:
+    workspace, canvas = UUID(int=2), UUID(int=3)
 
-    placed = chat_placement(client, session_id=_SESSION)
-
-    assert placed == SessionPlacement(workspace_id=_WORKSPACE, canvas_id=_CANVAS)
-    assert client.asked == [("/api/sessions", {"days": 1})]
-
-
-def test_a_session_on_no_canvas_or_left_off_the_list_has_no_canvas() -> None:
-    unplaced = _Lister([_listed(_SESSION, canvas=None)])
-    elsewhere = _Lister([_listed(UUID(int=3), canvas=_CANVAS)])
-
-    assert chat_placement(unplaced, session_id=_SESSION) == (SessionPlacement())
-    assert chat_placement(elsewhere, session_id=_SESSION) is None
-
-
-def test_a_refused_list_warns_and_leaves_the_run_unplaced(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    placed = chat_placement(_Lister(None), session_id=_SESSION)
-
-    assert placed is None
-    assert "running unplaced" in capsys.readouterr().err
-
-
-def test_the_child_env_holds_only_what_the_server_placed() -> None:
     assert placement_env(None) == {}
     assert placement_env(SessionPlacement()) == {}
+    assert placement_env(SessionPlacement(workspace_id=workspace)) == {
+        "TRAX_WORKSPACE": str(workspace),
+    }
     assert placement_env(
-        SessionPlacement(workspace_id=UUID(int=2), canvas_id=_CANVAS),
-    ) == {"TRAX_WORKSPACE": str(UUID(int=2)), "TRAX_CANVAS": str(_CANVAS)}
+        SessionPlacement(workspace_id=workspace, canvas_id=canvas),
+    ) == {"TRAX_WORKSPACE": str(workspace), "TRAX_CANVAS": str(canvas)}
+
+
+class TestRunGit:
+    """The subprocess runner's output bounds, missing binary, and deadline result."""
+
+    def test_reads_output_up_to_the_byte_cap(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Output is kept to ``max_bytes`` and the cut is reported."""
+        execute = Mock(return_value=CompletedProcess(["printf", "hello"], 0, b"hello"))
+        monkeypatch.setattr(subprocess, "run", execute)
+
+        done = run_git(["printf", "hello"], 100)
+        assert done == Output(returncode=0, stdout=b"hello", cut=False)
+        # Exactly the bound is whole: nothing was left out.
+        assert run_git(["printf", "hello"], 5) == done
+        cut = run_git(["printf", "hello"], 2)
+        assert cut == Output(returncode=0, stdout=b"he", cut=True)
+        assert (
+            execute.call_args_list
+            == [
+                call(
+                    ["printf", "hello"],
+                    env={
+                        **os.environ,
+                        "GIT_OPTIONAL_LOCKS": "0",
+                        "GIT_TERMINAL_PROMPT": "0",
+                    },
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=20.0,
+                    check=False,
+                ),
+            ]
+            * 3
+        )
+
+    def test_a_missing_binary_is_not_an_exception(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A git that cannot start ends as ``-1``, not a crash."""
+        execute = Mock(side_effect=FileNotFoundError("trax-run-no-such-binary-xyz"))
+        monkeypatch.setattr(subprocess, "run", execute)
+
+        done = run_git(["trax-run-no-such-binary-xyz"], 100)
+        assert done == Output(returncode=-1, stdout=b"", cut=False)
+        assert execute.call_args.args == (["trax-run-no-such-binary-xyz"],)
+
+    def test_a_git_past_its_time_ends_as_minus_one_with_what_it_printed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(placement, "GIT_SEC", 0.02)
+        argv = ["sh", "-c", "printf partial; exec sleep 30"]
+        execute = Mock(side_effect=TimeoutExpired(argv, 0.02, output=b"partial"))
+        monkeypatch.setattr(subprocess, "run", execute)
+
+        done = run_git(argv, 4)
+
+        assert done == Output(returncode=-1, stdout=b"part", cut=True)
+        execute.assert_called_once_with(
+            argv,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=0.02,
+            check=False,
+        )
+
+    @pytest.mark.parametrize(
+        ("printed", "kept"),
+        [(b"part", b"part"), (None, b"")],
+        ids=["exactly-the-bound", "nothing-printed"],
+    )
+    def test_a_git_past_its_time_keeps_what_it_printed_whole(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        printed: bytes | None,
+        kept: bytes,
+    ) -> None:
+        argv = ["git", "status"]
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            Mock(side_effect=TimeoutExpired(argv, 20.0, output=printed)),
+        )
+
+        done = run_git(argv, 4)
+
+        assert done == Output(returncode=-1, stdout=kept, cut=False)
 
 
 if __name__ == "__main__":

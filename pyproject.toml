@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 authors = [{name = "rekursiv.ai", email = "hello@rekursiv.ai"}]
-keywords = ["agents", "claude-code", "codex", "terminal", "cli"]
+keywords = ["agents", "sagent", "terminal", "cli"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
@@ -27,14 +27,18 @@ classifiers = [
 dependencies = [
     # Prefer https://awesome-python.com deps over alternatives.
     # The server's client, login and profiles, the wire models, and the session
-    # records the agent runner captures into. 0.1.11 adds `Client.host_runs` and
+    # records a stored session restores from. 0.1.11 adds `Client.host_runs` and
     # `Client.disconnect_host`, which `knowop status` and `knowop disconnect` call,
     # and the `Client` that ignores a field a newer server adds to an answer.
     # 0.1.12 ships `trackinizer.sagent`, where the session records now live.
     # The tool pipe the tool host serves on (`client/tool_bridge.py`,
     # `wire/wire_tools.py`) is unreleased; until it is, `can_serve` turns tools off.
     # `lib/posix/hostname.py`, which names this computer, is unreleased too, and
-    # knowop imports it: a knowop release needs a trackinizer that ships it.
+    # knowop imports it: a knowop release needs a trackinizer that ships it. So does
+    # `knowop upload`, with the unreleased `record_bodies` that takes records,
+    # `convert.sniff`, `transcripts`, `open_transcript` and `transcript_name`,
+    # `zstd_compat.open_text`, `session_records.record_time`, and the server's
+    # `SessionStart.keep_audience`.
     "trackinizer>=0.1.12",
     # the agent: the tool host serves sagent's remote tools through sagent's own tool
     # server. `Server.adopt`, which serves a pipe the relay dialed, is unreleased;
@@ -53,18 +57,6 @@ dependencies = [
     "aiortc>=1.15.0",
     # lazy imports
     "wrapt>=2.5.2",
-    # gitignore-aware tree walks: the explorer's search where ripgrep is not
-    # installed, through the vendored `knowop.lib.files.grep`.
-    "rignore>=0.8.1",
-    # shell parsing: the agent runner's session capture lifts a captured `cat` or
-    # `echo >` into a typed file result through trackinizer's
-    # `sagent/session/shell_results.py`; without it every such command is left
-    # unlifted, silently.
-    "bashlex>=0.18",
-    # filesystem watching: the agent runner follows the agent's session files through
-    # trackinizer's `lib/posix/follow.py`, whose macOS backend lazy-imports watchdog's
-    # fsevents.
-    "watchdog>=7.0.0 ; sys_platform == 'darwin'",
     # the macOS menu bar: `knowop menubar` shows its status item through AppKit.
     "pyobjc-framework-Cocoa>=13.0 ; sys_platform == 'darwin'",
 ]
@@ -166,9 +158,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["knowop"]
-# The vendored pytest harness imports pytest, a test-group dependency; the runner's
-# testdata, and the fake codex app-server its tests start, serve its tests alone.
-exclude = ["**/*_test.py", "**/conftest.py", "knowop/lib/testing/**", "knowop/agent/testdata/**", "knowop/agent/codex_app_fake.py"]
+# The vendored pytest harness imports pytest, a test-group dependency.
+exclude = ["**/*_test.py", "**/conftest.py", "knowop/lib/testing/**"]
 
 [tool.hatch.build.targets.sdist]
 exclude = [".github/**", ".codespell-ignore"]

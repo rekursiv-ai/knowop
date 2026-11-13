@@ -1,4 +1,4 @@
-"""Fakes the shell tests share: OS process replies, scripted servers and peers.
+"""Fakes the shell tests share: scripted servers and peers.
 
 Each test module keeps its own tests; what more than one reads lives here, so no test
 module imports another.
@@ -6,10 +6,7 @@ module imports another.
 
 from __future__ import annotations
 
-from asyncio.subprocess import Process
-from functools import partial
-from typing import TYPE_CHECKING, Final, Protocol, Self, override
-from unittest.mock import AsyncMock, Mock
+from typing import TYPE_CHECKING, Final, Self, override
 
 import asyncio
 import sys
@@ -32,14 +29,11 @@ from knowop.connect.terminal_serving import TerminalServing
 
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
-
-    from trackinizer.mock_test_support import AsyncMockProtocol, MockProtocol
 
     import pytest
 
-    from knowop.connect.files_channel import FilesChannel
     from knowop.connect.terminal_direct import PeerFactory
 
 
@@ -50,71 +44,19 @@ __all__ = [
     "_Client",
     "_FakeSocket",
     "_Messages",
-    "_Process",
     "_ScriptedPeer",
     "_SetOnceHeld",
     "_connect",
     "_connector",
-    "_fail_files",
-    "_finish_files",
     "_folder",
     "_opened",
-    "_process",
     "_python",
-    "_signal_process",
     "_startup_log",
     "_status",
     "_terminal_run",
     "_terminal_serving",
     "_unscoped",
 ]
-
-
-class _Stdin(Protocol):
-    write: MockProtocol[object]
-    close: MockProtocol[object]
-    drain: AsyncMockProtocol[object]
-
-
-class _Process(Mock):
-    pid: int
-    returncode: int | None
-    stdin: _Stdin
-    stdout: asyncio.StreamReader
-    stderr: asyncio.StreamReader
-    wait: AsyncMockProtocol[object]
-    send_signal: MockProtocol[None]
-
-
-def _process(
-    *,
-    stdout: bytes = b"",
-    stderr: bytes = b"",
-    code: int | None = 0,
-) -> _Process:
-    out, err = asyncio.StreamReader(), asyncio.StreamReader()
-    out.feed_data(stdout)
-    err.feed_data(stderr)
-    if code is not None:
-        out.feed_eof()
-        err.feed_eof()
-    process = _Process(
-        spec=Process,
-        pid=7,
-        returncode=code,
-        stdin=Mock(spec=asyncio.StreamWriter, drain=AsyncMock()),
-        stdout=out,
-        stderr=err,
-        wait=AsyncMock(side_effect=AssertionError("The tools wait was used.")),
-    )
-    process.send_signal.side_effect = partial(_signal_process, process)
-    return process
-
-
-def _signal_process(process: _Process, signum: int) -> None:
-    process.returncode = -signum
-    process.stdout.feed_eof()
-    process.stderr.feed_eof()
 
 
 _HOST: Final = uuid.UUID(int=1)
@@ -196,22 +138,6 @@ async def _terminal_run(daemon: TerminalServing, opened: TerminalWait) -> None:
         host_id=_HOST,
         instance=_INSTANCE,
     )
-
-
-async def _finish_files(
-    channel: FilesChannel,
-    send: Callable[[bytes], Awaitable[None]],
-) -> None:
-    del channel
-    await send(b"finished\n")
-
-
-async def _fail_files(
-    channel: FilesChannel,
-    send: Callable[[bytes], Awaitable[None]],
-) -> None:
-    del channel, send
-    raise RuntimeError("file service failed")
 
 
 class _ScriptedPeer:
