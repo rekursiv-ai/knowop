@@ -888,8 +888,8 @@ class TestTrackinizerSinkManifestMetadata:
     def test_the_manifest_carries_the_files_declared_encoding(self) -> None:
         r"""Without it a resumed file is not the file that was captured.
 
-        Claude's ascii-escaping convention rides on the ``TurnContext.encoding``
-        in force (a majority flag plus its exception bitmap). A rewrite that
+        Which claude lines escaped their Unicode rides on the
+        ``TurnContext.encoding`` in force. A rewrite that
         does not have it writes raw UTF-8 where the CLI wrote ``\\u00e9`` --
         every record matches and the bytes differ, which is exactly what the
         ``JSON``-not-``JSONB`` column and ``PartBody.metadata`` exist to
@@ -918,15 +918,9 @@ class TestTrackinizerSinkManifestMetadata:
     def test_the_metadata_tracks_the_prefix_read_so_far(self) -> None:
         r"""Re-sent per batch because it CHANGES as the file grows.
 
-        ``ascii_escaped`` is a majority over the lines consumed, so the value
-        correct for one batch may be wrong for the next. A manifest written
-        once at open would pin the first batch's answer forever -- here the
-        second line is ASCII and flips the majority the first line set.
-
-        The first line's ``é`` is RAW UTF-8, not the ``\\u00e9`` escape: the
-        escape is six ASCII characters, so a line spelled that way never moves
-        the majority and the test could not tell a restated encoding from a
-        pinned one.
+        Claude writes raw UTF-8; a line that spells ``é`` as ``\u00e9`` is an
+        exception the reader states when it arrives. A manifest written once at
+        open would pin the first batch's answer and lose it.
         """
         client = _FakeClient()
         sink = TrackinizerSink(client, "claude", batch_size=1)
@@ -941,22 +935,17 @@ class TestTrackinizerSinkManifestMetadata:
             adapter,
             _PART,
             b'{"type":"user","sessionId":"s1","message":'
-            b'{"role":"user","content":"plain"}}\n',
+            b'{"role":"user","content":"calf\\u00e9"}}\n',
         )
         sink.close()
 
-        assert len(client.manifests) >= 2
-        escaped = [
-            from_plain(m.metadata, dict[str, object]).get("ascii_escaped")
+        exceptions = [
+            from_plain(m.metadata, dict[str, object]).get("ascii_escape_exceptions")
             for m in client.manifests
         ]
-        assert len(set(escaped)) > 1, (
-            "every batch declared the same majority; the manifest pinned one "
-            "batch's answer instead of restating the prefix read so far"
-        )
-        # One of the two lines is ASCII, so the majority in force at the end is
-        # ``True`` -- and it is the LAST manifest that a rewrite reads.
-        assert escaped[-1] is True
+        # The second line (bit 1) escaped; it is the LAST manifest a rewrite reads.
+        assert exceptions[0] == ""
+        assert exceptions[-1] == "Ag=="
 
 
 class TestTrackinizerSinkSlashCommands:
@@ -2538,11 +2527,11 @@ def test_repeated_claude_replacement_pipeline(tmp_path: Path, *, server: bool) -
                 for line in output.getvalue().splitlines()
             ]
         )
-        assert positions == list(range(5)) * 3
+        assert positions == list(range(4)) * 3
         if server:
-            assert [restart for _, _, _, restart in client.appended] == [False] * 5 + [
+            assert [restart for _, _, _, restart in client.appended] == [False] * 4 + [
                 True,
-            ] * 10
+            ] * 8
     finally:
         for reader in readers:
             reader.close()
