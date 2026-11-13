@@ -107,7 +107,7 @@ def test_the_verb_and_its_arguments_reach_the_command(seen: _Seen) -> None:
 
 
 def test_connection_flags_before_the_verb_choose_the_client(seen: _Seen) -> None:
-    profile.save_profile("jan", Profile(url="http://jan-host:9100", author="jan"))
+    profile.save_profile("jan", Profile(url="https://jan-host:9100", author="jan"))
 
     assert main(["--profile", "jan", "status", "7"]) == 0
 
@@ -115,13 +115,13 @@ def test_connection_flags_before_the_verb_choose_the_client(seen: _Seen) -> None
     assert seen.factory is not None
     client = seen.factory()
     try:
-        assert (client.base_url, client.author) == ("http://jan-host:9100", "jan")
+        assert (client.base_url, client.author) == ("https://jan-host:9100", "jan")
     finally:
         close_clients()
 
 
 def test_host_and_port_flags_rewrite_the_profiles_address(seen: _Seen) -> None:
-    profile.save_profile("jan", Profile(url="http://jan-host:9100", author="jan"))
+    profile.save_profile("jan", Profile(url="https://jan-host:9100", author="jan"))
 
     assert main(["--profile=jan", "--host", "gx10", "--port", "8765", "status"]) == 0
 
@@ -129,7 +129,7 @@ def test_host_and_port_flags_rewrite_the_profiles_address(seen: _Seen) -> None:
     assert seen.factory is not None
     client = seen.factory()
     try:
-        assert client.base_url == "http://gx10:8765"
+        assert client.base_url == "https://gx10:8765"
     finally:
         close_clients()
 
@@ -215,7 +215,7 @@ def test_a_shell_from_a_server_without_a_profile_is_told_how_to_log_in(
 def test_the_shared_clients_are_closed_when_the_command_ends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    profile.save_profile("jan", Profile(url="http://jan-host:9100", author="jan"))
+    profile.save_profile("jan", Profile(url="https://jan-host:9100", author="jan"))
     closed: list[Client] = []
     real_close = Client.close
 
@@ -237,7 +237,7 @@ def test_the_shared_clients_are_closed_when_the_command_ends(
 
     assert main(["--profile", "jan", "status"]) == 0
 
-    assert [client.base_url for client in closed] == ["http://jan-host:9100"]
+    assert [client.base_url for client in closed] == ["https://jan-host:9100"]
 
 
 if __name__ == "__main__":

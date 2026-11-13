@@ -75,7 +75,7 @@ class _Server:
 
     def __init__(self) -> None:
         self.requests: list[httpx2.Request] = []
-        self.decision: Literal["approved", "denied"] = "approved"
+        self.decision: Literal["approved", "denied", "pending"] = "approved"
         self.revoked = False
         """Whether the key was revoked: every authenticated route answers 401."""
         self.refuse: dict[str, int] = {}
@@ -144,8 +144,8 @@ class _Server:
         return [request.url.path for request in self.requests]
 
     def _poll(self) -> DeviceToken:
-        if self.decision == "denied":
-            return DeviceToken(status="denied")
+        if self.decision != "approved":
+            return DeviceToken(status=self.decision)
         # An approval issues a fresh key, which no earlier revoke touched.
         self.revoked = False
         return DeviceToken(
@@ -1840,6 +1840,8 @@ def test_connect_with_a_piped_token_joins_without_a_login(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(sys, "stdin", io.StringIO(f"{_ENROLL_TOKEN}\n"))
+    # It serves on, waiting between heartbeats, until it ends.
+    host.waits = 1
 
     assert _knowop("connect", "acme", "--name", "box-7", "--sandbox") == 0
 
@@ -1870,7 +1872,67 @@ def test_a_piped_token_is_never_sent_over_plain_http_beyond_this_computer(
 
     assert host.connects == []
     assert server.requests == []
-    assert "plain http" in capsys.readouterr().err
+    assert capsys.readouterr().err.startswith(
+        "knowop: server 'http://knowop.example.org' is plain http;",
+    )
+
+
+def test_connect_never_logs_in_over_plain_http_beyond_this_computer(
+    server: _Server,
+    host: _Host,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("connect", "http://knowop.example.org") == 1
+
+    assert host.connects == []
+    assert server.requests == []
+    assert "server 'http://knowop.example.org' is plain http" in capsys.readouterr().err
+
+
+def test_connect_to_a_saved_server_named_with_a_trailing_slash_uses_its_login(
+    server: _Server,
+    host: _Host,
+) -> None:
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("connect", f"{_ACME}/") == 0
+
+    assert server.paths().count(DEVICE_CODE_PATH) == 1
+    assert [served.server for served in host.connects] == [_ACME]
+
+
+def test_connect_with_a_named_profile_serves_its_server_with_its_login(
+    server: _Server,
+    host: _Host,
+) -> None:
+    save_profile("staging", Profile(url="https://staging.example", api_key=_KEY))
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("--profile", "staging", "connect", "--name", "gpu1") == 0
+
+    assert server.paths().count(DEVICE_CODE_PATH) == 1
+    assert [(s.server, s.signed_in_to) for s in host.connects] == [
+        ("https://staging.example", "https://staging.example"),
+    ]
+
+
+def test_a_connect_nobody_approves_ends_when_its_code_expires(
+    server: _Server,
+    host: _Host,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.decision = "pending"
+    clock = _Time()
+
+    def advance(seconds: float) -> None:
+        # A login that read another clock would poll on past the code's life.
+        assert clock.now <= _CODE.expires_in
+        clock.sleep(seconds)
+
+    assert cli.main(["connect"], sleep=advance, clock=clock.clock) == 1
+
+    assert host.connects == []
+    assert "not approved in time" in capsys.readouterr().err
 
 
 def test_a_piped_token_is_left_to_the_host_when_knowop_is_logged_in_there(
@@ -2102,6 +2164,21 @@ def test_the_menu_bar_runs_on_macos_alone(
     assert capsys.readouterr().err == (
         "" if code == 0 else "knowop: knowop menubar runs on macOS alone\n"
     )
+
+
+def test_a_service_connect_with_no_login_joins_with_the_token_its_login_returned(
+    server: _Server,
+    host: _Host,
+    launchd: _Launchd,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ = _at_terminal(monkeypatch)
+
+    assert _knowop("connect", "acme") == 0
+
+    assert ENROLL_PATH not in server.paths()
+    assert [(s.token, s.join_only) for s in host.connects] == [(_LOGIN_TOKEN, True)]
+    assert launchd.started() == ["bootstrap"]
 
 
 def test_connect_again_leaves_a_current_service_serving(

@@ -955,15 +955,18 @@ def _connect(
             "shells; run it as your own user, or with --foreground",
         )
     saved = _saved(named)
-    server = (
+    # Checked before any request, whichever way connect goes on: a login, a token
+    # piped to a box, or a saved login, none of which crosses plain http.
+    server = server_url(
         saved[1].url
         if saved is not None and not flags.target
-        else _server(flags.target)
+        else _server(flags.target),
+        "server",
     )
     # A saved login the server now refuses (its host was logged out elsewhere) is
     # no login: at a terminal connect logs in again, and a service's run says so.
     found = next(
-        (each for each in _logins(named) if each[1].url == server.rstrip("/")),
+        (each for each in _logins(named) if each[1].url == server),
         None,
     )
     if found is not None and _accepted(found[1]):
@@ -976,11 +979,16 @@ def _connect(
         # A service has no person to approve a login, and no token piped to it.
         echo(f"knowop: not logged in to {server}; run knowop connect there", err=True)
         return
-    # A box has no browser to approve a login in: the token piped to it joins alone,
-    # and the server it names is checked as a login's would be.
+    # A box has no browser to approve a login in: the token piped to it joins alone.
     elif piped := serve.piped_token():
-        url = login.secure_url(server_url(server, "server"), what="server")
-        _serve(name, url, profile="", token=piped, flags=flags, sleep=sleep)
+        _serve(
+            name,
+            server,
+            profile="",  # pragma: no mutate[truthiness]
+            token=piped,
+            flags=flags,
+            sleep=sleep,
+        )
         return
     else:
         # The approval that logs in also enrolls and confirms this computer, and returns
