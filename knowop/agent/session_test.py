@@ -16,7 +16,6 @@ from collections.abc import (
     Iterator,
     Mapping,
     Sequence,
-    Sized,
 )
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
@@ -7114,6 +7113,8 @@ class TestPromptBridge:
     ) -> None:
         drained: dict[str, object] = {}
         hook = _PermissionHook()
+        # The run's records arrive from the hook's thread; a noted deque says when.
+        monkeypatch.setattr(session, "deque", _Noted)
 
         class _Claude:
             """Asks one permission, as claude does through its settings' hook."""
@@ -7183,7 +7184,7 @@ class _OpenPrompt:
 
     def __init__(self, tmp_path: Path) -> None:
         self.inbound = InboundState(fallback_sec=0.0)
-        records: list[SystemMessage] = []
+        records = _Noted[SystemMessage]()
         self.bridge = PromptBridge(
             socket_address(tmp_path / "bridge.sock"),
             emit=records.append,
@@ -7191,7 +7192,7 @@ class _OpenPrompt:
         )
         self.bridge.start()
         self.reply = _held_hook(bridge_path=tmp_path / "bridge.sock")
-        _wait_for_records(records, 1)
+        records.reached(1)
         assert self.inbound.prompt_pending.is_set()
         card = from_plain(records[0].extra["$interaction"], dict[str, object])
         self.prompt_id = from_plain(card["id"], str)
@@ -7224,12 +7225,23 @@ def _held_hook(*, bridge_path: Path) -> Callable[[], str]:
 # The bridge sets ``prompt_pending`` on the hook's thread before it writes the prompt's
 # record, so a test that sees the flag may not see the record yet. Wait on the record:
 # once it is written the flag is set too.
-def _wait_for_records(records: Sized, count: int) -> None:
-    """Block until ``records`` holds ``count`` records, or give up after 3s."""
-    deadline = time.monotonic() + 3.0
-    while len(records) < count and time.monotonic() < deadline:
-        # Events arrive from other threads; nothing signals the count.
-        time.sleep(0.005)  # house-ignore[sleep] -- See above.
+class _Noted[T](deque[T]):
+    """A deque whose appends, from any thread, wake a wait for its length."""
+
+    def __init__(self, iterable: Iterable[T] = (), maxlen: int | None = None) -> None:
+        super().__init__(iterable, maxlen)
+        self._appended = threading.Condition()
+
+    @override
+    def append(self, item: T, /) -> None:
+        with self._appended:
+            super().append(item)
+            self._appended.notify_all()
+
+    def reached(self, count: int) -> None:
+        """Return once ``count`` items are held, or give up after 3s."""
+        with self._appended:
+            _ = self._appended.wait_for(lambda: len(self) >= count, timeout=3.0)
 
 
 class _PermissionHook:
@@ -7260,8 +7272,8 @@ class _PermissionHook:
         self._thread.start()
         inbound = drained["inbound"]
         assert isinstance(inbound, InboundState)
-        records = cast(deque[Event], drained["run_records"])
-        _wait_for_records(records, 1)
+        records = cast(_Noted[Event], drained["run_records"])
+        records.reached(1)
         self.held.append(len(records) == 1 and inbound.prompt_pending.is_set())
 
     def reply(self) -> str:
