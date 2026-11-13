@@ -1,23 +1,27 @@
-"""Answer the file requests a ``files`` terminal carries: describe a path, read a file.
+"""Answer the file requests a ``files`` terminal carries: describe, read or upload a file.
 
 The owner's browser browses this host's files over a terminal of kind ``files``
 (``wire_terminals``), relayed like a shell or sent direct. It writes requests as the
 terminal's input and reads the replies from its output: UTF-8 JSON, one object per
 line. Requests are answered one at a time, in the order they came, as the user who
 started ``knowop connect``, but for a search, which runs beside them until a newer
-search stops it. Nothing is written, so a reply lost on the way is safe to ask for
-again.
+search stops it. A reply lost on the way is safe to ask for again: reads change
+nothing, and a write puts the same bytes at the same place each time.
 
 A request is ``{"id": n, "op": "info" | "read" | "search", "path": p}``, where
 ``n >= 1`` and ``p`` is absolute or starts with ``~``; a search adds ``query``,
-``case``, ``word``, ``regex``, ``include`` and ``exclude`` (``files_search.py``). The
-replies:
+``case``, ``word``, ``regex``, ``include`` and ``exclude`` (``files_search.py``). A
+``write`` is a piece of a file attached in Chat: ``p`` is the file's name, and it adds
+``upload`` (a UUID), ``offset`` and ``data`` (base64). It writes only to the upload's
+own folder under this user's knowop state, so Chat can hand the agent a local path.
+The replies:
 
 - ``info``: :class:`Info`, the path's kind, size, mtime and ``tag``; a folder's also
   lists its entries, folders first, up to :data:`MAX_ENTRIES`.
 - ``read``: :class:`Read`, the file's text, or none when it is binary or larger than
   :data:`MAX_READ_BYTES`.
 - ``search``: :class:`Found`, the matching lines under ``p`` by file.
+- ``write``: :class:`Written`, the file's path and its size so far.
 - Any failure: :class:`Failure`, with ``id`` 0 when the line named none.
 
 A ``tag`` changes whenever the size or mtime does, so a later write may say which
@@ -32,8 +36,10 @@ from typing import TYPE_CHECKING, Final, Literal
 import asyncio
 import os
 import stat
+import uuid
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import Base64Bytes, BaseModel, ConfigDict, ValidationError
+from trackinizer.lib.userdirs import state_dir
 
 from knowop.connect.files_search import Search, Searched, SearchError
 
@@ -51,6 +57,7 @@ __all__ = [
     "Found",
     "Info",
     "Read",
+    "Written",
     "answer",
 ]
 
@@ -111,6 +118,16 @@ class Read(BaseModel):
     text: str | None
     binary: bool
     too_large: bool
+
+
+class Written(BaseModel):
+    """Where a piece of an uploaded file went, and how long the file is now."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    id: int
+    path: str
+    size: int
 
 
 class Failure(BaseModel):
@@ -226,7 +243,7 @@ class FilesChannel:
 
     async def _reply(
         self,
-        reply: Info | Read | Found | Failure,
+        reply: Info | Read | Written | Found | Failure,
         send: Callable[[bytes], Awaitable[None]],
     ) -> None:
         """Send one reply as one line; a search's and another's never interleave."""
@@ -239,7 +256,7 @@ class FilesChannel:
                 await send(data[at : at + step])
 
 
-def answer(line: bytes | None) -> Info | Read | Failure:
+def answer(line: bytes | None) -> Info | Read | Written | Failure:
     """Answer one request line other than a search.
 
     Args:
@@ -263,8 +280,13 @@ def _parsed(line: bytes | None) -> _Request | Failure:
         return Failure(id=0, error="bad_request", message="not a request")
 
 
-def _answer(request: _Request) -> Info | Read | Failure:
-    """Answer an ``info`` or ``read``; any other op is a bad request."""
+def _answer(request: _Request) -> Info | Read | Written | Failure:
+    """Answer an ``info``, ``read`` or ``write``; any other op is a bad request."""
+    if request.op == "write":
+        try:
+            return _write(request)
+        except OSError as error:
+            return Failure(id=request.id, error=_code(error), message=str(error))
     path = _absolute(request.path)
     if path is None:
         return Failure(
@@ -299,6 +321,37 @@ class _Request(BaseModel):
     regex: bool = False
     include: str = ""
     exclude: str = ""
+    upload: uuid.UUID | None = None
+    offset: int = 0
+    data: Base64Bytes = b""
+
+
+def _write(request: _Request) -> Written | Failure:
+    """Put a piece of an uploaded file at its offset, in the upload's own folder."""
+    name = request.path
+    if (
+        request.upload is None
+        or request.offset < 0
+        or not name
+        or name in {".", ".."}
+        or any(each in name for each in ("/", "\\", "\x00"))
+        or len(name.encode()) > 255
+    ):
+        return Failure(
+            id=request.id,
+            error="bad_request",
+            message="a write names its upload, a file name and an offset from 0",
+        )
+    folder = state_dir() / "rekursiv-ai" / "knowop" / "uploads" / str(request.upload)
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = folder / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        _ = os.pwrite(fd, request.data, request.offset)
+        size = os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+    return Written(id=request.id, path=str(path), size=size)
 
 
 def _search(request: _Request, search: Search) -> Found | Failure:

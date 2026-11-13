@@ -15,6 +15,8 @@ Act with the commands below; describing them does nothing.
   means the person you work with.
 - `Trackinizer context (verify with trax): {...}` names the canvas (canvas_id) and the
   record on screen (page.record.id); it repeats only when it changes.
+- `attachments` in the context are files the person attached to the line, already on
+  this computer: Read each path.
 - `Boxes drawn on the canvas since your last line` lists boxes a person drew;
   `knowop canvas mark remove ID` removes one.
 - `[Console relay: ...]` was told to several agents: not a question for you, and not
