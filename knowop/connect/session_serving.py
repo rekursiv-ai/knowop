@@ -8,15 +8,17 @@ its own and, where ``systemd-run --user`` works, a scope of its own, so stopping
 upgrading or crashing the daemon leaves it running. The child reads the
 ``ServeSession`` as one JSON line on stdin, and its output goes to
 ``state_dir()/rekursiv-ai/knowop/processes/<process>/output.log``. When it exits the
-daemon reports its exit code and the end of that log; a start that fails before
-anything runs is reported with no exit code.
+daemon reports why in its own words, its exit code, which every reader of the session
+is told, and the end of that log apart, which only a writer of the session reads; then
+the folder is deleted. A start that fails before anything runs is reported with no
+exit code, and the daemon's own words for why.
 
 A daemon may restart while its processes run on, as the remote agent service does at
 each deploy. So beside the log the daemon writes ``process.json``, which names the
 host and the folder the process owns, and holds an exclusive ``flock`` on it that
 the child inherits and keeps until it exits. A daemon that starts takes up each such
 file of its host: one no process holds any more is reported ended, with no exit
-code, and its folder deleted; one still held is waited on, on a thread blocked on
+code, and its folders deleted; one still held is waited on, on a thread blocked on
 the lock, and reported so when its process ends. The lock is the daemon's own and
 names no pid, so a pid used again names nothing. A file free of its lock whose
 process still runs, which only a launcher that closed the descriptor would leave,
@@ -298,10 +300,13 @@ class SessionServing:
             / "output.log"
         )
         place: Place | None = None
+        # The folder this start made, once it has: one there already is another's.
+        made: list[Path] = []
         try:
             place = self._place(serve)
             # A process's folder is new: the server hands each start once.
             log.parent.mkdir(parents=True, mode=0o700)
+            made.append(log.parent)
             held = _held(log.parent / _RECORD, host_id=host_id, owned=place.owned)
             try:
                 pid = spawn_detached(
@@ -347,7 +352,8 @@ class SessionServing:
             return
         if place is not None and place.owned is not None:
             shutil.rmtree(place.owned, ignore_errors=True)
-        (log.parent / _RECORD).unlink(missing_ok=True)
+        for folder in made:
+            shutil.rmtree(folder, ignore_errors=True)
         self._report(
             host_id,
             ProcessEnded(
@@ -420,13 +426,21 @@ class SessionServing:
         log: Path,
         owned: Path | None,
     ) -> None:
-        """Delete the folder a process owned, then report its exit and its output's end."""
+        """Delete the folders a process owned and wrote to, then report its exit and output's end."""
         if owned is not None:
             shutil.rmtree(owned, ignore_errors=True)
-        (log.parent / _RECORD).unlink(missing_ok=True)
+        output = _tail(log)
+        shutil.rmtree(log.parent, ignore_errors=True)
         self._report(
             host_id,
-            ProcessEnded(process_id=process_id, exit_code=code, reason=_tail(log)),
+            ProcessEnded(
+                process_id=process_id,
+                exit_code=code,
+                reason="it ended while its daemon was away"
+                if code is None
+                else f"exited with code {code}",
+                output=output,
+            ),
         )
 
     def _report(self, host_id: uuid.UUID, ended: ProcessEnded) -> None:

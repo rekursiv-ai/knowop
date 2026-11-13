@@ -14,6 +14,7 @@ from typing import (
 )
 from uuid import UUID
 
+from sagent.providers.openai.wire import user_content
 from sagent.runtime.types import (
     AgentIdle,
     ChildEvent,
@@ -32,6 +33,7 @@ from sagent.tui.render import error_text
 from sagent.tui.types import CommandOutput
 from trackinizer.wire.wire_session_relay import Command, Input
 from trackinizer.wire.wire_sessions import CONTEXT_TRAILER
+from treekle import PlainTree, immutable
 
 import pytest
 
@@ -133,6 +135,25 @@ def test_a_person_s_line_becomes_a_message_named_by_its_author() -> None:
     )
 
 
+def test_a_line_keeps_the_files_it_names_for_whoever_draws_it() -> None:
+    files: PlainTree = [{"name": "shot.png", "type": "image/png", "size": 1}]
+    said = UserMessage(
+        content="what is this?",
+        attachments=(Attachment(mime_descriptor="image/png", data=b"a"),),
+        extra={"files": files, "author": "eve@example.com", "input": "x"},
+    )
+
+    message = input_message(_input("UserMessage", event_payload(said)))
+
+    assert isinstance(message, AgentToAgentMessage)
+    assert message.attachments == said.attachments
+    assert message.extra == {
+        "author": "dan@example.com",
+        "input": "00000000-0000-0000-0000-000000000007",
+        "files": immutable(files),
+    }
+
+
 def test_a_line_names_the_agent_it_is_for() -> None:
     sent = _input("UserMessage", {"py/object": "UserMessage", "content": "status?"})
 
@@ -140,6 +161,19 @@ def test_a_line_names_the_agent_it_is_for() -> None:
 
     assert isinstance(message, AgentToAgentMessage)
     assert message.recipient == "lead"
+
+
+def test_a_line_of_files_and_no_words_gives_the_model_their_list_and_the_picture() -> (
+    None
+):
+    listed = "\n\nFiles attached to this message:\n- shot.png (image/png, 1 B)\n"
+    picture = Attachment(mime_descriptor="image/png", data=b"a")
+    said = UserMessage(content=listed, attachments=(picture,))
+
+    message = input_message(_input("UserMessage", event_payload(said)))
+
+    assert isinstance(message, AgentToAgentMessage)
+    assert user_content(message) == (f"[from dan@example.com]: {listed}", (picture,))
 
 
 def test_a_line_that_names_its_canvas_tells_the_agent_after_its_words() -> None:

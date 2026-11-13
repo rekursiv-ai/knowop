@@ -20,8 +20,10 @@ text, and the API refuses a resumed conversation holding it. One over the share
 becomes a text block naming what went.
 
 A tool result gets :data:`MAX_TOOL_RESULT_BYTES`; any other kind
-:data:`MAX_RECORD_BYTES`, a backstop that ordinary prose never reaches. A record
-that fits is returned as it came, byte for byte.
+:data:`MAX_RECORD_BYTES`, a backstop that ordinary prose never reaches. The budget
+is for what a cut can shrink: a record's attachment bytes and seals, which none
+does, are counted beside it, so a person's words beside a picture stay whole. A
+record that fits is returned as it came, byte for byte.
 
 A cut record is a transcript the model never saw, and Trackinizer rebuilds
 sessions from stored records, so a cut record says so: under :data:`NOTE` in its
@@ -33,7 +35,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import TYPE_CHECKING, Final
-from uuid import UUID
 
 import json
 import re
@@ -46,6 +47,7 @@ from trackinizer.sagent.session.types import (
 )
 from trackinizer.types.session_records import (
     payload_record,
+    record_class,
     search_text,
     stored_payload,
 )
@@ -93,8 +95,8 @@ writers never emit as a provider field. Resume strips it regardless: a writer
 replays an uncategorized record's payload verbatim."""
 
 # Below this a cut string is mostly marker. A record still over its budget here is
-# held up by what no cut shrinks -- ciphertext, attachment bytes, or thousands of
-# short strings -- and goes as it is rather than being dropped.
+# held up by thousands of short strings, and goes as it is rather than being
+# dropped; its bytes and seals take no share of the budget (``_uncut_size``).
 _MIN_KEPT_BYTES: Final = 1 << 10
 
 # Matches what :func:`_marker` writes.
@@ -108,7 +110,9 @@ def bounded(body: RecordBody) -> RecordBody:
 
     Every string longer than one shared length keeps its beginning and end, and
     the length shrinks until the whole body fits, so short strings stay whole.
-    Bytes and ciphertext are never cut, so a body held up by them stays over.
+    Bytes and ciphertext are never cut, so they take no share of the budget: it
+    bounds what a cut can shrink, beside them. A message's words beside its
+    pictures are kept whole while they fit the budget alone.
 
     Args:
       body: One record's wire body, already redacted: a cut can leave the end
@@ -119,15 +123,15 @@ def bounded(body: RecordBody) -> RecordBody:
         :data:`NOTE` and whose search text is derived from what was kept.
 
     """
-    size = encoded_size(body)
-    if size <= MAX_TOOL_RESULT_BYTES:
+    # Within even a tool result's budget, a body is not read: most are, and a kind
+    # this client cannot decode passes as it came.
+    if encoded_size(body) <= MAX_TOOL_RESULT_BYTES:
         return body
-    record = body.row(UUID(int=0), 0).record()
+    record = payload_record(body.payload, record_class(body.kind))
     max_bytes = (
         MAX_TOOL_RESULT_BYTES if isinstance(record, ToolResult) else MAX_RECORD_BYTES
-    )
-    if size <= max_bytes:
-        return body
+    ) + _uncut_size(body)
+    # A body within its budget is returned by the first try, which cuts nothing.
     return _shrunk(
         max_bytes,
         cut=lambda cap: _cut(body, record, cap=cap),
@@ -217,6 +221,29 @@ def _shrunk[T](
         # Proportional, with an eighth to spare: escapes make a string's wire size
         # a multiple of its UTF-8 size that no single cap predicts.
         cap = max(_MIN_KEPT_BYTES, cap * max_bytes * 7 // (measured * 8))
+
+
+# Counted against the budget, these held a record over it however short its strings
+# were cut: a line's words beside its pictures were stored cut to a kilobyte, and a
+# resume read them so.
+def _uncut_size(body: RecordBody) -> int:
+    """Return the bytes of ``body`` that no cut shrinks: its bytes and its seals."""
+    sealed = 0 if body.ciphertext is None else _json_size(body.ciphertext)
+    return sealed + _uncut_tree_size(mutable(body.payload))
+
+
+def _uncut_tree_size(tree: MutablePlainTree) -> int:
+    """Return the bytes of ``tree`` that ``_cut_tree`` leaves as they are."""
+    if isinstance(tree, list):
+        return sum(_uncut_tree_size(item) for item in tree)
+    if not isinstance(tree, dict):
+        return 0
+    if "py/b64" in tree:
+        return _json_size(tree)
+    return sum(
+        _json_size(item) if key == "encrypted" else _uncut_tree_size(item)
+        for key, item in tree.items()
+    )
 
 
 def _json_size(tree: object) -> int:
