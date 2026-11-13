@@ -24,12 +24,12 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     from trackinizer.runs.adapters.custom_types import Adapter, Subagent
-    from trackinizer.sagent.session.types import EditResult
     from trackinizer.types.streams import TraxRecord
     from trackinizer.wire.wire_session_ir import RecordBody
 
     from knowop.agent.custom_types import Event
     from knowop.agent.slash import SlashCommand
+    from knowop.agent.worktree_diff import FileDiff
 
 
 __all__ = ["SubagentSinks"]
@@ -103,7 +103,7 @@ class SubagentSinks(Sink):
         self._root.emit_slash_command(command, at)
 
     @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         self._root.emit_worktree_diff(records)
 
     @override

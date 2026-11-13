@@ -27,6 +27,7 @@ from trackinizer.sagent.session.types import (
     ReadResult,
     Thinking,
     ToolCall,
+    ToolResult,
     UncategorizedRecord,
     UncategorizedToolResult,
     UserMessage,
@@ -155,7 +156,12 @@ class TestWhichTargetsResume:
                     [
                         UserMessage(content="what is in a.py?"),
                         ToolCall(call_id="c1", name="Read", arguments={"path": "a.py"}),
-                        ReadResult(call_id="c1", content="x = 1"),
+                        ToolResult(
+                            call_id="c1",
+                            state="done",
+                            stdout=("x = 1",),
+                            result=ReadResult(),
+                        ),
                         AssistantMessage(content="it sets x"),
                     ],
                 ),
@@ -169,7 +175,11 @@ class TestWhichTargetsResume:
         with written.path.open(encoding="utf-8") as handle:
             journal = list(sagent.normalize(handle))
         # Stamped on the way: a record crossing formats gets the time it lacked.
-        assert [r.content for r in journal if isinstance(r, ReadResult)] == [
+        assert [
+            r.text()
+            for r in journal
+            if isinstance(r, ToolResult) and isinstance(r.result, ReadResult)
+        ] == [
             "x = 1",
         ]
 
@@ -322,7 +332,12 @@ class TestAMixedSessionResumes:
                     [
                         UserMessage(content="look it up"),
                         ToolCall(call_id="t1", name="Grep"),
-                        GrepResult(call_id="t1", content="nothing"),
+                        ToolResult(
+                            call_id="t1",
+                            state="done",
+                            stdout=("nothing",),
+                            result=GrepResult(),
+                        ),
                         AssistantMessage(content="claude says"),
                     ],
                 ),
@@ -355,7 +370,12 @@ class TestAMixedSessionResumes:
                     [
                         UserMessage(content="look it up"),
                         ToolCall(call_id="t1", name="Grep"),
-                        GrepResult(call_id="t1", content="nothing"),
+                        ToolResult(
+                            call_id="t1",
+                            state="done",
+                            stdout=("nothing",),
+                            result=GrepResult(),
+                        ),
                         UserMessage(content="stop, wrong file"),
                         AssistantMessage(content="ok"),
                     ],
@@ -388,7 +408,12 @@ class TestAMixedSessionResumes:
                     "claude",
                     [
                         UserMessage(content="look it up"),
-                        UncategorizedToolResult(call_id="orphan", content="found it"),
+                        ToolResult(
+                            call_id="orphan",
+                            state="done",
+                            stdout=("found it",),
+                            result=UncategorizedToolResult(),
+                        ),
                         AssistantMessage(content="claude says"),
                     ],
                 ),
@@ -414,7 +439,11 @@ class TestAMixedSessionResumes:
                     "claude",
                     [
                         UserMessage(content="look it up"),
-                        BashResult(call_id="orphan", command=("ls",)),
+                        ToolResult(
+                            call_id="orphan",
+                            state="done",
+                            result=BashResult(command=("ls",)),
+                        ),
                         AssistantMessage(content="claude says"),
                     ],
                 ),
@@ -445,9 +474,10 @@ class TestAMixedSessionResumes:
             },
         )
         assert [
-            record.content
+            record.text()
             for record in full_capture
-            if isinstance(record, UncategorizedToolResult)
+            if isinstance(record, ToolResult)
+            and isinstance(record.result, UncategorizedToolResult)
         ] == ["found it"]
         bot_records: list[SessionRecord] = [
             AgentToAgentMessage(sender="ada@example.com", content="q1"),
@@ -568,11 +598,12 @@ class TestLossyConversion:
         assert written.path.exists()
         with written.path.open(encoding="utf-8") as handle:
             searches = [
-                record
+                (record.call_id, record.result.query)
                 for record in claude.normalize(handle)
-                if isinstance(record, WebSearchResult)
+                if isinstance(record, ToolResult)
+                and isinstance(record.result, WebSearchResult)
             ]
-        assert [(record.call_id, record.query) for record in searches] == [
+        assert searches == [
             ("search-1", "which fruit?"),
         ]
 
@@ -590,7 +621,11 @@ class TestLossyConversion:
                     "claude",
                     [
                         UserMessage(content="look it up"),
-                        BashResult(call_id="orphan", command=("ls",)),
+                        ToolResult(
+                            call_id="orphan",
+                            state="done",
+                            result=BashResult(command=("ls",)),
+                        ),
                         AssistantMessage(content="claude says"),
                     ],
                 ),
@@ -1106,9 +1141,10 @@ class TestTruncatedAtCapture:
                 0: (
                     "claude",
                     [
-                        BashResult(
+                        ToolResult(
                             call_id="cut",
-                            command=("ls",),
+                            state="done",
+                            result=BashResult(command=("ls",)),
                             extra=immutable({NOTE: {"omitted_bytes": 1}}),
                         ),
                     ],
@@ -1134,10 +1170,11 @@ class TestTruncatedAtCapture:
                             name="Bash",
                             arguments={"command": "ls"},
                         ),
-                        BashResult(
+                        ToolResult(
                             call_id="cut",
-                            command=("ls",),
-                            stdout=marker,
+                            state="done",
+                            stdout=(marker,),
+                            result=BashResult(command=("ls",)),
                             extra=immutable({NOTE: {"omitted_bytes": 1}}),
                         ),
                         UncategorizedRecord(

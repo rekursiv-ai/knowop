@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Final, Literal
 import re
 import threading
 
-from trackinizer.sagent.session.types import BashResult, ToolCall
+from trackinizer.sagent.session.types import BashResult, ToolCall, ToolResult
 
 from knowop.agent.pull_requests import links
 
@@ -81,10 +81,13 @@ class RecordNotes:
             if act is not None:
                 self._calls[record.call_id] = act
             return False
-        if not isinstance(record, BashResult):
+        if not isinstance(record, ToolResult):
             return False
-        act = self._calls.pop(record.call_id, None) or _act(record.command or ())
-        if act is None or record.is_error is True or record.exit_code not in {None, 0}:
+        tool_result = record.result
+        if not isinstance(tool_result, BashResult):
+            return False
+        act = self._calls.pop(record.call_id, None) or _act(tool_result.command or ())
+        if act is None or record.is_error or tool_result.exit_code not in {None, 0}:
             return False
         with self._lock:
             if act == "create":

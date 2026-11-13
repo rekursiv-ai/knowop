@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, override
 from uuid import UUID, uuid4
 
 from trackinizer.runs.adapters.custom_types import Subagent
-from trackinizer.sagent.session.types import BashResult
+from trackinizer.sagent.session.types import BashResult, ToolResult
 from trackinizer.wire.wire_session_ir import RecordBody
 
 import pytest
@@ -24,8 +24,9 @@ if TYPE_CHECKING:
 
     from trackinizer.lib.agent.sessions.tail import Tail
     from trackinizer.runs.adapters.custom_types import Adapter
-    from trackinizer.sagent.session.types import EditResult
     from trackinizer.types.streams import TraxRecord
+
+    from knowop.agent.worktree_diff import FileDiff
 
 
 _RUN: Path = Path("/projects/-w/s1.jsonl")
@@ -99,7 +100,7 @@ class _Recorded(Sink):
         self.commands += 1
 
     @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         del records
         self.diffs += 1
 
@@ -391,8 +392,20 @@ def test_each_record_reaches_the_sink_of_the_file_it_came_from() -> None:
     _ = tree.sinks.feed(_agents(), _KID, b"one\n")
     _ = tree.sinks.feed(_agents(), _RUN, b"hi\n")
 
-    tree.sinks.emit("fake", Event(record=BashResult(call_id="k"), path=_KID))
-    tree.sinks.emit("fake", Event(record=BashResult(call_id="r"), path=_RUN))
+    tree.sinks.emit(
+        "fake",
+        Event(
+            record=ToolResult(call_id="k", state="done", result=BashResult()),
+            path=_KID,
+        ),
+    )
+    tree.sinks.emit(
+        "fake",
+        Event(
+            record=ToolResult(call_id="r", state="done", result=BashResult()),
+            path=_RUN,
+        ),
+    )
 
     assert tree.children["a1"].emitted == [_KID]
     assert tree.run.emitted == [_RUN]
@@ -401,11 +414,28 @@ def test_each_record_reaches_the_sink_of_the_file_it_came_from() -> None:
 def test_the_runs_diff_records_and_buffer_are_its_own_sessions() -> None:
     tree = _Tree()
     _ = tree.sinks.feed(_agents(), _KID, b"one\n")
-    tree.sinks.emit("fake", Event(record=BashResult(call_id="r"), path=_RUN))
-    tree.sinks.emit("fake", Event(record=BashResult(call_id="k"), path=_KID))
+    tree.sinks.emit(
+        "fake",
+        Event(
+            record=ToolResult(call_id="r", state="done", result=BashResult()),
+            path=_RUN,
+        ),
+    )
+    tree.sinks.emit(
+        "fake",
+        Event(
+            record=ToolResult(call_id="k", state="done", result=BashResult()),
+            path=_KID,
+        ),
+    )
 
     tree.sinks.emit_worktree_diff(())
-    tree.sinks.emit_run_record(Event(record=BashResult(call_id="x"), path=_RUN))
+    tree.sinks.emit_run_record(
+        Event(
+            record=ToolResult(call_id="x", state="done", result=BashResult()),
+            path=_RUN,
+        ),
+    )
     tree.sinks.emit_slash_command(
         SlashCommand(command="compact"),
         datetime(2026, 1, 1, tzinfo=UTC),

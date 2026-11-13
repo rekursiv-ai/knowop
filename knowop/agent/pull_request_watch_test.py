@@ -21,7 +21,7 @@ import json
 import threading
 
 from trackinizer.client.errors import ClientError
-from trackinizer.sagent.session.types import BashResult, ToolCall
+from trackinizer.sagent.session.types import BashResult, ToolCall, ToolResult
 from treekle import from_plain
 
 import pytest
@@ -365,14 +365,21 @@ def _opened(watch: PullRequestWatch, *, call_id: str = "c1") -> None:
             arguments={"command": "gh pr create -f"},
         ),
     )
-    watch.note(BashResult(call_id=call_id, stdout=f"{_URL}\n"))
+    watch.note(
+        ToolResult(
+            call_id=call_id,
+            state="done",
+            stdout=(f"{_URL}\n",),
+            result=BashResult(),
+        ),
+    )
 
 
 def _pushed(watch: PullRequestWatch) -> None:
     watch.note(
         ToolCall(call_id="p", name="Bash", arguments={"command": "git push -u origin"}),
     )
-    watch.note(BashResult(call_id="p", stdout=""))
+    watch.note(ToolResult(call_id="p", state="done", result=BashResult()))
 
 
 def _tool(watch: PullRequestWatch, name: str) -> AgentTool:
@@ -425,17 +432,25 @@ def test_a_codex_result_names_its_own_command_and_a_failed_one_counts_for_nothin
     server, gh = _Server(), _Gh()
     watch = _watch(server, gh)
     watch.note(
-        BashResult(
+        ToolResult(
             call_id="x",
-            command=("bash", "-lc", "gh pr create --fill"),
-            stdout=_URL,
-            exit_code=1,
+            state="done",
+            stdout=(_URL,),
+            result=BashResult(
+                command=("bash", "-lc", "gh pr create --fill"),
+                exit_code=1,
+            ),
         ),
     )
     watch._sweep()
     assert server.rows == {}
     watch.note(
-        BashResult(call_id="y", command=("gh", "pr", "create"), stdout=_URL),
+        ToolResult(
+            call_id="y",
+            state="done",
+            stdout=(_URL,),
+            result=BashResult(command=("gh", "pr", "create")),
+        ),
     )
     watch._sweep()
     assert len(server.rows) == 1
@@ -494,7 +509,14 @@ def test_nothing_noted_reads_nothing() -> None:
     server, gh = _Server(), _Gh()
     watch = _watch(server, gh)
     watch.note(ToolCall(call_id="l", name="Bash", arguments={"command": "ls"}))
-    watch.note(BashResult(call_id="l", stdout=_URL))
+    watch.note(
+        ToolResult(
+            call_id="l",
+            state="done",
+            stdout=(_URL,),
+            result=BashResult(),
+        ),
+    )
     watch._sweep()
     assert gh.refs == []
     assert server.rows == {}
@@ -506,7 +528,9 @@ def test_a_pull_request_a_subagent_opened_in_its_own_worktree_is_watched() -> No
     watch = _watch(server, gh, git=_Git(branch=_BRANCH))
     command = "cd /opt/scratch/runs/other && gh pr create --draft 2>&1 | tail -2"
     watch.note(ToolCall(call_id="k", name="Bash", arguments={"command": command}))
-    watch.note(BashResult(call_id="k", shown=f"{_URL}\n"))
+    watch.note(
+        ToolResult(call_id="k", state="done", result=BashResult(), shown=f"{_URL}\n"),
+    )
     watch._sweep()
     assert [row["url"] for row in server.rows.values()] == [_URL]
 
@@ -516,7 +540,9 @@ def test_a_link_a_subagent_only_read_is_not_watched() -> None:
     watch = _watch(server, gh)
     command = 'grep -rn "gh pr create" /w/agent-a1.jsonl'
     watch.note(ToolCall(call_id="g", name="Bash", arguments={"command": command}))
-    watch.note(BashResult(call_id="g", shown=f"{_URL}\n"))
+    watch.note(
+        ToolResult(call_id="g", state="done", result=BashResult(), shown=f"{_URL}\n"),
+    )
     watch._sweep()
     assert gh.refs == []
     assert server.rows == {}

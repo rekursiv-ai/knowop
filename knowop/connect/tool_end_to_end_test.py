@@ -12,6 +12,7 @@ It lives here, not beside the relay, as trackinizer may not import ``knowop``.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
@@ -45,18 +46,20 @@ from sagent.model.scripted import (
 from sagent.session.jsonl import JsonlJournal, read_record
 from sagent.session.types import (
     BashResult,
-    FunctionResult,
     ReadResult,
     RemoteToolResult,
-    ToolErrorResult,
+    ToolResult,
+    UncategorizedToolResult,
 )
 from sagent.tools.bash import Bash
+from sagent.tools.display import ToolDisplay
 from sagent.tools.edit import Edit
 from sagent.tools.glob_tool import Glob
 from sagent.tools.grep import Grep
 from sagent.tools.list import List
 from sagent.tools.read import Read
 from sagent.tools.remote import Endpoint, Link, RemoteSession, RemoteTool
+from sagent.tools.types import ToolOutput, whole_output
 from sagent.tools.write import Write
 from trackinizer.client.tool_bridge import dial_tools
 from trackinizer.server.config import Config
@@ -72,6 +75,7 @@ from trackinizer.server.tool_relay import ToolConnectionEndError, ToolRelay
 from trackinizer.trax.connection import server_dir
 from trackinizer.wire import wire_terminals
 from trackinizer.wire.wire_tools import HOST_TOOLS_WS_PATH, TOOLS_WS_PATH
+from treekle import PlainTree
 from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
@@ -82,16 +86,14 @@ from knowop.connect.tool_serving import ToolClient, ToolServing, tool_dirs
 
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable, Mapping
+    from collections.abc import AsyncGenerator, Callable
     from pathlib import Path
 
     from sagent.host.server import Server
-    from sagent.session.types import AnyToolResult
-    from sagent.tools.types import Tool, ToolContext
+    from sagent.tools.types import Tool, ToolContext, ToolStreamingResult
     from trackinizer.server.tool_lines import Authorize
     from trackinizer.server.tool_relay import Inbound, ToolConnection
     from trackinizer.wire.wire_tools import ToolOffer
-    from treekle import PlainTree
     from websockets.asyncio.client import ClientConnection
     from websockets.asyncio.server import (
         Server as WebsocketServer,
@@ -355,31 +357,51 @@ class _Gated(Gate):
         default_factory=list[asyncio.AbstractEventLoop],
     )
 
+    # ``call`` is invoked on the daemon's event loop, the loop ``open`` must wake.
     @override
-    async def call(
+    def call(
         self,
         context: ToolContext,
         arguments: Mapping[str, PlainTree],
-    ) -> FunctionResult:
+    ) -> ToolStreamingResult[UncategorizedToolResult, str, str]:
         self.loops.append(asyncio.get_running_loop())
-        return await Gate.call(self, context, arguments)
+        return Gate.call(self, context, arguments)
 
     def open(self) -> None:
         _ = self.loops[-1].call_soon_threadsafe(self.opened.set)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class _Echo(Gate):
+class _Echo:
     """A tool that answers with the text it was given."""
 
-    @override
-    async def call(
+    name = "Echo"
+    description = "Say the text back."
+    schema: Mapping[str, PlainTree] = field(default_factory=lambda: {"type": "object"})
+    display: ToolDisplay = field(default=ToolDisplay())
+
+    def summary(self, arguments: Mapping[str, PlainTree]) -> str:
+        del arguments
+        return "Echo"
+
+    def serialize_key(
         self,
         context: ToolContext,
         arguments: Mapping[str, PlainTree],
-    ) -> FunctionResult:
+    ) -> str | None:
+        del context, arguments
+        return None
+
+    def call(
+        self,
+        context: ToolContext,
+        arguments: Mapping[str, PlainTree],
+    ) -> ToolStreamingResult[UncategorizedToolResult, str, str]:
         del context
-        return FunctionResult(call_id="", name="Echo", content=str(arguments["text"]))
+        return whole_output(self._run(str(arguments["text"])))
+
+    async def _run(self, text: str) -> ToolOutput[UncategorizedToolResult, str, str]:
+        return ToolOutput(stdout=(text,), result=UncategorizedToolResult())
 
 
 def _local(monkeypatch: pytest.MonkeyPatch, **tools: Tool) -> LocalHost:
@@ -468,17 +490,17 @@ async def _said(endpoint: Endpoint, text: str) -> None:
         await endpoint.until(lambda each: text in each.error)
 
 
-def _failed(result: AnyToolResult) -> str:
-    """Return why a call came to no result, as its agent is told."""
-    assert isinstance(result, RemoteToolResult), result
-    assert result.is_error is True
+def _failed(result: ToolResult) -> str:
+    """Return the error text of a failed ``RemoteTool`` call."""
+    assert isinstance(result.result, RemoteToolResult), result
+    assert result.is_error
     return result.text()
 
 
-def _text(result: AnyToolResult) -> str:
-    """Return what a real ``Read`` read."""
-    assert isinstance(result, ReadResult), result
-    return str(result.content)
+def _text(result: ToolResult) -> str:
+    """Return the text of a ``Read`` call's result."""
+    assert isinstance(result.result, ReadResult), result
+    return result.text()
 
 
 async def _call(
@@ -487,7 +509,7 @@ async def _call(
     *,
     agent: str = "Agent",
     **arguments: PlainTree,
-) -> AnyToolResult:
+) -> ToolResult:
     async with asyncio.timeout(_LIMIT_SEC):
         return await endpoint.call(
             agent=agent,
@@ -501,7 +523,7 @@ def _running(
     endpoint: Endpoint,
     tool: str,
     **arguments: PlainTree,
-) -> asyncio.Task[AnyToolResult]:
+) -> asyncio.Task[ToolResult]:
     return asyncio.create_task(
         endpoint.call(agent="Agent", window="w1", tool=tool, arguments=arguments),
     )
@@ -580,7 +602,7 @@ async def test_a_calls_session_record_names_it_by_the_id_the_relay_read(
     (record,) = [
         r
         for r in map(read_record, path.read_bytes().splitlines())
-        if isinstance(r, ReadResult)
+        if isinstance(r, ToolResult) and isinstance(r.result, ReadResult)
     ]
     (call,) = relay.calls
     assert "from this host" in _text(record)
@@ -619,8 +641,8 @@ async def test_a_call_survives_the_server_dropping(
 
         async with asyncio.timeout(_LIMIT_SEC):
             result = await call
-    assert isinstance(result, FunctionResult)
-    assert result.content == "open for Agent@laptop"
+    assert (result.state, result.result) == ("done", UncategorizedToolResult())
+    assert result.text() == "open for Agent@laptop"
     assert len(daemon.started) == 1
     assert len(relay.calls) == 1
 
@@ -644,10 +666,10 @@ async def test_two_sessions_on_one_host_get_their_own_results(
         await _until(gate.started.is_set)
         gate.open()
         one, two = await asyncio.gather(*calls)
-    assert isinstance(one, FunctionResult)
-    assert isinstance(two, FunctionResult)
-    assert one.content == "open for One@laptop"
-    assert two.content == "open for Two@laptop"
+    assert (one.state, one.result) == ("done", UncategorizedToolResult())
+    assert (two.state, two.result) == ("done", UncategorizedToolResult())
+    assert one.text() == "open for One@laptop"
+    assert two.text() == "open for Two@laptop"
     assert {call.session for call in relay.calls} == {
         first.session_id,
         second.session_id,
@@ -687,8 +709,9 @@ async def test_a_refused_line_decodes_as_a_result() -> None:
     message = await received(reader)
     assert isinstance(message, Result)
     assert message.id == "c1"
-    assert isinstance(message.record, ToolErrorResult)
-    assert (message.record.content, message.record.is_error) == ("no Bash", True)
+    assert isinstance(message.record, ToolResult)
+    assert message.record.state == "failed"
+    assert (message.record.text(), message.record.is_error) == ("no Bash", True)
 
 
 # -- What ends a tool connection, and what heals it -------------------------------------------------
@@ -724,7 +747,7 @@ async def test_a_sweep_ends_a_connection_whose_rule_no_longer_holds_and_says_so(
             gate.open()
             async with asyncio.timeout(_LIMIT_SEC):
                 result = await call
-    assert isinstance(result, FunctionResult)
+    assert (result.state, result.result) == ("done", UncategorizedToolResult())
 
 
 class _LosesTheFirstOffer:
@@ -794,8 +817,8 @@ async def test_a_line_longer_than_a_frame_crosses_both_ways(
         _agent(_link(relay)) as session,
     ):
         result = await _call(await _up(session), "Bash", text=text)
-    assert isinstance(result, FunctionResult)
-    assert result.content == text
+    assert isinstance(result.result, UncategorizedToolResult)
+    assert result.text() == text
     (call,) = relay.calls
     assert call.argument_bytes > len(text)
 
@@ -814,8 +837,8 @@ async def test_a_line_over_the_limit_ends_the_connection_and_the_agent_hears_it_
         lost = await _call(endpoint, "Bash", text="x" * (limit + 1))
         assert "lost this call" in _failed(lost)
         answered = await _call(await _up(session), "Bash", text="next")
-    assert isinstance(answered, FunctionResult)
-    assert answered.content == "next"
+    assert isinstance(answered.result, UncategorizedToolResult)
+    assert answered.text() == "next"
     assert len(relay.calls) == 1
 
 
@@ -833,7 +856,7 @@ async def test_a_read_of_an_image_past_the_relays_line_cap_returns_whole(
         _agent(_link(relay)) as session,
     ):
         result = await _call(await _up(session), "Read", file_path=str(image))
-    assert isinstance(result, ReadResult), result
+    assert isinstance(result.result, ReadResult), result
     (attachment,) = result.attachments
     assert attachment.data == image.read_bytes()
 
@@ -896,8 +919,8 @@ async def test_a_tool_a_rule_denies_is_refused_and_never_runs(
             denied = await _call(endpoint, "Bash")
             # What the rule allows still crosses, so the denied line would have by now.
             allowed = await _call(endpoint, "Read", file_path=str(readme))
-    assert isinstance(denied, ToolErrorResult)
-    assert denied.content == "Ada's rule denies Bash."
+    assert denied.state == "failed"
+    assert denied.text() == "Ada's rule denies Bash."
     assert "allowed" in _text(allowed)
     assert not gate.started.is_set()
     assert len(daemon.started) == 1
@@ -952,7 +975,12 @@ class _Stuck:
             whole = encoded(
                 Result(
                     id=message.id,
-                    record=FunctionResult(call_id="", name="Bash", content="corrupt"),
+                    record=ToolResult(
+                        call_id="",
+                        state="done",
+                        stdout=("corrupt",),
+                        result=UncategorizedToolResult(),
+                    ),
                 ),
             )
             await websocket.send(whole[: len(whole) // 2])
@@ -1139,7 +1167,7 @@ async def test_each_real_tool_answers_through_the_relay(
                     tool=tool,
                     arguments=arguments,
                 )
-            assert result.is_error is not True, (tool, result)
+            assert not result.is_error, (tool, result)
         # More than a frame, and more than a tool keeps in its answer.
         spilled = await _call(
             endpoint,
@@ -1147,9 +1175,9 @@ async def test_each_real_tool_answers_through_the_relay(
             command="head -c 100000 /dev/zero | tr '\\0' x",
             description="Print a lot",
         )
-    assert isinstance(spilled, BashResult)
-    assert spilled.exit_code == 0
-    assert spilled.stdout
+    assert isinstance(spilled.result, BashResult)
+    assert spilled.result.exit_code == 0
+    assert any(isinstance(part, str) and part for part in spilled.stdout)
     assert note.read_text() == "é second\n"
     assert len(relay.calls) == 7
 

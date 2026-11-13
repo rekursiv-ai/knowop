@@ -18,6 +18,9 @@ import subprocess
 from trackinizer.sagent.session.types import (
     AssistantMessage,
     EditResult,
+    ReadResult,
+    Splice,
+    ToolResult,
     WriteResult,
 )
 
@@ -37,6 +40,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     import pytest
+
+    from knowop.agent.worktree_diff import FileDiff
 
 
 _TOP = "/work/tree"
@@ -102,9 +107,9 @@ class _Emits:
     """Collects each batch of records a refresh uploads."""
 
     def __init__(self) -> None:
-        self.batches: list[list[EditResult]] = []
+        self.batches: list[list[FileDiff]] = []
 
-    def __call__(self, records: Sequence[EditResult]) -> None:
+    def __call__(self, records: Sequence[FileDiff]) -> None:
         self.batches.append(list(records))
 
 
@@ -150,36 +155,77 @@ class TestNote:
         """An edit or a write inside the tree is tracked; other records are not."""
         diff, _ = _opened([])
         diff.note(AssistantMessage(content="not a file"))
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
-        diff.note(WriteResult(call_id="", path="/work/tree/sub/b.py", content="x"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=ReadResult(path="/work/tree/r.py"),
+            ),
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=WriteResult(path="/work/tree/sub/b.py", content="x"),
+            ),
+        )
         assert diff.touched == {"a.py", "sub/b.py"}
 
     def test_path_outside_the_tree_is_dropped(self) -> None:
         """An edit above the tree (another agent's file) is never attributed here."""
         diff, _ = _opened([])
-        diff.note(EditResult(call_id="", path="/etc/passwd"))
-        diff.note(EditResult(call_id="", path="/work/other/c.py"))
+        diff.note(
+            ToolResult(call_id="", state="done", result=EditResult(path="/etc/passwd")),
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/other/c.py"),
+            ),
+        )
         assert diff.touched == set()
 
     def test_held_credential_path_is_dropped(self) -> None:
         """A credential file the session edited is not tracked, listed or diffed."""
         diff, _ = _opened([])
-        diff.note(EditResult(call_id="", path="/work/tree/.env"))
-        diff.note(EditResult(call_id="", path="/work/tree/deploy/id_rsa"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/.env"),
+            ),
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/deploy/id_rsa"),
+            ),
+        )
         assert diff.touched == set()
 
     def test_a_relative_path_is_inside_the_tree_and_an_empty_one_is_nowhere(
         self,
     ) -> None:
         diff, _ = _opened([])
-        diff.note(EditResult(call_id="", path="sub/c.py"))
-        diff.note(EditResult(call_id="", path=""))
+        diff.note(
+            ToolResult(call_id="", state="done", result=EditResult(path="sub/c.py")),
+        )
+        diff.note(ToolResult(call_id="", state="done", result=EditResult(path="")))
         assert diff.touched == {"sub/c.py"}
 
 
 class TestRefresh:
     def test_one_edit_record_per_changed_file(self) -> None:
-        """Each changed file becomes a EditResult whose edits are its diff."""
+        """Each changed file becomes one Edit record whose splices are its diff."""
         diff, _ = _opened(
             [
                 (
@@ -188,21 +234,40 @@ class TestRefresh:
                 ),
             ],
         )
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         [batch] = emit.batches
         [record] = batch
-        assert record.path == "a.py"
-        assert record.edits[0].before == "old\n"
-        assert record.edits[0].after == "new\n"
+        assert record.result == EditResult(path="a.py")
+        assert record.text() == "Edited a.py."
+        assert (
+            next(item for item in record.stdout if isinstance(item, Splice)).before
+            == "old\n"
+        )
+        assert (
+            next(item for item in record.stdout if isinstance(item, Splice)).after
+            == "new\n"
+        )
 
     def test_read_only_flags_on_every_git_call(self) -> None:
         """Every git invocation is read-only: no lock, no hook, no ext-diff."""
         diff, git = _opened(
             [(_has("diff", "--", "a.py"), _out(_diff("a.py", before="x", after="y")))],
         )
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
         diff.refresh(_Emits(), now=0.0)
         assert git.calls  # At least the diff ran.
         for argv in git.calls:
@@ -223,13 +288,24 @@ class TestRefresh:
                 ),
             ],
         )
-        diff.note(EditResult(call_id="", path="/work/tree/big.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/big.py"),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         [record] = emit.batches[0]
-        assert record.path == "big.py"
-        assert "omitted" in (record.edits[0].lead or "")
-        assert record.edits[0].before is None
+        assert record.result == EditResult(path="big.py")
+        assert "omitted" in (
+            next(item for item in record.stdout if isinstance(item, Splice)).lead or ""
+        )
+        assert (
+            next(item for item in record.stdout if isinstance(item, Splice)).before
+            is None
+        )
 
     def test_base_falls_back_to_head_when_sha_is_gone(self) -> None:
         """A rebase that drops the pinned sha falls back to diffing against HEAD."""
@@ -243,7 +319,13 @@ class TestRefresh:
                 ),
             ],
         )
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
         diff.refresh(_Emits(), now=0.0)
         diff_calls = [a for a in git.calls if "diff" in a and "a.py" in a]
         assert diff_calls
@@ -257,7 +339,13 @@ class TestTrigger:
         diff, _ = _opened(
             [(_has("diff", "--", "a.py"), _out(_diff("a.py", before="o", after="n")))],
         )
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         diff.refresh(emit, now=1.0)  # Nothing changed, well within the interval.
@@ -268,7 +356,13 @@ class TestTrigger:
         diff, git = _opened(
             [(_has("diff", "--", "a.py"), _out(_diff("a.py", before="o", after="n")))],
         )
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         # The file's content differs by the next interval, with no new edit record.
@@ -285,7 +379,13 @@ class TestTrigger:
         diff, git = _opened(
             [(_has("diff", "--", "a.py"), _out(_diff("a.py", before="o", after="n")))],
         )
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         # A second edit changes the diff, but barely any time has passed.
@@ -294,7 +394,13 @@ class TestTrigger:
             _head(),
             (_has("diff", "--", "a.py"), _out(_diff("a.py", before="o", after="z"))),
         ]
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
         diff.refresh(emit, now=1.0)
         assert len(emit.batches) == 1
         diff.refresh(emit, now=MIN_REFRESH_SEC + 0.5)
@@ -305,7 +411,13 @@ class TestTrigger:
         diff, git = _opened(
             [(_has("diff", "--", "a.py"), _out(_diff("a.py", before="o", after="n")))],
         )
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         git.responses = [
@@ -319,18 +431,65 @@ class TestTrigger:
         # Not due (not dirty, inside the interval), but forced at teardown.
         diff.refresh(emit, now=0.1, force=True)
         assert len(emit.batches) == 2
-        assert emit.batches[1][0].edits[0].after == "final\n"
+        assert (
+            next(
+                item for item in emit.batches[1][0].stdout if isinstance(item, Splice)
+            ).after
+            == "final\n"
+        )
 
     def test_unchanged_diff_is_not_re_uploaded(self) -> None:
         """Dedup: an identical rendered diff after the interval uploads nothing."""
         diff, _ = _opened(
             [(_has("diff", "--", "a.py"), _out(_diff("a.py", before="o", after="n")))],
         )
-        diff.note(EditResult(call_id="", path="/work/tree/a.py"))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         diff.refresh(emit, now=REFRESH_INTERVAL_SEC + 1.0)  # Same diff.
         assert len(emit.batches) == 1
+
+    def test_one_files_diff_that_reads_as_two_files_is_uploaded(self) -> None:
+        """A refresh is compared with the last upload per file, not as joined text."""
+        first = _diff("a.py", before="o", after="n")
+        second = _diff("b.py", before="p", after="q")
+        diff, git = _opened(
+            [
+                (_has("diff", "--", "a.py"), _out(first)),
+                (_has("diff", "--", "b.py"), _out(second)),
+            ],
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/a.py"),
+            ),
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path="/work/tree/b.py"),
+            ),
+        )
+        emit = _Emits()
+        diff.refresh(emit, now=0.0)
+        # ``b.py`` now has no diff, and ``a.py``'s diff text ends with ``b.py``'s
+        # path and diff text, so both refreshes would join to the same string.
+        git.responses = [
+            _toplevel(),
+            _head(),
+            (_has("diff", "--", "a.py"), _out(f"{first}\nb.py\n{second}")),
+        ]
+        diff.refresh(emit, now=REFRESH_INTERVAL_SEC + 1.0)
+        assert [len(batch) for batch in emit.batches] == [2, 1]
 
 
 class TestHeld:
@@ -366,12 +525,21 @@ class TestFileCases:
                 # The tracked diff (no match) returns empty, so the untracked path runs.
             ],
         )
-        diff.note(EditResult(call_id="", path=str(tmp_path / "new.py")))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "new.py")),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         [record] = emit.batches[0]
-        assert record.path == "new.py"
-        assert record.edits[0].after == "x\n"
+        assert record.result == EditResult(path="new.py")
+        assert (
+            next(item for item in record.stdout if isinstance(item, Splice)).after
+            == "x\n"
+        )
 
     def test_an_unchanged_tracked_file_is_skipped(self, tmp_path: Path) -> None:
         """A touched file with no net change is neither listed nor uploaded."""
@@ -379,7 +547,13 @@ class TestFileCases:
             tmp_path,
             [(_has("ls-files"), _out())],
         )  # Tracked, empty diff.
-        diff.note(EditResult(call_id="", path=str(tmp_path / "same.py")))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "same.py")),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         # An empty net diff dedups against the empty baseline: nothing uploads.
@@ -394,11 +568,19 @@ class TestFileCases:
         monkeypatch.setattr(worktree_diff, "SOURCE_BYTES", 4)
         (tmp_path / "big.py").write_text("x" * 20)
         diff = self._diffing(tmp_path, [])
-        diff.note(EditResult(call_id="", path=str(tmp_path / "big.py")))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "big.py")),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         [record] = emit.batches[0]
-        assert "large file" in (record.edits[0].lead or "")
+        assert "large file" in (
+            next(item for item in record.stdout if isinstance(item, Splice)).lead or ""
+        )
 
     def test_a_binary_diff_is_a_note(self, tmp_path: Path) -> None:
         """A diff with no textual hunk (a binary file) is reported, not parsed."""
@@ -406,11 +588,19 @@ class TestFileCases:
             tmp_path,
             [(_has("diff"), _out("Binary files a/x.bin and b/x.bin differ\n"))],
         )
-        diff.note(EditResult(call_id="", path=str(tmp_path / "x.bin")))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "x.bin")),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         [record] = emit.batches[0]
-        assert "binary" in (record.edits[0].lead or "")
+        assert "binary" in (
+            next(item for item in record.stdout if isinstance(item, Splice)).lead or ""
+        )
 
     def test_the_total_cap_stops_and_says_so(
         self,
@@ -421,13 +611,96 @@ class TestFileCases:
         text = _diff("a.py", before="o", after="n")
         monkeypatch.setattr(worktree_diff, "TOTAL_BYTES", len(text.encode()))
         diff = self._diffing(tmp_path, [(_has("diff"), _out(text))])
-        diff.note(EditResult(call_id="", path=str(tmp_path / "a.py")))
-        diff.note(EditResult(call_id="", path=str(tmp_path / "b.py")))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "a.py")),
+            ),
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "b.py")),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         batch = emit.batches[0]
         assert len(batch) == 2
-        assert "total size cap" in (batch[-1].edits[0].lead or "")
+        assert "total size cap" in (
+            next(item for item in batch[-1].stdout if isinstance(item, Splice)).lead
+            or ""
+        )
+        assert [record.result for record in batch] == [
+            EditResult(path="a.py"),
+            EditResult(path="(more)"),
+        ]
+        assert [
+            splice.lead
+            for splice in [
+                item for item in batch[-1].stdout if isinstance(item, Splice)
+            ]
+        ] == [
+            "(remaining diffs omitted: over the total size cap)\n",
+        ]
+
+    def test_the_total_cap_is_on_the_diffs_together(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two diffs that fill the cap between them leave no room for a third."""
+        text = _diff("a.py", before="o", after="n")
+        monkeypatch.setattr(worktree_diff, "TOTAL_BYTES", 2 * len(text.encode()))
+        diff = self._diffing(tmp_path, [(_has("diff"), _out(text))])
+        for name in ("a.py", "b.py", "c.py"):
+            diff.note(
+                ToolResult(
+                    call_id="",
+                    state="done",
+                    result=EditResult(path=str(tmp_path / name)),
+                ),
+            )
+        emit = _Emits()
+        diff.refresh(emit, now=0.0)
+        assert [record.result for record in emit.batches[0]] == [
+            EditResult(path="a.py"),
+            EditResult(path="b.py"),
+            EditResult(path="(more)"),
+        ]
+
+    def test_an_unchanged_file_does_not_end_the_diff(self, tmp_path: Path) -> None:
+        """A touched file with no net change is skipped; later files are still diffed."""
+        changed = _out(_diff("b.py", before="o", after="n"))
+        diff = self._diffing(
+            tmp_path,
+            [
+                (lambda argv: "diff" in argv and argv[-1] == "b.py", changed),
+                # Tracked, so an empty diff means unchanged.
+                (_has("ls-files"), _out()),
+            ],
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "a.py")),
+            ),
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "b.py")),
+            ),
+        )
+        emit = _Emits()
+        diff.refresh(emit, now=0.0)
+        assert [record.result for record in emit.batches[0]] == [
+            EditResult(path="b.py"),
+        ]
 
     def test_the_file_cap_counts_the_rest(
         self,
@@ -440,12 +713,39 @@ class TestFileCases:
             tmp_path,
             [(_has("diff"), _out(_diff("f", before="o", after="n")))],
         )
-        diff.note(EditResult(call_id="", path=str(tmp_path / "a.py")))
-        diff.note(EditResult(call_id="", path=str(tmp_path / "b.py")))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "a.py")),
+            ),
+        )
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "b.py")),
+            ),
+        )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         batch = emit.batches[0]
-        assert "more changed files" in (batch[-1].edits[0].lead or "")
+        assert "more changed files" in (
+            next(item for item in batch[-1].stdout if isinstance(item, Splice)).lead
+            or ""
+        )
+        assert [record.result for record in batch] == [
+            EditResult(path="a.py"),
+            EditResult(path="(more)"),
+        ]
+        assert [
+            splice.lead
+            for splice in [
+                item for item in batch[-1].stdout if isinstance(item, Splice)
+            ]
+        ] == [
+            "(1 more changed files omitted)\n",
+        ]
 
 
 class TestRunGit:

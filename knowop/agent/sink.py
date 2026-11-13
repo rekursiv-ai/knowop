@@ -68,7 +68,6 @@ if TYPE_CHECKING:
     from trackinizer.lib.agent.sessions.tail import Tail
     from trackinizer.runs.adapters.custom_types import Adapter
     from trackinizer.runs.redact import Redactor
-    from trackinizer.sagent.session.types import EditResult
     from trackinizer.types.streams import TraxRecord
     from trackinizer.wire.wire_session_ir import AppendRecordsResponse
     from trackinizer.wire.wire_sessions import (
@@ -77,6 +76,7 @@ if TYPE_CHECKING:
     )
 
     from knowop.agent.slash import SlashCommand
+    from knowop.agent.worktree_diff import FileDiff
 
 
 # The source "file" the synthetic diff part is keyed by; its records carry no
@@ -186,7 +186,7 @@ class Sink(Protocol):
         """
         ...
 
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         """Store the session's net worktree diff, overwriting the last one.
 
         NOT transcript records: these are a derived view, held on a synthetic
@@ -197,7 +197,7 @@ class Sink(Protocol):
         transcript, same redactor as every record.
 
         Args:
-          records: One :class:`EditResult` per changed file, in order.
+          records: One ``FileDiff`` per changed file, in order.
 
         """
         ...
@@ -466,7 +466,7 @@ class FileSink(Sink):
         )
 
     @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         # Written as ordinary record lines under the diff part. A local file is
         # an append log with no overwrite, so each refresh adds its lines afresh;
         # the dedup upstream keeps that to one set per actual change.
@@ -769,7 +769,7 @@ class TrackinizerSink(Sink):
         )
 
     @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         session_id = self._ensure_session()
         if self._diff_ir_id is None:
             self._diff_ir_id = uuid4()
@@ -1162,7 +1162,7 @@ class ResilientSink(Sink):
         )
 
     @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         # Sent, not buffered, so a send that fails is held and mirrored to the
         # local file; a restart append makes a replay on recovery idempotent.
         self._forward(
@@ -1423,7 +1423,7 @@ class LockedSink(Sink):
             self._inner.emit_run_record(event)
 
     @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         with self._lock:
             self._inner.emit_worktree_diff(records)
 
