@@ -15,7 +15,7 @@ import base64
 import json
 import re
 
-from trackinizer.lib.agent.sessions import claude
+from trackinizer.sagent.scripts.convert_session import claude
 from trackinizer.sagent.session.types import (
     CONCRETE_TYPES,
     Attachment,

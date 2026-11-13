@@ -36,7 +36,7 @@ _ALLOWED: Final = (
     # runner writes, their readers, the pty plumbing the hosts use, and the
     # per-user folders.
     "trackinizer.sagent.session",
-    "trackinizer.lib.agent",
+    "trackinizer.sagent.scripts.convert_session",
     # Sagent's tool server, from the sagent package knowop depends on: the tool host
     # serves sagent's remote tools through it (connect/tool_serving.py).
     "sagent.host",

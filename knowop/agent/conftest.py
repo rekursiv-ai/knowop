@@ -41,11 +41,6 @@ import uuid
 
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
-from trackinizer.lib.agent.sessions import (
-    claude,
-    codex,
-)
-from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.lib.posix.host import HostSpec
 from trackinizer.lib.posix.sockets import socket_address
 from trackinizer.runs.asks import (
@@ -54,6 +49,11 @@ from trackinizer.runs.asks import (
     Driver,
     DriverEvent,
 )
+from trackinizer.sagent.scripts.convert_session import (
+    claude,
+    codex,
+)
+from trackinizer.sagent.scripts.convert_session.tail import Tail
 from trackinizer.sagent.session.types import (
     AssistantMessage,
     IncompleteRecord,

@@ -12,7 +12,7 @@ import functools
 import json
 
 from trackinizer.client.conversation import Segment, read_part
-from trackinizer.lib.agent.sessions import (
+from trackinizer.sagent.scripts.convert_session import (
     claude,
     codex,
     sagent,

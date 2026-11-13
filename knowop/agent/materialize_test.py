@@ -12,12 +12,12 @@ from uuid import uuid4
 import re
 import subprocess
 
-from trackinizer.lib.agent.sessions import claude, codex, sagent
-from trackinizer.lib.agent.sessions.convert import detect_format
-from trackinizer.lib.agent.sessions.tail import Tail
 from trackinizer.runs.adapters.claude import ClaudeAdapter
 from trackinizer.runs.adapters.codex import CodexAdapter
 from trackinizer.runs.adapters.sagent import SagentAdapter
+from trackinizer.sagent.scripts.convert_session import claude, codex, sagent
+from trackinizer.sagent.scripts.convert_session.convert import detect_format
+from trackinizer.sagent.scripts.convert_session.tail import Tail
 from trackinizer.sagent.session.projects import find_sessions, project_dir
 from trackinizer.sagent.session.types import (
     AssistantMessage,
