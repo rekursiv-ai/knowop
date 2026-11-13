@@ -40,6 +40,7 @@ from trackinizer.sagent.session.types import (
     SessionRecord,
     TurnContext,
 )
+from trackinizer.types.session_records import record_kind
 from trackinizer.wire.refs import UuidRef
 from treekle import from_plain, immutable
 
@@ -343,10 +344,14 @@ def _undroppable(
 
 # ``TurnContext`` and ``ContextClear`` are restated per format rather than conveyed, so
 # a differing count is a spelling difference, not a loss.
+#
+# Counted by stored kind, not by class: every tool call's record is a ``ToolResult``,
+# so a count by class would miss a ``BashResult`` the target rewrote to the plain
+# ``UncategorizedToolResult``.
 def _acts(records: Iterable[SessionRecord]) -> Counter[str]:
     """Count the records carrying a turn, ignoring derived state."""
     return Counter(
-        type(record).__name__
+        record_kind(record)
         for record in records
         if not isinstance(record, TurnContext | ContextClear)
     )

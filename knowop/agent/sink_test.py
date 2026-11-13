@@ -37,11 +37,9 @@ from trackinizer.sagent.session.types import (
     Thinking,
     TokenUsage,
     ToolCall,
-    ToolErrorResult,
     ToolResult,
     TurnContext,
     UncategorizedRecord,
-    UncategorizedToolResult,
     UserMessage,
     WebFetchResult,
     WebSearchHit,
@@ -49,7 +47,7 @@ from trackinizer.sagent.session.types import (
     WriteResult,
 )
 from trackinizer.types.line_capture import LineCapture
-from trackinizer.types.session_records import _BY_KIND
+from trackinizer.types.session_records import _BY_KIND, record_kind
 from trackinizer.types.streams import Stderr, Stdin, Stdout
 from trackinizer.wire.wire_session_ir import (
     AppendRecordsRequest,
@@ -99,6 +97,8 @@ if TYPE_CHECKING:
     from trackinizer.lib.agent.sessions.tail import Tail
     from trackinizer.types.streams import TraxRecord
 
+    from knowop.agent.worktree_diff import FileDiff
+
 
 _OTHER = Path("/sessions/b.jsonl")
 _AT = datetime(2026, 6, 1, tzinfo=UTC)
@@ -108,20 +108,41 @@ _OVER_THE_LIMIT: Final = '\x00\x1b[0m"' * 5_000
 """Text oversized against the scaled proxy bound used in truncation tests."""
 
 _OVERSIZED: Final[dict[str, Callable[[str], TraxRecord]]] = {
-    "AgentSpawnResult": lambda text: AgentSpawnResult(call_id="c", content=text),
+    "AgentSpawnResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=AgentSpawnResult(),
+    ),
     "AgentToAgentMessage": lambda text: AgentToAgentMessage(content=text),
     "AssistantMessage": lambda text: AssistantMessage(content=text),
     "ContextClear": lambda text: ContextClear(history=(UserMessage(content=text),)),
     "ContextCompaction": lambda text: ContextCompaction(summary=text),
     "ContextState": lambda text: ContextState(content=text),
-    "EditResult": lambda text: EditResult(
+    "EditResult": lambda text: ToolResult(
         call_id="c",
-        edits=(Splice(before=text, after=text),),
+        state="done",
+        stdout=(Splice(before=text, after=text),),
+        result=EditResult(),
     ),
-    "ReadResult": lambda text: ReadResult(call_id="c", content=text),
-    "WriteResult": lambda text: WriteResult(call_id="c", content=text),
+    "ReadResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=ReadResult(),
+    ),
+    "WriteResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        result=WriteResult(content=text),
+    ),
     "IncompleteRecord": lambda text: IncompleteRecord(text=text),
-    "BashResult": lambda text: BashResult(call_id="c", stdout=text),
+    "BashResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=BashResult(),
+    ),
     "Stderr": lambda text: Stderr(text=text),
     "Stdin": lambda text: Stdin(text=text),
     "Stdout": lambda text: Stdout(text=text),
@@ -138,47 +159,132 @@ _OVERSIZED: Final[dict[str, Callable[[str], TraxRecord]]] = {
         kind="k",
         payload=immutable({"text": text}),
     ),
-    "UncategorizedToolResult": lambda text: UncategorizedToolResult(
+    "UncategorizedToolResult": lambda text: ToolResult(
         call_id="c",
-        content=text,
+        state="done",
+        stdout=(text,),
+        result=types.UncategorizedToolResult(),
     ),
-    "ToolErrorResult": lambda text: ToolErrorResult(call_id="c", content=text),
-    "GrepResult": lambda text: types.GrepResult(call_id="c", content=text),
-    "GlobResult": lambda text: types.GlobResult(call_id="c", content=text),
-    "ListResult": lambda text: types.ListResult(call_id="c", content=text),
-    "SkillResult": lambda text: types.SkillResult(call_id="c", content=text),
-    "AgentSendResult": lambda text: types.AgentSendResult(call_id="c", content=text),
-    "BackgroundTaskResult": lambda text: types.BackgroundTaskResult(
+    "ToolErrorResult": lambda text: ToolResult(
         call_id="c",
-        content=text,
+        state="failed",
+        stderr=(text,),
     ),
-    "AgentSelfResult": lambda text: types.AgentSelfResult(call_id="c", content=text),
-    "SessionResult": lambda text: types.SessionResult(call_id="c", content=text),
-    "MemoryResult": lambda text: types.MemoryResult(call_id="c", content=text),
-    "PlayAudioResult": lambda text: types.PlayAudioResult(call_id="c", content=text),
-    "PaperSearchResult": lambda text: types.PaperSearchResult(
+    "GrepResult": lambda text: ToolResult(
         call_id="c",
-        content=text,
+        state="done",
+        stdout=(text,),
+        result=types.GrepResult(),
     ),
-    "PaperDetailsResult": lambda text: types.PaperDetailsResult(
+    "GlobResult": lambda text: ToolResult(
         call_id="c",
-        content=text,
+        state="done",
+        stdout=(text,),
+        result=types.GlobResult(),
     ),
-    "PaperAuthorResult": lambda text: types.PaperAuthorResult(
+    "ListResult": lambda text: ToolResult(
         call_id="c",
-        content=text,
+        state="done",
+        stdout=(text,),
+        result=types.ListResult(),
     ),
-    "PaperFetchResult": lambda text: types.PaperFetchResult(call_id="c", content=text),
-    "RemoteToolResult": lambda text: types.RemoteToolResult(call_id="c", content=text),
-    "McpResult": lambda text: types.McpResult(call_id="c", content=text),
-    "FunctionResult": lambda text: types.FunctionResult(call_id="c", content=text),
-    "ToolResult": lambda text: ToolResult(call_id="c", stub="pending", shown=text),
+    "SkillResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.SkillResult(),
+    ),
+    "AgentSendResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.AgentSendResult(),
+    ),
+    "BackgroundTaskResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.BackgroundTaskResult(),
+    ),
+    "AgentSelfResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.AgentSelfResult(),
+    ),
+    "SessionResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.SessionResult(),
+    ),
+    "MemoryResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.MemoryResult(),
+    ),
+    "PlayAudioResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.PlayAudioResult(),
+    ),
+    "PaperSearchResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.PaperSearchResult(),
+    ),
+    "PaperDetailsResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.PaperDetailsResult(),
+    ),
+    "PaperAuthorResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.PaperAuthorResult(),
+    ),
+    "PaperFetchResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.PaperFetchResult(),
+    ),
+    "RemoteToolResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.RemoteToolResult(),
+    ),
+    "McpResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=types.McpResult(),
+    ),
+    "ToolResult": lambda text: ToolResult(call_id="c", state="pending", shown=text),
     "UserMessage": lambda text: UserMessage(content=text),
-    "WebBrowserResult": lambda text: types.WebBrowserResult(call_id="c", content=text),
-    "WebFetchResult": lambda text: WebFetchResult(call_id="c", content=text),
-    "WebSearchResult": lambda text: WebSearchResult(
+    "WebBrowserResult": lambda text: ToolResult(
         call_id="c",
-        content=(WebSearchHit(snippet=text),),
+        state="done",
+        stdout=(text,),
+        result=types.WebBrowserResult(),
+    ),
+    "WebFetchResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(text,),
+        result=WebFetchResult(),
+    ),
+    "WebSearchResult": lambda text: ToolResult(
+        call_id="c",
+        state="done",
+        stdout=(WebSearchHit(snippet=text),),
+        result=WebSearchResult(),
     ),
 }
 """One record of each stored kind, holding ``text`` where that kind holds prose."""
@@ -1021,10 +1127,11 @@ class TestWorktreeDiffSink:
         sink = _instant_sink(client)
         sink.emit_worktree_diff(
             [
-                EditResult(
+                ToolResult(
                     call_id="",
-                    path="a.py",
-                    edits=(Splice(before="old\n", after="new\n"),),
+                    state="done",
+                    stdout=("Edited a.py.", Splice(before="old\n", after="new\n")),
+                    result=EditResult(path="a.py"),
                 ),
             ],
         )
@@ -1043,10 +1150,14 @@ class TestWorktreeDiffSink:
         sink = _instant_sink(client, redactor=Redactor({"K": _VALUE}))
         sink.emit_worktree_diff(
             [
-                EditResult(
+                ToolResult(
                     call_id="",
-                    path="a.py",
-                    edits=(Splice(before="old\n", after=f"token {_VALUE}\n"),),
+                    state="done",
+                    stdout=(
+                        "Edited a.py.",
+                        Splice(before="old\n", after=f"token {_VALUE}\n"),
+                    ),
+                    result=EditResult(path="a.py"),
                 ),
             ],
         )
@@ -1060,15 +1171,17 @@ class TestWorktreeDiffSink:
         sink = FileSink(buf)
         sink.emit_worktree_diff(
             [
-                EditResult(
+                ToolResult(
                     call_id="",
-                    path="a.py",
-                    edits=(Splice(before="old\n", after="new\n"),),
+                    state="done",
+                    stdout=("Edited a.py.", Splice(before="old\n", after="new\n")),
+                    result=EditResult(path="a.py"),
                 ),
-                EditResult(
+                ToolResult(
                     call_id="",
-                    path="b.py",
-                    edits=(Splice(before="old\n", after="two\n"),),
+                    state="done",
+                    stdout=("Edited b.py.", Splice(before="old\n", after="two\n")),
+                    result=EditResult(path="b.py"),
                 ),
             ],
         )
@@ -1233,10 +1346,11 @@ class TestCatchUp:
         sink.emit("claude", _event("one"))
         sink.flush()
         client.down = True
-        diff = EditResult(
+        diff = ToolResult(
             call_id="",
-            path="a.py",
-            edits=(Splice(before="old\n", after="new\n"),),
+            state="done",
+            stdout=("Edited a.py.", Splice(before="old\n", after="new\n")),
+            result=EditResult(path="a.py"),
         )
 
         sink.emit_worktree_diff([diff])
@@ -1548,7 +1662,7 @@ class _ExplodingSink(Sink):
         raise RuntimeError("server exploded")
 
     @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         del records
         raise RuntimeError("server exploded")
 
@@ -2269,10 +2383,11 @@ class TestLockedSink:
         sink.emit("claude", _event("after the loaded history"))
         sink.emit_worktree_diff(
             [
-                EditResult(
+                ToolResult(
                     call_id="",
-                    path="a.py",
-                    edits=(Splice(before="old\n", after="new\n"),),
+                    state="done",
+                    stdout=("Edited a.py.", Splice(before="old\n", after="new\n")),
+                    result=EditResult(path="a.py"),
                 ),
             ],
         )
@@ -2737,7 +2852,12 @@ class TestRedaction:
         client = _FakeClient()
         sink = _instant_sink(client, redactor=Redactor({"K": secret}))
         # Mostly secret, so a cut lands inside one; still over budget once masked.
-        shell = BashResult(call_id="c", stdout=f"{secret} {'x' * 300}\n" * 420)
+        shell = ToolResult(
+            call_id="c",
+            state="done",
+            stdout=(f"{secret} {'x' * 300}\n" * 420,),
+            result=BashResult(),
+        )
         sink.emit("claude", Event(record=shell, path=_PART))
         sink.close()
         stored = _stored_by(client)
@@ -2759,9 +2879,11 @@ class TestOneRecordOverTheProxyLimit:
     def test_an_oversized_codex_result_uploads_with_its_marker(self) -> None:
         """Codex repeats its output; every copy is bounded before upload."""
         output = (_WORKER_LOG * 200)[:8_000]
-        record = BashResult(
+        record = ToolResult(
             call_id="exec-1",
-            stdout=output,
+            state="done",
+            stdout=(output,),
+            result=BashResult(),
             extra=immutable(
                 {"item": {"aggregated_output": output, "formatted_output": output}},
             ),
@@ -2775,10 +2897,15 @@ class TestOneRecordOverTheProxyLimit:
 
         assert server.uploads
         assert max(len(upload) for upload in server.uploads) <= server.proxy_limit
-        (shell,) = [r for r in server.read_back() if isinstance(r, BashResult)]
+        (shell,) = [
+            r
+            for r in server.read_back()
+            if isinstance(r, ToolResult) and isinstance(r.result, BashResult)
+        ]
         assert was_truncated(shell)
         item = from_plain(shell.extra["item"], dict[str, object])
-        for kept in (shell.stdout, item["aggregated_output"], item["formatted_output"]):
+        [printed] = [part for part in shell.stdout if isinstance(part, str)]
+        for kept in (printed, item["aggregated_output"], item["formatted_output"]):
             assert isinstance(kept, str)
             assert (
                 "[Trackinizer capture truncated: kept beginning/end; omitted " in kept
@@ -2798,6 +2925,7 @@ class TestOneRecordOverTheProxyLimit:
         assert max(len(upload) for upload in server.uploads) <= server.proxy_limit
         (stored,) = server.read_back()
         assert type(stored) is type(record)
+        assert record_kind(stored) == kind
         assert was_truncated(stored)
 
     def test_every_kind_has_an_oversized_example(self) -> None:
@@ -2837,7 +2965,12 @@ def test_the_out_file_holds_the_bounded_record() -> None:
     """Local capture and upload share one bound: the file is what the server gets."""
     buf = io.StringIO()
     sink = FileSink(buf)
-    shell = BashResult(call_id="c", stdout="x" * MAX_TOOL_RESULT_BYTES)
+    shell = ToolResult(
+        call_id="c",
+        state="done",
+        stdout=("x" * MAX_TOOL_RESULT_BYTES,),
+        result=BashResult(),
+    )
 
     sink.emit("codex", Event(record=shell, path=_PART))
 

@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from trackinizer.sagent.session.types import BashResult, SystemMessage, ToolCall
+from trackinizer.sagent.session.types import (
+    BashResult,
+    GrepResult,
+    SystemMessage,
+    ToolCall,
+    ToolResult,
+)
 
 import pytest
 
@@ -16,7 +22,17 @@ def test_a_claude_call_is_paired_with_its_result_by_id() -> None:
     notes = RecordNotes()
     call = ToolCall(call_id="c", name="Bash", arguments={"command": "gh pr create -f"})
     assert notes.note(call) is False
-    assert notes.note(BashResult(call_id="c", stdout=f"{_URL}\n")) is True
+    assert (
+        notes.note(
+            ToolResult(
+                call_id="c",
+                state="done",
+                stdout=(f"{_URL}\n",),
+                result=BashResult(),
+            ),
+        )
+        is True
+    )
     assert notes.take() == Noted(opened=(_URL,))
     assert notes.take() == Noted()
 
@@ -29,24 +45,41 @@ def test_a_command_spelled_as_a_list_is_read_from_its_words() -> None:
         arguments={"argv": ["git", "push", "origin"], "options": {"cwd": "/w"}},
     )
     assert notes.note(call) is False
-    assert notes.note(BashResult(call_id="c")) is True
+    assert (
+        notes.note(ToolResult(call_id="c", state="done", result=BashResult())) is True
+    )
     assert notes.take() == Noted(pushed=True)
 
 
 def test_a_record_that_is_no_shell_call_notes_nothing() -> None:
     notes = RecordNotes()
-    said = SystemMessage(
+    message = SystemMessage(
         timestamp="2026-01-01T00:00:00Z",
         subtype="x",
         content="git push",
     )
-    assert notes.note(said) is False
+    assert notes.note(message) is False
+    assert notes.take() == Noted()
+    # A Grep whose pattern is the command did not run the command.
+    call = ToolCall(call_id="g", name="Grep", arguments={"pattern": "gh pr create"})
+    assert notes.note(call) is False
+    grep_record = ToolResult(
+        call_id="g",
+        state="done",
+        stdout=(f"{_URL}\n",),
+        result=GrepResult(pattern="gh pr create"),
+    )
+    assert notes.note(grep_record) is False
     assert notes.take() == Noted()
 
 
 def test_a_codex_result_names_its_own_push() -> None:
     notes = RecordNotes()
-    pushed = BashResult(call_id="x", command=("bash", "-lc", "git push origin"))
+    pushed = ToolResult(
+        call_id="x",
+        state="done",
+        result=BashResult(command=("bash", "-lc", "git push origin")),
+    )
     assert notes.note(pushed) is True
     assert notes.take() == Noted(pushed=True)
 
@@ -63,7 +96,17 @@ def test_a_link_is_read_from_what_the_model_read() -> None:
         },
     )
     _ = notes.note(call)
-    assert notes.note(BashResult(call_id="c", shown=f"{_URL}\n")) is True
+    assert (
+        notes.note(
+            ToolResult(
+                call_id="c",
+                state="done",
+                result=BashResult(),
+                shown=f"{_URL}\n",
+            ),
+        )
+        is True
+    )
     assert notes.take() == Noted(opened=(_URL,))
 
 
@@ -79,7 +122,17 @@ def test_a_command_is_found_after_a_separator_or_an_assignment(
     command: tuple[str, ...],
 ) -> None:
     notes = RecordNotes()
-    assert notes.note(BashResult(call_id="x", command=command, stdout=_URL)) is True
+    assert (
+        notes.note(
+            ToolResult(
+                call_id="x",
+                state="done",
+                stdout=(_URL,),
+                result=BashResult(command=command),
+            ),
+        )
+        is True
+    )
 
 
 # Measured: an agent that greps transcripts for ``gh pr create`` prints the links of
@@ -96,20 +149,51 @@ def test_a_command_that_only_names_one_notes_nothing(command: str) -> None:
     notes = RecordNotes()
     call = ToolCall(call_id="c", name="Bash", arguments={"command": command})
     _ = notes.note(call)
-    assert notes.note(BashResult(call_id="c", stdout=_URL)) is False
+    assert (
+        notes.note(
+            ToolResult(
+                call_id="c",
+                state="done",
+                stdout=(_URL,),
+                result=BashResult(),
+            ),
+        )
+        is False
+    )
     assert notes.take() == Noted()
 
 
 @pytest.mark.parametrize(
     "result",
     [
-        BashResult(call_id="x", command=("gh", "pr", "create"), exit_code=1),
-        BashResult(call_id="x", command=("git", "push"), is_error=True),
-        BashResult(call_id="x", command=("ls",), stdout=_URL),
-        BashResult(call_id="x", stdout=_URL),
+        ToolResult(
+            call_id="x",
+            state="done",
+            result=BashResult(command=("gh", "pr", "create"), exit_code=1),
+        ),
+        # ``state="failed"`` with no exit code: only ``record.is_error`` rejects it.
+        ToolResult(
+            call_id="x",
+            state="failed",
+            result=BashResult(command=("git", "push")),
+        ),
+        ToolResult(
+            call_id="x",
+            state="done",
+            stdout=(_URL,),
+            result=BashResult(command=("ls",)),
+        ),
+        ToolResult(
+            call_id="x",
+            state="done",
+            stdout=(_URL,),
+            result=BashResult(),
+        ),
     ],
 )
-def test_a_failed_or_unrelated_call_notes_nothing(result: BashResult) -> None:
+def test_a_failed_or_unrelated_call_notes_nothing(
+    result: ToolResult[BashResult],
+) -> None:
     notes = RecordNotes()
     assert notes.note(result) is False
     assert notes.take() == Noted()

@@ -56,7 +56,6 @@ from trackinizer.runs.asks import (
 )
 from trackinizer.sagent.session.types import (
     AssistantMessage,
-    EditResult,
     IncompleteRecord,
     SessionRecord,
     SystemMessage,
@@ -130,6 +129,7 @@ if TYPE_CHECKING:
 
     from knowop.agent.custom_types import Event
     from knowop.agent.slash import SlashCommand
+    from knowop.agent.worktree_diff import FileDiff
     from knowop.connect.conftest import _Process
 
 __all__ = [
@@ -306,7 +306,7 @@ class _BlockingSink(Sink):
         del command, at
 
     @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         del records
 
     @override
@@ -1237,7 +1237,7 @@ class _RecordingSink(Sink):
     def __init__(self) -> None:
         self.events: list[tuple[int, str, Event]] = []
         self.slash: list[tuple[SlashCommand, datetime]] = []
-        self.diffs: list[list[EditResult]] = []
+        self.diffs: list[list[FileDiff]] = []
         self.closed = False
         self.flushes = 0
         self.cli_session_ids: list[str] = []
@@ -1279,7 +1279,7 @@ class _RecordingSink(Sink):
         self.slash.append((command, at))
 
     @override
-    def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+    def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
         self.diffs.append(list(records))
 
     @override

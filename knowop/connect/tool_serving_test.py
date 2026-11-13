@@ -47,9 +47,13 @@ from sagent.host.wire import (
     encoded,
     received,
 )
-from sagent.session.types import FunctionResult, ReadResult
+from sagent.session.types import (
+    ReadResult,
+    UncategorizedToolResult,
+)
 from sagent.tools.display import ToolDisplay
 from sagent.tools.read import Read
+from sagent.tools.types import ToolOutput, whole_output
 from trackinizer.client import tool_bridge
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import state_dir
@@ -90,7 +94,7 @@ if TYPE_CHECKING:
 
     from sagent.host.server import Host
     from sagent.host.wire import Message
-    from sagent.tools.types import Tool, ToolContext
+    from sagent.tools.types import Tool, ToolContext, ToolStreamingResult
     from websockets.asyncio.client import ClientConnection
     from websockets.datastructures import Headers
     from websockets.http11 import Request, Response
@@ -372,8 +376,13 @@ def _call(call_id: str, tool: str, **arguments: PlainTree) -> Call:
 
 
 def _content(result: Result) -> str:
-    assert isinstance(result.record, FunctionResult | ReadResult), result.record
-    return str(result.record.content)
+    """Return the text of a done Gate or Read call's record."""
+    tool_result = result.record.result
+    assert tool_result == UncategorizedToolResult() or isinstance(
+        tool_result,
+        ReadResult,
+    ), result.record
+    return result.record.text()
 
 
 def _threads() -> set[str]:
@@ -1466,14 +1475,20 @@ class _Spy:
     ) -> str | None:
         del context, arguments
 
-    async def call(
+    def call(
         self,
         context: ToolContext,
         arguments: Mapping[str, PlainTree],
-    ) -> FunctionResult:
+    ) -> ToolStreamingResult[UncategorizedToolResult, str, str]:
         del context
+        return whole_output(self._run(arguments))
+
+    async def _run(
+        self,
+        arguments: Mapping[str, PlainTree],
+    ) -> ToolOutput[UncategorizedToolResult, str, str]:
         self.ran.append(repr(arguments)[:100])
-        return FunctionResult(call_id="", name="Spy", content="ran")
+        return ToolOutput(stdout=("ran",), result=UncategorizedToolResult())
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

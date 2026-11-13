@@ -22,6 +22,7 @@ from trackinizer.sagent.session.types import (
     BashResult,
     ContextClear,
     IncompleteRecord,
+    ToolResult,
     UncategorizedRecord,
     UncategorizedToolResult,
     UserMessage,
@@ -69,16 +70,19 @@ _LOG: Final = (
 the wire, which is how ~1 MB of output became 11.39 MB."""
 
 
-def _shell(output: str, *, image: PlainTree = None) -> BashResult:
+def _shell(output: str, *, image: PlainTree = None) -> ToolResult[BashResult]:
     """Return a shell result holding ``output`` twice, as codex stores one."""
     extra: dict[str, PlainTree] = {"aggregated_output": output}
     if image is not None:
         extra["image"] = image
-    return BashResult(
+    return ToolResult(
         call_id="c",
-        command=("bash", "-lc", "find . -exec sed -n '1,180p' {} \\;"),
-        stdout=output,
-        exit_code=0,
+        state="done",
+        stdout=(output,),
+        result=BashResult(
+            command=("bash", "-lc", "find . -exec sed -n '1,180p' {} \\;"),
+            exit_code=0,
+        ),
         extra=immutable(extra),
     )
 
@@ -151,7 +155,14 @@ class TestARecordThatFitsIsUntouched:
     """Small results stay byte-identical: nothing is re-encoded on the way."""
 
     def test_a_tool_result_under_its_budget_sends_the_same_bytes(self) -> None:
-        body = _body(BashResult(call_id="c", stdout="é\x1b[0m" * 5_000))
+        body = _body(
+            ToolResult(
+                call_id="c",
+                state="done",
+                stdout=("é\x1b[0m" * 5_000,),
+                result=BashResult(),
+            ),
+        )
 
         assert _wire(bounded(body)) == _wire(body)
 
@@ -176,20 +187,22 @@ class TestAnOversizedToolResult:
         output = _LOG * 4_000
         record = _read(bounded(_body(_shell(output))))
 
-        assert isinstance(record, BashResult)
+        assert isinstance(record, ToolResult)
+        assert isinstance(record.result, BashResult)
         copy = record.extra["aggregated_output"]
         assert isinstance(copy, str)
-        for kept in (record.stdout, copy):
+        for kept in (_stdout_text(record), copy):
             _assert_cut_from(output, kept)
 
     def test_the_note_counts_every_byte_left_out(self) -> None:
         output = _LOG * 4_000
         record = _read(bounded(_body(_shell(output))))
 
-        assert isinstance(record, BashResult)
+        assert isinstance(record, ToolResult)
+        assert isinstance(record.result, BashResult)
         copy = record.extra["aggregated_output"]
         assert isinstance(copy, str)
-        stated = sum(_omitted(kept) for kept in (record.stdout, copy))
+        stated = sum(_omitted(kept) for kept in (_stdout_text(record), copy))
         assert record.extra[NOTE] == immutable({"omitted_bytes": stated})
 
     def test_search_text_is_derived_from_what_was_kept(self) -> None:
@@ -227,8 +240,9 @@ class TestTheCutKeepsTextValid:
         reread = RecordBody.model_validate_json(_wire(cut))
         record = _read(reread)
 
-        assert isinstance(record, BashResult)
-        _assert_cut_from(output, record.stdout)
+        assert isinstance(record, ToolResult)
+        assert isinstance(record.result, BashResult)
+        _assert_cut_from(output, _stdout_text(record))
 
     @pytest.mark.parametrize("offset", range(4))
     def test_no_cut_splits_a_character(self, offset: int) -> None:
@@ -237,23 +251,28 @@ class TestTheCutKeepsTextValid:
 
         record = _read(bounded(_body(_shell(output))))
 
-        assert isinstance(record, BashResult)
-        _assert_cut_from(output, record.stdout)
+        assert isinstance(record, ToolResult)
+        assert isinstance(record.result, BashResult)
+        _assert_cut_from(output, _stdout_text(record))
 
 
 class TestWhatIsNeverCut:
     def test_bytes_survive_whole(self) -> None:
         """An attachment is base64 of bytes: a cut would corrupt both."""
         data = bytes(range(256)) * 1_000
-        record = UncategorizedToolResult(
+        record = ToolResult(
             call_id="c",
-            content="x" * MAX_TOOL_RESULT_BYTES,
-            attachments=(Attachment(mime_descriptor="image/png", data=data),),
+            state="done",
+            stdout=(
+                "x" * MAX_TOOL_RESULT_BYTES,
+                Attachment(mime_descriptor="image/png", data=data),
+            ),
+            result=UncategorizedToolResult(),
         )
 
         cut = _read(bounded(_body(record)))
 
-        assert isinstance(cut, UncategorizedToolResult)
+        assert isinstance(cut, ToolResult)
         assert cut.attachments[0].data == data
         assert was_truncated(cut)
 
@@ -269,7 +288,8 @@ class TestAnImageIsKeptWholeOrNamed:
 
         assert encoded_size(cut) <= MAX_TOOL_RESULT_BYTES
         record = _read(cut)
-        assert isinstance(record, BashResult)
+        assert isinstance(record, ToolResult)
+        assert isinstance(record.result, BashResult)
         assert record.extra["image"] == immutable(image)
 
     def test_an_image_over_the_share_becomes_text_naming_it(self) -> None:
@@ -277,7 +297,8 @@ class TestAnImageIsKeptWholeOrNamed:
 
         record = _read(bounded(_body(_shell("short", image=image))))
 
-        assert isinstance(record, BashResult)
+        assert isinstance(record, ToolResult)
+        assert isinstance(record.result, BashResult)
         assert record.extra["image"] == immutable(
             {
                 "type": "text",
@@ -374,9 +395,11 @@ class TestTheLossyNote:
 def test_the_size_is_what_the_http_client_sends() -> None:
     """Measured as ``httpx2`` encodes ``json=``: compact, non-ASCII kept raw."""
     body = _body(
-        BashResult(
+        ToolResult(
             call_id="c",
-            stdout='é€😀\x00\x1b[31m"\\\n',
+            state="done",
+            stdout=('é€😀\x00\x1b[31m"\\\n',),
+            result=BashResult(),
             extra=immutable({"duration": 0.1, "nested": [{"a": None, "b": True}]}),
         ),
     )
@@ -419,6 +442,12 @@ def _assert_cut_from(original: str, kept: str) -> None:
     omitted = len(original.encode()) - len(head.encode()) - len(tail.encode())
     assert int(match["omitted"]) == omitted
     assert kept.encode().decode() == kept
+
+
+def _stdout_text(record: ToolResult[object, object, object]) -> str:
+    """Return the single text item of ``record.stdout``."""
+    [text] = [item for item in record.stdout if isinstance(item, str)]
+    return text
 
 
 def _omitted(kept: str) -> int:

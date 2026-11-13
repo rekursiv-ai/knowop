@@ -69,6 +69,7 @@ from trackinizer.sagent.session.types import (
     EditResult,
     SessionRecord,
     SystemMessage,
+    ToolResult,
     UncategorizedRecord,
     UserMessage,
 )
@@ -201,6 +202,8 @@ if TYPE_CHECKING:
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.types.streams import TraxRecord
 
+    from knowop.agent.worktree_diff import FileDiff
+
 
 @pytest.fixture(autouse=True)
 def short_queue_drain_interval(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -257,9 +260,13 @@ def _poison_records(stream: TextIO) -> Iterator[SessionRecord]:
 # Each line is the absolute path of a file the session edited, so the diff
 # capture's ``note`` sees it through ``feed``'s ``on_record`` hook.
 def _edit_records(stream: TextIO) -> Iterator[SessionRecord]:
-    """One empty ``EditResult`` per line, its path the line's text."""
+    """Yield one Edit record per line of ``stream``; the line is the edited path."""
     for line in stream:
-        yield EditResult(call_id="", path=line.rstrip("\n"), edits=())
+        yield ToolResult(
+            call_id="",
+            state="done",
+            result=EditResult(path=line.rstrip("\n")),
+        )
 
 
 class _FakeEditAdapter(_FakeAdapter):
@@ -1742,22 +1749,34 @@ class TestWorktreeDiffWiring:
     def test_refresh_uploads_the_diff_and_none_is_a_no_op(self, tmp_path: Path) -> None:
         """The teardown refresh uploads the net diff; no capture means nothing sent."""
         diff = WorktreeDiff(top=tmp_path, run=_diff_git, base="HEAD")
-        diff.note(EditResult(call_id="", path=str(tmp_path / "a.py"), edits=()))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "a.py")),
+            ),
+        )
         sink = _RecordingSink()
         session._refresh_diff(diff, sink, force=True)
         [batch] = sink.diffs
-        assert [record.path for record in batch] == ["a.py"]
+        assert [record.result for record in batch] == [EditResult(path="a.py")]
         session._refresh_diff(None, sink, force=True)
         assert len(sink.diffs) == 1
 
     def test_refresh_swallows_a_sink_failure(self, tmp_path: Path) -> None:
         """A git or sink failure costs one refresh, never the run's capture."""
         diff = WorktreeDiff(top=tmp_path, run=_diff_git, base="HEAD")
-        diff.note(EditResult(call_id="", path=str(tmp_path / "a.py"), edits=()))
+        diff.note(
+            ToolResult(
+                call_id="",
+                state="done",
+                result=EditResult(path=str(tmp_path / "a.py")),
+            ),
+        )
 
         class _Boom(_RecordingSink):
             @override
-            def emit_worktree_diff(self, records: Sequence[EditResult]) -> None:
+            def emit_worktree_diff(self, records: Sequence[FileDiff]) -> None:
                 raise RuntimeError("server down")
 
         session._refresh_diff(diff, _Boom(), force=True)  # Must not raise.
@@ -11420,7 +11439,12 @@ def test_the_pull_request_watch_sees_a_subagents_records_and_the_diff_does_not(
             pull_requests=watch,
         )
 
-    assert [getattr(record, "path", None) for record in noted] == [
+    assert [
+        record.result.path
+        if isinstance(record, ToolResult) and isinstance(record.result, EditResult)
+        else None
+        for record in noted
+    ] == [
         str(tmp_path / "a.py"),
         str(tmp_path / "b.py"),
     ]

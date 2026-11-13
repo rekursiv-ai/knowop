@@ -3365,7 +3365,7 @@ wheels = [
 [[package]]
 name = "trackinizer"
 version = "0.1.13"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#86e738bae86e71d43ed491c48c28d76d017bd179" }
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#ef831c3ec1633bb3aad520340a71f5945ca321d7" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
@@ -3712,7 +3712,7 @@ wheels = [
 [[package]]
 name = "wesearch"
 version = "0.1.18"
-source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#3c5339970e25dca91508f6367faa17cd47f7b53b" }
+source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#a46ab9f9e162330f9e2a9e32f986c5bc1ec9ffdb" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "brotli" },
