@@ -339,7 +339,7 @@ class DirectRouter:
         peer.send(encode_frame(Frame.ACK, resume.to_bytes(8)))
         self._send_output(peer, data)
         if self._fenced:
-            self._fenced = False  # pragma: no mutate -- read only for truthiness.
+            self._fenced = False  # pragma: no mutate[truthiness]
             peer.send(self._fence())
         if self._keepalive is None or self._keepalive.done():
             self._keepalive = asyncio.create_task(self._report_idle())
