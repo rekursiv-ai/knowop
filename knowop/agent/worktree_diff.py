@@ -328,9 +328,16 @@ class WorktreeDiff:
         for rel in sorted(self._touched):
             if len(records) >= MAX_FILES:
                 records.append(
-                    _note(
-                        "(more)",
-                        f"{len(self._touched) - MAX_FILES} more changed files omitted",
+                    ToolResult(
+                        call_id="",
+                        state="done",
+                        stdout=(
+                            "Edited (more).",
+                            Splice(
+                                lead=f"({f'{len(self._touched) - MAX_FILES} more changed files omitted'})\n",
+                            ),
+                        ),
+                        result=EditResult(path="(more)"),
                     ),
                 )
                 break
@@ -340,7 +347,17 @@ class WorktreeDiff:
             record, key, cost = file_diff
             if used + cost > TOTAL_BYTES:
                 records.append(
-                    _note("(more)", "remaining diffs omitted: over the total size cap"),
+                    ToolResult(
+                        call_id="",
+                        state="done",
+                        stdout=(
+                            "Edited (more).",
+                            Splice(
+                                lead="(remaining diffs omitted: over the total size cap)\n",
+                            ),
+                        ),
+                        result=EditResult(path="(more)"),
+                    ),
                 )
                 break
             records.append(record)
@@ -352,15 +369,51 @@ class WorktreeDiff:
         """One file's record, its dedup key and byte cost; ``None`` when unchanged."""
         size = self._size(rel)
         if size is not None and size > SOURCE_BYTES:
-            return _note(rel, "large file; diff omitted"), "large", 0
+            return (
+                ToolResult(
+                    call_id="",
+                    state="done",
+                    stdout=(
+                        f"Edited {rel}.",
+                        Splice(lead="(large file; diff omitted)\n"),
+                    ),
+                    result=EditResult(path=rel),
+                ),
+                "large",
+                0,
+            )
         text, cut = self._diff_text(rel, base, size)
         if text is None:
             return None
         if cut:
-            return _note(rel, "diff omitted: over the size cap"), "omitted", 0
+            return (
+                ToolResult(
+                    call_id="",
+                    state="done",
+                    stdout=(
+                        f"Edited {rel}.",
+                        Splice(lead="(diff omitted: over the size cap)\n"),
+                    ),
+                    result=EditResult(path=rel),
+                ),
+                "omitted",
+                0,
+            )
         edits = parse_udiff(_hunks(text))
         if not edits:
-            return _note(rel, "binary or no textual change"), "binary", 0
+            return (
+                ToolResult(
+                    call_id="",
+                    state="done",
+                    stdout=(
+                        f"Edited {rel}.",
+                        Splice(lead="(binary or no textual change)\n"),
+                    ),
+                    result=EditResult(path=rel),
+                ),
+                "binary",
+                0,
+            )
         record: FileDiff = ToolResult(
             call_id="",
             state="done",
@@ -440,16 +493,6 @@ class WorktreeDiff:
     def _git(self, *args: str, max_bytes: int = DIFF_BYTES) -> Output:
         """Run one git command in the tree, read-only."""
         return self._run(_argv(self._top, args), max_bytes)
-
-
-def _note(path: str, message: str) -> FileDiff:
-    """Build a placeholder edit whose line explains why a file's diff is not shown."""
-    return ToolResult(
-        call_id="",
-        state="done",
-        stdout=(f"Edited {path}.", Splice(lead=f"({message})\n")),
-        result=EditResult(path=path),
-    )
 
 
 def _argv(directory: Path, args: Sequence[str]) -> list[str]:

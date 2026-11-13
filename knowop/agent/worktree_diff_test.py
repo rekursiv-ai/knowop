@@ -245,6 +245,7 @@ class TestRefresh:
         diff.refresh(emit, now=0.0)
         [batch] = emit.batches
         [record] = batch
+        assert (record.call_id, record.state) == ("", "done")
         assert record.result == EditResult(path="a.py")
         assert record.text() == "Edited a.py."
         assert (
@@ -297,15 +298,21 @@ class TestRefresh:
         )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
-        [record] = emit.batches[0]
-        assert record.result == EditResult(path="big.py")
-        assert "omitted" in (
-            next(item for item in record.stdout if isinstance(item, Splice)).lead or ""
-        )
-        assert (
-            next(item for item in record.stdout if isinstance(item, Splice)).before
-            is None
-        )
+        assert emit.batches == [
+            [
+                ToolResult(
+                    call_id="",
+                    state="done",
+                    stdout=(
+                        "Edited big.py.",
+                        Splice(lead="(diff omitted: over the size cap)\n"),
+                    ),
+                    result=EditResult(path="big.py"),
+                ),
+            ],
+        ]
+        # The note's key for deduplication, and its cost against the total cap.
+        assert diff._file("big.py", "HEAD") == (emit.batches[0][0], "omitted", 0)
 
     def test_base_falls_back_to_head_when_sha_is_gone(self) -> None:
         """A rebase that drops the pinned sha falls back to diffing against HEAD."""
@@ -535,7 +542,9 @@ class TestFileCases:
         emit = _Emits()
         diff.refresh(emit, now=0.0)
         [record] = emit.batches[0]
+        assert (record.call_id, record.state) == ("", "done")
         assert record.result == EditResult(path="new.py")
+        assert record.text() == "Edited new.py."
         assert (
             next(item for item in record.stdout if isinstance(item, Splice)).after
             == "x\n"
@@ -577,10 +586,23 @@ class TestFileCases:
         )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
-        [record] = emit.batches[0]
-        assert "large file" in (
-            next(item for item in record.stdout if isinstance(item, Splice)).lead or ""
-        )
+        assert emit.batches == [
+            [
+                ToolResult(
+                    call_id="",
+                    state="done",
+                    stdout=(
+                        "Edited big.py.",
+                        Splice(lead="(large file; diff omitted)\n"),
+                    ),
+                    result=EditResult(path="big.py"),
+                ),
+            ],
+        ]
+        assert diff._file("big.py", "HEAD") == (emit.batches[0][0], "large", 0)
+        # A file of exactly the cap is diffed; untracked and unchanged, it has none.
+        (tmp_path / "at_cap.py").write_text("x" * 4)
+        assert diff._file("at_cap.py", "HEAD") is None
 
     def test_a_binary_diff_is_a_note(self, tmp_path: Path) -> None:
         """A diff with no textual hunk (a binary file) is reported, not parsed."""
@@ -597,10 +619,20 @@ class TestFileCases:
         )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
-        [record] = emit.batches[0]
-        assert "binary" in (
-            next(item for item in record.stdout if isinstance(item, Splice)).lead or ""
-        )
+        assert emit.batches == [
+            [
+                ToolResult(
+                    call_id="",
+                    state="done",
+                    stdout=(
+                        "Edited x.bin.",
+                        Splice(lead="(binary or no textual change)\n"),
+                    ),
+                    result=EditResult(path="x.bin"),
+                ),
+            ],
+        ]
+        assert diff._file("x.bin", "HEAD") == (emit.batches[0][0], "binary", 0)
 
     def test_the_total_cap_stops_and_says_so(
         self,
@@ -627,24 +659,17 @@ class TestFileCases:
         )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
-        batch = emit.batches[0]
-        assert len(batch) == 2
-        assert "total size cap" in (
-            next(item for item in batch[-1].stdout if isinstance(item, Splice)).lead
-            or ""
+        [first, more] = emit.batches[0]
+        assert first.result == EditResult(path="a.py")
+        assert more == ToolResult(
+            call_id="",
+            state="done",
+            stdout=(
+                "Edited (more).",
+                Splice(lead="(remaining diffs omitted: over the total size cap)\n"),
+            ),
+            result=EditResult(path="(more)"),
         )
-        assert [record.result for record in batch] == [
-            EditResult(path="a.py"),
-            EditResult(path="(more)"),
-        ]
-        assert [
-            splice.lead
-            for splice in [
-                item for item in batch[-1].stdout if isinstance(item, Splice)
-            ]
-        ] == [
-            "(remaining diffs omitted: over the total size cap)\n",
-        ]
 
     def test_the_total_cap_is_on_the_diffs_together(
         self,
@@ -729,23 +754,17 @@ class TestFileCases:
         )
         emit = _Emits()
         diff.refresh(emit, now=0.0)
-        batch = emit.batches[0]
-        assert "more changed files" in (
-            next(item for item in batch[-1].stdout if isinstance(item, Splice)).lead
-            or ""
+        [first, more] = emit.batches[0]
+        assert first.result == EditResult(path="a.py")
+        assert more == ToolResult(
+            call_id="",
+            state="done",
+            stdout=(
+                "Edited (more).",
+                Splice(lead="(1 more changed files omitted)\n"),
+            ),
+            result=EditResult(path="(more)"),
         )
-        assert [record.result for record in batch] == [
-            EditResult(path="a.py"),
-            EditResult(path="(more)"),
-        ]
-        assert [
-            splice.lead
-            for splice in [
-                item for item in batch[-1].stdout if isinstance(item, Splice)
-            ]
-        ] == [
-            "(1 more changed files omitted)\n",
-        ]
 
 
 class TestRunGit:
