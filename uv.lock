@@ -445,7 +445,7 @@ wheels = [
 [[package]]
 name = "codedoctor"
 version = "0.1.5"
-source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#d1fd2b79548005bf1fd793d5fb600dad013a0557" }
+source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#121f46fffe76981a06c48dc93aad4fe68c22a466" }
 dependencies = [
     { name = "pyyaml" },
     { name = "rignore" },
@@ -2784,7 +2784,7 @@ wheels = [
 [[package]]
 name = "rekursiv-ai-typings"
 version = "0.1.18"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#a8f8b306bfd62f32a2cbf0b786d2da8439335b67" }
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#fcbb316cf9226ec7aeab8c346f2436faee8583bb" }
 
 [[package]]
 name = "requests"
@@ -3026,7 +3026,7 @@ wheels = [
 [[package]]
 name = "sagent"
 version = "0.2.3"
-source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#927290dc107fcfc5ea9d036407a3aff9381fafeb" }
+source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#4f8779f0896dbb11e32e7af9fa06fb9768fe1ee2" }
 dependencies = [
     { name = "bashlex" },
     { name = "cachetools" },
@@ -3044,6 +3044,7 @@ dependencies = [
     { name = "starlette" },
     { name = "tiktoken" },
     { name = "treekle" },
+    { name = "typing-extensions" },
     { name = "uvicorn" },
     { name = "wesearch" },
     { name = "wrapt" },
@@ -3365,7 +3366,7 @@ wheels = [
 [[package]]
 name = "trackinizer"
 version = "0.1.13"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#ef831c3ec1633bb3aad520340a71f5945ca321d7" }
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#51eeafe1c91880a4c47c3eb6cbb63ef4c71f7e62" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
@@ -3712,7 +3713,7 @@ wheels = [
 [[package]]
 name = "wesearch"
 version = "0.1.18"
-source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#a46ab9f9e162330f9e2a9e32f986c5bc1ec9ffdb" }
+source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#bbbffa72203e31725ffb2d09dd5cfb7b27094d83" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "brotli" },
