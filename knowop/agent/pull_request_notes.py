@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 __all__ = ["Noted", "RecordNotes"]
 
 
-type _Act = Literal["create", "push"]
+type _PullRequestAction = Literal["create", "push"]
 """What a shell call did: opened a pull request, or pushed a branch."""
 
 # Where a shell runs a command: first, or after a separator, a ``then`` or a ``do``,
@@ -62,7 +62,7 @@ class RecordNotes:
         """Hold no notes yet."""
         self._lock = threading.Lock()
         # Only the drain thread reads or writes it.
-        self._calls: dict[str, _Act] = {}
+        self._calls: dict[str, _PullRequestAction] = {}
         self._opened: list[str] = []
         self._pushed = False
 
@@ -77,20 +77,22 @@ class RecordNotes:
 
         """
         if isinstance(record, ToolCall):
-            act = _act(_strings(record.arguments))
-            if act is not None:
-                self._calls[record.call_id] = act
+            action = _pull_request_action(_strings(record.arguments))
+            if action is not None:
+                self._calls[record.call_id] = action
             return False
         if not isinstance(record, ToolResult):
             return False
         tool_result = record.result
         if not isinstance(tool_result, BashResult):
             return False
-        act = self._calls.pop(record.call_id, None) or _act(tool_result.command or ())
-        if act is None or record.is_error or tool_result.exit_code not in {None, 0}:
+        action = self._calls.pop(record.call_id, None) or _pull_request_action(
+            tool_result.command or (),
+        )
+        if action is None or record.is_error or tool_result.exit_code not in {None, 0}:
             return False
         with self._lock:
-            if act == "create":
+            if action == "create":
                 self._opened.extend(links(record.text()))
             else:
                 self._pushed = True
@@ -107,7 +109,7 @@ class RecordNotes:
 # Each word alone, and all of them as one line: an argv (``["git", "push"]``) is one
 # command only joined, and the script of ``["bash", "-lc", "git push"]`` starts its
 # own word.
-def _act(words: Sequence[str]) -> _Act | None:
+def _pull_request_action(words: Sequence[str]) -> _PullRequestAction | None:
     """Say whether a shell command opened a pull request or pushed a branch."""
     lines = (*words, " ".join(words))
     if any(_CREATE.search(line) for line in lines):

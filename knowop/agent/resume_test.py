@@ -17,11 +17,13 @@ from trackinizer.sagent.scripts.convert_session import (
     codex,
     sagent,
 )
+from trackinizer.sagent.session.jsonl import record_line
 from trackinizer.sagent.session.types import (
     AgentToAgentMessage,
     AssistantMessage,
     BashResult,
     ContextClear,
+    ContextCompaction,
     GrepResult,
     IncompleteRecord,
     ReadResult,
@@ -836,32 +838,25 @@ def _codex_compaction(*, at: int, message: str = "") -> dict[str, object]:
     }
 
 
-def _bot_part(*rows: Mapping[str, object]) -> list[SessionRecord]:
-    """Read the bot's chat log, written as its ``session_io`` writes it."""
-    text = "".join(json.dumps(row) + "\n" for row in rows)
+def _bot_part(*records: SessionRecord) -> list[SessionRecord]:
+    """Read the bot's journal back, written as sagent writes it."""
+    text = b"".join(record_line(record) for record in records).decode()
     return list(sagent.normalize(StringIO(text)))
 
 
-def _bot_said(sender: str, text: str, *, at: int) -> dict[str, object]:
-    return {
-        "kind": "history",
-        "ref": {"session_id": "agent", "ordinal": at},
-        "type": "agent_send",
-        "source": sender,
-        "text": text,
-        "timestamp": datetime.fromisoformat(_stamp(at)).timestamp(),
-    }
+def _bot_said(sender: str, text: str, *, at: int) -> AgentToAgentMessage:
+    return AgentToAgentMessage(
+        timestamp=datetime.fromisoformat(_stamp(at)).isoformat(),
+        content=text,
+        sender=sender,
+    )
 
 
-def _bot_compaction(summary: str) -> dict[str, object]:
-    return {
-        "kind": "context_splice",
-        "ref": {"session_id": "agent", "ordinal": 0},
-        "mask": [],
-        "insert_after": None,
-        "payload": [{"type": "user", "text": summary}],
-        "strategy": "summary",
-    }
+def _bot_compaction(summary: str) -> list[SessionRecord]:
+    return [
+        ContextCompaction(extra={"strategy": "summary"}),
+        ContextClear(summary=summary),
+    ]
 
 
 def _written(target: str, *parts: tuple[str, Sequence[SessionRecord]]) -> Resumed:
@@ -917,7 +912,7 @@ class TestTheWindowIsWhatEachSwitchLoads:
         """The bot compacts, then claude, then codex: both open with the bot's summary."""
         bot = _bot_part(
             _bot_said("ada@example.com", "F1 is apples", at=1),
-            _bot_compaction("Summary: ada said F1 is apples."),
+            *_bot_compaction("Summary: ada said F1 is apples."),
             _bot_said("ada@example.com", "F2 is pears", at=2),
         )
         later = _claude_part(
@@ -1018,7 +1013,7 @@ class TestJpsTwoSequencesLoadTheLinesAfterTheCut:
     def test_the_bot_compacts_then_claude_speaks(self, target: str) -> None:
         compacting = _bot_part(
             _bot_said("ada@example.com", "F1 is apples", at=1),
-            _bot_compaction("Summary: ada said F1 is apples."),
+            *_bot_compaction("Summary: ada said F1 is apples."),
             _bot_said("ada@example.com", "F2 is pears", at=2),
         )
         later = _claude_part(

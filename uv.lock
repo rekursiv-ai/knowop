@@ -3026,7 +3026,7 @@ wheels = [
 [[package]]
 name = "sagent"
 version = "0.2.3"
-source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#364360109924f43737b7f78183255a1db8a9c98d" }
+source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#e49b6d590a0e213b177c273658e8c34263cf77c9" }
 dependencies = [
     { name = "bashlex" },
     { name = "cachetools" },
