@@ -37,7 +37,7 @@ from sagent.session.types import (
 from sagent.tui.render import error_text
 from sagent.tui.types import CommandOutput
 from trackinizer.wire.wire_session_relay import Command
-from trackinizer.wire.wire_sessions import CONTEXT_TRAILER
+from trackinizer.wire.wire_sessions import CONTEXT_TRAILER, LINE_CANVAS
 from treekle import from_plain
 
 
@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     from trackinizer.wire.wire_session_relay import Input
 
 
-__all__ = ["CLASSES", "event_payload", "input_message"]
+__all__ = ["CLASSES", "event_payload", "input_message", "told_canvas"]
 
 
 CLASSES: Final[Mapping[str, type]] = MappingProxyType(
@@ -81,11 +81,12 @@ def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
     says: a person's email, or ``label#number`` for another session's agent. Its
     recipient is the agent the input names; ``None``, for the root. A line whose
     ``extra`` names the canvas it was sent from (``canvas_id``, a UUID) tells the
-    agent so after its words, behind ``CONTEXT_TRAILER``, with the command that reads
-    and changes it; Chat names it only when it has not told this session's agent that
-    canvas yet. A line's ``extra.files``, the name, kind and size of each file Chat
-    attached to it, is kept in the message's, which Chat draws the stored line's files
-    from without reading their bytes.
+    agent so after its words, behind ``CONTEXT_TRAILER``, with the tools and the
+    command that act on it, and keeps it in the message's own ``extra``
+    (:func:`told_canvas`); Chat names it only when it has not told this session's
+    agent that canvas yet. A line's ``extra.files``, the name, kind and size of each
+    file Chat attached to it, is kept in the message's, which Chat draws the stored
+    line's files from without reading their bytes.
 
     Args:
       sent: An input, as the server handed it down.
@@ -100,14 +101,19 @@ def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
     match sent.kind:
         case "UserMessage":
             said = stored_record(sent.payload, UserMessage)
+            canvas = _canvas(said)
             files = said.extra.get("files")
             return AgentToAgentMessage(
-                content=_told(said),
+                content=_told(said, canvas=canvas),
                 attachments=said.attachments,
                 sender=sent.author,
                 recipient=sent.recipient or None,
-                extra={"author": sent.author, "input": str(sent.id)}
-                | ({} if files is None else {"files": files}),
+                extra={
+                    "author": sent.author,
+                    "input": str(sent.id),
+                    **({} if canvas is None else {"canvas_id": str(canvas)}),
+                    **({} if files is None else {"files": files}),
+                },
             )
         case "Halt":
             return stored_record(sent.payload, Halt, classes=CLASSES)
@@ -115,17 +121,41 @@ def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
             return Command.model_validate(sent.payload)
 
 
+def told_canvas(message: AgentToAgentMessage) -> UUID | None:
+    """Return the canvas a line from Chat named, as :func:`input_message` keeps it.
+
+    Args:
+      message: A message the agent was sent, a stored one included.
+
+    Returns:
+      canvas: The canvas; ``None`` for a message that named none.
+
+    """
+    named = message.extra.get("canvas_id")
+    return None if named is None else UUID(from_plain(named, str))
+
+
 # The canvas is a hint from the sender's page: one that is no UUID is left out, and
 # the line goes as typed.
-def _told(said: UserMessage) -> str | None:
-    """Return ``said``'s words, then the canvas it names, if it names one."""
+def _canvas(said: UserMessage) -> UUID | None:
+    """Return the canvas ``said`` names, if it names one."""
     try:
-        canvas = UUID(from_plain(said.extra.get("canvas_id"), str))
+        return UUID(from_plain(said.extra.get(LINE_CANVAS), str))
     except ValueError:
+        return None
+
+
+def _told(said: UserMessage, *, canvas: UUID | None) -> str | None:
+    """Return ``said``'s words, then ``canvas`` and what acts on it, if it names one."""
+    if canvas is None:
         return said.content
     context = json.dumps({"canvas_id": str(canvas)})
     # ``knowop``, not ``trax``: a host's ``trax`` may be a wrapper that wants a profile.
-    how = f"Read or change it with `knowop canvas {canvas}`; `knowop canvas --help` says how."
+    how = (
+        "Your Canvas tool (show, capture, mark and the rest) acts on it; with a "
+        f"shell, `knowop canvas {canvas}` reads and changes it too, and `knowop canvas "
+        "--help` says how."
+    )
     return f"{said.content or ''}{CONTEXT_TRAILER}{context}\n{how}"
 
 

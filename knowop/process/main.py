@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast
 from uuid import UUID, uuid4
@@ -55,7 +55,13 @@ import time
 
 from sagent.runtime import types
 from sagent.session.jsonl import JournalInUseError
-from sagent.session.types import AgentToAgentMessage
+from sagent.session.types import (
+    AgentToAgentMessage,
+    Attachment,
+    UncategorizedToolResult,
+)
+from sagent.tools.function import tool
+from sagent.tools.types import ToolOutput
 from sagent.tui.main import StartError, opened, parse_flags, run, signals
 from sagent.tui.prompt import Panes
 from sagent.tui.render import error_text
@@ -71,6 +77,7 @@ from trackinizer.client.session_socket import (
     SocketClosedError,
 )
 from trackinizer.client.session_upload import RecordAppender
+from trackinizer.trax.canvas import canvas_from_env
 from trackinizer.wire.wire_session_relay import (
     Command,
     Hello,
@@ -85,6 +92,7 @@ from trackinizer.wire.wire_terminals import (
     CLOSE_REFUSED,
     CLOSE_TAKEN_OVER,
 )
+from treekle import ReadError
 
 from knowop.agent.errors import (
     LossyConversionError,
@@ -93,12 +101,21 @@ from knowop.agent.errors import (
 from knowop.agent.placement import place_run, placement_env
 from knowop.agent.resume import session_journal
 from knowop.hosts import host_name
-from knowop.process.codec import input_message
+from knowop.process.codec import input_message, told_canvas
 from knowop.process.host_follower import HostFollower, HostLister
 from knowop.process.publisher import Publisher
 from knowop.process.remote_commands import REMOTE_AGENT
 from knowop.process.server_relay import AgentMessenger, ServerRelay
 from knowop.service import knowop_version
+from knowop.tools.canvas import (
+    CANVAS_DESCRIPTION,
+    CANVAS_TOOL,
+    CanvasClient,
+    CanvasTools,
+    Picture,
+    agent_settings,
+    with_settings,
+)
 
 
 if TYPE_CHECKING:
@@ -107,20 +124,25 @@ if TYPE_CHECKING:
         AsyncIterator,
         Awaitable,
         Callable,
+        Iterable,
+        Mapping,
         Sequence,
     )
 
     from sagent.agent.agent import Agent
     from sagent.agent.team import Team
+    from sagent.session.types import SessionRecord
+    from sagent.tools.types import Tool
     from sagent.tui.main import OpenAgent
     from sagent.tui.slash import Allowed
     from trackinizer.trax.profile import Profile
     from trackinizer.wire.wire_session_relay import Input, ViewerFrame
+    from treekle import PlainTree
 
     from knowop.agent.resume import JournalChoice
 
 
-__all__ = ["ServeClient", "delivering", "first_done", "main", "serve"]
+__all__ = ["ServeClient", "agent_tools", "delivering", "first_done", "main", "serve"]
 
 
 _GIVE_UP_SEC: Final = 600.0
@@ -238,6 +260,7 @@ class ServeClient(
     HostLister,
     SocketClient,
     AgentMessenger,
+    CanvasClient,
     Protocol,
 ):
     """The ``Client`` an agent process holds: the calls it makes, its server and key."""
@@ -281,6 +304,11 @@ async def serve(
         return 1
     flags, given = parse_flags([*args, "--session", str(choice.path)])
     hello = Hello(process_id=process_id, version=knowop_version(), host=host)
+    canvas = CanvasTools(
+        client,
+        canvas_id=canvas_from_env(os.environ),
+        settings=await _agent_settings(client),
+    )
     try:
         async with SessionSocket(
             client,
@@ -295,6 +323,7 @@ async def serve(
                 given=given,
                 interactive=tui,
                 use_daemon=not remote,
+                tools=agent_tools(canvas),
             ) as o:
                 ended = await _live(
                     o,
@@ -307,6 +336,7 @@ async def serve(
                     history=flags.history,
                     time_limit=time_limit,
                     allowed=REMOTE_AGENT if remote else None,
+                    canvas=canvas,
                 )
     except SocketClosedError as closed:
         sys.stderr.write(f"Error: {closed.reason}\n")
@@ -331,13 +361,15 @@ async def delivering(
     relay: ServerRelay,
     commands: Awaitable[Commands],
     publisher: Publisher,
+    canvas: CanvasTools,
 ) -> AsyncGenerator[asyncio.Future[Ended]]:
     """Deliver each input to the agent, as its kind says, while the block runs.
 
     A halt halts the turn at once. An agent's message from another session goes to
     the team at once, booked as its sender booked it. A person's line is pushed as a
     message from its author to the agent it names, and a slash line runs in
-    ``commands``, each in its turn after the slash line before it.
+    ``commands``, each in its turn after the slash line before it. A line that names
+    the canvas it was sent from moves the canvas tools to it as it arrives.
 
     Args:
       inputs: The inputs, as they come down the socket.
@@ -347,6 +379,7 @@ async def delivering(
       commands: The root agent's commands, which run each slash line and say what
         it did; awaited at the first slash line.
       publisher: Says what does not read, and sends the settings a slash line changed.
+      canvas: The session's canvas tools, which act on the canvas Chat named last.
 
     Yields:
       quit_ran: Resolves once a ``/quit`` ran.
@@ -362,6 +395,7 @@ async def delivering(
                 relay=relay,
                 publisher=publisher,
                 lines=lines,
+                canvas=canvas,
             ),
         ),
         asyncio.create_task(
@@ -405,6 +439,31 @@ async def first_done[T](*awaited: Awaitable[T]) -> T:
     return next(task for task in tasks if task in done).result()
 
 
+def agent_tools(canvas: CanvasTools) -> list[Tool]:
+    """Make the Canvas tool a sagent tool, bound to ``canvas``.
+
+    Every agent of the process gets it, on a person's host and as a remote agent;
+    sagent's ``--tools`` chooses it as one of its own. Its arguments are the shape of
+    :meth:`CanvasTools.act`, ``set``'s settings the schema ``canvas`` holds, which is
+    also all it sends; its description is ``CANVAS_DESCRIPTION``, and a picture it
+    answers with reaches the model as an attachment.
+
+    Args:
+      canvas: The session's canvas tools.
+
+    Returns:
+      tools: The one sagent tool, ``Canvas``.
+
+    """
+    made = tool(
+        _answering(canvas.act),
+        name=CANVAS_TOOL,
+        description=CANVAS_DESCRIPTION,
+    )
+    made.schema = with_settings(made.schema, canvas.settings)
+    return [made]
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Ended:
     """Why an agent process ends."""
@@ -418,6 +477,60 @@ class Ended:
     stopped: bool = False
     """Whether a person stopped or quit it, or its time ran out, so it uploads what it
     has before it ends."""
+
+
+# A process that could not read the schema still starts. Its set then names no
+# setting, and changes none: under a person's own key the server would take settings
+# an agent's tool may not change.
+async def _agent_settings(client: ServeClient) -> Mapping[str, PlainTree]:
+    """Return the schema of a change of settings the server takes from an agent."""
+    try:
+        return await asyncio.to_thread(agent_settings, client)
+    except (ClientError, ReadError) as error:
+        logger.warning("could not read the settings an agent may change: %s", error)
+        return {"type": "object"}
+
+
+# The wrapper keeps the tool's own signature and docstring (``wraps``), which sagent
+# reads for its schema and each argument's description.
+def _answering(
+    function: Callable[..., Awaitable[str | Picture]],
+) -> Callable[..., Awaitable[str | _Answer]]:
+    """Return ``function``, answering as a sagent tool does: a picture as an attachment."""
+
+    @wraps(function)
+    async def answering(**arguments: object) -> str | _Answer:
+        return _answer(await function(**arguments))
+
+    return answering
+
+
+type _Answer = ToolOutput[UncategorizedToolResult, Attachment | str, str]
+"""A tool's answer that carries a picture."""
+
+
+def _answer(said: str | Picture) -> str | _Answer:
+    """Return a tool's line as it is, and its picture with its line as an attachment."""
+    if isinstance(said, str):
+        return said
+    return ToolOutput(
+        stdout=(said.text, Attachment(mime_descriptor=said.mime, data=said.data)),
+        result=UncategorizedToolResult(),
+    )
+
+
+# A process that continues a session is told no canvas again until a tab reloads, so
+# the one its restored lines named last stands until a line names another. Run on a
+# worker thread, as the publisher reads the journal: a long one is read from its file.
+def _last_told(records: Iterable[SessionRecord]) -> UUID | None:
+    """Return the canvas the newest line of ``records`` named, if any named one."""
+    told = [
+        canvas
+        for record in records
+        if isinstance(record, AgentToAgentMessage)
+        and (canvas := told_canvas(record)) is not None
+    ]
+    return told[-1] if told else None
 
 
 def _parse_args(
@@ -613,6 +726,7 @@ async def _live(
     history: Path | None,
     time_limit: timedelta | None,
     allowed: Allowed | None,
+    canvas: CanvasTools,
 ) -> Ended:
     """Run the open agent live until a stop, its time limit, a quit, or an answer that ends it."""
     publisher = Publisher(
@@ -624,6 +738,13 @@ async def _live(
         send=socket.send,
     )
     o.agent.runtime.observers.append(publisher)
+    # The agent runs from ``opened`` on, so nothing is awaited before the publisher
+    # listens: what the agent says meanwhile, its first idle among it, would reach no
+    # viewer. The journal is read then, off the loop, and before any line is delivered.
+    canvas.canvas_id = (
+        await asyncio.to_thread(_last_told, o.agent.session.history())
+        or canvas.canvas_id
+    )
     # Chat is the user an agent's send to ``user`` reaches. At a terminal the screen
     # takes it over as it builds (``Views``), and prints it there.
     o.team.to_user = publisher.to_user
@@ -672,6 +793,7 @@ async def _live(
                 relay=relay,
                 commands=commands,
                 publisher=publisher,
+                canvas=canvas,
             ) as quit_ran,
         ):
             screen = (
@@ -809,6 +931,7 @@ async def _delivered(
     relay: ServerRelay,
     publisher: Publisher,
     lines: asyncio.Queue[AgentToAgentMessage | Command],
+    canvas: CanvasTools,
 ) -> None:
     """Halt at each halt and hand each agent's message on as it comes; queue the rest."""
     async for sent in inputs:
@@ -822,6 +945,8 @@ async def _delivered(
         elif isinstance(message, AgentToAgentMessage) and sent.booked is not None:
             relay.deliver(message, booked=sent.booked)
         else:
+            if isinstance(message, AgentToAgentMessage):
+                canvas.canvas_id = told_canvas(message) or canvas.canvas_id
             lines.put_nowait(message)
 
 

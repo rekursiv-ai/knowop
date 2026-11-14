@@ -58,6 +58,34 @@ knowop run --model opus             # any other flag is sagent's own
   `GET /api/sessions/ID/lines` follows it.
 - `knowop status` lists each host's live sessions.
 
+## The canvas
+
+A line you send from Chat, or from the tab of a session that is no chat's, names
+the canvas it came from, once, after its words. Another person's line in a chat
+you share names none: the agent acts for you, on your canvas. Every agent of the
+run then acts on that canvas with its `Canvas` tool, with or without a shell, on
+your own host and on Our cloud alike. Its `action` is the verb `knowop canvas`
+takes, and the rest of its arguments are what the verb needs:
+
+- `read` lists the canvas's page, visuals and red boxes, each with its id.
+- `show` opens a `visual` (`trax.record`, `trax.subgraph`, `trax.timeline`,
+  `trax.files`, `trax.terminal` and the rest) on a `record`, with its `params`;
+  `hide` closes one. `chat` is a visual too: hide it to have the person look.
+- `navigate` moves the page to a `route`, such as `#/pulls`.
+- `highlight` points at records; `mark` and `unmark` draw and take away a red box;
+  `capture` sees the canvas as the person does, as a picture.
+- `set` changes how the app looks for the person: font, text sizes, theme, skin,
+  Chat's side and the rest its schema lists, which the server gives. The tool sends
+  no other setting: never the folder an agent starts in, nor auto-fix or
+  auto-merge. For an agent a daemon or Our cloud started, the server refuses those
+  to its key too. An agent you run at a terminal holds your own key, which the
+  server lets set them, as `knowop canvas autofix to true` does: there only the
+  tool, not the server, keeps `set` to its schema.
+
+A record is `Issue#123` or its UUID. Until a line has named a canvas, the tool says
+there is none. With a shell, `knowop canvas` does the same (`knowop canvas --help`).
+The agent's key reaches the canvas its session's Chat is on, and no other.
+
 ## Continue a stored session
 
 `knowop run --session ID` continues it here: in this host's own journal of its

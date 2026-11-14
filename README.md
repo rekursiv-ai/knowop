@@ -228,6 +228,7 @@ computer. Terminals use the server relay when a direct link is unavailable.
 | `jobs/` | The job runner `knowop job` hands to. |
 | `hosts.py` | `knowop host`: the host registry, and KnowHosts through the server's KnowHost API. |
 | `canvas.py` | `knowop canvas`: trax's canvas command, named as knowop's. |
+| `tools/` | The tools every agent of `knowop run` is given, plain functions over the client: the canvas's (`tools/canvas.py`). |
 | `upload.py` | `knowop upload`: finds session files and sends each as an AgentSession. |
 | `skills/` | Each package's instructions for agents. |
 
