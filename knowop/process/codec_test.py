@@ -37,7 +37,12 @@ from treekle import PlainTree, immutable
 
 import pytest
 
-from knowop.process.codec import CLASSES, event_payload, input_message
+from knowop.process.codec import (
+    CLASSES,
+    event_payload,
+    input_message,
+    told_canvas,
+)
 
 
 if TYPE_CHECKING:
@@ -180,20 +185,24 @@ def test_a_line_that_names_its_canvas_tells_the_agent_after_its_words() -> None:
     canvas = "c5286865-67b6-4bd8-ab51-e06e10c326c5"
     said = UserMessage(content="what is this?", extra={"canvas_id": canvas})
 
-    assert input_message(
-        _input("UserMessage", event_payload(said)),
-    ) == AgentToAgentMessage(
+    message = input_message(_input("UserMessage", event_payload(said)))
+
+    assert message == AgentToAgentMessage(
         content=(
             f'what is this?{CONTEXT_TRAILER}{{"canvas_id": "{canvas}"}}\n'
-            f"Read or change it with `knowop canvas {canvas}`; "
+            "Your Canvas tool (show, capture, mark and the rest) acts on it; "
+            f"with a shell, `knowop canvas {canvas}` reads and changes it too, and "
             "`knowop canvas --help` says how."
         ),
         sender="dan@example.com",
         extra={
             "author": "dan@example.com",
             "input": "00000000-0000-0000-0000-000000000007",
+            "canvas_id": canvas,
         },
     )
+    assert isinstance(message, AgentToAgentMessage)
+    assert told_canvas(message) == UUID(canvas)
 
 
 def test_a_line_of_no_words_that_names_its_canvas_tells_only_the_canvas() -> None:
@@ -222,6 +231,7 @@ def test_a_line_naming_no_canvas_reads_as_it_was_typed(extra: dict[str, JSON]) -
 
     assert isinstance(message, AgentToAgentMessage)
     assert message.content == "hi"
+    assert told_canvas(message) is None
 
 
 def test_a_halt_reads_as_a_halt() -> None:

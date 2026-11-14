@@ -7,6 +7,27 @@ All notable knowop changes are documented here. This project follows
 
 ### Added
 
+- The `Canvas` tool's `set` verb: an agent changes how the app looks for the person
+  (font, text sizes, theme, skin, Chat's side and the rest), offered with the schema
+  the server gives (`knowop.tools.canvas.agent_settings`), read as the agent starts,
+  each try bounded to 3 seconds. A person asks their agent to make the text bigger
+  and Chat's text grows in every tab. The tool sends only the settings of that
+  schema and refuses any other by name, under a person's own key too; where the
+  schema could not be read, it changes nothing.
+- Every `knowop run` agent, on your own host and as a remote agent, is given the
+  `Canvas` tool: one tool whose `action` is a verb of `knowop canvas` (`read`,
+  `show`, `hide`, `navigate`, `highlight`, `capture`, `mark`, `unmark`), with the
+  visual, record, params, route or box the verb needs, and a picture as an
+  attachment for `capture`. It does what the removed chat assistant's seventeen
+  canvas tools did (`ShowRecord`, `ShowGraph`, `LookAtCanvas`, `DrawBox` and the
+  rest), a visual being a parameter the server's catalog checks. It acts on the
+  canvas the newest line from Chat named, else the one a continued session's
+  stored lines named last, else the one the run was placed on, so an agent with no
+  shell reads and changes its canvas. It is a plain function over the client
+  (`knowop.tools`), which `knowop run` makes a sagent tool. A line naming its
+  canvas names the tool beside `knowop canvas`. A line sent from the tab of a
+  session that is no chat's names its canvas too, and a row that could not be
+  looked up is said with why, where it was said to be no such row.
 - A daemon that starts takes up the agent processes an earlier one started on its
   host and left running: one that ended meanwhile is reported ended, and the folder
   it owned deleted; one still running is reported when it ends. Each process holds
