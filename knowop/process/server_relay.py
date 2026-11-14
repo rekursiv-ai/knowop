@@ -222,7 +222,10 @@ class ServerRelay(AsyncResource):
             self._refused(note, str(error))
             return
         if not delivered:
-            self._refused(note, f"no live session takes messages for {note.recipient}")
+            self._refused(
+                note,
+                f"no agent is connected to a live session {note.recipient} names",
+            )
 
     def _refused(self, note: _Note, why: str) -> None:
         """Tell ``note``'s sender it was not delivered, as sagent's own links do."""

@@ -180,7 +180,7 @@ async def test_a_send_is_posted_later_in_order_as_this_session_s_agent(
             ClientError("POST /api/messages -> 422: one target", status_code=422),
             "POST /api/messages -> 422: one target",
         ),
-        ([], "no live session takes messages for lead#412"),
+        ([], "no agent is connected to a live session lead#412 names"),
     ],
     ids=["out of reach", "403", "409", "422", "delivered to no one"],
 )
