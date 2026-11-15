@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
+from functools import partial
 from http import HTTPStatus
 from pathlib import Path
 from typing import (
@@ -39,7 +40,9 @@ from sagent.agent.agent import Agent
 from sagent.agent.agents_md import AgentsMdConfig
 from sagent.agent.team import Team
 from sagent.model.scripted import Reply, ScriptedProvider, call, reply
-from sagent.providers.catalog import ModelCatalog
+from sagent.providers import openai
+from sagent.providers.catalog import ModelCatalog, ModelMemory
+from sagent.providers.table import ModelTags, models
 from sagent.session.jsonl import JournalInUseError, JsonlJournal
 from sagent.session.types import (
     AgentToAgentMessage,
@@ -108,6 +111,7 @@ import pytest
 
 from knowop.agent import placement
 from knowop.agent.errors import NotResumableError
+from knowop.agent.resume import JournalChoice
 from knowop.connect.session_serving import SERVE_COMMAND
 from knowop.lib.testing.import_graph import Counted, import_graph
 from knowop.process import (
@@ -134,6 +138,7 @@ from knowop.process.remote_commands import REMOTE_AGENT
 from knowop.tools.canvas import (
     CANVAS_DESCRIPTION,
     CANVAS_TOOL,
+    CanvasTools,
     with_settings,
 )
 
@@ -152,6 +157,8 @@ if TYPE_CHECKING:
     from trackinizer.wire.refs import Ref
     from trackinizer.wire.wire_session_relay import InputKind
     from websockets.http11 import Request, Response
+
+    from knowop.tools.canvas import CanvasClient
 
 
 _SESSION: Final = UUID(int=11)
@@ -660,6 +667,93 @@ async def test_the_journal_is_the_sessions_own_and_sagents_flags_reach_the_build
     assert flags.session.parent.parent.name == str(_SESSION)
 
 
+def _chosen(choice: JournalChoice, client: object, session_id: UUID) -> JournalChoice:
+    del client, session_id
+    return choice
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "effort"),
+    [("sol-6.1", "high"), ("gpt-4.1", "none")],
+    ids=["a model that offers high", "one that offers no effort"],
+)
+async def test_knowops_effort_is_high_where_the_model_offers_it_and_stands_at_once(
+    tmp_path: Path,
+    model: str,
+    effort: str,
+) -> None:
+    """A process killed before the first turn leaves the stood model for the next."""
+    provider = ScriptedProvider(models=models(openai, section="openai"))
+    journal = JsonlJournal(tmp_path / "session.jsonl")
+    agent = Agent(
+        model=provider[model],
+        journal=journal,
+        tool_context=ToolContext(cwd=tmp_path),
+        system_prompt="S",
+    )
+    async with journal, agent:
+        main_module.effort_default(agent)
+        stood = {each.kind: each.payload for each in agent.session.standing()}
+
+    assert agent.model.settings.thinking_effort == effort
+    assert (
+        ModelTags.parse(from_plain(stood["model"], ModelMemory).model).effort == effort
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "restored", "args", "defaulted"),
+    [
+        (0, False, [], True),
+        (0, False, ["--name", "Lead"], True),
+        (4, False, [], False),
+        (0, True, [], False),
+        (0, False, ["--effort", "low"], False),
+        (0, False, ["--model.thinking.effort", "low"], False),
+        (0, False, ["--model", "luna"], False),
+    ],
+    ids=[
+        "a new session",
+        "a new session given another flag",
+        "its journal here holds records",
+        "restored from the server",
+        "a person's --effort",
+        "a person's --model.thinking.effort",
+        "a person's --model",
+    ],
+)
+async def test_knowops_effort_is_set_for_a_new_session_alone_and_a_persons_wins(
+    opened: _Opened,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    start: int,
+    restored: bool,
+    args: list[str],
+    defaulted: bool,
+) -> None:
+    """A setting over a session's stood one would undo a person's ``/model``."""
+    folder = uuid4()
+    journal = tmp_path / str(_SESSION) / str(folder) / "session.jsonl"
+    journal.parent.mkdir(parents=True)
+    choice = JournalChoice(
+        path=journal,
+        part=f"{folder}.jsonl",
+        start=start,
+        restored=restored,
+    )
+    monkeypatch.setattr(main_module, "_journal", partial(_chosen, choice))
+    set_for: list[object] = []
+    monkeypatch.setattr(main_module, "effort_default", set_for.append)
+    async with _relayed() as relay, _serving(relay, args=args) as (task, _):
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert set_for == ([opened.agent] if defaulted else [])
+
+
 @pytest.mark.asyncio
 async def test_a_line_from_chat_is_the_authors_and_the_agent_answers_it(
     opened: _Opened,
@@ -1061,6 +1155,40 @@ async def test_a_halt_from_chat_halts_the_turn(opened: _Opened) -> None:
         _ = await _exited(task)
 
     assert opened.halts == 1
+
+
+@pytest.mark.asyncio
+async def test_a_halt_for_all_halts_every_agent_and_chats_halt_the_root_alone(
+    opened: _Opened,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    critic_halts: list[str] = []
+    async with _relayed() as relay, _serving(relay) as (task, _):
+        _ = await relay.seen(_is("settings"))
+        assert opened.team is not None
+        assert opened.agent is not None
+        critic = Agent(
+            model=opened.agent.model,
+            journal=JsonlJournal(tmp_path / "critic.jsonl"),
+            tool_context=ToolContext(cwd=tmp_path),
+            system_prompt="S",
+        )
+        _ = opened.team.join(critic, label="critic")
+        monkeypatch.setattr(critic.runtime, "halt", lambda: critic_halts.append("x"))
+        _ = await relay.send("Halt", {"py/object": "Halt"})
+        _ = await relay.seen(_is("event", event="Halt"))
+        chats = (opened.halts, list(critic_halts))
+        _ = await relay.send("Halt", {"py/object": "Halt"}, recipient="all")
+        async with asyncio.timeout(5), relay.arrived:
+            _ = await relay.arrived.wait_for(
+                lambda: len(relay.every(_is("event", event="Halt"))) == 2,
+            )
+        await relay.close(CLOSE_TAKEN_OVER)
+        _ = await _exited(task)
+
+    assert chats == (1, [])
+    assert (opened.halts, critic_halts) == (2, ["x"])
 
 
 @pytest.mark.asyncio
@@ -2075,6 +2203,18 @@ def test_a_run_whose_agent_sagent_will_not_build_opens_no_session(
     assert (server.starts, served.calls) == ([], [])
 
 
+def _canvas_tools(
+    made_over: list[object],
+    client: CanvasClient,
+    *,
+    canvas_id: UUID | None,
+    settings: Mapping[str, PlainTree],
+) -> CanvasTools:
+    """Make the canvas tools as the process does, keeping the client they talk over."""
+    made_over.append(client)
+    return CanvasTools(client, canvas_id=canvas_id, settings=settings)
+
+
 def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2096,6 +2236,8 @@ def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
         yield
 
     monkeypatch.setattr(main_module, "opened", opened)
+    canvases: list[object] = []
+    monkeypatch.setattr(main_module, "CanvasTools", partial(_canvas_tools, canvases))
     client = cast("Client", _Server(version=1))
 
     fine = main_module._unbuilt(["--effort", "high"], client=client)
@@ -2103,6 +2245,8 @@ def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
     refused = main_module._unbuilt(["--effortt", "high"], client=client)
 
     assert (fine, refused) == ("", "--effortt names no setting; see /help")
+    # The canvas tools a run would give the agent, over this process's own client.
+    assert canvases == [client, client]
     flags, given, interactive, use_daemon, tools = built[0]
     assert (flags.ephemeral, flags.session, list(given)) == (
         True,
