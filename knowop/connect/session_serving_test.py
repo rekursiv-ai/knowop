@@ -8,6 +8,7 @@ test waits on the fake server's condition, a queue, or a thread's end.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from trackinizer.wire.wire_session_relay import (
     ProcessEnded,
     ProcessSpec,
     ServeSession,
+    StopProcess,
 )
 from trackinizer.wire.wire_tools import WAIT_MAX_SEC
 from treekle import json_loads
@@ -50,7 +52,7 @@ from knowop.connect.wake import Wake
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 
     from knowop.connect.job_limits import Run
 
@@ -153,7 +155,9 @@ class _Client:
     """The calls SessionServing makes: each wait takes the next start put here."""
 
     def __init__(self) -> None:
-        self.answers: queue.Queue[ServeSession | Exception] = queue.Queue()
+        self.answers: queue.Queue[ServeSession | StopProcess | Exception] = (
+            queue.Queue()
+        )
         self.waits: list[tuple[uuid.UUID, uuid.UUID, float]] = []
         self.changed = threading.Condition()
         """Notified as each wait is asked; the serving asks from its listener thread."""
@@ -175,7 +179,7 @@ class _Client:
         *,
         instance: uuid.UUID,
         wait_sec: float,
-    ) -> ServeSession | None:
+    ) -> ServeSession | StopProcess | None:
         self.asked(host_id, instance, wait_sec)
         try:
             answer = self.answers.get(timeout=0.005)
@@ -285,6 +289,11 @@ def _no_systemd(argv: Sequence[str]) -> tuple[int, str]:
     return 127, ""
 
 
+def _stops_none(process_id: uuid.UUID) -> None:
+    """Stop nothing, as a person's own host does: it is handed no stop."""
+    raise AssertionError(f"no stop was to be carried out: {process_id}")
+
+
 def _serving(
     client: _Client,
     *,
@@ -295,6 +304,8 @@ def _serving(
     retry_sec: float = 0.005,
     wait_sec: float = 0.0,
     wake: Wake | None = None,
+    stop: Callable[[uuid.UUID], None] = _stops_none,
+    running: Callable[[], Iterable[uuid.UUID]] = tuple,
 ) -> SessionServing:
     return SessionServing(
         _URL,
@@ -307,6 +318,8 @@ def _serving(
         or (sys.executable, "-I", "-S", "-c", _STUB, _said_in(), exit_with),
         run=run,
         wake=wake,
+        stop=stop,
+        running=running,
     )
 
 
@@ -878,6 +891,27 @@ def test_a_place_gives_the_child_its_folder_its_environment_alone_and_its_flags(
     assert ServeSession.model_validate_json(said["stdin"]) == start
 
 
+def test_a_place_s_launcher_runs_the_command_its_words_first() -> None:
+    """A jail's program goes before the command, as ``env`` does here."""
+    start = _start()
+
+    said, ended = _served(start, place=_launched)
+
+    assert (ended.process_id, ended.exit_code) == (start.process_id, 0)
+    assert _env(said) == {
+        "PATH": os.environ["PATH"],
+        "ONLY": "listed",
+        "LAUNCHED": "yes",
+    }
+    assert said["argv"] == [_URL, "--", "--tools", "RemoteTool"]
+    assert ServeSession.model_validate_json(said["stdin"]) == start
+
+
+def _launched(serve: ServeSession) -> Place:
+    """Return the confined place, run through ``env`` as a jail's program would run it."""
+    return replace(_confined(serve), launcher=("env", "LAUNCHED=yes"))
+
+
 def test_a_folder_the_place_owns_is_gone_once_its_process_ends() -> None:
     first, second = _start(), _start()
 
@@ -1018,7 +1052,7 @@ class _Relayed(_Client):
         *,
         instance: uuid.UUID,
         wait_sec: float,
-    ) -> ServeSession | None:
+    ) -> ServeSession | StopProcess | None:
         self.asked(host_id, instance, wait_sec)
         return asyncio.run(
             self.relay.wait(host_id, wait_sec=0.005, dropped=_still_there),
@@ -1239,14 +1273,25 @@ def _released(fifo: Path) -> None:
         pass
 
 
-@pytest.mark.parametrize("ends", ["after", "before"], ids=["still runs", "ended"])
+@pytest.mark.parametrize(
+    ("ends", "reason"),
+    [
+        ("after", "it ended after its daemon restarted, so its exit code is not known"),
+        ("before", "it ended while its daemon was away"),
+    ],
+    ids=["still runs", "ended"],
+)
 def test_a_new_daemon_reports_the_end_of_a_process_an_earlier_one_started(
     tmp_path: Path,
     echoes: _Echoes,
     monkeypatch: pytest.MonkeyPatch,
     ends: str,
+    reason: str,
 ) -> None:
-    """Its owned folder goes with it, whether it ends before the new daemon starts or after."""
+    """Its owned folder goes with it, whether it ends before the new daemon starts or after.
+
+    Either way its exit code is not known, so its end says why, truly.
+    """
     start, fifo, exited = _outliving(tmp_path, echoes, monkeypatch)
     owned = state_dir() / "rekursiv-ai" / "confined" / str(start.process_id)
     assert owned.is_dir()
@@ -1268,7 +1313,7 @@ def test_a_new_daemon_reports_the_end_of_a_process_an_earlier_one_started(
     assert (ended.process_id, ended.exit_code, ended.reason) == (
         start.process_id,
         None,
-        "it ended while its daemon was away",
+        reason,
     )
     assert not owned.exists()
     # Its output's folder, its lock in it, goes too.
@@ -1374,6 +1419,71 @@ def test_a_start_whose_folder_is_gone_when_it_fails_is_still_reported(
     [ended] = _ends(start)
 
     assert (ended.exit_code, ended.reason) == (None, "no such program")
+
+
+def test_a_stop_the_server_hands_is_carried_out_by_the_place_and_waits_go_on() -> None:
+    """A remote agent service's wait is handed each stop of a process it runs."""
+    process = uuid.uuid4()
+    stopped: queue.Queue[uuid.UUID] = queue.Queue()
+    client = _Client()
+    client.answers.put(StopProcess(process_id=process))
+    serving = _serving(client, stop=stopped.put)
+
+    serving.start(_HOST, _INSTANCE)
+    try:
+        assert stopped.get(timeout=_PATIENCE_SEC) == process
+        with client.changed:
+            assert client.changed.wait_for(lambda: len(client.waits) >= 2, 1)
+    finally:
+        serving.stop()
+
+
+def test_a_persons_own_daemon_handed_a_stop_ends_nothing_and_waits_on() -> None:
+    """No server hands it one; by default a stop ends nothing here."""
+    client = _Client()
+    client.answers.put(StopProcess(process_id=uuid.uuid4()))
+    serving = SessionServing(
+        _URL,
+        credential=_CREDENTIAL,
+        client_for=client,
+        retry_sec=0.005,
+    )
+
+    serving.start(_HOST, _INSTANCE)
+    try:
+        with client.changed:
+            assert client.changed.wait_for(lambda: len(client.waits) >= 2, 1)
+    finally:
+        serving.stop()
+    assert client.ended.empty()
+
+
+def test_a_start_stops_each_process_the_place_runs_that_no_record_names() -> None:
+    """Its launcher is gone, so no one waits on it or reports its end; one a record
+    names is taken up as before.
+    """
+    named, orphan = uuid.uuid4(), uuid.uuid4()
+    record = (
+        state_dir()
+        / "rekursiv-ai"
+        / "knowop"
+        / "processes"
+        / str(named)
+        / "process.json"
+    )
+    record.parent.mkdir(parents=True)
+    held = session_serving._held(record, host_id=_HOST, owned=None)
+    stopped: list[uuid.UUID] = []
+    client = _Client()
+    serving = _serving(client, stop=stopped.append, running=lambda: (named, orphan))
+
+    serving.start(_HOST, _INSTANCE)
+    try:
+        assert stopped == [orphan]
+    finally:
+        serving.stop()
+        os.close(held)
+    assert client.end().process_id == named
 
 
 def test_a_start_whose_folder_another_process_holds_leaves_it_alone() -> None:
