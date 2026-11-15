@@ -6,6 +6,8 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from trackinizer.wire.refs import SeqRef, UuidRef
+
 import pytest
 
 from knowop.process.command import (
@@ -30,6 +32,32 @@ def _refusal(argv: Sequence[str], capsys: pytest.CaptureFixture[str]) -> str:
         _ = parse_run(run_parser(), argv)
     assert refused.value.code == 2
     return capsys.readouterr().err.rpartition("knowop run: error: ")[2].strip()
+
+
+@pytest.mark.parametrize(
+    ("given", "ref"),
+    [
+        (_ID, UuidRef(uuid=UUID(_ID))),
+        ("AgentSession#412", SeqRef(kind="AgentSession", seq=412)),
+        ("agentsession#412", SeqRef(kind="AgentSession", seq=412)),
+        ("412", SeqRef(kind="AgentSession", seq=412)),
+    ],
+)
+def test_a_session_is_named_by_its_uuid_or_number(given: str, ref: object) -> None:
+    for flag in ("--session", "--stop"):
+        flags, _ = parse_run(run_parser(), [flag, given])
+        assert (flags.session if flag == "--session" else flags.stop) == ref
+
+
+@pytest.mark.parametrize("given", ["Issue#7", "knowop ui v2", "#412", ""])
+def test_anything_else_is_no_session(
+    given: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _refusal(["--session", given], capsys) == (
+        f"argument --session: {given!r} is no session: give its UUID or number "
+        "(AgentSession#N)"
+    )
 
 
 @pytest.mark.parametrize(
@@ -61,7 +89,10 @@ def test_knowops_own_flags_read_before_the_separator() -> None:
         ["--session", _ID, "--time", "90", "--on", "lab", "--login-host", "desk"],
     )
 
-    assert (flags.session, flags.time_limit) == (UUID(_ID), timedelta(minutes=90))
+    assert (flags.session, flags.time_limit) == (
+        UuidRef(uuid=UUID(_ID)),
+        timedelta(minutes=90),
+    )
     assert (flags.on, flags.login_host, flags.cwd, given) == ("lab", "desk", "~", [])
 
 

@@ -7,6 +7,9 @@ All notable knowop changes are documented here. This project follows
 
 ### Added
 
+- `knowop run --session` and `--stop` take a session's number (`AgentSession#412`,
+  or `412`) as well as its UUID. Chat's ⋯ menu copies either: Copy session # and
+  Copy UUID.
 - The `Canvas` tool's `set` verb: an agent changes how the app looks for the person
   (font, text sizes, theme, skin, Chat's side and the rest), offered with the schema
   the server gives (`knowop.tools.canvas.agent_settings`), read as the agent starts,

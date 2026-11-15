@@ -24,6 +24,7 @@ everything of sagent's after `--`, untouched.
 knowop run                          # sagent here, live in Chat
 knowop run --headless               # the same, with no screen
 knowop run --session ID             # continue session ID here
+knowop run --session AgentSession#412   # the same, by its number (or 412)
 knowop run --on lab --cwd ~/work    # start it on your host lab, through its daemon
 knowop run --stop ID                # stop session ID's agent, wherever it runs
 knowop run --time 2:00:00           # end 2 h after it starts, as a stop does
@@ -100,6 +101,9 @@ there is none. With a shell, `knowop canvas` does the same (`knowop canvas --hel
 The agent's key reaches the canvas its session's Chat is on, and no other.
 
 ## Continue a stored session
+
+`--session` and `--stop` take a session's UUID or its number (`AgentSession#412`,
+or `412`); Chat's ⋯ menu copies either (Copy session #, Copy UUID).
 
 `knowop run --session ID` continues it here: in this host's own journal of its
 newest part when this host holds it whole, else in a new journal restored from the

@@ -68,7 +68,7 @@ from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.client.session_socket import SessionSocket, SocketClient
 from trackinizer.trax.profile import Profile
-from trackinizer.wire.refs import SeqRef
+from trackinizer.wire.refs import Ref, SeqRef
 from trackinizer.wire.wire_capture import CaptureImage
 from trackinizer.wire.wire_process_keys import PROCESS_KEY_ROUTES, WEBSOCKET
 from trackinizer.wire.wire_session_ir import ManifestBody, PartBody, RecordBody
@@ -154,7 +154,6 @@ if TYPE_CHECKING:
     from sagent.tui.types import CommandOutput
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.wire.json_types import JSON
-    from trackinizer.wire.refs import Ref
     from trackinizer.wire.wire_session_relay import InputKind
     from websockets.http11 import Request, Response
 
@@ -325,8 +324,17 @@ class _Server(_Client):
     )
     """What the server answers for the settings an agent may change, or why not."""
 
+    resolved: list[Ref] = field(default_factory=list[Ref])
+    """Each reference resolved: a session's number, which only the server knows."""
+
+    numbered: bool = True
+    """Whether a number names a row; else resolving one is refused as not found."""
+
     def resolve_id(self, ref: Ref) -> tuple[Inquiry.InquiryKind, UUID]:
         assert isinstance(ref, SeqRef)
+        self.resolved.append(ref)
+        if not self.numbered:
+            raise ClientError(f"{ref} not found")
         return ref.kind, _ROW
 
     def read_canvas(self, canvas_id: UUID) -> dict[str, PlainTree]:
@@ -2166,7 +2174,44 @@ def test_a_session_named_is_continued_here(served: _Served, server: _Server) -> 
     assert main(["--session", str(other), "--headless"], profile=_PROFILE) == 0
 
     assert served.calls[0]["session_id"] == other
-    del server
+    assert server.resolved == []
+
+
+@pytest.mark.parametrize("number", ["AgentSession#412", "412"])
+def test_a_session_named_by_its_number_is_continued_here(
+    served: _Served,
+    server: _Server,
+    number: str,
+) -> None:
+    assert main(["--session", number, "--headless"], profile=_PROFILE) == 0
+
+    assert server.resolved == [SeqRef(kind="AgentSession", seq=412)]
+    assert served.calls[0]["session_id"] == _ROW
+    assert server.starts == []
+
+
+def test_a_number_the_server_does_not_find_exits_1_and_starts_nothing(
+    served: _Served,
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.numbered = False
+
+    assert main(["--session", "AgentSession#9", "--headless"], profile=_PROFILE) == 1
+
+    assert capsys.readouterr().err == "Error: AgentSession#9 not found\n"
+    assert (served.calls, server.starts) == ([], [])
+
+
+def test_stop_by_number_stops_that_sessions_agent(
+    served: _Served,
+    server: _Server,
+) -> None:
+    server.stop_answer = _attached("detached")
+
+    assert main(["--stop", "AgentSession#412"], profile=_PROFILE) == 0
+    assert server.stopped == [_ROW]
+    assert served.calls == []
 
 
 def test_dans_mistyped_command_says_the_fixed_one_and_opens_no_session(
@@ -2520,7 +2565,7 @@ def test_help_names_each_of_knowops_own_flags_with_what_it_takes_and_does(
     assert [" ".join(line.split()) for line in options] == [
         "-h, --help show this help message and exit",
         "--headless Run with no screen, at a terminal too.",
-        "--session SESSION The session to continue here.",
+        "--session ID The session to continue here: its UUID or number (AgentSession#N).",
         "--on [NAME] Start on host NAME through its daemon; with no name, the server's.",
         "--cwd DIR With --on, the folder there to start in (default: ~).",
         "--login-host NAME Use host NAME's model login.",
