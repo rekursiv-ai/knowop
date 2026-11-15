@@ -7,6 +7,9 @@ All notable knowop changes are documented here. This project follows
 
 ### Added
 
+- An agent of `knowop run` is told, in AgentSend's reminder, that another
+  session's agent is `LABEL#SESSION`, as `Agent#412` for `AgentSession#412`; one
+  that names an unknown agent `lead` is asked "Did you mean 'lead#N'?".
 - `knowop run` stores each child an agent spawns, a watcher among them, as an
   AgentSession of its own, linked `produced_by` the session that spawned it, at any
   depth, on your own host and as a remote agent. A child's session opens at its

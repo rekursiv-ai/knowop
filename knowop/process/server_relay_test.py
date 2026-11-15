@@ -229,6 +229,26 @@ async def test_a_label_that_names_no_session_is_refused_unposted(team: Team) -> 
 
 
 @pytest.mark.asyncio
+async def test_an_unknown_label_is_asked_if_it_meant_another_session_s_agent(
+    team: Team,
+) -> None:
+    """The name it suggests is one the relay posts."""
+    server = _Server()
+    async with ServerRelay(
+        server,
+        session_id=_SESSION,
+        team=team,
+        root="Agent",
+    ) as relay:
+        team.relay = relay
+        with pytest.raises(ValueError, match=r"Did you mean 'lead#N'"):
+            team.send("worker", "lead", "status?")
+        team.send("worker", "lead#412", "status?")
+
+    assert [p.to for p in server.posted] == [SessionAgent.parse("lead#412")]
+
+
+@pytest.mark.asyncio
 async def test_a_send_waiting_as_the_process_ends_is_sent_or_told_as_not_sent(
     team: Team,
     monkeypatch: pytest.MonkeyPatch,
