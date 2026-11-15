@@ -35,6 +35,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 
 from sagent.agent.agent import Agent
 from sagent.agent.agents_md import AgentsMdConfig
@@ -148,6 +149,8 @@ _CWD: Final[Path] = _THIS.parent
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator, Mapping
+
+    import queue
 
     from mcp.client.stdio import StdioServerParameters
     from sagent.runtime.types import RuntimeEvent
@@ -296,6 +299,10 @@ class _Server(_Client):
     answer: AgentProcess | None = None
     frames: list[ViewerFrame] = field(default_factory=list[ViewerFrame])
     lines_refused: bool = False
+
+    reader: tuple[str, bool] | None = None
+    """The name of the thread that read the lines, and whether it is a daemon."""
+
     start_refused: bool = False
     starts: list[SessionStart] = field(default_factory=list[SessionStart])
     """Each session start asked for."""
@@ -461,6 +468,8 @@ class _Server(_Client):
 
     def open_lines(self, session_id: UUID) -> Iterator[ViewerFrame]:
         assert session_id == _SESSION
+        reading = threading.current_thread()
+        self.reader = (reading.name, reading.daemon)
         if self.lines_refused:
             raise ClientError("GET lines -> 501", status_code=501)
         yield from self.frames
@@ -2427,17 +2436,25 @@ def test_ctrl_c_or_sigterm_exits_130(
 @pytest.mark.parametrize(
     "case",
     [
-        (_attached(), [], 0),
+        (_attached(), [], ""),
         (
             _attached("starting"),
             [
-                ProcessLine(process=_attached(process=uuid4())),
+                ProcessLine(process=_attached("detached", process=uuid4())),
                 ProcessLine(process=_attached()),
             ],
-            0,
+            "",
         ),
-        (_attached("starting"), [ProcessLine(process=_attached("detached"))], 1),
-        (_attached("starting"), [], 1),
+        (
+            _attached("starting"),
+            [ProcessLine(process=_attached("detached"))],
+            "Error: the process did not start: it crashed\n",
+        ),
+        (
+            _attached("starting"),
+            [],
+            "Error: the process did not attach within 0.05 s\n",
+        ),
     ],
     ids=["attached-at-once", "attached-later", "detached", "never"],
 )
@@ -2445,9 +2462,10 @@ def test_on_starts_it_through_a_daemon_and_waits_for_it_to_attach(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
-    case: tuple[AgentProcess, list[ViewerFrame], int],
+    case: tuple[AgentProcess, list[ViewerFrame], str],
 ) -> None:
-    answer, frames, exit_code = case
+    answer, frames, said = case
+    exit_code = 1 if said else 0
     monkeypatch.setattr(main_module, "_ATTACHED_SEC", 0.05)
     server.answer = answer
     server.frames = [Opened(), *frames]
@@ -2479,7 +2497,11 @@ def test_on_starts_it_through_a_daemon_and_waits_for_it_to_attach(
             args=("--model", "opus"),
         ),
     ]
-    assert (capsys.readouterr().out == f"{_SESSION}\n") == (exit_code == 0)
+    printed = capsys.readouterr()
+    assert (printed.out == f"{_SESSION}\n") == (exit_code == 0)
+    assert printed.err == said
+    # Read on a daemon thread of its own, so a stream that never ends keeps no exit.
+    assert server.reader == ("lines", True)
     # Its checkout is on the host it starts on, which this command cannot read.
     assert server.placed == []
 
@@ -2492,6 +2514,69 @@ def test_on_with_no_name_starts_it_where_the_server_runs_agents(
 
     assert main(["--on"], profile=_PROFILE) == 0
     assert server.started == [ProcessSpec()]
+
+
+def test_a_start_the_servers_agents_would_refuse_opens_no_session(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert main(["--on", "--", "--tools", "Bash"], profile=_PROFILE) == 1
+
+    assert capsys.readouterr().err == "Error: a remote agent takes no --tools\n"
+    assert (server.starts, server.started) == ([], [])
+
+
+def test_a_run_here_takes_a_flag_the_servers_agents_would_refuse(
+    served: _Served,
+    server: _Server,
+) -> None:
+    assert main(["--headless", "--", "--tools", "Bash"], profile=_PROFILE) == 0
+
+    assert server.built == [["--tools", "Bash"]]
+    (called,) = served.calls
+    assert called["args"] == ["--tools", "Bash"]
+
+
+def test_on_waits_for_each_frame_until_a_deadline_ahead(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server.answer = _attached("starting")
+    server.frames = [Opened(), ProcessLine(process=_attached())]
+    ahead: list[float] = []
+    wait = main_module._next_frame
+
+    def timed(
+        frames: queue.Queue[ViewerFrame | ClientError],
+        *,
+        deadline: float,
+    ) -> ViewerFrame:
+        ahead.append(deadline - time.monotonic())
+        return wait(frames, deadline=deadline)
+
+    monkeypatch.setattr(main_module, "_next_frame", timed)
+
+    assert main(["--on"], profile=_PROFILE) == 0
+    assert len(ahead) == 2
+    assert all(0 < left <= main_module._ATTACHED_SEC for left in ahead)
+
+
+def test_the_servers_agents_take_a_time_limit_and_a_campaign_leads_flags(
+    server: _Server,
+) -> None:
+    server.answer = _attached()
+    server.frames = [Opened()]
+
+    assert (
+        main(
+            ["--on", "--time", "90", "--", "--max-budget-usd", "0.5"],
+            profile=_PROFILE,
+        )
+        == 0
+    )
+    assert server.started == [
+        ProcessSpec(args=("--time", "0-01:30:00", "--max-budget-usd", "0.5")),
+    ]
 
 
 def test_on_hands_the_time_limit_to_the_process_it_starts_as_its_own_flag(

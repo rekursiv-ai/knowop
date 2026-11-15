@@ -81,6 +81,7 @@ from trackinizer.wire.wire_session_relay import (
     ProcessLine,
     ProcessSpec,
     ServeSession,
+    remote_flags_refused,
 )
 from trackinizer.wire.wire_sessions import SessionStart
 from trackinizer.wire.wire_terminals import (
@@ -232,6 +233,13 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
             unbuilt = _unbuilt(args, client=client)
             if unbuilt:
                 sys.stderr.write(f"Error: {unbuilt}\n")
+                return 1
+        # The server's own agents are remote agents, which take only some flags: checked
+        # here too, by the rule the server keeps, so a start they refuse opens no session.
+        if named is None and flags.on == "":
+            refused = remote_flags_refused(_start_args(flags, args))
+            if refused:
+                sys.stderr.write(f"Error: {refused}\n")
                 return 1
         try:
             session_id = (
@@ -1012,17 +1020,13 @@ def _started_on(
         # The stream opens before the start, so the line that says it attached is
         # not missed.
         _ = _next_frame(frames, deadline=deadline)
-        # The time limit is the process's own flag, so it goes on the line it is
-        # started with, and runs from its start there.
-        limit = flags.time_limit
-        timed = () if limit is None else ("--time", _slurm_time(limit))
         started = client.start_process(
             session_id,
             ProcessSpec(
                 host=flags.on or "",
                 login_host=flags.login_host,
                 cwd=flags.cwd,
-                args=(*timed, *args),
+                args=_start_args(flags, args),
             ),
         )
         process = started
@@ -1043,6 +1047,15 @@ def _started_on(
         return 1
     sys.stdout.write(f"{session_id}\n")
     return 0
+
+
+# The time limit is the process's own flag, so it goes on the line it is started with,
+# first, and runs from its start there.
+def _start_args(flags: Flags, args: Sequence[str]) -> tuple[str, ...]:
+    """Return the flags an ``--on`` start hands its process: its time limit, then sagent's."""
+    limit = flags.time_limit
+    timed = () if limit is None else ("--time", _slurm_time(limit))
+    return (*timed, *args)
 
 
 def _read_lines(
