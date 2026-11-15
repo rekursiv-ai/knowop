@@ -8,10 +8,13 @@
     knowop run --headless -- --effort high      no screen; sagent's setting after --
     knowop run --on lab --cwd ~/work -- --model sol
     knowop run --session ID                     continue session ID here
+    knowop run --session AgentSession#412       the same, by its number (or 412)
     knowop run --stop ID                        stop session ID's agent, wherever it runs
     knowop run -- login --provider oaisub       sagent's sign-in, on this computer
     knowop run -- mcp list                      any of sagent's actions, on this computer
     knowop run -- --help                        sagent's own help
+
+A session is named by its UUID or its number, as Chat's ⋯ menu shows both.
 
 Before ``--``, only knowop's flags below; everything after it is sagent's, untouched:
 its settings as flags, or an action, which runs here and opens no session. Every sagent
@@ -25,7 +28,6 @@ from __future__ import annotations
 from datetime import timedelta
 from itertools import islice
 from typing import TYPE_CHECKING, Final, Protocol, cast
-from uuid import UUID
 
 import argparse
 import re
@@ -33,6 +35,8 @@ import shlex
 import sys
 
 from sagent.tui.main import opened, parse_flags
+from trackinizer.trax.grammar import parse_ref
+from trackinizer.wire.refs import Ref, SeqRef
 
 
 if TYPE_CHECKING:
@@ -52,11 +56,11 @@ class Flags(Protocol):
     """knowop's own flags, which come before ``--``."""
 
     headless: bool
-    session: UUID | None
+    session: Ref | None
     on: str | None
     cwd: str
     login_host: str
-    stop: UUID | None
+    stop: Ref | None
     time_limit: timedelta | None
     serve: str | None
 
@@ -174,7 +178,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Run with no screen, at a terminal too.",
     )
-    parser.add_argument("--session", type=UUID, help="The session to continue here.")
+    parser.add_argument(
+        "--session",
+        type=_session,
+        metavar="ID",
+        help="The session to continue here: its UUID or number (AgentSession#N).",
+    )
     parser.add_argument(
         "--on",
         nargs="?",
@@ -196,7 +205,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--stop",
-        type=UUID,
+        type=_session,
         metavar="ID",
         help="Stop session ID's agent, wherever it runs, and exit.",
     )
@@ -215,6 +224,19 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="URL",
         help="Serve the session a daemon hands on stdin, through the server at URL.",
     )
+
+
+def _session(text: str) -> Ref:
+    """Read a session as its UUID or number: ``AgentSession#412``, or ``412`` alone."""
+    try:
+        ref = parse_ref(f"AgentSession#{text}" if text.isdigit() else text)
+    except ValueError:
+        ref = None
+    if ref is None or (isinstance(ref, SeqRef) and ref.kind != "AgentSession"):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is no session: give its UUID or number (AgentSession#N)",
+        )
+    return ref
 
 
 # Without days, ``M``, ``M:S`` or ``H:M:S``; with them, ``D-H``, ``D-H:M`` or

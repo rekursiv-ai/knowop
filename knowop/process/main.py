@@ -73,6 +73,7 @@ from trackinizer.client.session_socket import (
 )
 from trackinizer.client.session_upload import RecordAppender
 from trackinizer.trax.canvas import canvas_from_env
+from trackinizer.wire.refs import UuidRef
 from trackinizer.wire.wire_science_chat import chat_session_id
 from trackinizer.wire.wire_session_relay import (
     Command,
@@ -140,6 +141,7 @@ if TYPE_CHECKING:
     from sagent.tui.main import OpenAgent
     from sagent.tui.slash import Allowed
     from trackinizer.trax.profile import Profile
+    from trackinizer.wire.refs import Ref
     from trackinizer.wire.wire_session_relay import Input, ViewerFrame
     from treekle import PlainTree
 
@@ -214,18 +216,26 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
         )
         return 1
     with Client(profile.url, author=profile.author, api_key=profile.api_key) as client:
-        if flags.stop is not None:
-            return _stopped(client, flags.stop)
+        try:
+            stop = None if flags.stop is None else _session_id(client, flags.stop)
+            named = (
+                None if flags.session is None else _session_id(client, flags.session)
+            )
+        except ClientError as error:
+            sys.stderr.write(f"Error: {error}\n")
+            return 1
+        if stop is not None:
+            return _stopped(client, stop)
         # Built here before a new session opens, so a setting it refuses leaves none
         # behind; on another host, only sagent's parser checked them here.
-        if flags.session is None and flags.on is None:
+        if named is None and flags.on is None:
             unbuilt = _unbuilt(args, client=client)
             if unbuilt:
                 sys.stderr.write(f"Error: {unbuilt}\n")
                 return 1
         try:
             session_id = (
-                flags.session
+                named
                 or client.session_start(
                     SessionStart(cli="sagent", cli_session_id=chat_session_id(uuid4())),
                 ).id
@@ -960,6 +970,11 @@ async def _ran(
             # As a stop: a remote agent's folder goes as it ends, its journal too.
             quit_ran.set_result(Ended(code=0, stopped=True))
             return
+
+
+def _session_id(client: Client, ref: Ref) -> UUID:
+    """Return the session a UUID or a number names; a number is looked up."""
+    return ref.uuid if isinstance(ref, UuidRef) else client.resolve_id(ref)[1]
 
 
 def _stopped(client: Client, session_id: UUID) -> int:
