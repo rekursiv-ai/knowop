@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 
 from sagent.agent.agent import Agent
@@ -106,6 +107,8 @@ import pytest
 
 from knowop.agent import placement
 from knowop.agent.errors import NotResumableError
+from knowop.connect.session_serving import SERVE_COMMAND
+from knowop.lib.testing.import_graph import Counted, import_graph
 from knowop.process import (
     main as main_module,
     publisher,
@@ -132,6 +135,9 @@ from knowop.tools.canvas import (
     with_settings,
 )
 
+
+_THIS: Final[Path] = Path(__file__).resolve()
+_CWD: Final[Path] = _THIS.parent
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator, Mapping
@@ -2435,6 +2441,31 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
 def _template_pattern(path: str) -> str:
     """Return a pattern that each URL a route's template names matches in full."""
     return re.sub(r"\\\{[a-z_]+\\\}", "[^/]+", re.escape(path))
+
+
+def test_a_headless_start_loads_neither_sagents_screen_nor_the_mcp_sdk() -> None:
+    """The daemon's start imports its package's ``__main__``, then this module, at once.
+
+    Read from source: the imports that run before the process reads its session.
+    """
+    package = SERVE_COMMAND[SERVE_COMMAND.index("-m") + 1]
+    graph = import_graph(
+        [f"{package}.__main__", main_module.__name__],
+        path=[str(_THIS.parents[__name__.count(".")]), *sys.path],
+        follow=lambda name: name.partition(".")[0] == __name__.partition(".")[0],
+        counted=Counted.IMPORT_TIME,
+    )
+    reached = {*graph, *(name for names in graph.values() for name in names)}
+
+    assert Commands.__module__ in reached
+    assert (
+        sorted(
+            name
+            for name in reached
+            if name.partition(".")[0] in {"prompt_toolkit", "markdown_it", "mcp"}
+        )
+        == []
+    )
 
 
 if __name__ == "__main__":
