@@ -30,7 +30,9 @@ default) the child starts in the start's folder, with the daemon's environment l
 every variable no tool inherits either (:func:`scrubbed_names`), and sagent's flags
 after ``--``; a start the server placed for a remote agent is refused there. A place
 may own a folder made for its process alone, which is deleted when the process ends
-or its start fails.
+or its start fails, and may name a launcher that runs the command: the remote agent
+service's jail, which starts each agent in a systemd unit of its own and waits for it,
+so the launcher's exit is the agent's.
 """
 
 from __future__ import annotations
@@ -56,7 +58,11 @@ from trackinizer.lib.posix.detached import spawn_detached
 from trackinizer.lib.posix.pids import running
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.trax.render import echo
-from trackinizer.wire.wire_session_relay import MAX_REASON_CHARS, ProcessEnded
+from trackinizer.wire.wire_session_relay import (
+    MAX_REASON_CHARS,
+    ProcessEnded,
+    StopProcess,
+)
 from trackinizer.wire.wire_tools import WAIT_MAX_SEC
 from treekle import json_dumps, json_loads
 
@@ -67,7 +73,7 @@ from knowop.connect.wake import Listener
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
 
     from trackinizer.wire.wire_session_relay import ServeSession
 
@@ -109,6 +115,8 @@ class Place:
       flags: The start's flags: a leading ``--time TIME`` of knowop's, then sagent's.
       owned: A folder made for the process alone, deleted when it ends or its start
         fails; ``None`` for none.
+      launcher: The words that run the command, before its own: a jail's program,
+        which starts it in a unit of its own; empty runs the command itself.
 
     """
 
@@ -116,6 +124,7 @@ class Place:
     env: Mapping[str, str]
     flags: tuple[str, ...]
     owned: Path | None = None
+    launcher: tuple[str, ...] = ()
 
 
 class RefusedError(Exception):
@@ -162,8 +171,8 @@ class SessionClient(Protocol):
         *,
         instance: uuid.UUID,
         wait_sec: float,
-    ) -> ServeSession | None:
-        """Hold for the next start."""
+    ) -> ServeSession | StopProcess | None:
+        """Hold for the next start, or a stop of a process it runs."""
         ...
 
     def report_process_ended(self, host_id: uuid.UUID, ended: ProcessEnded) -> None:
@@ -173,6 +182,12 @@ class SessionClient(Protocol):
     def close(self) -> None:
         """Release the connection."""
         ...
+
+
+# Before the class, whose default it is: a person's own daemon is handed no stop.
+def _stops_none(process_id: uuid.UUID) -> None:
+    """End no process."""
+    del process_id
 
 
 class SessionServing:
@@ -188,10 +203,18 @@ class SessionServing:
         server did not hold.
       wait_sec: How long to ask the server to hold each wait; ``0`` asks for the
         longest it holds.
-      command: What starts an agent process; the URL and its flags follow it.
+      command: What starts an agent process, after the place's launcher: the URL, a
+        time limit, ``--`` and sagent's flags follow it, as ``knowop run --serve``
+        takes them.
       run: Runs ``systemd-run`` once, to learn whether a process can have a scope.
       wake: Tells when this computer wakes from a pause: the wait held across it then
         waits on a dead socket, so a new one is started at once. ``None`` watches not.
+      stop: Ends a process the server stopped, whole, when the wait hands its stop:
+        the remote agent service's jail stops its unit. A person's own daemon is
+        handed none, and ends none.
+      running: Returns the processes the place runs now. A start of the serving stops
+        each one no record names: its launcher is gone, so no one waits on it or
+        reports its end.
 
     """
 
@@ -207,6 +230,8 @@ class SessionServing:
         command: Sequence[str] = SERVE_COMMAND,
         run: Run = run,
         wake: Wake | None = None,
+        stop: Callable[[uuid.UUID], None] = _stops_none,
+        running: Callable[[], Iterable[uuid.UUID]] = tuple,
     ) -> None:
         self._url = url
         self._credential = credential
@@ -218,6 +243,8 @@ class SessionServing:
         self._command = tuple(command)
         self._run = run
         self._wake = wake
+        self._stopper = stop
+        self._running = running
         self._stop = threading.Event()
         self._scoped: bool | None = None
         """Whether a process gets a scope of its own; ``None`` until first asked."""
@@ -236,6 +263,14 @@ class SessionServing:
         processes = state_dir() / "rekursiv-ai" / "knowop" / "processes"
         for record in sorted(processes.glob(f"*/{_RECORD}")):
             self._adopt(record, host_id=host_id)
+        for process in self._running():
+            if not (processes / str(process) / _RECORD).exists():
+                echo(
+                    f"knowop: agent process stopped: process={process}: it ran with no "
+                    "record, so nothing waited on it",
+                    err=True,
+                )
+                self._stopper(process)
         Listener(
             name="session-listener",
             listen=partial(self._listen, host_id, instance),
@@ -280,7 +315,14 @@ class SessionServing:
                     _ = self._stop.wait(self._retry_sec)
                     continue
                 said = None
-                if serve is not None:
+                if isinstance(serve, StopProcess):
+                    echo(
+                        f"knowop: agent process stopped: process={serve.process_id}: "
+                        "its server stopped it",
+                        err=True,
+                    )
+                    self._stopper(serve.process_id)
+                elif serve is not None:
                     self._start_process(serve, host_id=host_id)
                 elif time.monotonic() - asked < self._wait_sec / 2:
                     # Not held: asking at once would spin on this server.
@@ -311,7 +353,11 @@ class SessionServing:
             try:
                 pid = spawn_detached(
                     self._scoped_argv(
-                        [*self._command, *_serve_args(self._url, place.flags)],
+                        [
+                            *place.launcher,
+                            *self._command,
+                            *_serve_args(self._url, place.flags),
+                        ],
                         unit=f"knowop-process-{process}",
                     ),
                     log=log,
@@ -425,6 +471,7 @@ class SessionServing:
         host_id: uuid.UUID,
         log: Path,
         owned: Path | None,
+        reason: str = "",
     ) -> None:
         """Delete the folders a process owned and wrote to, then report its exit and output's end."""
         if owned is not None:
@@ -436,9 +483,12 @@ class SessionServing:
             ProcessEnded(
                 process_id=process_id,
                 exit_code=code,
-                reason="it ended while its daemon was away"
-                if code is None
-                else f"exited with code {code}",
+                reason=reason
+                or (
+                    "it ended while its daemon was away"
+                    if code is None
+                    else f"exited with code {code}"
+                ),
                 output=output,
             ),
         )
@@ -510,13 +560,14 @@ def _write(held: int, *, host_id: uuid.UUID, owned: Path | None, pid: int) -> No
 # A blocked ``flock`` is the wait: the lock is freed when the process, the last holder
 # of the descriptor, exits. No portable event marks the exit of a process that is not
 # this one's child, and this needs none.
-def _outlived(held: int, ended: Callable[[], None]) -> None:
+def _outlived(held: int, ended: Callable[..., None]) -> None:
     """Wait for the process holding ``held`` to exit; then report it ended."""
     try:
         fcntl.flock(held, fcntl.LOCK_EX)
     finally:
         os.close(held)
-    ended()
+    # This daemon saw the end, but not the exit code: an earlier daemon started it.
+    ended(reason="it ended after its daemon restarted, so its exit code is not known")
 
 
 # Read whole: a headless agent prints its session's id and its errors, no more. A log
