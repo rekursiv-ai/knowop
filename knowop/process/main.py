@@ -134,6 +134,7 @@ if TYPE_CHECKING:
 
     from sagent.agent.agent import Agent
     from sagent.agent.team import Team
+    from sagent.model.capability import ThinkingEffort
     from sagent.session.types import SessionRecord
     from sagent.tools.types import Tool
     from sagent.tui.main import OpenAgent
@@ -146,8 +147,23 @@ if TYPE_CHECKING:
     from knowop.process.command import Flags
 
 
-__all__ = ["ServeClient", "agent_tools", "delivering", "first_done", "main", "serve"]
+__all__ = [
+    "KNOWOP_EFFORT",
+    "ServeClient",
+    "agent_tools",
+    "delivering",
+    "effort_default",
+    "first_done",
+    "main",
+    "serve",
+]
 
+
+KNOWOP_EFFORT: Final[ThinkingEffort] = "high"
+"""The thinking effort every agent knowop starts runs at, where its model offers it,
+until its session picks another (Dan, 2026-11-14: "For KnowOp, let's set a default of
+high for everything for now"); the model stays sagent's default. One value, which a
+person's stored preference is to replace."""
 
 _GIVE_UP_SEC: Final = 600.0
 """How long a headless process runs without its socket before it ends itself."""
@@ -291,6 +307,13 @@ async def serve(
         sys.stderr.write(f"Error: {error}\n")
         return 1
     flags, given = parse_flags([*args, "--session", str(choice.path)])
+    # A setting sagent is given applies over the one a session stood on, so the
+    # default is set for a session with no records yet alone: given at each start,
+    # it would undo a person's ``/model`` at every restart. A flag naming the model
+    # or the effort is the person's own choice, and wins.
+    fresh = not (choice.start or choice.restored) and not any(
+        name == "model" or name.endswith("effort") for name, _ in given
+    )
     hello = Hello(process_id=process_id, version=knowop_version(), host=host)
     canvas = CanvasTools(
         client,
@@ -313,6 +336,8 @@ async def serve(
                 use_daemon=not remote,
                 tools=agent_tools(canvas),
             ) as o:
+                if fresh:
+                    effort_default(o.agent)
                 ended = await _live(
                     o,
                     socket=socket,
@@ -353,11 +378,12 @@ async def delivering(
 ) -> AsyncGenerator[asyncio.Future[Ended]]:
     """Deliver each input to the agent, as its kind says, while the block runs.
 
-    A halt halts the turn at once. An agent's message from another session goes to
-    the team at once, booked as its sender booked it. A person's line is pushed as a
-    message from its author to the agent it names, and a slash line runs in
-    ``commands``, each in its turn after the slash line before it. A line that names
-    the canvas it was sent from moves the canvas tools to it as it arrives.
+    A halt halts the turn at once; one for ``all`` halts every agent of the team. An
+    agent's message from another session goes to the team at once, booked as its
+    sender booked it. A person's line is pushed as a message from its author to the
+    agent it names, and a slash line runs in ``commands``, each in its turn after the
+    slash line before it. A line that names the canvas it was sent from moves the
+    canvas tools to it as it arrives.
 
     Args:
       inputs: The inputs, as they come down the socket.
@@ -380,6 +406,7 @@ async def delivering(
             _delivered(
                 inputs,
                 agent=agent,
+                team=team,
                 relay=relay,
                 publisher=publisher,
                 lines=lines,
@@ -450,6 +477,26 @@ def agent_tools(canvas: CanvasTools) -> list[Tool]:
     )
     made.schema = with_settings(made.schema, canvas.settings)
     return [made]
+
+
+def effort_default(agent: Agent, effort: ThinkingEffort = KNOWOP_EFFORT) -> None:
+    """Set a new session's agent to ``effort`` where its model offers it.
+
+    A model that offers no such effort keeps its own default, so a start never fails
+    for it. The model stands with its settings at once, so the session's next process
+    recalls it, as it recalls a person's ``/model``.
+
+    Args:
+      agent: The session's root agent, opened, before its first turn.
+      effort: The effort; knowop's own default unless something more specific says.
+
+    """
+    model = agent.model
+    if effort in model.capability.values("thinking_effort"):
+        model.settings = model.settings.with_value("thinking_effort", effort)
+        # The open stood the model as it was; left to the first turn's save, a
+        # process killed before that turn leaves its next process the catalog's.
+        agent.runtime.publish(types.SaveSession())
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -849,6 +896,7 @@ async def _delivered(
     inputs: AsyncIterator[Input],
     *,
     agent: Agent,
+    team: Team,
     relay: ServerRelay,
     publisher: Publisher,
     lines: asyncio.Queue[AgentToAgentMessage | Command],
@@ -861,8 +909,12 @@ async def _delivered(
         except ValueError as error:
             publisher.say(CommandOutput(text=error_text(error), tone="error"))
             continue
+        # A root's halt leaves its sub-agents' calls running, each on a runtime of
+        # its own; one for ``all``, the server's when the owner can no longer pay,
+        # halts every agent here.
         if isinstance(message, types.Halt):
-            agent.runtime.halt()
+            for halted in team.values() if sent.recipient == "all" else (agent,):
+                halted.runtime.halt()
         elif isinstance(message, AgentToAgentMessage) and sent.booked is not None:
             relay.deliver(message, booked=sent.booked)
         else:
