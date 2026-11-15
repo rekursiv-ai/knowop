@@ -28,7 +28,7 @@ Where and with what each process starts is its :class:`Place`, which the serving
 ``place`` returns for each start. On a person's own host (:func:`own_place`, the
 default) the child starts in the start's folder, with the daemon's environment less
 every variable no tool inherits either (:func:`scrubbed_names`), and sagent's flags
-after the URL; a start the server placed for a remote agent is refused there. A place
+after ``--``; a start the server placed for a remote agent is refused there. A place
 may own a folder made for its process alone, which is deleted when the process ends
 or its start fails.
 """
@@ -94,7 +94,7 @@ SERVE_COMMAND: Final = (
     "--serve",
 )
 """How the daemon starts an agent process: this install's ``knowop run --serve``, which
-the server's URL and sagent's flags follow. ``PATH`` may hold another knowop, or none,
+the server's URL, a time limit if the start has one, ``--`` and sagent's flags follow. ``PATH`` may hold another knowop, or none,
 and the published package is named otherwise, so the package is named from this
 module; ``-P`` keeps a module in the child's folder from running in its place."""
 
@@ -106,7 +106,7 @@ class Place:
     Attributes:
       folder: The folder it starts in.
       env: Its whole environment.
-      flags: sagent's flags, which follow the server's URL.
+      flags: The start's flags: a leading ``--time TIME`` of knowop's, then sagent's.
       owned: A folder made for the process alone, deleted when it ends or its start
         fails; ``None`` for none.
 
@@ -311,7 +311,7 @@ class SessionServing:
             try:
                 pid = spawn_detached(
                     self._scoped_argv(
-                        [*self._command, self._url, *place.flags],
+                        [*self._command, *_serve_args(self._url, place.flags)],
                         unit=f"knowop-process-{process}",
                     ),
                     log=log,
@@ -477,6 +477,15 @@ class _Record(TypedDict):
 
     pid: int
     """Its pid once spawned; 0 before."""
+
+
+# ``knowop run --on HOST --time TIME`` hands its time limit at the head of the start's
+# args (``process/main.py::_started_on``); it is knowop's flag, so it goes before
+# ``--``, where sagent would refuse it as a setting it has not.
+def _serve_args(url: str, flags: Sequence[str]) -> list[str]:
+    """Return what follows ``knowop run --serve``: the URL, a time limit, ``--``, sagent's."""
+    timed = list(flags[:2]) if flags[:1] == ("--time",) else []
+    return [url, *timed, "--", *flags[len(timed) :]]
 
 
 def _held(path: Path, *, host_id: uuid.UUID, owned: Path | None) -> int:

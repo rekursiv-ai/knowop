@@ -13,7 +13,11 @@ Examples:
   knowop connect          log in if needed, then connect this computer
   knowop login acme       log in to https://acme.knowop.ai, without connecting
   knowop run              sagent in this folder, live in Chat
+  knowop run --headless -- --effort high
+                          no screen; sagent's settings and actions go after --
   knowop run --on lab     sagent on your host lab, live in Chat
+  knowop run -- login --provider oaisub
+                          sagent's sign-in to a model provider, on this computer
   knowop job submit -- python train.py
                           run a job on a GPU node from this repository
   knowop job status       list your jobs
@@ -76,7 +80,10 @@ if TYPE_CHECKING:
     from knowop import canvas, upload
     from knowop.connect import job_limits
     from knowop.jobs import cli as jobs_cli
-    from knowop.process import main as process_main
+    from knowop.process import (
+        command as process_command,
+        main as process_main,
+    )
 else:
     from wrapt import lazy_import
 
@@ -87,8 +94,9 @@ else:
     jobs_cli = lazy_import("knowop.jobs.cli")
     job_limits = lazy_import("knowop.connect.job_limits")
     login = lazy_import("trackinizer.trax.login")
-    # The agent process ``run`` hands to; it brings sagent.
+    # The agent process ``run`` hands to, and its command line; each brings sagent.
     process_main = lazy_import("knowop.process.main")
+    process_command = lazy_import("knowop.process.command")
     # ``upload`` alone reads transcripts; it brings every CLI's session reader.
     upload = lazy_import("knowop.upload")
     redact = lazy_import("trackinizer.runs.redact")
@@ -344,7 +352,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     # Only listed here: ``main`` hands every ``run`` form to the agent process.
     verbs.add_parser(
         "run",
-        help="run sagent's agent here, or with --on on a host, live in Chat",
+        help="run sagent's agent here, or with --on on a host, live in Chat; "
+        "sagent's arguments go after --",
     )
     verbs.add_parser(
         "job",
@@ -1273,24 +1282,18 @@ def _hand_off(
     if verb == "job":
         name, _ = _profile(named)
         return jobs_cli.main(["--profile", name, *args])
-    if args[:1] == ["--serve"] or not _starts_an_agent(args):
-        # A daemon started it, and hands it the server's address and a key of its own
-        # on stdin; a help page asks the server nothing. Neither reads a profile, and
-        # neither logs in.
+    # A refused command is refused here, before a login. A daemon's start is handed
+    # the server's address and a key of its own on stdin; a help page and an action
+    # of sagent's ask the server nothing. None reads a profile, and none logs in.
+    if not process_command.logs_in(args):
         return process_main.main(args, profile=None)
     if _saved(named) is None:
         _log_in(named=named, sleep=sleep, clock=clock)
     _, profile = _profile(named)
     _say_whether_connected(profile)
-    # Sagent's own agent, in this process, live in Trackinizer; its flags are sagent's,
-    # and knowop's own.
+    # Sagent's own agent, in this process, live in Trackinizer: knowop's flags, then
+    # sagent's after ``--``.
     return process_main.main(args, profile=profile)
-
-
-def _starts_an_agent(args: Sequence[str]) -> bool:
-    """Whether ``knowop run ARGS`` starts an agent, not a help page."""
-    head = args[: args.index("--")] if "--" in args else args
-    return not {"-h", "--help"} & set(head)
 
 
 # A run reaches Chat without this computer being connected; a connected one also opens
