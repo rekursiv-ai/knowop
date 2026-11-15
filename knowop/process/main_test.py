@@ -288,6 +288,7 @@ class _Server(_Client):
 
     base_url: str = "http://127.0.0.1:1"
     api_key: str = "process-key"
+    author: str = ""
     parts: list[PartBody] = field(default_factory=list[PartBody])
     stored: list[RecordBody] = field(default_factory=list[RecordBody])
     failing: list[ClientError] = field(default_factory=list[ClientError])
@@ -2023,7 +2024,9 @@ def test_a_model_elsewhere_is_not_reached_from_here_yet(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert main(["--login-host", "desk"], profile=_PROFILE) == 1
-    assert "no host answers another's model calls yet" in capsys.readouterr().err
+    assert capsys.readouterr().err == (
+        "Error: no host answers another's model calls yet; --login-host needs --on.\n"
+    )
     assert server.started == []
 
 
@@ -2066,8 +2069,7 @@ def server(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Server]:
     fake = _Server(version=1)
 
     def client(url: str, *, author: str = "", api_key: str = "") -> _Server:
-        del author
-        fake.base_url, fake.api_key = url, api_key
+        fake.base_url, fake.author, fake.api_key = url, author, api_key
         return fake
 
     monkeypatch.setattr(main_module, "Client", client)
@@ -2084,7 +2086,7 @@ def server(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Server]:
     monkeypatch.setenv("TRAX_WORKSPACE", "")
 
     def checkout(cwd: Path) -> GitRef:
-        del cwd
+        assert cwd == Path.cwd()
         return _CHECKOUT
 
     monkeypatch.setattr(placement, "git_ref", checkout)
@@ -2115,7 +2117,13 @@ def test_a_run_here_places_its_session_and_tells_its_tools_where(
         str(_WORKSPACE),
         str(_PLACED_ON),
     )
-    assert len(served.calls) == 1
+    [call] = served.calls
+    assert isinstance(call["process_id"], UUID)
+    assert (server.base_url, server.author, server.api_key) == (
+        _PROFILE.url,
+        _PROFILE.author,
+        _PROFILE.api_key,
+    )
 
 
 def test_a_run_the_server_will_not_place_runs_unplaced(
@@ -2393,9 +2401,15 @@ def test_a_session_the_server_will_not_start_exits_1(
     assert (served.calls, server.started) == ([], [])
 
 
-def test_a_run_with_no_profile_and_no_daemon_exits_1(served: _Served) -> None:
+def test_a_run_with_no_profile_and_no_daemon_exits_1(
+    served: _Served,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     assert main([], profile=None) == 1
     assert served.calls == []
+    assert capsys.readouterr().err == (
+        "Error: knowop run needs a profile; run knowop login.\n"
+    )
 
 
 @pytest.mark.parametrize("raised", [KeyboardInterrupt(), asyncio.CancelledError()])
@@ -2693,6 +2707,10 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
         "read_session_parts": lambda c: c.read_session_parts(session_id),
         "read_session_records": lambda c: c.read_session_records(session_id),
         "append_records": lambda c: c.append_records(session_id),
+        # A child's session, which its agent spawned (``publisher.py``).
+        "session_start": lambda c: c.session_start(
+            SessionStart(cli="sagent", cli_session_id="a/b", spawned_by=session_id),
+        ),
         "terminal_hosts": lambda c: c.terminal_hosts(),
         "hosts_version": lambda c: c.hosts_version(since=None, wait_sec=0),
         "message_agent": lambda c: c.message_agent(

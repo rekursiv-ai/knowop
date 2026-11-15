@@ -1,23 +1,32 @@
-"""What an agent process tells Trackinizer: the root agent's records, and its live lines.
+"""What an agent process tells Trackinizer: each agent's records, and the root's lines.
 
 One observer on the root agent's runtime. Each event goes up the session's socket as
-it is published, and the journal goes up as records from each ``SaveSession``. What an
-agent sends ``user`` goes up as its ``AgentToAgentMessage``, Chat being the user. The
-agent's state is sagent's own status line, and what a slash line can name is sagent's
-own settings registry, each sent when it changes. A secret named in
+it is published, and the root's journal goes up as records from each ``SaveSession``.
+What an agent sends ``user`` goes up as its ``AgentToAgentMessage``, Chat being the
+user. The agent's state is sagent's own status line, and what a slash line can name is
+sagent's own settings registry, each sent when it changes. A secret named in
 ``TRAX_REDACT_NAMES`` is masked in each line as it is in each record; a reply is
 masked piece by piece as it streams, so a value the model writes across two pieces
 is masked only in its record.
 
+Each child an agent spawns, a watcher among them, journals in a folder of its
+spawner's (``child_journal``). Its journal goes up from its own ``SaveSession`` to a
+session of its own, started at its first save ``spawned_by`` its spawner's session,
+its label the link's note, named by its folders from the root's down
+(``projects.session_id``), as ``knowop upload`` names it. A refused child is let go;
+the root's session goes on.
+
 ::
 
     runtime event ──Publisher──▶ EventLine, StateLine, SettingsLine ──▶ the socket
-    SaveSession   ──Publisher──▶ journal lines ──▶ POST .../records (a worker thread)
+    SaveSession   ──_Journal───▶ journal lines ──▶ POST .../records (a worker thread)
+      (each agent's own: the root's to the session, a child's to the session its
+       first save starts, spawned_by its spawner's)
 
 Typical usage example:
 
-  publisher = Publisher(agent, client=client, session_id=session_id, part=part,
-                        start=start, send=socket.send)
+  publisher = Publisher(agent, team=team, client=client, session_id=session_id,
+                        part=part, start=start, send=socket.send)
   agent.runtime.observers.append(publisher)
   commands = Commands(agent, ..., say=publisher.say)
   publisher.commands = commands           # The settings' source from now on.
@@ -25,7 +34,9 @@ Typical usage example:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 from io import StringIO
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
@@ -36,12 +47,14 @@ import os
 import time
 
 from sagent.runtime import types
+from sagent.session import projects
 from sagent.session.jsonl import record_line
 from sagent.session.types import AgentToAgentMessage
 from sagent.tui.status import Status
 from trackinizer.client.errors import ClientError
 from trackinizer.client.session_socket import retry_delays
 from trackinizer.client.session_upload import (
+    PartUploader,
     append_batch,
     record_bodies,
     send_batches,
@@ -56,6 +69,7 @@ from trackinizer.wire.wire_session_relay import (
     SettingsLine,
     StateLine,
 )
+from trackinizer.wire.wire_sessions import SessionStart
 
 from knowop.agent.truncate import (
     bounded,
@@ -66,13 +80,15 @@ from knowop.process.codec import event_payload
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Awaitable, Callable, Iterable
+    from pathlib import Path
 
     from sagent.agent.agent import Agent
+    from sagent.agent.team import Team
     from sagent.session.types import SessionRecord
     from sagent.tui.slash import Commands
     from sagent.tui.types import CommandOutput
-    from trackinizer.client.session_upload import RecordAppender
+    from trackinizer.runs.redact import Redactor
     from trackinizer.wire.json_types import JSON
     from trackinizer.wire.wire_session_ir import RecordBody
 
@@ -94,10 +110,11 @@ logger = logging.getLogger(__name__)
 
 
 class Publisher:
-    """One sagent observer: uploads the root agent's records and sends its live lines.
+    """One sagent observer: uploads each agent's records and sends the root's lines.
 
     Args:
       agent: The root agent, whose journal is the session's part.
+      team: The session's agents; each child that joins with a journal goes up too.
       client: Where the records are stored.
       session_id: The session.
       part: The part's name, ``<folder>.jsonl``, the folder a uuid's hex.
@@ -110,25 +127,22 @@ class Publisher:
         self,
         agent: Agent,
         *,
-        client: RecordAppender,
+        team: Team,
+        client: PartUploader,
         session_id: UUID,
         part: str,
         start: int,
         send: Callable[[EventLine | StateLine | SettingsLine], None],
     ) -> None:
         self._agent = agent
+        self._team = team
         self._send = send
         self._status = Status(agent.runtime, spend=agent.spend_usd)
         self._commands: Commands | None = None
         # The settings last sent: first sent, and set, with ``commands``.
         self._settings: tuple[Setting, ...]
-        self._next = start
         self._client = client
-        self._session_id = session_id
-        self._part = part
         self._redactor = redactor_from_environ(os.environ)
-        self._uploading: asyncio.Task[None] | None = None
-        self._saved = asyncio.Event()
         self.ended: asyncio.Future[int] = asyncio.get_running_loop().create_future()
         """The exit code, once an upload's answer ends the process: 1 for a key or
         a session the server refused, 3 for a part another host continued."""
@@ -136,6 +150,19 @@ class Publisher:
         self.reason = ""
         """Why :attr:`ended`, once it is."""
 
+        self._root = _Journal(
+            agent,
+            client=client,
+            redactor=self._redactor,
+            opened=partial(_part, _Part(session_id=session_id, name=part, start=start)),
+            ends=self._ends,
+        )
+        # By journal, so a child finds its spawner's session (``spawner_journal``). Only
+        # the root's may be ``None``: a child with no journal sends nothing.
+        self._journals: dict[Path | None, _Journal] = {
+            agent.session.journal.path: self._root,
+        }
+        team.changes.add(self._joined)
         self._sent(self._now(since=datetime.now(UTC)))
 
     @property
@@ -158,7 +185,7 @@ class Publisher:
         if not isinstance(inner, types.SaveSession):
             self._event(event)
         elif inner is event:
-            self.upload()
+            self._root.upload()
         self._check_state()
 
     def say(self, output: CommandOutput) -> None:
@@ -179,23 +206,19 @@ class Publisher:
             self._settings = settings
             self._send(SettingsLine(settings=settings))
 
-    def upload(self) -> None:
-        """Upload the journal from where the last upload got to; one running reads it again."""
-        self._saved.set()
-        if self._uploading is None or self._uploading.done():
-            self._uploading = asyncio.create_task(self._uploaded())
-
+    # One at a time, in the order the agents joined: a spawner before its children,
+    # whose upload waits for its session. Not gathered: a gather yields to the loop
+    # even when nothing runs, and the agent would publish meanwhile.
     async def caught_up(self) -> None:
-        """Upload until the journal is caught up, or an answer ends the process."""
-        self.upload()
-        assert isinstance(self._uploading, asyncio.Task)
-        await self._uploading
+        """Upload each agent's journal until it is caught up, or an answer ends it."""
+        for each in list(self._journals.values()):
+            await each.caught_up()
 
     async def aclose(self) -> None:
-        """Stop the upload running, if one is."""
-        if self._uploading is not None:
-            self._uploading.cancel()
-            await asyncio.gather(self._uploading, return_exceptions=True)
+        """Stop each upload running, and hear of no more agents."""
+        self._team.changes.discard(self._joined)
+        for each in self._journals.values():
+            await each.aclose()
 
     def _event(self, event: object) -> None:
         """Send ``event`` up as a line of its class's name, cut to fit or not at all."""
@@ -248,31 +271,217 @@ class Publisher:
         self._state_sent_sec = time.monotonic()
         self._send(StateLine(state=state))
 
+    # A child joins before its journal opens (``AgentSpawn._start``), so its first save
+    # is heard; one with no journal, a far caller's, has nothing to send.
+    def _joined(self) -> None:
+        """Hear each agent that joined the team with a journal save it."""
+        for label in self._team:
+            agent = self._team[label]
+            path = agent.session.journal.path
+            if path is None or path in self._journals:
+                continue
+            journal = _Journal(
+                agent,
+                client=self._client,
+                redactor=self._redactor,
+                opened=partial(self._child_part, path, label=label),
+                ends=partial(self._let_go, label),
+            )
+            self._journals[path] = journal
+            agent.runtime.observers.append(journal.saved)
+
+    # Its spawner's session is opened first: a spawner saves before its model is called,
+    # so before it spawns, but its start may still be on its way.
+    async def _child_part(self, journal: Path, *, label: str) -> _Part:
+        """Start the session of the child whose journal ``journal`` is; return its part."""
+        above = projects.spawner_journal(journal)
+        spawner = None if above is None else self._journals.get(above)
+        if spawner is None:
+            raise _NoSpawnerError(f"no journal of this session spawned {label!r}")
+        spawned_by = await spawner.session()
+        return await asyncio.to_thread(
+            self._started,
+            journal,
+            label=label,
+            spawned_by=spawned_by,
+        )
+
+    def _started(self, journal: Path, *, label: str, spawned_by: UUID) -> _Part:
+        """Start the child's session, or re-open it; return where its upload begins."""
+        cli_session_id = projects.session_id(journal)
+        opened = self._client.session_start(
+            SessionStart(
+                cli="sagent",
+                cli_session_id=cli_session_id,
+                # Its own, so no live session holds it, as ``knowop upload`` names one.
+                actor=f"sagent/{cli_session_id}",
+                spawned_by=spawned_by,
+                note=label,
+            ),
+        )
+        name = f"{journal.parent.name}.jsonl"
+        stored = next(
+            (
+                part.records
+                for part in self._client.read_session_parts(opened.id)
+                if part.name == name
+            ),
+            0,
+        )
+        return _Part(session_id=opened.id, name=name, start=stored)
+
+    def _let_go(self, label: str, error: ClientError | _NoSpawnerError) -> bool:
+        """Stop uploading ``label``'s journal on an answer no retry changes."""
+        if isinstance(error, ClientError) and error.status_code not in _GONE:
+            return False
+        logger.warning("did not store agent %s: %s", label, error)
+        return True
+
+    def _ends(self, error: ClientError | _NoSpawnerError) -> bool:
+        """End the process on an answer no retry changes; say whether it did."""
+        assert isinstance(error, ClientError)
+        if error.status_code == 409 and error.code == STALE_PART:
+            self._end(3, "another host continued the session; this journal is kept")
+            return True
+        if error.status_code in _GONE:
+            self._end(1, f"the server refused the upload: {error}")
+            return True
+        return False
+
+    def _end(self, code: int, reason: str) -> None:
+        """Resolve :attr:`ended`, unless it is already done."""
+        if not self.ended.done():
+            self.reason = reason
+            self.ended.set_result(code)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Part:
+    """Where one journal's records are stored."""
+
+    session_id: UUID
+    name: str
+    """``<folder>.jsonl``, the journal's folder."""
+
+    start: int
+    """The journal's first position not yet stored."""
+
+
+class _NoSpawnerError(Exception):
+    """A journal of the team whose spawner's journal this process does not upload."""
+
+
+async def _part(part: _Part) -> _Part:
+    """Return ``part``: the root's, known before its first upload."""
+    return part
+
+
+class _Journal:
+    """One agent's journal, uploaded as one part of its session from where it was stored.
+
+    Args:
+      agent: The agent whose journal it is.
+      client: Where the records are stored.
+      redactor: Masks secret values in each record; ``None`` keeps them.
+      opened: Returns where its records are stored; awaited once, at the first upload.
+      ends: Says whether an answer no retry changes ends this journal's upload.
+
+    """
+
+    def __init__(
+        self,
+        agent: Agent,
+        *,
+        client: PartUploader,
+        redactor: Redactor | None,
+        opened: Callable[[], Awaitable[_Part]],
+        ends: Callable[[ClientError | _NoSpawnerError], bool],
+    ) -> None:
+        self._agent = agent
+        self._client = client
+        self._redactor = redactor
+        self._opened = opened
+        self._ends = ends
+        self._part: _Part | None = None
+        self._next = 0
+        self._gone = False
+        self._uploading: asyncio.Task[None] | None = None
+        self._saved = asyncio.Event()
+        # Set once its session is opened, or it is let go.
+        self._settled = asyncio.Event()
+
+    async def session(self) -> UUID:
+        """Return its session once its first upload opens it.
+
+        Returns:
+          session_id: The session its records are stored in.
+
+        Raises:
+          _NoSpawnerError: It was let go before its session opened, so none will.
+
+        """
+        _ = await self._settled.wait()
+        if self._part is None:
+            raise _NoSpawnerError("the session of its spawner was not stored")
+        return self._part.session_id
+
+    def saved(self, event: types.RuntimeEvent) -> None:
+        """Upload at the agent's own ``SaveSession``."""
+        if isinstance(event, types.SaveSession):
+            self.upload()
+
+    def upload(self) -> None:
+        """Upload from where the last upload got to; one running reads it again."""
+        self._saved.set()
+        if not self._gone and (self._uploading is None or self._uploading.done()):
+            self._uploading = asyncio.create_task(self._uploaded())
+
+    async def caught_up(self) -> None:
+        """Upload until the journal is caught up, or an answer ends it."""
+        self.upload()
+        if self._uploading is not None:
+            await self._uploading
+
+    async def aclose(self) -> None:
+        """Stop the upload running, if one is."""
+        if self._uploading is not None:
+            self._uploading.cancel()
+            await asyncio.gather(self._uploading, return_exceptions=True)
+
     # Read on the runtime's loop, which writes the journal first; turned into lines and
     # sent on a worker thread. A pass reads the journal as it stood when the pass began,
     # so a save during it asks for one more: a record written meanwhile goes with this
     # upload, not with the next ``SaveSession``, which may be the person's next line.
     async def _uploaded(self) -> None:
-        """Upload the journal until it is caught up, retrying an outage."""
+        """Open the session once, then upload until caught up, retrying an outage."""
         delays = retry_delays()
         while True:
             self._saved.clear()
-            records = self._agent.session.history(self._next)
-            pending = await asyncio.to_thread(self._bodies, records, start=self._next)
-            if not pending:
-                if not self._saved.is_set():
-                    return
-                continue
-            count = len(pending)
             try:
-                refused = await asyncio.to_thread(
-                    send_batches,
-                    pending,
-                    send=self._appended,
+                part = await self._part_opened()
+                records = self._agent.session.history(self._next)
+                pending = await asyncio.to_thread(
+                    self._bodies,
+                    records,
+                    start=self._next,
                 )
-            except ClientError as error:
-                self._next += count - len(pending)
+                if not pending:
+                    if not self._saved.is_set():
+                        return
+                    continue
+                count = len(pending)
+                try:
+                    refused = await asyncio.to_thread(
+                        send_batches,
+                        pending,
+                        send=partial(self._appended, part),
+                    )
+                finally:
+                    self._next += count - len(pending)
+            except (ClientError, _NoSpawnerError) as error:
                 if self._ends(error):
+                    self._gone = True
+                    self._settled.set()
                     return
                 logger.warning("upload failed, trying again: %s", error)
                 await asyncio.sleep(next(delays))
@@ -282,8 +491,15 @@ class Publisher:
                     "the server refused record %d; a stand-in holds it",
                     body.idx,
                 )
-            self._next += count
             delays = retry_delays()
+
+    async def _part_opened(self) -> _Part:
+        """Return where the records are stored, opening it at the first call."""
+        if self._part is None:
+            self._part = await self._opened()
+            self._next = self._part.start
+            self._settled.set()
+        return self._part
 
     # One reader over all the lines: a line sagent's ``record_line`` wrote reads as
     # exactly one record, so a record's position is its line's.
@@ -302,33 +518,17 @@ class Publisher:
             bounded=bounded,
         )
 
-    def _appended(self, batch: list[RecordBody]) -> None:
+    def _appended(self, part: _Part, batch: list[RecordBody]) -> None:
         """Append one batch of the part's records."""
         append_batch(
             self._client,
-            session=self._session_id,
-            name=self._part,
-            ir_id=UUID(hex=self._part.removesuffix(".jsonl")),
+            session=part.session_id,
+            name=part.name,
+            ir_id=UUID(hex=part.name.removesuffix(".jsonl")),
             encoding={},
             batch=batch,
             format="sagent",
         )
-
-    def _ends(self, error: ClientError) -> bool:
-        """End the process on an answer no retry changes; say whether it did."""
-        if error.status_code == 409 and error.code == STALE_PART:
-            self._end(3, "another host continued the session; this journal is kept")
-            return True
-        if error.status_code in _GONE:
-            self._end(1, f"the server refused the upload: {error}")
-            return True
-        return False
-
-    def _end(self, code: int, reason: str) -> None:
-        """Resolve :attr:`ended`, unless it is already done."""
-        if not self.ended.done():
-            self.reason = reason
-            self.ended.set_result(code)
 
 
 def _harvested(commands: Commands) -> tuple[Setting, ...]:

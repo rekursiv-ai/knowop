@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import asyncio
 import contextlib
@@ -16,25 +16,28 @@ import time
 
 from sagent.agent.agent import Agent
 from sagent.agent.agents_md import AgentsMdConfig
-from sagent.model.scripted import ScriptedProvider, reply
+from sagent.agent.team import Team
+from sagent.model.scripted import ScriptedProvider, call, reply
 from sagent.providers.catalog import ModelCatalog
 from sagent.runtime import types
 from sagent.session.jsonl import JsonlJournal
 from sagent.session.types import AgentToAgentMessage, UserMessage
 from sagent.settings.harvest import harvest
+from sagent.tools.agent_spawn import AgentSpawn
 from sagent.tools.types import ToolContext
 from sagent.tui.prompt import Panes
 from sagent.tui.slash import Commands
 from sagent.tui.types import CommandOutput
 from trackinizer.client.errors import ClientError
 from trackinizer.client.session_upload import send_batches
-from trackinizer.wire.wire_session_ir import ManifestBody, RecordBody
+from trackinizer.wire.wire_session_ir import ManifestBody, PartBody, RecordBody
 from trackinizer.wire.wire_session_relay import (
     STALE_PART,
     EventLine,
     SettingsLine,
     StateLine,
 )
+from trackinizer.wire.wire_sessions import SessionStart, SessionStartResponse
 
 import pytest
 
@@ -58,11 +61,16 @@ _PART: Final = f"{_FOLDER}.jsonl"
 
 @dataclass(slots=True, kw_only=True)
 class _Store:
-    """Trackinizer's records route: it keeps what is appended, or answers as told."""
+    """Trackinizer as the publisher meets it: the root's records route, and a start
+    and a parts read for each child's session, each keeping what it is sent or
+    answering as told.
+    """
 
     appended: list[tuple[str, ManifestBody, list[RecordBody]]] = field(
         default_factory=list[tuple[str, ManifestBody, list[RecordBody]]],
     )
+    """The root session's appends."""
+
     failing: list[ClientError | None] = field(default_factory=list[ClientError | None])
     """What the next appends raise, in turn; ``None`` lets one through."""
 
@@ -72,6 +80,38 @@ class _Store:
     refusing: str = ""
     """A kind of record the server cannot store; empty for none."""
 
+    starts: list[SessionStart] = field(default_factory=list[SessionStart])
+    """Each child's start, in order."""
+
+    start_failing: list[ClientError | None] = field(
+        default_factory=list[ClientError | None],
+    )
+    """What the next starts raise, in turn; ``None`` lets one through."""
+
+    stored: int = 0
+    """How many records the server holds of each child's part already."""
+
+    children: dict[UUID, tuple[str, list[RecordBody]]] = field(
+        default_factory=dict[UUID, tuple[str, list[RecordBody]]],
+    )
+    """Each child's session: its part's name, and the records appended to it."""
+
+    def session_start(self, body: SessionStart) -> SessionStartResponse:
+        if self.start_failing and (error := self.start_failing.pop(0)) is not None:
+            raise error
+        self.starts.append(body)
+        assert isinstance(body.cli_session_id, str)
+        session_id = uuid5(NAMESPACE_URL, body.cli_session_id)
+        part = f"{body.cli_session_id.rpartition('/')[2]}.jsonl"
+        _ = self.children.setdefault(session_id, (part, []))
+        return SessionStartResponse(id=session_id, seq=0)
+
+    def read_session_parts(self, session_id: UUID) -> list[PartBody]:
+        name, _ = self.children[session_id]
+        if not self.stored:
+            return []
+        return [PartBody(part=0, name=name, format="sagent", records=self.stored)]
+
     def append_records(
         self,
         session_id: UUID,
@@ -80,7 +120,10 @@ class _Store:
         manifest: ManifestBody,
         records: Sequence[RecordBody],
     ) -> object:
-        assert session_id == _SESSION
+        if session_id != _SESSION:
+            assert (name, manifest.name) == (self.children[session_id][0],) * 2
+            self.children[session_id][1].extend(records)
+            return None
         if self.held is not None:
             assert self.held.wait(5)
         if self.failing and (error := self.failing.pop(0)) is not None:
@@ -102,6 +145,7 @@ class _Screen:
 @dataclass(slots=True, kw_only=True)
 class _Published:
     agent: Agent
+    team: Team
     publisher: Publisher
     store: _Store
     sent: list[EventLine | StateLine | SettingsLine]
@@ -116,17 +160,31 @@ class _Published:
         return [line for line in self.sent if isinstance(line, SettingsLine)]
 
 
+# Given ``children``, it spawns, and they answer them in turn.
+#
+# Only a root that spawns joins the team: joining wakes it, which its other tests would
+# see as one more ``AgentIdle``.
 @contextlib.asynccontextmanager
 async def _published(
     tmp_path: Path,
     *replies: Reply,
     start: int = 0,
     store: _Store | None = None,
+    children: Sequence[Reply] = (),
 ) -> AsyncGenerator[_Published]:
+    """Publish a root agent; given ``children``, it spawns, and they answer them."""
     provider = ScriptedProvider(replies=replies)
+    team = Team(
+        catalog=ModelCatalog(
+            factories={
+                "scripted": functools.partial(ScriptedProvider, replies=children),
+            },
+        ),
+    )
     journal = JsonlJournal(tmp_path / _FOLDER / "session.jsonl")
     agent = Agent(
         model=provider["scripted"],
+        tools=[AgentSpawn(team=team)] if children else [],
         journal=journal,
         tool_context=ToolContext(cwd=tmp_path),
         system_prompt="S",
@@ -135,11 +193,14 @@ async def _published(
             user_dir=tmp_path / "user",
         ),
     )
+    if children:
+        _ = team.join(agent)
     sent: list[EventLine | StateLine | SettingsLine] = []
-    async with journal, agent:
+    async with journal, agent, team:
         store = store if store is not None else _Store()
         publisher = Publisher(
             agent,
+            team=team,
             client=store,
             session_id=_SESSION,
             part=_PART,
@@ -148,7 +209,13 @@ async def _published(
         )
         agent.runtime.observers.append(publisher)
         try:
-            yield _Published(agent=agent, publisher=publisher, store=store, sent=sent)
+            yield _Published(
+                agent=agent,
+                team=team,
+                publisher=publisher,
+                store=store,
+                sent=sent,
+            )
         finally:
             await publisher.aclose()
 
@@ -225,6 +292,159 @@ async def test_a_child_s_save_session_is_not_sent_at_any_depth(tmp_path: Path) -
 
     assert [line.kind for line in p.events()] == ["ChildEvent"]
     assert p.store.appended == []
+
+
+# The root spawns ``kid``, who spawns ``grandkid``; each idles with what it says last.
+_SPAWNS_KID: Final = (
+    reply(calls=[call("AgentSpawn", "s1", prompt="dig", label="kid")]),
+    reply("root done"),
+)
+_KID_SPAWNS_GRANDKID: Final = (
+    reply(calls=[call("AgentSpawn", "s2", prompt="deeper", label="grandkid")]),
+    reply("grandkid done"),
+    reply("kid done"),
+)
+
+
+@pytest.mark.asyncio
+async def test_each_child_goes_up_to_a_session_of_its_own_spawned_by_its_spawners(
+    tmp_path: Path,
+) -> None:
+    async with _published(
+        tmp_path,
+        *_SPAWNS_KID,
+        children=_KID_SPAWNS_GRANDKID,
+    ) as p:
+        _ = await p.agent.send("go")
+        await p.publisher.caught_up()
+        paths = {label: p.team[label].session.journal.path for label in p.team}
+        histories = {label: list(p.team[label].session.history()) for label in p.team}
+
+    kid, grandkid = paths["kid"], paths["grandkid"]
+    assert kid is not None
+    assert grandkid is not None
+    kid_id = f"{_FOLDER}/{kid.parent.name}"
+    grandkid_id = f"{kid_id}/{grandkid.parent.name}"
+    assert [(s.cli_session_id, s.actor, s.note) for s in p.store.starts] == [
+        (kid_id, f"sagent/{kid_id}", "kid"),
+        (grandkid_id, f"sagent/{grandkid_id}", "grandkid"),
+    ]
+    assert [s.spawned_by for s in p.store.starts] == [
+        _SESSION,
+        uuid5(NAMESPACE_URL, kid_id),
+    ]
+    for label, cli_id in (("kid", kid_id), ("grandkid", grandkid_id)):
+        _, stored = p.store.children[uuid5(NAMESPACE_URL, cli_id)]
+        assert [r.idx for r in stored] == list(range(len(histories[label])))
+    assert p.store.positions() == list(range(len(histories["Agent"])))
+
+
+@pytest.mark.asyncio
+async def test_a_child_s_upload_starts_where_its_part_was_stored_to(
+    tmp_path: Path,
+) -> None:
+    store = _Store(stored=2)
+    async with _published(
+        tmp_path,
+        *_SPAWNS_KID,
+        children=_KID_SPAWNS_GRANDKID[1:],
+        store=store,
+    ) as p:
+        _ = await p.agent.send("go")
+        await p.publisher.caught_up()
+
+    [(_, stored)] = store.children.values()
+    assert stored[0].idx == 2
+
+
+@pytest.mark.asyncio
+async def test_an_outage_opening_a_child_s_session_is_tried_again(
+    tmp_path: Path,
+) -> None:
+    store = _Store(start_failing=[ClientError("down", status_code=503)])
+    async with _published(
+        tmp_path,
+        *_SPAWNS_KID,
+        children=_KID_SPAWNS_GRANDKID[1:],
+        store=store,
+    ) as p:
+        _ = await p.agent.send("go")
+        await p.publisher.caught_up()
+
+    assert [s.note for s in store.starts] == ["kid"]
+    [(_, stored)] = store.children.values()
+    assert stored
+
+
+@pytest.mark.asyncio
+async def test_a_child_the_server_refuses_is_let_go_and_the_root_goes_on(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _Store(start_failing=[ClientError("not yours", status_code=403)] * 9)
+    async with _published(
+        tmp_path,
+        *_SPAWNS_KID,
+        children=_KID_SPAWNS_GRANDKID[1:],
+        store=store,
+    ) as p:
+        _ = await p.agent.send("go")
+        await p.publisher.caught_up()
+        stored = len(list(p.agent.session.history()))
+
+    assert not p.publisher.ended.done()
+    assert len(store.start_failing) == 8
+    assert store.positions() == list(range(stored))
+    assert any(
+        "kid" in warned and "not yours" in warned for warned in _warnings(caplog)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_child_of_a_refused_child_is_let_go_too(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Its spawner's session never opens, so it waits for none."""
+    store = _Store(start_failing=[ClientError("not yours", status_code=403)])
+    async with _published(
+        tmp_path,
+        *_SPAWNS_KID,
+        children=_KID_SPAWNS_GRANDKID,
+        store=store,
+    ) as p:
+        _ = await p.agent.send("go")
+        await p.publisher.caught_up()
+
+    assert store.starts == []
+    assert any(
+        "grandkid" in warned and "spawner was not stored" in warned
+        for warned in _warnings(caplog)
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_agent_whose_spawner_this_session_does_not_hold_is_let_go(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async with _published(tmp_path) as p:
+        journal = JsonlJournal(tmp_path / "elsewhere" / str(uuid4()) / "session.jsonl")
+        stray = Agent(
+            model=ScriptedProvider()["scripted"],
+            journal=journal,
+            tool_context=ToolContext(cwd=tmp_path),
+        )
+        _ = p.team.join(stray, label="stray")
+        async with journal, stray:
+            stray.runtime.publish(types.SaveSession())
+            await p.publisher.caught_up()
+
+    assert p.store.starts == []
+    assert any(
+        "stray" in warned and "no journal of this session" in warned
+        for warned in _warnings(caplog)
+    )
 
 
 @pytest.mark.asyncio
@@ -321,6 +541,7 @@ async def test_the_first_state_counts_what_a_resumed_session_spent(
         p.agent.spend_usd = 1.25
         _ = Publisher(
             p.agent,
+            team=p.team,
             client=p.store,
             session_id=_SESSION,
             part=_PART,
@@ -504,6 +725,7 @@ async def test_a_refused_key_or_a_gone_session_ends_the_process(
 
     assert p.publisher.ended.result() == 1
     assert "refused the upload" in p.publisher.reason
+    assert store.appended == []
 
 
 @pytest.mark.asyncio
@@ -511,12 +733,30 @@ async def test_a_part_another_host_continued_ends_the_process_with_3(
     tmp_path: Path,
 ) -> None:
     stale = ClientError("stale", status_code=409, code=STALE_PART)
-    async with _published(tmp_path, reply("hello"), store=_Store(failing=[stale])) as p:
+    store = _Store(failing=[stale])
+    async with _published(tmp_path, reply("hello"), store=store) as p:
         _ = await p.agent.send("hi")
         await p.publisher.caught_up()
 
     assert p.publisher.ended.result() == 3
-    assert "another host" in p.publisher.reason
+    assert p.publisher.reason == (
+        "another host continued the session; this journal is kept"
+    )
+    assert store.appended == []
+
+
+@pytest.mark.asyncio
+async def test_another_conflict_is_tried_again_and_ends_nothing(
+    tmp_path: Path,
+) -> None:
+    other = ClientError("busy", status_code=409, code="busy")
+    store = _Store(failing=[other])
+    async with _published(tmp_path, reply("hello"), store=store) as p:
+        _ = await p.agent.send("hi")
+        await p.publisher.caught_up()
+
+    assert not p.publisher.ended.done()
+    assert store.appended
 
 
 @pytest.mark.asyncio

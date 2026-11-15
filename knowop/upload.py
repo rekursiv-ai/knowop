@@ -4,13 +4,14 @@
 found in folders, and sends each as an AgentSession under the CLI's own id for it, so a
 second upload lands on the same one and sends only the records it lacks. A session's
 sub-agents go up as AgentSessions of their own, each after the session that spawned
-it and linked to it by a ``produced_by`` edge, as a recorded run's were. A session
-the server holds already keeps the audience it has, whatever the upload asks.
+it, started ``spawned_by`` it: the server links it ``produced_by`` it and opens it in
+its audience, as a live run's children are. A session the server holds already keeps
+the audience it has, whatever the upload asks.
 
 ::
 
     PATH... ──plan──▶ Session: file, format, CLI id, what spawned it
-            ──upload──▶ start ─▶ parts held ─▶ records not held ─▶ end ─▶ produced_by
+            ──upload──▶ start (spawned_by) ─▶ parts held ─▶ records not held ─▶ end
                         (sessions side by side, ``jobs`` at a time, each a sub-agent's
                          spawner first)
 
@@ -46,7 +47,7 @@ import re
 
 from trackinizer.client.errors import ClientError
 from trackinizer.client.session_upload import (
-    RecordAppender,
+    PartUploader,
     append_batch,
     record_bodies,
     send_batches,
@@ -62,7 +63,7 @@ from trackinizer.sagent.scripts.convert_session.convert import (
     transcripts,
 )
 from trackinizer.sagent.session.jsonl import read_record
-from trackinizer.sagent.session.projects import is_session
+from trackinizer.sagent.session.projects import session_id, spawner_journal
 from trackinizer.sagent.session.types import TurnContext, UncategorizedRecord
 from trackinizer.types.session_records import record_time
 from trackinizer.wire.audience import PRIVATE
@@ -81,7 +82,6 @@ if TYPE_CHECKING:
     from trackinizer.runs.adapters.custom_types import Subagent
     from trackinizer.runs.redact import Redactor
     from trackinizer.sagent.session.types import SessionRecord
-    from trackinizer.wire.wire_session_ir import PartBody
     from trackinizer.wire.wire_sessions import SessionStartResponse
 
 
@@ -152,31 +152,11 @@ class Uploaded:
     """Why it failed; ``""`` when it went up."""
 
 
-class SessionClient(RecordAppender, Protocol):
+class SessionClient(PartUploader, Protocol):
     """The ``Client`` calls an upload makes."""
-
-    def session_start(self, body: SessionStart) -> SessionStartResponse:
-        """Open the session, or re-open the one the caller holds under its CLI id."""
-        ...
-
-    def read_session_parts(self, session_id: UUID) -> list[PartBody]:
-        """Return the parts the server holds of the session."""
-        ...
 
     def session_end(self, session_id: UUID, body: SessionEnd | None = None) -> object:
         """End the session."""
-        ...
-
-    def add_edge(
-        self,
-        from_id: UUID,
-        to_id: UUID,
-        edge_kind: str,
-        *,
-        actor: str,
-        note: str = "",
-    ) -> object:
-        """Add an edge, or annotate the one there."""
         ...
 
     def close(self) -> None:
@@ -429,7 +409,7 @@ def _sent(
     parent: UUID | None,
     redactor: Redactor | None,
 ) -> Uploaded:
-    """Send ``session``'s records the server lacks, then link it to ``parent``."""
+    """Send ``session``, spawned by ``parent``, and its records the server lacks."""
     with open_transcript(session.path, errors="replace") as handle:
         read = _Read(_READERS[session.format](handle))
         opened = client.session_start(
@@ -443,6 +423,8 @@ def _sent(
                 # The audience is for a session this start mints: one sent before, or
                 # recorded live, stays with the readers it has.
                 keep_audience=True,
+                spawned_by=parent,
+                note="" if parent is None else session.note,
             ),
         )
         try:
@@ -456,14 +438,6 @@ def _sent(
             )
         finally:
             _ = client.session_end(opened.id, SessionEnd(ended=read.ended()))
-    if parent is not None:
-        _ = client.add_edge(
-            opened.id,
-            parent,
-            "produced_by",
-            actor=session.format,
-            note=session.note,
-        )
     return Uploaded(
         session=session,
         agent_session=opened.id,
@@ -783,12 +757,12 @@ class _Sagent:
 
         """
         root = path
-        while (up := _spawner_journal(root)) is not None:
+        while (up := spawner_journal(root)) is not None:
             root = up
         beneath = sorted(
             journal
             for journal in root.parent.rglob("session.jsonl")
-            if _spawner_journal(journal) is not None
+            if spawner_journal(journal) is not None
         )
         return [root, *beneath]
 
@@ -804,13 +778,13 @@ class _Sagent:
             under, if any.
 
         """
-        spawner = _spawner_journal(path)
-        session = Session(format=found, id=_sagent_id(path), path=path)
+        spawner = spawner_journal(path)
+        session = Session(format=found, id=session_id(path), path=path)
         if spawner is None:
             return session
         return replace(
             session,
-            spawned_by=_sagent_id(spawner),
+            spawned_by=session_id(spawner),
             note=self._label(spawner).get(path.parent.name, ""),
         )
 
@@ -819,26 +793,6 @@ class _Sagent:
         if journal not in self._labels:
             self._labels[journal] = _standing_labels(journal)
         return self._labels[journal]
-
-
-# A spawned agent's folder sits in its spawner's, so a session's folder in a project
-# folder that holds an old sagent's log is no spawned agent: sagent's own rule says so.
-def _spawner_journal(path: Path) -> Path | None:
-    """Return the journal of the agent that spawned ``path``'s, or ``None`` for a root."""
-    up = path.parent.parent / "session.jsonl"
-    return up if up.is_file() and not is_session(path) else None
-
-
-# Its folders from the root session's down: a spawned agent's folder is a uuid today but
-# was its label, and two sessions each spawn a ``watcher``.
-def _sagent_id(path: Path) -> str:
-    """Return the id of the session ``path`` is the journal of."""
-    folders = [path.parent.name]
-    here = path
-    while (up := _spawner_journal(here)) is not None:
-        folders.append(up.parent.name)
-        here = up
-    return "/".join(reversed(folders))
 
 
 # A child stands in its spawner's journal as the record that starts it again: its label

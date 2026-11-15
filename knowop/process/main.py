@@ -71,7 +71,7 @@ from trackinizer.client.session_socket import (
     SocketClient,
     SocketClosedError,
 )
-from trackinizer.client.session_upload import RecordAppender
+from trackinizer.client.session_upload import PartUploader
 from trackinizer.trax.canvas import canvas_from_env
 from trackinizer.wire.refs import UuidRef
 from trackinizer.wire.wire_science_chat import chat_session_id
@@ -270,7 +270,7 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
 
 class ServeClient(
     PartReader,
-    RecordAppender,
+    PartUploader,
     HostLister,
     SocketClient,
     AgentMessenger,
@@ -709,6 +709,7 @@ async def _live(
     """Run the open agent live until a stop, its time limit, a quit, or an answer that ends it."""
     publisher = Publisher(
         o.agent,
+        team=o.team,
         client=client,
         session_id=session_id,
         part=choice.part,
