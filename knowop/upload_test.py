@@ -62,7 +62,11 @@ class _Held:
 
 @dataclass(slots=True, kw_only=True)
 class _Server:
-    """Trackinizer as an upload meets it: a start re-opens the session it holds."""
+    """Trackinizer as an upload meets it: a start re-opens the session it holds.
+
+    A start ``spawned_by`` another links its session ``produced_by`` that one, and a
+    session it mints takes that one's audience.
+    """
 
     held: dict[str, _Held] = field(default_factory=dict[str, _Held])
     """By CLI id."""
@@ -70,8 +74,6 @@ class _Server:
     edges: list[tuple[UUID, UUID, str, str]] = field(
         default_factory=list[tuple[UUID, UUID, str, str]],
     )
-    edge_actors: list[str] = field(default_factory=list[str])
-    """Who each edge was added as."""
 
     calls: list[str] = field(default_factory=list[str])
     refusing: frozenset[int] = frozenset()
@@ -110,10 +112,14 @@ class _Server:
             audience = (
                 "private" if body.private and not self.predates_hiding else "open"
             )
+            if body.spawned_by is not None:
+                audience = self._by_id(body.spawned_by).audience
             held = _Held(id=uuid4(), start=body, audience=audience)
             self.held[body.cli_session_id] = held
         elif body.private and not body.keep_audience:
             held.audience = "private"
+        if body.spawned_by is not None:
+            self.edges.append((held.id, body.spawned_by, "produced_by", body.note))
         return SessionStartResponse(
             id=held.id,
             seq=0,
@@ -159,20 +165,6 @@ class _Server:
         self.calls.append("end")
         assert body is not None
         self._by_id(session_id).ends.append(body)
-        return None
-
-    def add_edge(
-        self,
-        from_id: UUID,
-        to_id: UUID,
-        edge_kind: str,
-        *,
-        actor: str,
-        note: str = "",
-    ) -> object:
-        self.edge_actors.append(actor)
-        self.calls.append("edge")
-        self.edges.append((from_id, to_id, edge_kind, note))
         return None
 
     def session(self, cli_id: str) -> _Held:
@@ -495,7 +487,6 @@ def test_claude_sub_agents_go_after_their_spawner_each_linked_to_it(
         (ids["s1/agent-a1"], ids["s1"], "produced_by", "general-purpose: Dig (t1)"),
         (ids["s1/agent-a2"], ids["s1/agent-a1"], "produced_by", ""),
     ]
-    assert server.edge_actors == ["claude", "claude"]
     assert [r.error for r in results] == ["", "", ""]
 
 
@@ -793,7 +784,8 @@ def test_a_second_upload_sends_nothing_and_lands_on_the_same_sessions(
 
     assert [r.agent_session for r in again] == [r.agent_session for r in first]
     assert [(r.sent, r.held) for r in again] == [(0, 6), (0, 6)]
-    assert server.calls == ["start", "parts", "end", "start", "parts", "end", "edge"]
+    assert server.calls == ["start", "parts", "end", "start", "parts", "end"]
+    assert len(set(server.edges)) == 1
     assert len(server.held) == 2
 
 

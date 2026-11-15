@@ -7,6 +7,14 @@ All notable knowop changes are documented here. This project follows
 
 ### Added
 
+- `knowop run` stores each child an agent spawns, a watcher among them, as an
+  AgentSession of its own, linked `produced_by` the session that spawned it, at any
+  depth, on your own host and as a remote agent. A child's session opens at its
+  first save, named by its journal's folders from the root's down, its label the
+  link's note; it is read by whoever reads its spawner's. A restarted process
+  continues the same child's session from where it was stored. A child the server
+  refuses is left out, and the root's session goes on. `knowop upload` links a
+  sub-agent the same way, in its start.
 - `knowop run --session` and `--stop` take a session's number (`AgentSession#412`,
   or `412`) as well as its UUID. Chat's ⋯ menu copies either: Copy session # and
   Copy UUID.
