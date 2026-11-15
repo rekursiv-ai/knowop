@@ -314,14 +314,7 @@ def test_knowops_help_needs_no_login_and_is_knowop_runs_usage(
 def test_sagents_command_runs_this_installs_sagent_with_the_words_given() -> None:
     command = sagent_command(["login", "--provider", "oaisub"])
 
-    assert command[1:] == [
-        "-P",
-        "-m",
-        "trackinizer.sagent",
-        "login",
-        "--provider",
-        "oaisub",
-    ]
+    assert command[1:] == ["-P", "-m", "sagent", "login", "--provider", "oaisub"]
 
 
 def test_the_parser_is_knowop_runs_and_takes_no_abbreviation() -> None:
