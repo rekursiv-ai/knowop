@@ -435,7 +435,7 @@ def test_by_default_it_serves_its_own_account_asks_the_longest_hold_and_rests_5_
 
     # Its own host's start: the flags are passed on.
     assert (ended.process_id, ended.exit_code) == (start.process_id, 0)
-    assert _said(start)["argv"] == [_URL, "--model", "opus"]
+    assert _said(start)["argv"] == [_URL, "--", "--model", "opus"]
     assert {wait_sec for _, _, wait_sec in client.waits} == {WAIT_MAX_SEC}
 
 
@@ -618,11 +618,15 @@ def test_a_start_runs_in_its_folder_with_its_flags_and_reads_the_start_on_stdin(
     tmp_path: Path,
 ) -> None:
     start = _start(cwd=str(tmp_path), args=("--model", "opus"))
+    timed = _start(cwd=str(tmp_path), args=("--time", "0-01:30:00", "--model", "opus"))
 
     said, ended = _served(start)
+    said_timed, _ = _served(timed)
 
     assert Path(said["cwd"]).resolve() == tmp_path.resolve()
-    assert said["argv"] == [_URL, "--model", "opus"]
+    assert said["argv"] == [_URL, "--", "--model", "opus"]
+    # The time limit ``--on`` hands is knowop's own, before sagent's flags.
+    assert said_timed["argv"] == [_URL, "--time", "0-01:30:00", "--", "--model", "opus"]
     assert said["stdin"] == start.model_dump_json() + "\n"
     assert ServeSession.model_validate_json(said["stdin"]).token == _TOKEN
     assert (ended.process_id, ended.exit_code) == (start.process_id, 0)
@@ -853,7 +857,7 @@ def test_a_persons_own_host_gives_the_child_its_folder_environment_and_flags(
     assert ended.exit_code == 0
     assert Path(said["cwd"]).resolve() == tmp_path.resolve()
     assert (env["NOT_LISTED"], env["HOME"]) == ("x", os.environ["HOME"])
-    assert said["argv"] == [_URL]
+    assert said["argv"] == [_URL, "--"]
     # Not the process's own: a person's folder outlives it.
     assert tmp_path.is_dir()
 
@@ -870,7 +874,7 @@ def test_a_place_gives_the_child_its_folder_its_environment_alone_and_its_flags(
     assert (ended.process_id, ended.exit_code) == (start.process_id, 0)
     assert Path(said["cwd"]).resolve() == owned.resolve()
     assert _env(said) == {"PATH": os.environ["PATH"], "ONLY": "listed"}
-    assert said["argv"] == [_URL, "--tools", "RemoteTool"]
+    assert said["argv"] == [_URL, "--", "--tools", "RemoteTool"]
     assert ServeSession.model_validate_json(said["stdin"]) == start
 
 
@@ -1165,7 +1169,7 @@ def test_a_process_gets_a_scope_of_its_own_where_systemd_run_works(
     probe = ["systemd-run", "--user", "--scope", "--quiet", "--", "true"]
     if code:
         assert systemd.asked == [probe]
-        assert recorded.argvs == [["knowop-stub", _URL, "--add-dir", "$work"]] * 2
+        assert recorded.argvs == [["knowop-stub", _URL, "--", "--add-dir", "$work"]] * 2
         return
     assert systemd.asked == [probe, *[["systemd-run", "--version"]] * 2]
     assert recorded.argvs == [
@@ -1179,6 +1183,7 @@ def test_a_process_gets_a_scope_of_its_own_where_systemd_run_works(
             "--",
             "knowop-stub",
             _URL,
+            "--",
             "--add-dir",
             "$work",
         ]

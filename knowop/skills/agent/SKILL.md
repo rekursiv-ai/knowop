@@ -9,11 +9,16 @@ description: ALWAYS invoke this skill before running sagent with knowop run, sta
 terminal and headless elsewhere. Its session is live in Chat: each event goes up as
 it happens, its journal is stored as records, and a line sent from Chat reaches the
 agent as one typed at its screen. A first run logs in when knowop has no login.
+Every session opens in Chat the same way, however it was started; Chat names where
+its agent runs.
 
 `knowop run --help` is the source of truth for the flags; if this skill disagrees,
 trust the help.
 
 ## Run
+
+`knowop run [KNOWOP FLAGS] -- [SAGENT ARGUMENTS]`: knowop's flags first, then
+everything of sagent's after `--`, untouched.
 
 ```bash
 knowop run                          # sagent here, live in Chat
@@ -22,20 +27,29 @@ knowop run --session ID             # continue session ID here
 knowop run --on lab --cwd ~/work    # start it on your host lab, through its daemon
 knowop run --stop ID                # stop session ID's agent, wherever it runs
 knowop run --time 2:00:00           # end 2 h after it starts, as a stop does
-knowop run --model opus             # any other flag is sagent's own
+knowop run -- --model opus          # sagent's settings go after --
+knowop run -- login --provider oaisub   # sagent's sign-in, on this computer
+knowop run -- --help                # sagent's own flags and actions
 ```
 
 - The first line a run prints on stdout is its session's id.
+- A sagent flag before `--` is refused, and the error shows the command with it
+  after `--`; `--profile` goes before `run` (`knowop --profile NAME run ...`).
+  A refused or mistyped command opens no session.
+- An action after `--` (`login`, `mcp ...`, `--help`) runs on this computer as
+  sagent's own command and opens no session; it takes none of knowop's flags. A
+  sign-in made here is used by every later `knowop run` here.
 - Every sagent flag works but those that pick a journal (`--resume`, `--continue`,
-  `--ephemeral` and their kin): knowop keeps the session's journal.
+  `--ephemeral`, `--session` and their kin): knowop keeps the session's journal.
 - `--on NAME` asks the host's daemon (`knowop connect` there) to start the agent,
   waits for it to attach, prints the session's id and exits. With no name, the
   server's own host runs it.
 - A run says so when this computer is not connected; a connected computer also
   opens its terminal in Chat.
 - Exit codes: 0 after a stop or a quit; 1 for a start error, a refused key or a
-  session that is gone; 3 when another process holds the session; 4 when a headless
-  run went 10 minutes without its socket; 130 on Ctrl-C.
+  session that is gone; 2 for a refused command; 3 when another process holds the
+  session; 4 when a headless run went 10 minutes without its socket; 130 on Ctrl-C.
+  An action exits as sagent's command does.
 
 ## Reach it
 
@@ -60,8 +74,7 @@ knowop run --model opus             # any other flag is sagent's own
 
 ## The canvas
 
-A line you send from Chat, or from the tab of a session that is no chat's, names
-the canvas it came from, once, after its words. Another person's line in a chat
+A line you send from Chat names the canvas it came from, once, after its words. Another person's line in a chat
 you share names none: the agent acts for you, on your canvas. Every agent of the
 run then acts on that canvas with its `Canvas` tool, with or without a shell, on
 your own host and on Our cloud alike. Its `action` is the verb `knowop canvas`

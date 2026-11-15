@@ -23,7 +23,9 @@ See [Install](#install) for additional details.
 knowop connect          # this computer: log in, enroll, serve it in the background
 knowop logs -f          # follow this computer's connect
 knowop run              # sagent in this folder, live in Chat
+knowop run --headless -- --effort high   # sagent's settings go after --
 knowop run --on lab-box # sagent on your computer lab-box, through its connect
+knowop run -- login --provider oaisub    # sagent's sign-in, on this computer
 knowop job submit -- python train.py   # a job on a GPU node, from this repository
 knowop job submit --host lab-box -- python train.py   # on your computer lab-box
 knowop upload ~/.claude # your finished Claude Code sessions, sub-agents and all
@@ -193,7 +195,7 @@ host, not the unit, and `knowop logs` reads only a user service's log: use
 | `knowop status [--json]` | Prints, for each server knowop is logged in to (the one its commands use first), the profile, the server, your account and role, your computers with whether each is online, the knowop version and process serving each one online, and the agent processes live on each; and this computer's connect services with their flags, and whether each is turned off (macOS Login Items). On macOS, the menu bar: running, stopped, or failing with its exit code and its last log line. `--json` prints the same as one JSON object, one entry per login. Exits 1 when not logged in, or when a server refuses its login's key. |
 | `knowop disconnect [NAME]` | Disconnects NAME (default this computer) on the server: its connect is revoked and every agent process on it stops. Removes NAME's connect service on this computer, and waits until the server shows NAME offline. `knowop connect` joins it again with no login. |
 | `knowop logout [NAME\|--all]` | Logs this computer's host out on the server (its connect revoked, its agent processes stopped, the keys its logins made revoked), revokes knowop's key if that left it, removes this computer's connect services of that server, and deletes the saved login; knowop then uses its login to another server, if it has one, and says which. `--all` logs every host of yours out first. NAME logs that one host out alone, as the Hosts page does, and keeps this computer's login. |
-| `knowop run [--headless] [--session ID] [--on NAME [--cwd DIR]] [SAGENT FLAGS]` | Runs sagent's own agent in this process, live in Chat: sagent's screen at a terminal, else headless. `--session` continues a stored session; `--on` starts the agent on host NAME through its connect. Says to run `knowop connect` when this computer is not connected. |
+| `knowop run [--headless] [--session ID] [--on NAME [--cwd DIR]] [--time TIME] [-- SAGENT ARGUMENTS]` | Runs sagent's own agent in this process, live in Chat: sagent's screen at a terminal, else headless. The session opens in Chat as one started there does, and Chat names where its agent runs. `--session` continues a stored session; `--on` starts the agent on host NAME through its connect. Everything after `--` is sagent's: its settings as flags, or an action (`-- login --provider oaisub`, `-- mcp list`, `-- --help`), which runs on this computer and opens no session. A sagent flag before `--` is refused with the command that puts it after; a mistyped command opens no session. Says to run `knowop connect` when this computer is not connected. |
 | `knowop job submit\|logs\|results ...` | Runs a job on a GPU node from this repository, or with `--host NAME` on a computer of yours, and reads its log and results. |
 | `knowop job status [JOB]\|cancel JOB\|secrets\|secret NAME set\|del` | Lists your jobs or shows one, stops one, and keeps the secrets a job may use. |
 | `knowop host [NAME ...]` | Lists, shows, sets, labels and deletes the hosts campaigns may run on, then lists your KnowHosts. |
@@ -203,7 +205,7 @@ host, not the unit, and `knowop logs` reads only a user service's log: use
 | `knowop --version` | Prints the version; `unknown` from a checkout. |
 
 Every command takes `--help`; `knowop run --help` and `knowop job submit --help`
-show the runner's own.
+show the runner's own, and `knowop run -- --help` shows sagent's.
 
 knowop keeps a login per server it logs in or connects to, and every command uses
 the last one; `knowop status` shows each. A connect service signs in with its own

@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import threading
 
@@ -118,6 +119,7 @@ from knowop.process.codec import (
     input_message,
     told_canvas,
 )
+from knowop.process.command import sagent_command
 from knowop.process.host_follower import HostFollower
 from knowop.process.host_follower_test import _Client, _daemons, _host
 from knowop.process.main import (
@@ -288,6 +290,15 @@ class _Server(_Client):
     frames: list[ViewerFrame] = field(default_factory=list[ViewerFrame])
     lines_refused: bool = False
     start_refused: bool = False
+    starts: list[SessionStart] = field(default_factory=list[SessionStart])
+    """Each session start asked for."""
+
+    built: list[list[str]] = field(default_factory=list[list[str]])
+    """sagent's words of each build checked before a session opens."""
+
+    unbuilt: str = ""
+    """Why each such build fails; empty for one that builds."""
+
     placed: list[tuple[str, object]] = field(default_factory=list[tuple[str, object]])
     place_refused: bool = False
     stopped: list[UUID] = field(default_factory=list[UUID])
@@ -419,6 +430,7 @@ class _Server(_Client):
 
     def session_start(self, body: SessionStart) -> SessionStartResponse:
         assert body.cli == "sagent"
+        self.starts.append(body)
         if self.start_refused:
             raise ClientError("no", status_code=403)
         return SessionStartResponse.model_validate(
@@ -1923,6 +1935,13 @@ def server(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Server]:
         return fake
 
     monkeypatch.setattr(main_module, "Client", client)
+
+    def unbuilt(args: Sequence[str], *, client: object) -> str:
+        assert client is fake
+        fake.built.append(list(args))
+        return fake.unbuilt
+
+    monkeypatch.setattr(main_module, "_unbuilt", unbuilt)
     # A run started from no canvas, in a checkout the test names: set, so that what a
     # run writes of its placement is undone with the test.
     monkeypatch.setenv("TRAX_CANVAS", "")
@@ -1993,10 +2012,15 @@ def test_a_run_starts_a_session_here_with_a_screen_only_at_a_terminal(
     monkeypatch.setattr(stdin, "isatty", lambda: isatty)
     monkeypatch.setattr("sys.stdin", stdin)
 
-    assert main([*argv, "--model", "opus"], profile=_PROFILE) == 0
+    assert main([*argv, "--", "--model", "opus"], profile=_PROFILE) == 0
 
     (called,) = served.calls
     assert called["args"] == ["--model", "opus"]
+    # Built first, then opened as a new chat, as one started in Chat is.
+    assert server.built == [["--model", "opus"]]
+    (start,) = server.starts
+    assert (start.cli_session_id or "").startswith("chat:")
+    assert UUID((start.cli_session_id or "").removeprefix("chat:"))
     assert (called["session_id"], called["tui"], called["host"]) == (
         _SESSION,
         tui,
@@ -2017,28 +2041,104 @@ def test_a_session_named_is_continued_here(served: _Served, server: _Server) -> 
     del server
 
 
-@pytest.mark.parametrize(
-    "picked",
-    [
-        ["--resume"],
-        ["--continue"],
-        ["--resume-all"],
-        ["--continue-all"],
-        ["--ephemeral"],
-        ["--hosted-session", "x/session.jsonl"],
-    ],
-)
-def test_a_flag_that_picks_a_journal_is_refused(
+def test_dans_mistyped_command_says_the_fixed_one_and_opens_no_session(
     served: _Served,
+    server: _Server,
     capsys: pytest.CaptureFixture[str],
-    picked: list[str],
 ) -> None:
+    """``knowop run --headless --effort high --profile X`` left an empty session once."""
     with pytest.raises(SystemExit) as refused:
-        _ = main(picked, profile=_PROFILE)
+        _ = main(
+            ["--headless", "--effort", "high", "--profile", "alpha-staging.knowop.ai"],
+            profile=_PROFILE,
+        )
 
     assert refused.value.code == 2
-    assert f"drop {picked[0]}" in capsys.readouterr().err
-    assert served.calls == []
+    assert capsys.readouterr().err.endswith(
+        "goes before run: knowop --profile alpha-staging.knowop.ai run --headless "
+        "-- --effort high\n",
+    )
+    assert (server.starts, server.built, served.calls) == ([], [], [])
+
+
+def test_a_run_whose_agent_sagent_will_not_build_opens_no_session(
+    served: _Served,
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.unbuilt = "--effortt names no setting; see /help"
+
+    assert main(["--headless", "--", "--effortt", "high"], profile=_PROFILE) == 1
+
+    assert capsys.readouterr().err == "Error: --effortt names no setting; see /help\n"
+    assert server.built == [["--effortt", "high"]]
+    assert (server.starts, served.calls) == ([], [])
+
+
+def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[tuple[Flags, Sequence[tuple[str, str]], bool, bool, list[str]]] = []
+    raised: list[BaseException] = []
+
+    @contextlib.asynccontextmanager
+    async def opened(
+        flags: Flags,
+        *,
+        given: Sequence[tuple[str, str]],
+        interactive: bool,
+        use_daemon: bool = True,
+        tools: Sequence[Tool] = (),
+    ) -> AsyncGenerator[None]:
+        built.append((flags, given, interactive, use_daemon, [t.name for t in tools]))
+        if raised:
+            raise raised[0]
+        yield
+
+    monkeypatch.setattr(main_module, "opened", opened)
+    client = cast("Client", _Server(version=1))
+
+    fine = main_module._unbuilt(["--effort", "high"], client=client)
+    raised.append(StartError("--effortt names no setting; see /help"))
+    refused = main_module._unbuilt(["--effortt", "high"], client=client)
+
+    assert (fine, refused) == ("", "--effortt names no setting; see /help")
+    flags, given, interactive, use_daemon, tools = built[0]
+    assert (flags.ephemeral, flags.session, list(given)) == (
+        True,
+        None,
+        [("effort", "high")],
+    )
+    assert (interactive, use_daemon, tools) == (False, False, [CANVAS_TOOL])
+
+
+@pytest.mark.parametrize(
+    ("ran", "code"),
+    [(subprocess.CompletedProcess[bytes]([], 3), 3), (KeyboardInterrupt(), 130)],
+    ids=["its-code", "ctrl-c"],
+)
+def test_an_action_runs_sagents_own_command_here_and_reaches_no_server(
+    monkeypatch: pytest.MonkeyPatch,
+    ran: subprocess.CompletedProcess[bytes] | KeyboardInterrupt,
+    code: int,
+) -> None:
+    commands: list[list[str]] = []
+
+    def run(command: list[str], *, check: bool) -> subprocess.CompletedProcess[bytes]:
+        assert check is False
+        commands.append(command)
+        if isinstance(ran, KeyboardInterrupt):
+            raise ran
+        return ran
+
+    def no_server(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError(f"an action reached a server: {args} {kwargs}")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(main_module, "Client", no_server)
+
+    assert main(["--", "login", "--provider", "oaisub"], profile=None) == code
+    assert commands == [sagent_command(["login", "--provider", "oaisub"])]
 
 
 @pytest.mark.parametrize("remote", [False, True])
@@ -2065,6 +2165,7 @@ def test_a_daemons_start_serves_the_session_it_hands_with_its_key(
             "https://box.example",
             "--time",
             "120",
+            "--",
             "--model",
             "opus",
         ],
@@ -2149,11 +2250,24 @@ def test_on_starts_it_through_a_daemon_and_waits_for_it_to_attach(
     server.frames = [Opened(), *frames]
 
     code = main(
-        ["--on", "vm", "--cwd", "~/src", "--login-host", "desk", "--model", "opus"],
+        [
+            "--on",
+            "vm",
+            "--cwd",
+            "~/src",
+            "--login-host",
+            "desk",
+            "--",
+            "--model",
+            "opus",
+        ],
         profile=_PROFILE,
     )
 
     assert code == exit_code
+    # The host's sagent builds it; this computer's need not have its providers.
+    assert server.built == []
+    assert (server.starts[0].cli_session_id or "").startswith("chat:")
     assert server.started == [
         ProcessSpec(
             host="vm",
@@ -2184,7 +2298,8 @@ def test_on_hands_the_time_limit_to_the_process_it_starts_as_its_own_flag(
     server.frames = [Opened()]
 
     assert (
-        main(["--on", "vm", "--time", "90", "--model", "opus"], profile=_PROFILE) == 0
+        main(["--on", "vm", "--time", "90", "--", "--model", "opus"], profile=_PROFILE)
+        == 0
     )
     assert server.started == [
         ProcessSpec(host="vm", args=("--time", "0-01:30:00", "--model", "opus")),

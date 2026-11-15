@@ -7,48 +7,43 @@ from Chat comes down the socket into the runtime, as a key typed at the screen d
 A slash line runs on the one ``Commands`` the screen runs typed lines on, so the
 terminal and Chat each show what the other ran.
 
-::
+``knowop run [KNOWOP FLAGS] -- [SAGENT ARGUMENTS]``, as ``command.py`` reads it; a
+daemon's start is ``knowop run --serve URL [--time TIME] -- [SAGENT FLAGS]``, the
+``ServeSession`` on stdin. A new session begins a chat, as one started in Chat does,
+so the app shows and drives it as any chat; it is opened only once both halves of
+the command hold and, here, once sagent has built its agent from them, so a mistyped
+command leaves no session behind. An action of sagent's (``-- login ...``) runs here
+as sagent's own command and opens none.
 
-    knowop run [SAGENT FLAGS]          sagent's screen at a terminal, else headless
-    knowop run --headless              headless at a terminal
-    knowop run --session ID            continue session ID here
-    knowop run --on NAME [--cwd DIR]   start on host NAME through its daemon
-    knowop run --login-host NAME       with --on, or alone: use host NAME's model login
-    knowop run --stop ID               stop session ID's agent, wherever it runs
-    knowop run --time TIME             end TIME after it starts, as a stop does (Slurm's --time)
-    knowop run --serve URL             headless; reads one ServeSession from stdin
-
-Every sagent flag works but those that pick a journal: knowop keeps the session's.
 A start the server placed for a remote agent opens without sagent's own daemon, which
 would otherwise start beside each agent and stay, and runs only the slash lines
 ``remote_commands.py`` lists.
 A run prints the session's id alone as its first line on stdout, once the server
-has its ``Hello``. A run started here has the server place its session in a workspace
+has its ``Hello``. A run started here has the server place its chat in a workspace
 and a canvas, by the canvas it was started from (``TRAX_CANVAS``) and its checkout,
 and its tools read where in ``TRAX_WORKSPACE`` and ``TRAX_CANVAS``.
 
 Exit codes: 0 after a stop, its time limit, a screen's quit or a ``/quit``; 1 for a start error, a
-refused key, a revoked host or a session that is gone; 3 when another process holds
-the session, continued it elsewhere, or holds its journal; 4 when headless and
-without a socket for 10 minutes; 130 on Ctrl+C or SIGTERM.
+refused key, a revoked host or a session that is gone; 2 for a refused command; 3
+when another process holds the session, continued it elsewhere, or holds its
+journal; 4 when headless and without a socket for 10 minutes; 130 on Ctrl+C or
+SIGTERM. An action exits as sagent's command does.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
 from functools import partial, wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol, cast
+from typing import TYPE_CHECKING, Final, Protocol
 from uuid import UUID, uuid4
 
-import argparse
 import asyncio
 import contextlib
 import logging
 import os
 import queue
-import re
+import subprocess
 import sys
 import threading
 import time
@@ -78,6 +73,7 @@ from trackinizer.client.session_socket import (
 )
 from trackinizer.client.session_upload import RecordAppender
 from trackinizer.trax.canvas import canvas_from_env
+from trackinizer.wire.wire_science_chat import chat_session_id
 from trackinizer.wire.wire_session_relay import (
     Command,
     Hello,
@@ -102,6 +98,12 @@ from knowop.agent.placement import place_run, placement_env
 from knowop.agent.resume import session_journal
 from knowop.hosts import host_name
 from knowop.process.codec import input_message, told_canvas
+from knowop.process.command import (
+    is_action,
+    parse_run,
+    run_parser,
+    sagent_command,
+)
 from knowop.process.host_follower import HostFollower, HostLister
 from knowop.process.publisher import Publisher
 from knowop.process.remote_commands import REMOTE_AGENT
@@ -128,6 +130,7 @@ if TYPE_CHECKING:
         Mapping,
         Sequence,
     )
+    from datetime import timedelta
 
     from sagent.agent.agent import Agent
     from sagent.agent.team import Team
@@ -140,6 +143,7 @@ if TYPE_CHECKING:
     from treekle import PlainTree
 
     from knowop.agent.resume import JournalChoice
+    from knowop.process.command import Flags
 
 
 __all__ = ["ServeClient", "agent_tools", "delivering", "first_done", "main", "serve"]
@@ -163,36 +167,26 @@ _EXITS: Final = {
 }
 """The exit code for each way the session's socket closes for good."""
 
-_SLURM_TIME: Final = re.compile(r"(?:([0-9]+)-)?([0-9]+)(?::([0-9]+))?(?::([0-9]+))?")
-"""Slurm's ``--time``: ``M``, ``M:S`` or ``H:M:S``; ``D-H``, ``D-H:M`` or ``D-H:M:S``."""
-
 logger = logging.getLogger(__name__)
 
 
 def main(argv: Sequence[str], *, profile: Profile | None) -> int:
-    """Run one session's agent process until it ends.
+    """Run one session's agent process until it ends, or one of sagent's actions.
 
     Args:
-      argv: What follows ``knowop run``: sagent's flags, and knowop's own.
+      argv: What follows ``knowop run``: knowop's flags, then ``--`` and sagent's.
       profile: The saved server and key it reports to; ``None`` when a daemon
-        started it, which hands it both.
+        started it, which hands it both, and for an action, which reaches none.
 
     Returns:
       code: 0 after a stop or a quit; 1 for a start error, a refused key or a
         session that is gone; 3 when another process holds the session; 4 when it
-        ran headless too long without its socket.
+        ran headless too long without its socket; an action's own code.
 
     """
-    parser = argparse.ArgumentParser(
-        prog="knowop run",
-        description=(__doc__ or "").strip(),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        allow_abbrev=False,
-    )
-    flags, args = _parse_args(parser, argv)
-    picked = _journal_flags(args)
-    if picked:
-        parser.error(f"knowop keeps the session's journal; drop {', '.join(picked)}")
+    flags, args = parse_run(run_parser(), argv)
+    if is_action(args):
+        return _ran_here(args)
     if flags.serve is not None:
         return _served(flags.serve, args, time_limit=flags.time_limit)
     if profile is None:
@@ -206,11 +200,18 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
     with Client(profile.url, author=profile.author, api_key=profile.api_key) as client:
         if flags.stop is not None:
             return _stopped(client, flags.stop)
+        # Built here before a new session opens, so a setting it refuses leaves none
+        # behind; on another host, only sagent's parser checked them here.
+        if flags.session is None and flags.on is None:
+            unbuilt = _unbuilt(args, client=client)
+            if unbuilt:
+                sys.stderr.write(f"Error: {unbuilt}\n")
+                return 1
         try:
             session_id = (
                 flags.session
                 or client.session_start(
-                    SessionStart(cli="sagent"),
+                    SessionStart(cli="sagent", cli_session_id=chat_session_id(uuid4())),
                 ).id
             )
         except ClientError as error:
@@ -239,19 +240,6 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
             time_limit=flags.time_limit,
             remote=False,
         )
-
-
-class Flags(Protocol):
-    """knowop's own flags; every other word is sagent's."""
-
-    headless: bool
-    session: UUID | None
-    on: str | None
-    cwd: str
-    login_host: str
-    stop: UUID | None
-    time_limit: timedelta | None
-    serve: str | None
 
 
 class ServeClient(
@@ -533,116 +521,11 @@ def _last_told(records: Iterable[SessionRecord]) -> UUID | None:
     return told[-1] if told else None
 
 
-def _parse_args(
-    parser: argparse.ArgumentParser,
-    argv: Sequence[str],
-) -> tuple[Flags, list[str]]:
-    """Register knowop's flags; return them and sagent's, which follow untouched."""
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run with no screen, at a terminal too.",
-    )
-    parser.add_argument("--session", type=UUID, help="The session to continue here.")
-    parser.add_argument(
-        "--on",
-        nargs="?",
-        const="",
-        metavar="NAME",
-        help="Start on host NAME through its daemon; with no name, the server's.",
-    )
-    parser.add_argument(
-        "--cwd",
-        default="~",
-        metavar="DIR",
-        help="With --on, the folder there to start in (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--login-host",
-        default="",
-        metavar="NAME",
-        help="Use host NAME's model login.",
-    )
-    parser.add_argument(
-        "--stop",
-        type=UUID,
-        metavar="ID",
-        help="Stop session ID's agent, wherever it runs, and exit.",
-    )
-    parser.add_argument(
-        "--time",
-        type=_time_limit,
-        metavar="TIME",
-        dest="time_limit",
-        help=(
-            "End TIME after it starts, as a stop ends it; Slurm's --time: 120, "
-            "2:00:00 or 1-0."
-        ),
-    )
-    parser.add_argument(
-        "--serve",
-        metavar="URL",
-        help="Serve the session a daemon hands on stdin, through the server at URL.",
-    )
-    parsed, rest = parser.parse_known_args(argv)
-    flags = cast("Flags", parsed)
-    if flags.stop is not None and (others := _other_flags(argv)):
-        parser.error(f"--stop takes no other flag: {', '.join(others)}")
-    return flags, rest
-
-
-# Without days, ``M``, ``M:S`` or ``H:M:S``; with them, ``D-H``, ``D-H:M`` or
-# ``D-H:M:S``.
-def _time_limit(text: str) -> timedelta:
-    """Read a time limit as Slurm's ``--time`` reads one, refusing one of no time."""
-    matched = _SLURM_TIME.fullmatch(text)
-    if matched is not None:
-        days, *clock = matched.groups()
-        given = [int(field) for field in clock if field is not None]
-        # Without days, one or two fields are minutes first: ``M`` or ``M:S``.
-        if days is None and len(given) < 3:
-            given = [0, *given]
-        hours, minutes, seconds = (*given, 0, 0)[:3]
-        limit = timedelta(
-            days=int(days or 0),
-            hours=hours,
-            minutes=minutes,
-            seconds=seconds,
-        )
-        if limit:
-            return limit
-    raise argparse.ArgumentTypeError(
-        f"{text!r} is no time limit, such as 120, 2:00:00 or 1-0",
-    )
-
-
 def _slurm_time(limit: timedelta) -> str:
     """Write ``limit`` as Slurm's ``D-HH:MM:SS``."""
     minutes, seconds = divmod(limit.seconds, 60)
     hours, minutes = divmod(minutes, 60)
     return f"{limit.days}-{hours:02}:{minutes:02}:{seconds:02}"
-
-
-# Read off the words, not the parsed values: a flag given at its default, such as
-# ``--cwd ~``, parses as if it were not given.
-def _other_flags(argv: Sequence[str]) -> list[str]:
-    """Return each flag ``argv`` gives besides ``--stop``, by the name given."""
-    names = (word.partition("=")[0] for word in argv)
-    return [name for name in names if name.startswith("--") and name != "--stop"]
-
-
-def _journal_flags(args: Sequence[str]) -> list[str]:
-    """Return the flags of ``args`` that pick a journal, which knowop refuses."""
-    flags, _ = parse_flags(args)
-    named = {
-        "--ephemeral": flags.ephemeral,
-        "--resume": flags.resume is not None,
-        "--continue": flags.continue_,
-        "--resume-all": flags.resume_all,
-        "--continue-all": flags.continue_all,
-        "--hosted-session": flags.hosted_session is not None,
-    }
-    return [name for name, given in named.items() if given]
 
 
 def _served(url: str, args: Sequence[str], *, time_limit: timedelta | None) -> int:
@@ -663,6 +546,44 @@ def _served(url: str, args: Sequence[str], *, time_limit: timedelta | None) -> i
             time_limit=time_limit,
             remote=handed.remote,
         )
+
+
+def _ran_here(args: Sequence[str]) -> int:
+    """Run the action of sagent's ``args`` names here, as sagent's own command."""
+    try:
+        return subprocess.run(  # noqa: S603 -- this install's sagent, no shell.
+            sagent_command(args),
+            check=False,
+        ).returncode
+    # The action had the terminal, and took the Ctrl+C as its own.
+    except KeyboardInterrupt:
+        return 130
+
+
+# The build ``serve`` makes, less a journal and sagent's daemon, closed at once: what it
+# refuses, a setting no agent has or a provider not signed in, the run would refuse
+# only after its session had opened.
+def _unbuilt(args: Sequence[str], *, client: Client) -> str:
+    """Return why sagent cannot build the agent ``args`` describe; empty when it can."""
+    try:
+        asyncio.run(_built(args, client=client))
+    except StartError as error:
+        return str(error)
+    return ""
+
+
+async def _built(args: Sequence[str], *, client: Client) -> None:
+    """Build and close the agent ``args`` describe, with the tools a run gives it."""
+    flags, given = parse_flags([*args, "--ephemeral"])
+    canvas = CanvasTools(client, canvas_id=None, settings={"type": "object"})
+    async with opened(
+        flags,
+        given=given,
+        interactive=False,
+        use_daemon=False,
+        tools=agent_tools(canvas),
+    ):
+        pass
 
 
 def _signalled(

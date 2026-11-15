@@ -1186,12 +1186,11 @@ def test_connect_leaves_no_client_open_for_a_later_command(
     "argv",
     [
         [],
-        ["--headless", "--model", "opus"],
+        ["--headless", "--", "--model", "opus"],
         ["--session", "00000000-0000-0000-0000-000000000009"],
         ["--on", "lab", "--", "--name", "nightly"],
-        ["--", "--help"],
     ],
-    ids=["bare", "sagents-flags", "a-session", "on-a-host", "help-after-the-dashes"],
+    ids=["bare", "sagents-flags", "a-session", "on-a-host"],
 )
 def test_run_is_the_agent_process_with_knowops_profile(
     runners: _Runners,
@@ -1207,10 +1206,24 @@ def test_run_is_the_agent_process_with_knowops_profile(
 
 @pytest.mark.parametrize(
     "argv",
-    [["--help"], ["-h"], ["--headless", "--help"], ["-h", "--", "x"]],
-    ids=["help", "h", "after-a-flag", "before-the-dashes"],
+    [
+        ["--help"],
+        ["-h"],
+        ["--headless", "--help"],
+        ["-h", "--", "x"],
+        ["--", "--help"],
+        ["--", "login", "--provider", "oaisub"],
+    ],
+    ids=[
+        "help",
+        "h",
+        "after-a-flag",
+        "before-the-dashes",
+        "sagents-help",
+        "sagents-login",
+    ],
 )
-def test_run_help_is_the_agent_processs_needs_no_login_and_asks_the_server_nothing(
+def test_run_help_or_an_action_needs_no_login_and_asks_the_server_nothing(
     server: _Server,
     runners: _Runners,
     argv: list[str],
@@ -1220,6 +1233,21 @@ def test_run_help_is_the_agent_processs_needs_no_login_and_asks_the_server_nothi
     assert runners.process.calls == [(argv, None)]
     assert server.requests == []
     assert list_profiles() == []
+
+
+def test_a_mistyped_run_is_refused_before_a_login_or_a_request(
+    server: _Server,
+    runners: _Runners,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as refused:
+        _knowop("run", "--headless", "--effort", "high", "--profile", "acme")
+
+    assert refused.value.code == 2
+    assert capsys.readouterr().err.endswith(
+        "knowop --profile acme run --headless -- --effort high\n",
+    )
+    assert (server.requests, runners.process.calls, list_profiles()) == ([], [], [])
 
 
 @pytest.mark.parametrize(("argv", "code"), [(["run"], 3), (["job", "logs", "7"], 4)])
@@ -2821,7 +2849,7 @@ def test_run_serve_hands_the_agent_process_its_arguments_and_no_profile(
 ) -> None:
     runners.process.code = 4
 
-    argv = ["--serve", "https://know.example", "--model", "opus"]
+    argv = ["--serve", "https://know.example", "--", "--model", "opus"]
     assert _knowop("--profile", "staging", "run", *argv) == 4
 
     assert runners.process.calls == [(argv, None)]

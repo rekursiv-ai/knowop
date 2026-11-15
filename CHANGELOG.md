@@ -68,6 +68,18 @@ All notable knowop changes are documented here. This project follows
 
 ### Changed
 
+- **Breaking:** `knowop run [KNOWOP FLAGS] -- [SAGENT ARGUMENTS]`, as `trax run` was:
+  sagent's settings and actions go after `--`, untouched. A sagent flag before `--` is
+  refused, and the error shows the command with it after `--` (and `--profile`
+  before `run`). Both halves are checked, and here sagent builds its agent from
+  them, before a session opens, so a mistyped command leaves no session behind.
+  An action after `--` runs sagent's own command on this computer and opens no
+  session: `knowop run -- login --provider oaisub` signs sagent in here, for every
+  later run here. The old mixed form is refused. A daemon's start is
+  `knowop run --serve URL [--time TIME] -- [SAGENT FLAGS]`.
+- A `knowop run` session begins a chat, as one started in Chat does, so it opens in
+  Chat with the same header, controls and message box, and Chat names where its
+  agent runs. A run of a knowop older than this opens on its record page.
 - **Breaking:** `knowop machine` is `knowop host`, with the same forms; `start` is
   now a reserved host name. A computer enrolled with the server is a host, and this
   `knowop connect` speaks the server's renamed host wire (trackinizer's `/api/hosts`
