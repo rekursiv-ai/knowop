@@ -88,12 +88,30 @@ def test_knowops_own_flags_read_before_the_separator() -> None:
         run_parser(),
         ["--session", _ID, "--time", "90", "--on", "lab", "--login-host", "desk"],
     )
+    named, _ = parse_run(run_parser(), ["--name", " paper review "])
 
     assert (flags.session, flags.time_limit) == (
         UuidRef(uuid=UUID(_ID)),
         timedelta(minutes=90),
     )
     assert (flags.on, flags.login_host, flags.cwd, given) == ("lab", "desk", "~", [])
+    assert (flags.name, named.name) == (None, "paper review")
+
+
+@pytest.mark.parametrize("given", ["", "   ", "x" * 121], ids=["empty", "blank", "121"])
+def test_a_name_no_chat_could_have_is_refused(
+    capsys: pytest.CaptureFixture[str],
+    given: str,
+) -> None:
+    assert _refusal(["--name", given], capsys) == (
+        "argument --name: A canvas name is 1 to 120 characters."
+    )
+
+
+def test_a_name_of_120_characters_is_a_chats() -> None:
+    flags, _ = parse_run(run_parser(), ["--name", "x" * 120])
+
+    assert flags.name == "x" * 120
 
 
 @pytest.mark.parametrize(

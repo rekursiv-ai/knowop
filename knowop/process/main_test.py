@@ -335,6 +335,11 @@ class _Server(_Client):
     resolved: list[Ref] = field(default_factory=list[Ref])
     """Each reference resolved: a session's number, which only the server knows."""
 
+    canvases: list[dict[str, PlainTree]] | ClientError = field(
+        default_factory=list[dict[str, "PlainTree"]],
+    )
+    """The account's canvases, by name and the session each shows, or why not."""
+
     numbered: bool = True
     """Whether a number names a row; else resolving one is refused as not found."""
 
@@ -389,6 +394,27 @@ class _Server(_Client):
         if isinstance(self.settings, ClientError):
             raise self.settings
         return self.settings
+
+    def list_canvases(self) -> list[dict[str, PlainTree]]:
+        if isinstance(self.canvases, ClientError):
+            raise self.canvases
+        return self.canvases
+
+    def list_workspaces(self) -> list[dict[str, PlainTree]]:
+        return []
+
+    def rename_canvas(self, canvas_id: UUID, *, name: str) -> dict[str, PlainTree]:
+        self.canvased.append((canvas_id, "rename", name))
+        return {"name": name}
+
+    def rename_workspace(
+        self,
+        workspace_id: UUID,
+        *,
+        title: str,
+    ) -> dict[str, PlainTree]:
+        self.canvased.append((workspace_id, "retitle", title))
+        return {"title": title}
 
     def capture_canvas(self, canvas_id: UUID) -> CaptureImage:
         self.canvased.append((canvas_id, "capture", None))
@@ -875,6 +901,8 @@ async def test_every_agent_acts_on_the_canvas_the_newest_line_from_chat_named(
         "mark",
         "unmark",
         "set",
+        "chats",
+        "rename",
     ]
     unplaced, placed, kept = (results[f"c{n}"] for n in range(3))
     look = results["look"]
@@ -2146,7 +2174,153 @@ def test_a_run_the_server_will_not_place_runs_unplaced(
 
     assert len(served.calls) == 1
     assert (os.environ["TRAX_WORKSPACE"], os.environ["TRAX_CANVAS"]) == ("", "")
-    assert "running unplaced" in capsys.readouterr().err
+    assert "could not place this session" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("argv", "git"),
+    [
+        (["--headless"], {"origin": _CHECKOUT.origin, "branch": _CHECKOUT.branch}),
+        (["--on", "vm"], None),
+    ],
+    ids=["here", "on-a-host"],
+)
+def test_a_named_run_places_its_chat_by_that_name(
+    served: _Served,
+    server: _Server,
+    argv: list[str],
+    git: dict[str, str] | None,
+) -> None:
+    server.answer = _attached()
+    server.frames = [Opened()]
+    server.canvases = [{"name": "Paper review"}, {"name": "paper review 2"}]
+
+    assert main([*argv, "--name", " paper review "], profile=_PROFILE) == 0
+
+    assert server.placed == [
+        (
+            f"/api/sessions/{_SESSION}/place",
+            {"name": "paper review"} | ({} if git is None else {"git": git}),
+        ),
+    ]
+    # Either way the agent starts: here, or through the host's daemon.
+    assert len(served.calls) + len(server.started) == 1
+
+
+def test_a_named_run_here_whose_chat_cannot_be_placed_exits_1_and_starts_no_agent(
+    served: _Served,
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.place_refused = True
+
+    assert main(["--headless", "--name", "paper review"], profile=_PROFILE) == 1
+
+    assert capsys.readouterr().err.endswith(
+        "Error: the chat could not be named 'paper review'\n",
+    )
+    assert served.calls == []
+
+
+def test_a_named_run_on_a_host_whose_chat_cannot_be_placed_exits_1_as_its_agent_runs(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Placed once its agent is up: the agent runs on, unnamed."""
+    server.place_refused = True
+    server.answer = _attached()
+    server.frames = [Opened()]
+
+    assert main(["--on", "vm", "--name", "paper review"], profile=_PROFILE) == 1
+
+    assert capsys.readouterr().err.endswith(
+        "Error: its agent runs, but the chat could not be named 'paper review'\n",
+    )
+    assert len(server.started) == 1
+    assert len(server.placed) == 1
+
+
+def test_an_unnamed_run_on_a_host_that_cannot_be_placed_starts_unplaced(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.place_refused = True
+    server.answer = _attached()
+    server.frames = [Opened()]
+
+    assert main(["--on", "vm"], profile=_PROFILE) == 0
+
+    assert len(server.started) == 1
+    assert "could not place this session" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "canvases",
+    [
+        [{"name": "other"}, {"name": "paper review"}],
+        [{"name": "paper review", "session": {"id": str(_SESSION), "seq": 1}}],
+    ],
+    ids=["a-tab-with-no-chat", "another-sessions-tab"],
+)
+@pytest.mark.parametrize("on", [[], ["--on", "vm"]], ids=["here", "on"])
+def test_a_name_another_tab_has_is_refused_before_a_session_opens(
+    served: _Served,
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+    canvases: list[dict[str, PlainTree]],
+    on: list[str],
+) -> None:
+    server.canvases = canvases
+
+    assert main([*on, "--name", "paper review"], profile=_PROFILE) == 1
+
+    assert capsys.readouterr().err == "Error: a tab of yours is named 'paper review'\n"
+    assert (server.starts, server.started, server.placed, served.calls) == (
+        [],
+        [],
+        [],
+        [],
+    )
+
+
+def test_a_continued_session_keeps_the_name_its_own_tab_has(
+    served: _Served,
+    server: _Server,
+) -> None:
+    other = uuid4()
+    server.canvases = [
+        {"name": "other", "session": None},
+        {"name": "paper review", "session": {"id": str(other), "seq": 9}},
+    ]
+
+    assert (
+        main(
+            ["--session", str(other), "--headless", "--name", "paper review"],
+            profile=_PROFILE,
+        )
+        == 0
+    )
+
+    assert served.calls[0]["session_id"] == other
+    assert [body for _, body in server.placed] == [
+        {
+            "git": {"origin": _CHECKOUT.origin, "branch": _CHECKOUT.branch},
+            "name": "paper review",
+        },
+    ]
+
+
+def test_tabs_that_cannot_be_listed_leave_a_named_run_unstarted(
+    served: _Served,
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    server.canvases = ClientError("GET /api/canvases -> 503: down", status_code=503)
+
+    assert main(["--headless", "--name", "x"], profile=_PROFILE) == 1
+
+    assert capsys.readouterr().err == "Error: GET /api/canvases -> 503: down\n"
+    assert (server.starts, served.calls) == ([], [])
 
 
 @pytest.mark.parametrize(
@@ -2502,8 +2676,11 @@ def test_on_starts_it_through_a_daemon_and_waits_for_it_to_attach(
     assert printed.err == said
     # Read on a daemon thread of its own, so a stream that never ends keeps no exit.
     assert server.reader == ("lines", True)
-    # Its checkout is on the host it starts on, which this command cannot read.
-    assert server.placed == []
+    # Placed here once its agent is up, so its chat has a tab; its checkout is on the
+    # host it starts on, which this command cannot read. A start that failed leaves none.
+    assert server.placed == (
+        [(f"/api/sessions/{_SESSION}/place", {})] if exit_code == 0 else []
+    )
 
 
 def test_on_with_no_name_starts_it_where_the_server_runs_agents(
@@ -2667,6 +2844,7 @@ def test_help_names_each_of_knowops_own_flags_with_what_it_takes_and_does(
         "--session ID The session to continue here: its UUID or number (AgentSession#N).",
         "--on [NAME] Start on host NAME through its daemon; with no name, the server's.",
         "--cwd DIR With --on, the folder there to start in (default: ~).",
+        "--name NAME Open the chat's tab in Chat, named NAME (else it opens closed).",
         "--login-host NAME Use host NAME's model login.",
         "--stop ID Stop session ID's agent, wherever it runs, and exit.",
         "--time TIME End TIME after it starts, as a stop ends it; Slurm's --time: 120, 2:00:00 or 1-0.",
@@ -2817,6 +2995,10 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
         "chat_window": lambda c: c.chat_window(_CANVAS_ON, hidden=True),
         "capture_canvas": lambda c: c.capture_canvas(_CANVAS_ON),
         "set_preferences": lambda c: c.set_preferences(_CANVAS_ON, change={}),
+        "list_canvases": lambda c: c.list_canvases(),
+        "list_workspaces": lambda c: c.list_workspaces(),
+        "rename_canvas": lambda c: c.rename_canvas(_CANVAS_ON, name="x"),
+        "rename_workspace": lambda c: c.rename_workspace(_ROW, title="x"),
         "get": lambda c: c.get("/api/me/preferences/agent"),
     }
     with Client(

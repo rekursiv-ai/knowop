@@ -19,9 +19,12 @@ A start the server placed for a remote agent opens without sagent's own daemon, 
 would otherwise start beside each agent and stay, and runs only the slash lines
 ``remote_commands.py`` lists.
 A run prints the session's id alone as its first line on stdout, once the server
-has its ``Hello``. A run started here has the server place its chat in a workspace
-and a canvas, by the canvas it was started from (``TRAX_CANVAS``) and its checkout,
-and its tools read where in ``TRAX_WORKSPACE`` and ``TRAX_CANVAS``.
+has its ``Hello``. A run started here, or from here ``--on`` a host once its agent is
+up, has the server place its chat in a workspace and a canvas, by the canvas it was
+started from (``TRAX_CANVAS``) and, run here, its checkout; its tools read where in
+``TRAX_WORKSPACE`` and ``TRAX_CANVAS``. ``--name`` names the chat's tab and opens it:
+a name another tab has is refused before a session opens, and a named run whose
+chat cannot be placed exits 1. An unnamed one that cannot be placed runs unplaced.
 
 Exit codes: 0 after a stop, its time limit, a screen's quit or a ``/quit``; 1 for a start error, a
 refused key, a revoked host or a session that is gone; 2 for a refused command; 3
@@ -32,6 +35,7 @@ SIGTERM. An action exits as sagent's command does.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial, wraps
 from pathlib import Path
@@ -129,7 +133,6 @@ if TYPE_CHECKING:
         Awaitable,
         Callable,
         Iterable,
-        Mapping,
         Sequence,
     )
     from datetime import timedelta
@@ -242,6 +245,14 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
                 sys.stderr.write(f"Error: {refused}\n")
                 return 1
         try:
+            # Asked before a session opens, so a name already taken leaves none behind.
+            if flags.name is not None and _name_taken(
+                client,
+                name=flags.name,
+                session=named,
+            ):
+                sys.stderr.write(f"Error: a tab of yours is named {flags.name!r}\n")
+                return 1
             session_id = (
                 named
                 or client.session_start(
@@ -252,18 +263,19 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
             sys.stderr.write(f"Error: {error}\n")
             return 1
         if flags.on is not None:
-            return _started_on(client, flags, args, session_id=session_id)
-        # Told to this process's environment, which each tool the agent runs inherits.
-        os.environ.update(
-            placement_env(
-                place_run(
-                    client,
-                    session_id=session_id,
-                    environ=os.environ,
-                    cwd=Path.cwd(),
-                ),
-            ),
+            return _placed_on(client, flags, args, session_id=session_id)
+        placement = place_run(
+            client,
+            session_id=session_id,
+            environ=os.environ,
+            cwd=Path.cwd(),
+            name=flags.name or "",
         )
+        if flags.name is not None and placement is None:
+            sys.stderr.write(f"Error: the chat could not be named {flags.name!r}\n")
+            return 1
+        # Told to this process's environment, which each tool the agent runs inherits.
+        os.environ.update(placement_env(placement))
         return _signalled(
             args,
             session_id=session_id,
@@ -997,6 +1009,45 @@ def _stopped(client: Client, session_id: UUID) -> int:
         sys.stderr.write(f"Error: session {session_id} has had no agent process\n")
         return 1
     sys.stdout.write(f"stopped {session_id} on {process.host}\n")
+    return 0
+
+
+def _name_taken(client: Client, *, name: str, session: UUID | None) -> bool:
+    """Say whether a canvas has ``name``, other than the one ``session`` shows."""
+    for canvas in client.list_canvases():
+        shown = canvas.get("session")
+        if canvas.get("name") == name and not (
+            isinstance(shown, Mapping) and shown.get("id") == str(session)
+        ):
+            return True
+    return False
+
+
+# Placed once its agent is up, so a host that refuses it leaves no tab, nor a name
+# taken; its checkout is there, and this one's would place it by the wrong branch.
+def _placed_on(
+    client: Client,
+    flags: Flags,
+    args: Sequence[str],
+    *,
+    session_id: UUID,
+) -> int:
+    """Start the session on the host ``--on`` names, then place it; return its code."""
+    started = _started_on(client, flags, args, session_id=session_id)
+    if started:
+        return started
+    placement = place_run(
+        client,
+        session_id=session_id,
+        environ=os.environ,
+        cwd=None,
+        name=flags.name or "",
+    )
+    if flags.name is not None and placement is None:
+        sys.stderr.write(
+            f"Error: its agent runs, but the chat could not be named {flags.name!r}\n",
+        )
+        return 1
     return 0
 
 

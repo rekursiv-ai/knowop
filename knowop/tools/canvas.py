@@ -5,16 +5,18 @@ in the grammar of ``trax canvas`` / ``knowop canvas``: ``read`` it, ``show`` a v
 ``hide`` one, ``navigate`` the page, ``highlight`` rows, ``capture`` it as a picture,
 ``mark`` a red box and ``unmark`` one, or ``set`` how the app looks for the person,
 with the schema the server gives (:func:`agent_settings`), beyond which it sends no
-setting. A visual is a parameter, as the server's
+setting; and list the person's ``chats`` by workspace, or ``rename`` a chat or a
+workspace. A visual is a parameter, as the server's
 catalog names it (``trax.subgraph``), not a tool of its own: whether a visual, a
 record or a param is acceptable is the server's to say, and its refusal is the line
 the model reads. The command and the tool build each operation with the same
-functions (``show_operation``, ``mark_operation``) and say a canvas in the same
-lines (``canvas_lines``).
+functions (``show_operation``, ``mark_operation``) and say a canvas and the chats in
+the same lines (``canvas_lines``, ``chat_lines``).
 
 The tool acts on the canvas the session's Chat is on, which a line from Chat names
 (``CanvasTools.canvas_id``), so a model never names a canvas. Until a line has named
-one, each action says there is none. It moves the person's attention, never data: a
+one, each action but ``chats``, and ``rename`` of another chat or a workspace, says
+there is none. Besides names, it moves the person's attention, never data: a
 visual draws its record's rows. Each action answers with one short line, or a
 ``Picture``; a refused request comes back as a line, and only a bug raises. The
 client is synchronous, so each call goes through ``asyncio.to_thread``. What the
@@ -35,7 +37,12 @@ import json
 import uuid
 
 from trackinizer.client.errors import ClientError
-from trackinizer.trax.canvas import canvas_lines, mark_operation, show_operation
+from trackinizer.trax.canvas import (
+    canvas_lines,
+    chat_lines,
+    mark_operation,
+    show_operation,
+)
 from trackinizer.trax.grammar import parse_ref
 from trackinizer.wire.refs import SeqRef
 from treekle import PlainTree, ReadError, from_plain, json_loads
@@ -73,9 +80,11 @@ type Action = Literal[
     "mark",
     "unmark",
     "set",
+    "chats",
+    "rename",
 ]
 """What the tool does, as ``trax canvas`` names each; ``unmark`` is its ``mark remove``,
-and ``set`` its ``KEY to VALUE``."""
+``set`` its ``KEY to VALUE`` and ``chats`` its ``list``."""
 
 type Placement = Literal["main", "left", "side", "floating"]
 """Where a shown visual goes, as ``trax canvas show --placement`` takes it."""
@@ -186,6 +195,27 @@ class CanvasClient(Protocol):
         """Send a GET request and return the body; it reads the settings' schema."""
         ...
 
+    def list_canvases(self) -> list[dict[str, PlainTree]]:
+        """List the account's canvases, each with its workspace and session."""
+        ...
+
+    def list_workspaces(self) -> list[dict[str, PlainTree]]:
+        """List the account's workspaces."""
+        ...
+
+    def rename_canvas(self, canvas_id: uuid.UUID, *, name: str) -> dict[str, PlainTree]:
+        """Rename one of the account's canvases."""
+        ...
+
+    def rename_workspace(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        title: str,
+    ) -> dict[str, PlainTree]:
+        """Rename one of the account's workspaces."""
+        ...
+
 
 class Caller(Protocol):
     """The agent calling the tool, as an adapter hands it in as ``context``."""
@@ -251,9 +281,11 @@ class CanvasTools:
         box: tuple[float, ...] = (),
         box_id: str = "",
         settings: dict[str, PlainTree] | None = None,
+        name: str = "",
+        target: str = "",
         context: Caller,
     ) -> str | Picture:
-        """Do ``action`` on the canvas the session's Chat is on.
+        """Do ``action`` on the canvas the session's Chat is on, or on the chats.
 
         Args:
           action: What to do.
@@ -269,14 +301,23 @@ class CanvasTools:
           box_id: For unmark, the red box's id, as read and mark give it.
           settings: For set, the settings to change, by key; null puts one back to its
             default.
+          name: For chats, what a workspace title or chat name holds (left out,
+            every chat); for rename, the new name.
+          target: For rename, a chat's canvas id from chats, or a workspace as
+            ``Issue#N``; left out, this chat.
           context: Not an argument: the tool is handed who calls it, whose last
             capture places their next box.
 
         Returns:
           result: One line saying what was done, or why nothing was; for capture, the
-            picture with a line saying what is on it.
+            picture with a line saying what is on it; for chats, a line a workspace
+            and a line a chat.
 
         """
+        if action == "chats":
+            return await self._chats(query=name.strip())
+        if action == "rename":
+            return await self._rename(target=target.strip(), name=name.strip())
         canvas = self.canvas_id
         if canvas is None:
             return _NO_CANVAS
@@ -589,6 +630,53 @@ class CanvasTools:
             default=dict[str, object](),
         )
         return f"Set {', '.join(f'{key} to {now.get(key)}' for key in change)}."
+
+    async def _chats(self, *, query: str) -> str:
+        """Say the account's chats by workspace, as ``trax canvas list`` prints them."""
+        try:
+            canvases, workspaces = await asyncio.gather(
+                asyncio.to_thread(self._client.list_canvases),
+                asyncio.to_thread(self._client.list_workspaces),
+            )
+        except ClientError as error:
+            return f"Could not list the chats: {_why(error)}"
+        return "\n".join(chat_lines(canvases, workspaces, query=query))
+
+    async def _rename(self, *, target: str, name: str) -> str:
+        """Rename a workspace ``Issue#N``, a chat's canvas by id, else this chat."""
+        if not name:
+            return "Not renamed: give the new name."
+        if target.casefold().startswith("issue#"):
+            try:
+                ref = parse_ref(target)
+                _, workspace = await asyncio.to_thread(self._client.resolve_id, ref)
+                renamed = await asyncio.to_thread(
+                    self._client.rename_workspace,
+                    workspace,
+                    title=name,
+                )
+            except ValueError as error:
+                return f"Not renamed: {error}."
+            except ClientError as error:
+                return f"Could not rename {target}: {_why(error)}"
+            return f"The workspace {target} is now {renamed.get('title')}."
+        try:
+            canvas = uuid.UUID(target) if target else self.canvas_id
+        except ValueError:
+            return (
+                "Not renamed: name a chat by its canvas id, or a workspace as Issue#N."
+            )
+        if canvas is None:
+            return _NO_CANVAS
+        try:
+            renamed = await asyncio.to_thread(
+                self._client.rename_canvas,
+                canvas,
+                name=name,
+            )
+        except ClientError as error:
+            return f"Could not rename the chat: {_why(error)}"
+        return f"The chat is now {renamed.get('name')}."
 
     async def _rows(self, refs: Sequence[Ref]) -> dict[Ref, uuid.UUID]:
         """Return the id of each of ``refs`` that exists, the others left out."""
