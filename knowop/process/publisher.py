@@ -50,6 +50,7 @@ from sagent.runtime import types
 from sagent.session import projects
 from sagent.session.jsonl import record_line
 from sagent.session.types import AgentToAgentMessage
+from sagent.tools.background_task import without_controls
 from sagent.tui.status import Status
 from trackinizer.client.errors import ClientError
 from trackinizer.client.session_socket import retry_delays
@@ -64,6 +65,7 @@ from trackinizer.sagent.scripts.convert_session.sagent import normalize
 from trackinizer.wire.wire_session_relay import (
     STALE_PART,
     AgentState,
+    BackgroundJob,
     EventLine,
     Setting,
     SettingsLine,
@@ -85,7 +87,8 @@ if TYPE_CHECKING:
 
     from sagent.agent.agent import Agent
     from sagent.agent.team import Team
-    from sagent.session.types import SessionRecord
+    from sagent.session.types import SessionRecord, ToolCall
+    from sagent.tools.types import Tool
     from sagent.tui.slash import Commands
     from sagent.tui.types import CommandOutput
     from trackinizer.runs.redact import Redactor
@@ -162,6 +165,11 @@ class Publisher:
         self._journals: dict[Path | None, _Journal] = {
             agent.session.journal.path: self._root,
         }
+        # The children whose events this publisher hears, by label.
+        self._heard: dict[str, Agent] = {}
+        # Whether the root called its model since its turn last ended.
+        self._worked = False
+        self._turn_ended: datetime | None = None
         team.changes.add(self._joined)
         self._sent(self._now(since=datetime.now(UTC)))
 
@@ -179,6 +187,7 @@ class Publisher:
     def __call__(self, event: types.RuntimeEvent) -> None:
         """Send ``event`` up, or upload the journal at a ``SaveSession``; then the state."""
         self._status(event)
+        self._turn(event)
         inner = event
         while isinstance(inner, types.ChildEvent):
             inner = inner.inner
@@ -217,6 +226,8 @@ class Publisher:
     async def aclose(self) -> None:
         """Stop each upload running, and hear of no more agents."""
         self._team.changes.discard(self._joined)
+        for child in self._heard.values():
+            child.runtime.observers.remove(self._child_heard)
         for each in self._journals.values():
             await each.aclose()
 
@@ -231,14 +242,28 @@ class Publisher:
             return
         self._send(line)
 
+    # An idle with no model call since is no turn's end: a runtime idles as it starts.
+    # A failure or a halt ends the turn it stops, whatever came before it.
+    def _turn(self, event: types.RuntimeEvent) -> None:
+        """Note when the root agent's turn ends."""
+        if isinstance(event, types.ModelCallStarted):
+            self._worked = True
+        elif isinstance(
+            event,
+            (types.ModelResponseError, types.ModelResponseCancelled),
+        ) or (isinstance(event, types.AgentIdle) and self._worked):
+            self._worked = False
+            self._turn_ended = datetime.now(UTC)
+
+    # Its text, once a second.
     def _check_state(self) -> None:
-        """Send the state if ``busy`` or ``pending`` changed, or its text, once a second."""
+        """Send the state at once when anything but its text changed."""
         last = self._state
         state = self._now(since=last.since)
         if state.busy != last.busy:
             self._sent(state.model_copy(update={"since": datetime.now(UTC)}))
             self.check_settings()
-        elif state.pending != last.pending or (
+        elif state.model_copy(update={"line": last.line}) != last or (
             state.line != last.line
             and time.monotonic() - self._state_sent_sec >= _LINE_SEC
         ):
@@ -246,8 +271,13 @@ class Publisher:
 
     # ``busy`` is whether sagent turns its spinner: a call, tool calls or a compaction.
     def _now(self, *, since: datetime) -> AgentState:
-        """Return the agent's state now, ``busy`` last changed at ``since``."""
+        """Return the agents' state now, ``busy`` last changed at ``since``."""
         line = self._status.line()
+        children = [
+            (label, self._team[label])
+            for label in self._team
+            if self._team[label] is not self._agent
+        ]
         return AgentState(
             line=line,
             busy=self._status.frame() != line,
@@ -255,7 +285,37 @@ class Publisher:
             pending=tuple(
                 self._plain(m) for m in self._agent.runtime.pending_mid_stream()
             ),
+            jobs=(
+                *self._jobs(self._agent, label=""),
+                *(
+                    job
+                    for label, agent in children
+                    for job in self._jobs(agent, label=label)
+                ),
+            ),
+            agents=tuple(label for label, agent in children if _at_work(agent)),
+            turn_ended=self._turn_ended,
         )
+
+    def _jobs(self, agent: Agent, *, label: str) -> list[BackgroundJob]:
+        """Return ``agent``'s background jobs, each title's secrets masked."""
+        runtime = agent.runtime
+        return [
+            BackgroundJob(
+                call_id=job.call.call_id,
+                tool=job.call.name,
+                title=self._masked(_title(runtime.tools.get(job.call.name), job.call)),
+                agent=label,
+                started=datetime.fromtimestamp(job.started, UTC),
+                state="sleeping" if job.state == "sleeping" else "running",
+            )
+            for job in runtime.jobs.values()
+            if job.state != "running"
+        ]
+
+    def _masked(self, text: str) -> str:
+        """Return ``text`` with each secret value masked."""
+        return text if self._redactor is None else self._redactor.redact(text)
 
     # Masked first, then cut, as a record is: a cut could split a value.
     def _plain(self, said: object) -> JSON:
@@ -274,9 +334,12 @@ class Publisher:
     # A child joins before its journal opens (``AgentSpawn._start``), so its first save
     # is heard; one with no journal, a far caller's, has nothing to send.
     def _joined(self) -> None:
-        """Hear each agent that joined the team with a journal save it."""
+        """Hear each child that joined the team at work, and one with a journal save it."""
         for label in self._team:
             agent = self._team[label]
+            if agent is not self._agent and self._heard.get(label) is not agent:
+                self._heard[label] = agent
+                agent.runtime.observers.append(self._child_heard)
             path = agent.session.journal.path
             if path is None or path in self._journals:
                 continue
@@ -289,6 +352,13 @@ class Publisher:
             )
             self._journals[path] = journal
             agent.runtime.observers.append(journal.saved)
+
+    # A child's own runtime tells when it starts and stops work; its spawner hears only
+    # some of its events (``agent_spawn._Forward``), and none as its model is called.
+    def _child_heard(self, event: types.RuntimeEvent) -> None:
+        """Send the state if a child's event changed it."""
+        del event
+        self._check_state()
 
     # Its spawner's session is opened first: a spawner saves before its model is called,
     # so before it spawns, but its start may still be on its way.
@@ -529,6 +599,21 @@ class _Journal:
             batch=batch,
             format="sagent",
         )
+
+
+def _title(tool: Tool | None, call: ToolCall) -> str:
+    """Return the tool's own label for ``call``, or its name for a tool not held."""
+    if tool is None:
+        return call.name
+    return tool.summary(without_controls(call.arguments))
+
+
+def _at_work(agent: Agent) -> bool:
+    """Return whether ``agent``'s model call, its tool calls or a compaction runs."""
+    runtime = agent.runtime
+    return bool(
+        runtime.model_call is not None or runtime.cohort or runtime.compact_task,
+    )
 
 
 def _harvested(commands: Commands) -> tuple[Setting, ...]:
