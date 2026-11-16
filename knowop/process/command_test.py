@@ -34,6 +34,38 @@ def _refusal(argv: Sequence[str], capsys: pytest.CaptureFixture[str]) -> str:
     return capsys.readouterr().err.rpartition("knowop run: error: ")[2].strip()
 
 
+def test_help_names_each_of_knowops_own_flags_with_what_it_takes_and_does(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COLUMNS", "200")
+
+    with pytest.raises(SystemExit) as exited:
+        _ = parse_run(run_parser(), ["--help"])
+
+    help_text = capsys.readouterr().out
+    options = help_text[help_text.index("\noptions:\n") :].splitlines()[2:]
+    assert exited.value.code == 0
+    assert [" ".join(line.split()) for line in options] == [
+        "-h, --help show this help message and exit",
+        "--headless Run with no screen, through this computer's daemon, at a terminal too.",
+        "--session ID The session to continue here: its UUID or number (AgentSession#N).",
+        "--on [NAME] Start on host NAME through its daemon; with no name, the server's.",
+        "--cwd DIR The folder to start in (default: ~ with --on, else this folder).",
+        "--name NAME Open the chat's tab in Chat, named NAME (else it opens closed).",
+        "--login-host NAME Use host NAME's model login.",
+        "--stop ID Stop session ID's agent, wherever it runs, and exit.",
+        "--time TIME End TIME after it starts, as a stop ends it; Slurm's --time: 120, 2:00:00 or 1-0.",
+        "--serve URL Serve the session a daemon hands on stdin, through the server at URL.",
+    ]
+
+
+def test_on_with_no_name_names_the_servers_host_and_no_login_host() -> None:
+    flags, _ = parse_run(run_parser(), ["--on"])
+
+    assert (flags.on, flags.login_host) == ("", "")
+
+
 @pytest.mark.parametrize(
     ("given", "ref"),
     [
@@ -94,7 +126,8 @@ def test_knowops_own_flags_read_before_the_separator() -> None:
         UuidRef(uuid=UUID(_ID)),
         timedelta(minutes=90),
     )
-    assert (flags.on, flags.login_host, flags.cwd, given) == ("lab", "desk", "~", [])
+    # No --cwd: the run picks the folder, ~ on another host, this folder here.
+    assert (flags.on, flags.login_host, flags.cwd, given) == ("lab", "desk", None, [])
     assert (flags.name, named.name) == (None, "paper review")
 
 

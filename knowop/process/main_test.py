@@ -2102,6 +2102,14 @@ def served(monkeypatch: pytest.MonkeyPatch) -> _Served:
 
 
 @pytest.fixture
+def at_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run at a terminal, where a run's screen serves its agent in this process."""
+    stdin = io.StringIO()
+    monkeypatch.setattr(stdin, "isatty", lambda: True)
+    monkeypatch.setattr("sys.stdin", stdin)
+
+
+@pytest.fixture
 def server(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Server]:
     fake = _Server(version=1)
 
@@ -2131,6 +2139,7 @@ def server(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Server]:
     fake.change(closed=True)
 
 
+@pytest.mark.usefixtures("at_terminal")
 def test_a_run_here_places_its_session_and_tells_its_tools_where(
     served: _Served,
     server: _Server,
@@ -2139,7 +2148,7 @@ def test_a_run_here_places_its_session_and_tells_its_tools_where(
     started_from = uuid4()
     monkeypatch.setenv("TRAX_CANVAS", str(started_from))
 
-    assert main(["--headless"], profile=_PROFILE) == 0
+    assert main([], profile=_PROFILE) == 0
 
     assert server.placed == [
         (
@@ -2163,6 +2172,7 @@ def test_a_run_here_places_its_session_and_tells_its_tools_where(
     )
 
 
+@pytest.mark.usefixtures("at_terminal")
 def test_a_run_the_server_will_not_place_runs_unplaced(
     served: _Served,
     server: _Server,
@@ -2170,7 +2180,7 @@ def test_a_run_the_server_will_not_place_runs_unplaced(
 ) -> None:
     server.place_refused = True
 
-    assert main(["--headless"], profile=_PROFILE) == 0
+    assert main([], profile=_PROFILE) == 0
 
     assert len(served.calls) == 1
     assert (os.environ["TRAX_WORKSPACE"], os.environ["TRAX_CANVAS"]) == ("", "")
@@ -2207,6 +2217,7 @@ def test_a_named_run_places_its_chat_by_that_name(
     assert len(served.calls) + len(server.started) == 1
 
 
+@pytest.mark.usefixtures("at_terminal")
 def test_a_named_run_here_whose_chat_cannot_be_placed_exits_1_and_starts_no_agent(
     served: _Served,
     server: _Server,
@@ -2214,7 +2225,7 @@ def test_a_named_run_here_whose_chat_cannot_be_placed_exits_1_and_starts_no_agen
 ) -> None:
     server.place_refused = True
 
-    assert main(["--headless", "--name", "paper review"], profile=_PROFILE) == 1
+    assert main(["--name", "paper review"], profile=_PROFILE) == 1
 
     assert capsys.readouterr().err.endswith(
         "Error: the chat could not be named 'paper review'\n",
@@ -2222,16 +2233,22 @@ def test_a_named_run_here_whose_chat_cannot_be_placed_exits_1_and_starts_no_agen
     assert served.calls == []
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [["--on", "vm"], ["--headless"]],
+    ids=["on-a-host", "this-computers-daemon"],
+)
 def test_a_named_run_on_a_host_whose_chat_cannot_be_placed_exits_1_as_its_agent_runs(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
+    argv: list[str],
 ) -> None:
     """Placed once its agent is up: the agent runs on, unnamed."""
     server.place_refused = True
     server.answer = _attached()
     server.frames = [Opened()]
 
-    assert main(["--on", "vm", "--name", "paper review"], profile=_PROFILE) == 1
+    assert main([*argv, "--name", "paper review"], profile=_PROFILE) == 1
 
     assert capsys.readouterr().err.endswith(
         "Error: its agent runs, but the chat could not be named 'paper review'\n",
@@ -2283,6 +2300,7 @@ def test_a_name_another_tab_has_is_refused_before_a_session_opens(
     )
 
 
+@pytest.mark.usefixtures("at_terminal")
 def test_a_continued_session_keeps_the_name_its_own_tab_has(
     served: _Served,
     server: _Server,
@@ -2295,7 +2313,7 @@ def test_a_continued_session_keeps_the_name_its_own_tab_has(
 
     assert (
         main(
-            ["--session", str(other), "--headless", "--name", "paper review"],
+            ["--session", str(other), "--name", "paper review"],
             profile=_PROFILE,
         )
         == 0
@@ -2323,23 +2341,12 @@ def test_tabs_that_cannot_be_listed_leave_a_named_run_unstarted(
     assert (server.starts, served.calls) == ([], [])
 
 
-@pytest.mark.parametrize(
-    "case",
-    [([], True, True), (["--headless"], True, False), ([], False, False)],
-    ids=["terminal", "headless-at-a-terminal", "no-terminal"],
-)
-def test_a_run_starts_a_session_here_with_a_screen_only_at_a_terminal(
+@pytest.mark.usefixtures("at_terminal")
+def test_a_run_at_a_terminal_serves_its_session_here_with_a_screen(
     served: _Served,
     server: _Server,
-    monkeypatch: pytest.MonkeyPatch,
-    case: tuple[list[str], bool, bool],
 ) -> None:
-    argv, isatty, tui = case
-    stdin = io.StringIO()
-    monkeypatch.setattr(stdin, "isatty", lambda: isatty)
-    monkeypatch.setattr("sys.stdin", stdin)
-
-    assert main([*argv, "--", "--model", "opus"], profile=_PROFILE) == 0
+    assert main(["--", "--model", "opus"], profile=_PROFILE) == 0
 
     (called,) = served.calls
     assert called["args"] == ["--model", "opus"]
@@ -2350,31 +2357,101 @@ def test_a_run_starts_a_session_here_with_a_screen_only_at_a_terminal(
     assert UUID((start.cli_session_id or "").removeprefix("chat:"))
     assert (called["session_id"], called["tui"], called["host"]) == (
         _SESSION,
-        tui,
+        True,
         _HOST,
     )
     # A person's own run is no remote agent: it starts sagent's own daemon.
     assert called["remote"] is False
     assert called["client"] is server
-    assert server.api_key == "k"
+    assert (server.api_key, server.started) == ("k", [])
 
 
+@pytest.mark.parametrize(
+    ("argv", "isatty"),
+    [(["--headless"], True), ([], False)],
+    ids=["headless-at-a-terminal", "no-terminal"],
+)
+def test_a_run_with_no_screen_starts_through_this_computers_daemon(
+    *,
+    served: _Served,
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    isatty: bool,
+) -> None:
+    """An agent ran ``knowop run --headless`` in a tool call; the call's limit ended both."""
+    stdin = io.StringIO()
+    monkeypatch.setattr(stdin, "isatty", lambda: isatty)
+    monkeypatch.setattr("sys.stdin", stdin)
+    server.answer = _attached()
+    server.frames = [Opened()]
+
+    assert main([*argv, "--", "--model", "opus"], profile=_PROFILE) == 0
+
+    # Built and placed here, as a screen's run is; served by the daemon, in this folder.
+    assert server.built == [["--model", "opus"]]
+    assert [path for path, _ in server.placed] == [f"/api/sessions/{_SESSION}/place"]
+    assert server.started == [
+        ProcessSpec(host=_HOST, cwd=str(Path.cwd()), args=("--model", "opus")),
+    ]
+    assert served.calls == []
+    assert capsys.readouterr().out == f"{_SESSION}\n"
+
+
+def test_a_run_with_no_screen_starts_in_the_folder_cwd_names(
+    served: _Served,
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    server.answer = _attached()
+    server.frames = [Opened()]
+    checked: list[Path] = []
+
+    def checkout(cwd: Path) -> None:
+        checked.append(cwd)
+
+    monkeypatch.setattr(placement, "git_ref", checkout)
+
+    assert main(["--headless", "--cwd", str(tmp_path)], profile=_PROFILE) == 0
+
+    assert checked == [tmp_path]
+    assert server.started == [ProcessSpec(host=_HOST, cwd=str(tmp_path))]
+    assert served.calls == []
+
+
+def test_a_session_named_with_no_screen_continues_through_this_computers_daemon(
+    served: _Served,
+    server: _Server,
+) -> None:
+    server.answer = _attached()
+    server.frames = [Opened()]
+
+    assert main(["--session", str(_SESSION), "--headless"], profile=_PROFILE) == 0
+
+    assert server.started == [ProcessSpec(host=_HOST, cwd=str(Path.cwd()))]
+    assert (server.starts, server.built, served.calls) == ([], [], [])
+
+
+@pytest.mark.usefixtures("at_terminal")
 def test_a_session_named_is_continued_here(served: _Served, server: _Server) -> None:
     other = uuid4()
 
-    assert main(["--session", str(other), "--headless"], profile=_PROFILE) == 0
+    assert main(["--session", str(other)], profile=_PROFILE) == 0
 
     assert served.calls[0]["session_id"] == other
     assert server.resolved == []
 
 
+@pytest.mark.usefixtures("at_terminal")
 @pytest.mark.parametrize("number", ["AgentSession#412", "412"])
 def test_a_session_named_by_its_number_is_continued_here(
     served: _Served,
     server: _Server,
     number: str,
 ) -> None:
-    assert main(["--session", number, "--headless"], profile=_PROFILE) == 0
+    assert main(["--session", number], profile=_PROFILE) == 0
 
     assert server.resolved == [SeqRef(kind="AgentSession", seq=412)]
     assert served.calls[0]["session_id"] == _ROW
@@ -2388,7 +2465,7 @@ def test_a_number_the_server_does_not_find_exits_1_and_starts_nothing(
 ) -> None:
     server.numbered = False
 
-    assert main(["--session", "AgentSession#9", "--headless"], profile=_PROFILE) == 1
+    assert main(["--session", "AgentSession#9"], profile=_PROFILE) == 1
 
     assert capsys.readouterr().err == "Error: AgentSession#9 not found\n"
     assert (served.calls, server.starts) == ([], [])
@@ -2595,6 +2672,7 @@ def test_a_run_with_no_profile_and_no_daemon_exits_1(
     )
 
 
+@pytest.mark.usefixtures("at_terminal")
 @pytest.mark.parametrize("raised", [KeyboardInterrupt(), asyncio.CancelledError()])
 def test_ctrl_c_or_sigterm_exits_130(
     served: _Served,
@@ -2603,7 +2681,7 @@ def test_ctrl_c_or_sigterm_exits_130(
 ) -> None:
     served.raises = raised
 
-    assert main(["--headless"], profile=_PROFILE) == 130
+    assert main([], profile=_PROFILE) == 130
     del server
 
 
@@ -2703,11 +2781,12 @@ def test_a_start_the_servers_agents_would_refuse_opens_no_session(
     assert (server.starts, server.started) == ([], [])
 
 
+@pytest.mark.usefixtures("at_terminal")
 def test_a_run_here_takes_a_flag_the_servers_agents_would_refuse(
     served: _Served,
     server: _Server,
 ) -> None:
-    assert main(["--headless", "--", "--tools", "Bash"], profile=_PROFILE) == 0
+    assert main(["--", "--tools", "Bash"], profile=_PROFILE) == 0
 
     assert server.built == [["--tools", "Bash"]]
     (called,) = served.calls
@@ -2783,14 +2862,15 @@ def test_on_hands_the_time_limit_to_the_process_it_starts_as_its_own_flag(
     ],
     ids=["M", "M:S", "H:M:S", "D-H", "D-H:M", "D-H:M:S"],
 )
+@pytest.mark.usefixtures("at_terminal")
 def test_a_time_limit_reads_as_slurms_time_does(
     served: _Served,
     server: _Server,
     given: str,
     limit: timedelta,
 ) -> None:
-    assert main(["--headless", "--time", given], profile=_PROFILE) == 0
-    assert main(["--headless"], profile=_PROFILE) == 0
+    assert main(["--time", given], profile=_PROFILE) == 0
+    assert main([], profile=_PROFILE) == 0
     assert [call["time_limit"] for call in served.calls] == [limit, None]
     del server
 
@@ -2824,32 +2904,6 @@ def test_a_time_limit_slurm_would_not_read_or_of_no_time_is_refused(
         in said
     )
     assert served.calls == []
-
-
-def test_help_names_each_of_knowops_own_flags_with_what_it_takes_and_does(
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("COLUMNS", "200")
-
-    with pytest.raises(SystemExit) as exited:
-        _ = main(["--help"], profile=None)
-
-    help_text = capsys.readouterr().out
-    options = help_text[help_text.index("\noptions:\n") :].splitlines()[2:]
-    assert exited.value.code == 0
-    assert [" ".join(line.split()) for line in options] == [
-        "-h, --help show this help message and exit",
-        "--headless Run with no screen, at a terminal too.",
-        "--session ID The session to continue here: its UUID or number (AgentSession#N).",
-        "--on [NAME] Start on host NAME through its daemon; with no name, the server's.",
-        "--cwd DIR With --on, the folder there to start in (default: ~).",
-        "--name NAME Open the chat's tab in Chat, named NAME (else it opens closed).",
-        "--login-host NAME Use host NAME's model login.",
-        "--stop ID Stop session ID's agent, wherever it runs, and exit.",
-        "--time TIME End TIME after it starts, as a stop ends it; Slurm's --time: 120, 2:00:00 or 1-0.",
-        "--serve URL Serve the session a daemon hands on stdin, through the server at URL.",
-    ]
 
 
 def test_stop_stops_the_sessions_agent_wherever_it_runs_and_starts_none(

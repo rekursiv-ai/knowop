@@ -7,6 +7,16 @@ All notable knowop changes are documented here. This project follows
 
 ### Added
 
+- `knowop run` with no screen (`--headless`, or no terminal) starts the agent
+  through this computer's connect, as `--on` this host does, in this folder unless
+  `--cwd` names another, and returns with the session's id within seconds; the agent
+  runs on until stopped. An agent once started another with `knowop run --headless`
+  in a tool call, and the call's 10-minute limit ended both. Only a screen's agent
+  still runs in the `knowop run` process.
+- A run on this computer connects it first when it is not, as `knowop connect`
+  does, with its service's own flags, saying so and where its log is on stderr.
+  Where no user service manager answers, the run says to run `knowop connect
+  --foreground` and starts nothing.
 - An agent of `knowop run` is told, in AgentSend's reminder, that another
   session's agent is `LABEL#SESSION`, as `Agent#412` for `AgentSession#412`; one
   that names an unknown agent `lead` is asked "Did you mean 'lead#N'?".
