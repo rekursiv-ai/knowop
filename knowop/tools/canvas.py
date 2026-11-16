@@ -30,13 +30,12 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from importlib.resources import files
 from math import hypot, isfinite
-from typing import TYPE_CHECKING, Final, Literal, Protocol, TypedDict
+from typing import TYPE_CHECKING, Final, Literal, Protocol
 
 import asyncio
-import json
 import uuid
 
-from trackinizer.client.errors import ClientError
+from trackinizer.client.errors import ClientError, server_answer
 from trackinizer.trax.canvas import (
     canvas_lines,
     chat_lines,
@@ -45,7 +44,7 @@ from trackinizer.trax.canvas import (
 )
 from trackinizer.trax.grammar import parse_ref
 from trackinizer.wire.refs import SeqRef
-from treekle import PlainTree, ReadError, from_plain, json_loads
+from treekle import PlainTree, from_plain
 
 
 if TYPE_CHECKING:
@@ -353,7 +352,7 @@ class CanvasTools:
         try:
             state = await asyncio.to_thread(self._client.read_canvas, canvas)
         except ClientError as error:
-            return f"Could not read the canvas: {_why(error)}"
+            return f"Could not read the canvas: {server_answer(error)}"
         return "\n".join(canvas_lines(state))
 
     async def _show(
@@ -390,7 +389,7 @@ class CanvasTools:
             try:
                 row = await self._row(parsed)
             except ClientError as error:
-                return f"Could not show {_label(parsed)}: {_why(error)}"
+                return f"Could not show {_label(parsed)}: {server_answer(error)}"
         operation = show_operation(
             visual,
             record_id=row,
@@ -404,7 +403,7 @@ class CanvasTools:
                 operation=operation,
             )
         except ClientError as error:
-            return f"Could not show {label}{visual}: {_why(error)}"
+            return f"Could not show {label}{visual}: {server_answer(error)}"
         return f"Showing {label}{visual} on the canvas."
 
     # A terminal opens only on a host of the person's that is ready: a name they have
@@ -414,7 +413,7 @@ class CanvasTools:
         try:
             listed = await asyncio.to_thread(self._client.terminal_hosts)
         except ClientError as error:
-            return f"Not shown: I could not list your hosts: {_why(error)}"
+            return f"Not shown: I could not list your hosts: {server_answer(error)}"
         # The server lists the newest first; the person is told the oldest first.
         return [
             each.name
@@ -453,7 +452,7 @@ class CanvasTools:
                 operation={"kind": "hide", "tabs": [tab]},
             )
         except ClientError as error:
-            return f"Could not hide {visual}: {_why(error)}"
+            return f"Could not hide {visual}: {server_answer(error)}"
         return f"Hid {visual}."
 
     async def _chat(self, canvas: uuid.UUID, *, hidden: bool) -> str:
@@ -465,7 +464,7 @@ class CanvasTools:
                 hidden=hidden,
             )
         except ClientError as error:
-            return f"Chat is as it was: {_why(error)}"
+            return f"Chat is as it was: {server_answer(error)}"
         return "Chat is hidden." if hidden else "Chat is shown."
 
     async def _navigate(self, canvas: uuid.UUID, *, route: str) -> str:
@@ -477,7 +476,7 @@ class CanvasTools:
         try:
             _ = await asyncio.to_thread(self._client.navigate, canvas, route=route)
         except ClientError as error:
-            return f"Could not open {route}: {_why(error)}"
+            return f"Could not open {route}: {server_answer(error)}"
         return f"Opened {route} on the canvas."
 
     async def _highlight(self, canvas: uuid.UUID, *, refs: Sequence[str]) -> str:
@@ -491,7 +490,7 @@ class CanvasTools:
         try:
             found = await self._rows(parsed)
         except ClientError as error:
-            return f"Could not highlight: {_why(error)}"
+            return f"Could not highlight: {server_answer(error)}"
         missing = [_label(each) for each in parsed if each not in found]
         if refs and not found:
             return f"Not highlighted: no row {', '.join(missing)}."
@@ -502,7 +501,7 @@ class CanvasTools:
                 ids=[found[each] for each in parsed if each in found],
             )
         except ClientError as error:
-            return f"Could not highlight: {_why(error)}"
+            return f"Could not highlight: {server_answer(error)}"
         if not refs:
             return "Cleared the highlights."
         marked = ", ".join(_label(each) for each in parsed if each in found)
@@ -514,7 +513,7 @@ class CanvasTools:
         try:
             seen = await asyncio.to_thread(self._client.capture_canvas, canvas)
         except ClientError as error:
-            return f"Could not capture the canvas: {_why(error)}"
+            return f"Could not capture the canvas: {server_answer(error)}"
         self._tiles[caller.label] = seen.tiles
         boxes = ", ".join(f"{each.id} ({each.author})" for each in seen.boxes)
         missed = ", ".join(seen.not_captured)
@@ -554,7 +553,7 @@ class CanvasTools:
         try:
             found = await self._rows(parsed)
         except ClientError as error:
-            return f"Could not draw the box: {_why(error)}"
+            return f"Could not draw the box: {server_answer(error)}"
         missing = [_label(each) for each in parsed if each not in found]
         if missing:
             return f"Not drawn: no row {', '.join(missing)}."
@@ -571,7 +570,7 @@ class CanvasTools:
                 ),
             )
         except ClientError as error:
-            return f"Could not draw the box: {_why(error)}"
+            return f"Could not draw the box: {server_answer(error)}"
         drawn = [
             from_plain(each.get("id"), str)
             for each in from_plain(
@@ -597,7 +596,7 @@ class CanvasTools:
                 operation={"kind": "remove_mark", "id": str(box)},
             )
         except ClientError as error:
-            return f"Could not remove the box: {_why(error)}"
+            return f"Could not remove the box: {server_answer(error)}"
         return f"The box {box} is gone."
 
     # Held here too: the server holds a key minted for an agent process to these
@@ -623,7 +622,7 @@ class CanvasTools:
                 change=change,
             )
         except ClientError as error:
-            return f"Not changed: {_why(error)}"
+            return f"Not changed: {server_answer(error)}"
         now = from_plain(
             state.get("preferences"),
             dict[str, object],
@@ -639,7 +638,7 @@ class CanvasTools:
                 asyncio.to_thread(self._client.list_workspaces),
             )
         except ClientError as error:
-            return f"Could not list the chats: {_why(error)}"
+            return f"Could not list the chats: {server_answer(error)}"
         return "\n".join(chat_lines(canvases, workspaces, query=query))
 
     async def _rename(self, *, target: str, name: str) -> str:
@@ -658,7 +657,7 @@ class CanvasTools:
             except ValueError as error:
                 return f"Not renamed: {error}."
             except ClientError as error:
-                return f"Could not rename {target}: {_why(error)}"
+                return f"Could not rename {target}: {server_answer(error)}"
             return f"The workspace {target} is now {renamed.get('title')}."
         try:
             canvas = uuid.UUID(target) if target else self.canvas_id
@@ -675,7 +674,7 @@ class CanvasTools:
                 name=name,
             )
         except ClientError as error:
-            return f"Could not rename the chat: {_why(error)}"
+            return f"Could not rename the chat: {server_answer(error)}"
         return f"The chat is now {renamed.get('name')}."
 
     async def _rows(self, refs: Sequence[Ref]) -> dict[Ref, uuid.UUID]:
@@ -748,22 +747,6 @@ def with_settings(
             "settings": {**settings, "description": described["description"]},
         },
     }
-
-
-class _Failure(TypedDict):
-    detail: str
-
-
-def _why(error: ClientError) -> str:
-    """Say what the server answered, in words without the request's path."""
-    if error.status_code is None:
-        return "the server could not be reached."
-    body = str(error).partition(f"-> {error.status_code}: ")[2]
-    try:
-        detail = json_loads(body, _Failure)["detail"]
-    except (json.JSONDecodeError, ReadError):
-        return f"the server answered {error.status_code}."
-    return f"the server answered {error.status_code}: {detail.removesuffix('.')}."
 
 
 def _label(ref: Ref) -> str:

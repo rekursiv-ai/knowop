@@ -59,7 +59,7 @@ from sagent.session.types import (
 from sagent.tools import mcp
 from sagent.tools.read import Read
 from sagent.tools.remote import RemoteSession, RemoteTool
-from sagent.tools.types import Tool, ToolContext
+from sagent.tools.types import Tool, ToolContext, settled
 from sagent.tui.main import Flags, OpenAgent, StartError
 from sagent.tui.prompt import Panes
 from sagent.tui.render import error_text
@@ -118,6 +118,7 @@ from knowop.lib.testing.import_graph import Counted, import_graph
 from knowop.process import (
     main as main_module,
     publisher,
+    start,
 )
 from knowop.process.codec import (
     event_payload,
@@ -148,7 +149,7 @@ _THIS: Final[Path] = Path(__file__).resolve()
 _CWD: Final[Path] = _THIS.parent
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Iterator, Mapping
+    from collections.abc import AsyncGenerator, Generator, Iterator, Mapping
 
     import queue
 
@@ -436,13 +437,25 @@ class _Server(_Client):
         self.messaged.append((to, text, from_label, booked))
         return [UUID(int=412)]
 
+    def read_process(self, session_id: UUID) -> AgentProcess | None:
+        del session_id
+        return self.answer
+
     def stop_process(self, session_id: UUID) -> AgentProcess | None:
         self.stopped.append(session_id)
         if isinstance(self.stop_answer, ClientError):
             raise self.stop_answer
         return self.stop_answer
 
-    def post(self, path: str, *, body: object = None) -> dict[str, str]:
+    def post(
+        self,
+        path: str,
+        *,
+        body: object = None,
+        timeout: float | None = None,
+        retry_attempts: int = 3,
+    ) -> PlainTree:
+        del timeout, retry_attempts
         self.placed.append((path, body))
         if self.place_refused:
             raise ClientError("POST place -> 403", status_code=403)
@@ -491,6 +504,10 @@ class _Server(_Client):
         self.started.append(spec)
         assert self.answer is not None
         return self.answer
+
+    @contextlib.contextmanager
+    def lines_stream(self, session_id: UUID) -> Generator[Iterator[ViewerFrame]]:
+        yield self.open_lines(session_id)
 
     def open_lines(self, session_id: UUID) -> Iterator[ViewerFrame]:
         assert session_id == _SESSION
@@ -846,49 +863,41 @@ def _line(text: str, *, canvas: UUID | None = None) -> JSON:
 @pytest.mark.parametrize("remote", [False, True], ids=["own-host", "remote"])
 async def test_every_agent_acts_on_the_canvas_the_newest_line_from_chat_named(
     opened: _Opened,
+    tmp_path: Path,
     *,
     remote: bool,
 ) -> None:
     """The Canvas tool is handed in by name; it acts on no canvas until a line names one."""
-    shown = [
-        call("Canvas", f"c{n}", action="show", visual="trax.record", record="Issue#12")
-        for n in range(3)
-    ]
-    files = call(
-        "Canvas",
-        "files",
-        action="show",
-        visual="trax.files",
-        record="Issue#12",
-        params={"changed": True, "depth": 2, "path": "src/"},
-    )
-    opened.replies = [
-        reply(calls=[shown[0]]),
-        reply("none yet"),
-        reply(calls=[shown[1], call("Canvas", "look", action="capture"), files]),
-        reply("shown"),
-        reply(calls=[shown[2]]),
-        reply("still"),
-    ]
+    opened.replies = [reply("none yet"), reply("shown"), reply("still")]
+    context = ToolContext(cwd=tmp_path)
+    results: list[ToolResult] = []
     async with _relayed() as relay, _serving(relay, remote=remote) as (task, server):
         _ = await relay.seen(_is("settings"))
-        _ = await relay.send("UserMessage", _line("show it"))
-        await _completed(relay, 2)
-        _ = await relay.send("UserMessage", _line("now", canvas=_CANVAS_ON))
-        await _completed(relay, 4)
-        _ = await relay.send("UserMessage", _line("again"))
-        await _completed(relay, 6)
-        assert opened.agent is not None
-        results = {
-            r.call_id: r
-            for r in opened.agent.session.history()
-            if isinstance(r, ToolResult)
-        }
+        canvas, _ = opened.given_tools[0]
+        for completed, line in enumerate(
+            [_line("show it"), _line("now", canvas=_CANVAS_ON), _line("again")],
+            start=1,
+        ):
+            _ = await relay.send("UserMessage", line)
+            await _completed(relay, completed)
+            results.append(
+                await settled(
+                    canvas.call(
+                        context,
+                        {
+                            "action": "show",
+                            "visual": "trax.record",
+                            "record": "Issue#12",
+                        },
+                    ),
+                ),
+            )
         await relay.close(CLOSE_ENDED)
         _ = await _exited(task)
 
     (given,) = opened.given_tools
-    (canvas,) = given
+    canvas, host_tool = given
+    assert host_tool.name == "KnowOp"
     assert (canvas.name, canvas.description) == (CANVAS_TOOL, CANVAS_DESCRIPTION)
     actions = from_plain(canvas.schema["properties"], dict[str, dict[str, object]])
     assert actions["action"]["enum"] == [
@@ -904,8 +913,19 @@ async def test_every_agent_acts_on_the_canvas_the_newest_line_from_chat_named(
         "chats",
         "rename",
     ]
-    unplaced, placed, kept = (results[f"c{n}"] for n in range(3))
-    look = results["look"]
+    unplaced, placed, kept = results
+    look = await settled(canvas.call(context, {"action": "capture"}))
+    files = await settled(
+        canvas.call(
+            context,
+            {
+                "action": "show",
+                "visual": "trax.files",
+                "record": "Issue#12",
+                "params": {"changed": True, "depth": 2, "path": "src/"},
+            },
+        ),
+    )
     assert [r.stdout for r in (unplaced, placed, kept)] == [
         (
             (
@@ -916,7 +936,7 @@ async def test_every_agent_acts_on_the_canvas_the_newest_line_from_chat_named(
         ("Showing Issue#12 in trax.record on the canvas.",),
         ("Showing Issue#12 in trax.record on the canvas.",),
     ]
-    assert results["files"].stdout == ("Showing Issue#12 in trax.files on the canvas.",)
+    assert files.stdout == ("Showing Issue#12 in trax.files on the canvas.",)
     assert look.stdout == (
         (
             "The canvas as the person sees it, 2 x 1 px. A mark's corner is a fraction "
@@ -933,7 +953,6 @@ async def test_every_agent_acts_on_the_canvas_the_newest_line_from_chat_named(
         "record_id": str(_ROW),
         "params": {"changed": True, "depth": 2, "path": "src/"},
     }
-    # The second line's three calls run side by side, in no set order.
     assert sorted(server.canvased, key=lambda each: (each[1], str(each[2]))) == [
         (_CANVAS_ON, "apply", narrowed),
         (_CANVAS_ON, "apply", record),
@@ -1059,7 +1078,8 @@ async def test_set_offers_the_settings_the_server_gives_and_sets_only_those(
         _ = await _exited(task)
 
     (given,) = opened.given_tools
-    (canvas,) = given
+    canvas, host_tool = given
+    assert host_tool.name == "KnowOp"
     schema = from_plain(canvas.schema, dict[str, PlainTree])
     assert schema == with_settings(
         schema,
@@ -2566,7 +2586,7 @@ def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
         None,
         [("effort", "high")],
     )
-    assert (interactive, use_daemon, tools) == (False, False, [CANVAS_TOOL])
+    assert (interactive, use_daemon, tools) == (False, False, [CANVAS_TOOL, "KnowOp"])
 
 
 @pytest.mark.parametrize(
@@ -2718,7 +2738,7 @@ def test_on_starts_it_through_a_daemon_and_waits_for_it_to_attach(
 ) -> None:
     answer, frames, said = case
     exit_code = 1 if said else 0
-    monkeypatch.setattr(main_module, "_ATTACHED_SEC", 0.05)
+    monkeypatch.setattr(start, "_ATTACHED_SEC", 0.05)
     server.answer = answer
     server.frames = [Opened(), *frames]
 
@@ -2800,7 +2820,7 @@ def test_on_waits_for_each_frame_until_a_deadline_ahead(
     server.answer = _attached("starting")
     server.frames = [Opened(), ProcessLine(process=_attached())]
     ahead: list[float] = []
-    wait = main_module._next_frame
+    wait = start._next_frame
 
     def timed(
         frames: queue.Queue[ViewerFrame | ClientError],
@@ -2810,11 +2830,11 @@ def test_on_waits_for_each_frame_until_a_deadline_ahead(
         ahead.append(deadline - time.monotonic())
         return wait(frames, deadline=deadline)
 
-    monkeypatch.setattr(main_module, "_next_frame", timed)
+    monkeypatch.setattr(start, "_next_frame", timed)
 
     assert main(["--on"], profile=_PROFILE) == 0
     assert len(ahead) == 2
-    assert all(0 < left <= main_module._ATTACHED_SEC for left in ahead)
+    assert all(0 < left <= start._ATTACHED_SEC for left in ahead)
 
 
 def test_the_servers_agents_take_a_time_limit_and_a_campaign_leads_flags(
@@ -2848,62 +2868,6 @@ def test_on_hands_the_time_limit_to_the_process_it_starts_as_its_own_flag(
     assert server.started == [
         ProcessSpec(host="vm", args=("--time", "0-01:30:00", "--model", "opus")),
     ]
-
-
-@pytest.mark.parametrize(
-    ("given", "limit"),
-    [
-        ("120", timedelta(minutes=120)),
-        ("90:30", timedelta(minutes=90, seconds=30)),
-        ("2:05:07", timedelta(hours=2, minutes=5, seconds=7)),
-        ("1-0", timedelta(days=1)),
-        ("1-2:30", timedelta(days=1, hours=2, minutes=30)),
-        ("1-2:30:15", timedelta(days=1, hours=2, minutes=30, seconds=15)),
-    ],
-    ids=["M", "M:S", "H:M:S", "D-H", "D-H:M", "D-H:M:S"],
-)
-@pytest.mark.usefixtures("at_terminal")
-def test_a_time_limit_reads_as_slurms_time_does(
-    served: _Served,
-    server: _Server,
-    given: str,
-    limit: timedelta,
-) -> None:
-    assert main(["--time", given], profile=_PROFILE) == 0
-    assert main([], profile=_PROFILE) == 0
-    assert [call["time_limit"] for call in served.calls] == [limit, None]
-    del server
-
-
-@pytest.mark.parametrize(
-    "given",
-    ["2h", "1:2:3:4", "1-2:3:4:5", "-30", "1-", "", "0", "0-0:00"],
-    ids=[
-        "a unit",
-        "four fields",
-        "days and four",
-        "no days",
-        "no hours",
-        "empty",
-        "zero",
-        "zero days",
-    ],
-)
-def test_a_time_limit_slurm_would_not_read_or_of_no_time_is_refused(
-    served: _Served,
-    capsys: pytest.CaptureFixture[str],
-    given: str,
-) -> None:
-    with pytest.raises(SystemExit) as refused:
-        _ = main(["--headless", "--time", given], profile=_PROFILE)
-
-    assert refused.value.code == 2
-    said = capsys.readouterr().err
-    assert (
-        f"argument --time: {given!r} is no time limit, such as 120, 2:00:00 or 1-0"
-        in said
-    )
-    assert served.calls == []
 
 
 def test_stop_stops_the_sessions_agent_wherever_it_runs_and_starts_none(
@@ -3054,13 +3018,24 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
         "rename_canvas": lambda c: c.rename_canvas(_CANVAS_ON, name="x"),
         "rename_workspace": lambda c: c.rename_workspace(_ROW, title="x"),
         "get": lambda c: c.get("/api/me/preferences/agent"),
+        "post": lambda c: c.post("/api/addons/knowhost/hosts", retry_attempts=1),
+        "start_process": lambda c: c.start_process(session_id, ProcessSpec()),
+        "stop_process": lambda c: c.stop_process(session_id),
+        "read_process": lambda c: c.read_process(session_id),
+        "lines_stream": lambda c: c.lines_stream(session_id).__enter__(),
     }
+    additional: list[Callable[[Client], object]] = [
+        lambda c: c.get("/api/addons/knowhost/hosts"),
+        lambda c: c.get(f"/api/inquiries/{session_id}"),
+        lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/pause"),
+        lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/resume"),
+    ]
     with Client(
         "https://trax.test",
         api_key="k",
         transport=httpx2.MockTransport(refused),
     ) as client:
-        for call in calls.values():
+        for call in [*calls.values(), *additional]:
             with pytest.raises(ClientError):
                 _ = call(client)
 
@@ -3071,7 +3046,7 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
         (WEBSOCKET, TOOLS_WS_PATH),
     ]
     assert members == {*calls, "base_url", "api_key"}
-    assert len(sent) == len(calls)
+    assert len(sent) == len(calls) + len(additional)
     assert all(
         any(
             method == listed and re.fullmatch(_template_pattern(path), url)

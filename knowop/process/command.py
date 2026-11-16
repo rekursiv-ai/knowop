@@ -48,7 +48,15 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
 
-__all__ = ["Flags", "is_action", "logs_in", "parse_run", "run_parser", "sagent_command"]
+__all__ = [
+    "Flags",
+    "is_action",
+    "logs_in",
+    "parse_run",
+    "run_parser",
+    "sagent_command",
+    "time_limit",
+]
 
 
 _SLURM_TIME: Final = re.compile(r"(?:([0-9]+)-)?([0-9]+)(?::([0-9]+))?(?::([0-9]+))?")
@@ -177,92 +185,21 @@ def sagent_command(sagent: Sequence[str]) -> list[str]:
     return [sys.executable, "-P", "-m", opened.__module__.rsplit(".", 2)[0], *sagent]
 
 
-def _add_arguments(parser: argparse.ArgumentParser) -> None:
-    """Register knowop's flags on ``parser``."""
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run with no screen, through this computer's daemon, at a terminal too.",
-    )
-    parser.add_argument(
-        "--session",
-        type=_session,
-        metavar="ID",
-        help="The session to continue here: its UUID or number (AgentSession#N).",
-    )
-    parser.add_argument(
-        "--on",
-        nargs="?",
-        const="",
-        metavar="NAME",
-        help="Start on host NAME through its daemon; with no name, the server's.",
-    )
-    parser.add_argument(
-        "--cwd",
-        metavar="DIR",
-        help="The folder to start in (default: ~ with --on, else this folder).",
-    )
-    parser.add_argument(
-        "--name",
-        type=_name,
-        help="Open the chat's tab in Chat, named NAME (else it opens closed).",
-    )
-    parser.add_argument(
-        "--login-host",
-        default="",
-        metavar="NAME",
-        help="Use host NAME's model login.",
-    )
-    parser.add_argument(
-        "--stop",
-        type=_session,
-        metavar="ID",
-        help="Stop session ID's agent, wherever it runs, and exit.",
-    )
-    parser.add_argument(
-        "--time",
-        type=_time_limit,
-        metavar="TIME",
-        dest="time_limit",
-        help=(
-            "End TIME after it starts, as a stop ends it; Slurm's --time: 120, "
-            "2:00:00 or 1-0."
-        ),
-    )
-    parser.add_argument(
-        "--serve",
-        metavar="URL",
-        help="Serve the session a daemon hands on stdin, through the server at URL.",
-    )
-
-
-# Read before a session opens: the server holds a canvas name to the same bounds, and a
-# name it refused after the start would leave a session behind.
-def _name(text: str) -> str:
-    """Read a chat's name as the server holds a canvas's."""
-    try:
-        return checked_canvas_name(text)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(str(error)) from error
-
-
-def _session(text: str) -> Ref:
-    """Read a session as its UUID or number: ``AgentSession#412``, or ``412`` alone."""
-    try:
-        ref = parse_ref(f"AgentSession#{text}" if text.isdigit() else text)
-    except ValueError:
-        ref = None
-    if ref is None or (isinstance(ref, SeqRef) and ref.kind != "AgentSession"):
-        raise argparse.ArgumentTypeError(
-            f"{text!r} is no session: give its UUID or number (AgentSession#N)",
-        )
-    return ref
-
-
 # Without days, ``M``, ``M:S`` or ``H:M:S``; with them, ``D-H``, ``D-H:M`` or
 # ``D-H:M:S``.
-def _time_limit(text: str) -> timedelta:
-    """Read a time limit as Slurm's ``--time`` reads one, refusing one of no time."""
+def time_limit(text: str) -> timedelta:
+    """Read a positive Slurm time limit.
+
+    Args:
+      text: Minutes, M:S, H:M:S, D-H, D-H:M, or D-H:M:S.
+
+    Returns:
+      limit: The requested duration.
+
+    Raises:
+      argparse.ArgumentTypeError: The text names no positive duration.
+
+    """
     matched = _SLURM_TIME.fullmatch(text)
     if matched is not None:
         days, *clock = matched.groups()
@@ -369,3 +306,85 @@ def _journal_flags(sagent: Sequence[str]) -> list[str]:
         "--hosted-session": flags.hosted_session is not None,
     }
     return [name for name, given in named.items() if given]
+
+
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Register knowop's flags on ``parser``."""
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run with no screen, through this computer's daemon, at a terminal too.",
+    )
+    parser.add_argument(
+        "--session",
+        type=_session,
+        metavar="ID",
+        help="The session to continue here: its UUID or number (AgentSession#N).",
+    )
+    parser.add_argument(
+        "--on",
+        nargs="?",
+        const="",
+        metavar="NAME",
+        help="Start on host NAME through its daemon; with no name, the server's.",
+    )
+    parser.add_argument(
+        "--cwd",
+        metavar="DIR",
+        help="The folder to start in (default: ~ with --on, else this folder).",
+    )
+    parser.add_argument(
+        "--name",
+        type=_name,
+        help="Open the chat's tab in Chat, named NAME (else it opens closed).",
+    )
+    parser.add_argument(
+        "--login-host",
+        default="",
+        metavar="NAME",
+        help="Use host NAME's model login.",
+    )
+    parser.add_argument(
+        "--stop",
+        type=_session,
+        metavar="ID",
+        help="Stop session ID's agent, wherever it runs, and exit.",
+    )
+    parser.add_argument(
+        "--time",
+        type=time_limit,
+        metavar="TIME",
+        dest="time_limit",
+        help=(
+            "End TIME after it starts, as a stop ends it; Slurm's --time: 120, "
+            "2:00:00 or 1-0."
+        ),
+    )
+    parser.add_argument(
+        "--serve",
+        metavar="URL",
+        help="Serve the session a daemon hands on stdin, through the server at URL.",
+    )
+
+
+# Read before a session opens: the server holds a canvas name to the same bounds, and a
+# name it refused after the start would leave a session behind.
+def _name(text: str) -> str:
+    """Read a chat's name as the server holds a canvas's."""
+    try:
+        return checked_canvas_name(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _session(text: str) -> Ref:
+    """Read a session as its UUID or number: ``AgentSession#412``, or ``412`` alone."""
+    try:
+        ref = parse_ref(f"AgentSession#{text}" if text.isdigit() else text)
+    except ValueError:
+        ref = None
+    if ref is None or (isinstance(ref, SeqRef) and ref.kind != "AgentSession"):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is no session: give its UUID or number (AgentSession#N)",
+        )
+    return ref

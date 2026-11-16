@@ -12,7 +12,15 @@ recorded elsewhere reads as a host name through :func:`short_name`.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Final, NotRequired, TypedDict, cast, override
+from typing import (
+    TYPE_CHECKING,
+    Final,
+    NotRequired,
+    Protocol,
+    TypedDict,
+    cast,
+    override,
+)
 
 import argparse
 import re
@@ -30,6 +38,7 @@ if TYPE_CHECKING:
     from trackinizer.client.client import Client
     from trackinizer.wire import wire_hosts
     from trackinizer.wire.wire_hosts import Host
+    from treekle import PlainTree
 else:
     from wrapt import lazy_import
 
@@ -38,7 +47,22 @@ else:
     wire_hosts = lazy_import("trackinizer.wire.wire_hosts")
 
 
-__all__ = ["HOST_WORD", "Hosts", "check_name", "host_name", "short_name"]
+__all__ = [
+    "HOST_WORD",
+    "Hosts",
+    "KnowHost",
+    "check_name",
+    "host_name",
+    "listed_knowhosts",
+    "named_knowhost",
+    "pause_knowhost",
+    "paused_line",
+    "resume_knowhost",
+    "resumed_lines",
+    "short_name",
+    "start_knowhost",
+    "started_lines",
+]
 
 HOST_WORD: Final = "host"
 """The verb that selects this command, in matching, help, usage and confirmations."""
@@ -74,7 +98,7 @@ class Hosts(Command):
         summary=(
             "Bare 'host' lists the registered hosts, then your KnowHosts; 'host NAME' "
             "shows one. Both need the writer role. Setting, labelling and deleting "
-            "need the admin role. 'host start' rents a _KnowHost, billed to your "
+            "need the admin role. 'host start' rents a KnowHost, billed to your "
             "account, that joins as one of your hosts; it pauses after 30 minutes "
             "with no tool call and no terminal use, and costs nothing while paused. "
             "'knowop connect' connects this computer."
@@ -144,7 +168,8 @@ class Hosts(Command):
             run_list(client_factory)
             return
         if words == ["start"]:
-            _start(client_factory())
+            for line in started_lines(start_knowhost(client_factory())):
+                echo(line)
             return
         name = tokens[0]
         check_name(name)
@@ -155,8 +180,13 @@ class Hosts(Command):
                 run_del(client_factory, name)
             case ["pause" | "resume" as action]:
                 http = client_factory()
-                knowhost = _knowhost(http, name)
-                (_pause if action == "pause" else _resume)(http, knowhost)
+                knowhost = named_knowhost(http, name)
+                if action == "pause":
+                    paused = pause_knowhost(http, knowhost)
+                    echo(paused_line(paused))
+                else:
+                    for line in resumed_lines(resume_knowhost(http, knowhost)):
+                        echo(line)
             case [field] if field in _FIELDS:
                 run_field(client_factory, name, field)
             case [field, "to", _] if field in _FIELDS:
@@ -186,11 +216,11 @@ def run_list(client_factory: Callable[[], Client]) -> None:
     for *head, how in cells:
         padded = (cell.ljust(width) for cell, width in zip(head, widths, strict=True))
         echo("  ".join((*padded, how)))
-    rented = _listed(http)
-    if rented:
+    rented = listed_knowhosts(http)
+    if rented is not None and len(rented) > 0:
         echo("")
         echo("KnowHosts:")
-    for each in rented:
+    for each in rented or ():
         echo(f"{each['host']}  {each['state'].ljust(8)}  {each['id']}")
 
 
@@ -289,7 +319,7 @@ def run_del(client_factory: Callable[[], Client], name: str) -> None:
 
     """
     http = client_factory()
-    for each in _listed(http):
+    for each in listed_knowhosts(http) or ():
         if each["host"] == name:
             _end(http, each)
             return
@@ -353,8 +383,8 @@ def check_name(name: str) -> None:
         )
 
 
-class _KnowHost(TypedDict):
-    """One _KnowHost as the server answers it."""
+class KnowHost(TypedDict):
+    """One KnowHost as the server answers it."""
 
     id: str
     host: str
@@ -363,16 +393,43 @@ class _KnowHost(TypedDict):
     tools: NotRequired[bool | None]
 
 
-class _KnowHosts(TypedDict):
-    hosts: list[_KnowHost]
+class KnowHosts(TypedDict):
+    hosts: list[KnowHost]
 
 
-def _start(http: Client) -> None:
-    """Start a _KnowHost, sent once: a retry would wait out the same deadline again."""
+class KnowHostClient(Protocol):
+    """The HTTP calls needed to rent and operate KnowHosts."""
+
+    def get(self, path: str, *, timeout: float | None = None) -> PlainTree:
+        """Read a server response."""
+        ...
+
+    def post(
+        self,
+        path: str,
+        *,
+        body: object = None,
+        timeout: float | None = None,
+        retry_attempts: int = 3,
+    ) -> PlainTree:
+        """Send a server request."""
+        ...
+
+
+def start_knowhost(http: KnowHostClient) -> KnowHost:
+    """Rent a KnowHost once, waiting past the server's 90-second deadline.
+
+    Args:
+      http: The person's authenticated server client.
+
+    Returns:
+      host: The online KnowHost.
+
+    """
     try:
-        knowhost = from_plain(
+        return from_plain(
             http.post(_KNOWHOSTS, timeout=_WAIT_SEC, retry_attempts=1),
-            _KnowHost,
+            KnowHost,
         )
     except ClientError as error:
         if error.status_code == 404:
@@ -381,61 +438,110 @@ def _start(http: Client) -> None:
                 status_code=404,
             ) from error
         raise
-    echo(f"{knowhost['host']} is running: open its terminal from Hosts.")
-    _say_tools(knowhost)
 
 
-def _listed(http: Client) -> list[_KnowHost]:
-    """Return the caller's KnowHosts; none from a server that rents none (404)."""
+def listed_knowhosts(http: KnowHostClient) -> list[KnowHost] | None:
+    """Return the caller's KnowHosts, or None when the server rents none.
+
+    Args:
+      http: The person's authenticated server client.
+
+    Returns:
+      hosts: The rentals, or None when the server has no rental service.
+
+    """
     try:
         answer = http.get(_KNOWHOSTS)
     except ClientError as error:
         if error.status_code == 404:
-            return []
+            return None
         raise
-    return from_plain(answer, _KnowHosts)["hosts"]
+    return from_plain(answer, KnowHosts)["hosts"]
 
 
-def _knowhost(http: Client, name: str) -> _KnowHost:
+def named_knowhost(http: KnowHostClient, name: str) -> KnowHost:
     """Return the caller's KnowHost named ``name``."""
-    for each in _listed(http):
+    check_name(name)
+    for each in listed_knowhosts(http) or ():
         if each["host"] == name:
             return each
     raise ClientError(f"you have no KnowHost {name}")
 
 
-def _pause(http: Client, knowhost: _KnowHost) -> None:
+def pause_knowhost(http: KnowHostClient, knowhost: KnowHost) -> KnowHost:
     """Pause ``knowhost`` now; charging stops."""
     _ = http.post(f"{_KNOWHOSTS}/{knowhost['id']}/pause")
-    echo(f"{knowhost['host']} is paused. {_PAUSE_NOTE}")
+    return {**knowhost, "state": "paused"}
 
 
-def _resume(http: Client, knowhost: _KnowHost) -> None:
-    """Wake ``knowhost``; answer once it is online again."""
-    woken = from_plain(
+def resume_knowhost(http: KnowHostClient, knowhost: KnowHost) -> KnowHost:
+    """Wake ``knowhost``; answer once it is online again.
+
+    Args:
+      http: The person's authenticated server client.
+      knowhost: The rental to resume.
+
+    Returns:
+      host: The online KnowHost, including whether memory was retained.
+
+    """
+    return from_plain(
         http.post(
             f"{_KNOWHOSTS}/{knowhost['id']}/resume",
             timeout=_WAIT_SEC,
             retry_attempts=1,
         ),
-        _KnowHost,
+        KnowHost,
     )
-    echo(f"{woken['host']} is running again. {_PAUSE_NOTE}")
-    if woken.get("memory_kept") is False:
-        echo("It rebooted from its files: its processes were lost.")
-    _say_tools(woken)
 
 
-def _end(http: Client, knowhost: _KnowHost) -> None:
+def started_lines(knowhost: KnowHost) -> list[str]:
+    """Describe a KnowHost just rented, as the CLI and tool say it."""
+    return [
+        f"{knowhost['host']} is running: open its terminal from Hosts.",
+        *_tools_lines(knowhost),
+    ]
+
+
+def paused_line(knowhost: KnowHost) -> str:
+    """Describe a KnowHost just paused."""
+    return f"{knowhost['host']} is paused. {_PAUSE_NOTE}"
+
+
+def resumed_lines(knowhost: KnowHost) -> list[str]:
+    """Describe a KnowHost just woken, including lost memory and absent tools.
+
+    Args:
+      knowhost: The rental the server resumed.
+
+    Returns:
+      lines: The CLI and tool's explanation of the resume.
+
+    """
+    return [
+        f"{knowhost['host']} is running again. {_PAUSE_NOTE}",
+        *(
+            ["It rebooted from its files: its processes were lost."]
+            if knowhost.get("memory_kept") is False
+            else []
+        ),
+        *_tools_lines(knowhost),
+    ]
+
+
+def _end(http: Client, knowhost: KnowHost) -> None:
     """End ``knowhost`` for good: its VM, and the host it joined as."""
     _ = http.delete(f"{_KNOWHOSTS}/{knowhost['id']}")
     echo(f"{knowhost['host']} is gone, and its VM with it.")
 
 
-def _say_tools(knowhost: _KnowHost) -> None:
+def _tools_lines(knowhost: KnowHost) -> list[str]:
     """Say when the KnowHost's host serves terminals but no tools."""
-    if knowhost.get("tools") is False:
-        echo("Its knowop serves terminals but no tools.")
+    return (
+        ["Its knowop serves terminals but no tools."]
+        if knowhost.get("tools") is False
+        else []
+    )
 
 
 def _get(client_factory: Callable[[], Client], name: str) -> Host:

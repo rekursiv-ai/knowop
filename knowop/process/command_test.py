@@ -16,6 +16,7 @@ from knowop.process.command import (
     parse_run,
     run_parser,
     sagent_command,
+    time_limit,
 )
 
 
@@ -302,11 +303,42 @@ def test_a_sagent_flag_that_picks_a_journal_is_refused(
     )
 
 
+@pytest.mark.parametrize(
+    ("given", "limit"),
+    [
+        ("120", timedelta(minutes=120)),
+        ("90:30", timedelta(minutes=90, seconds=30)),
+        ("2:05:07", timedelta(hours=2, minutes=5, seconds=7)),
+        ("1-0", timedelta(days=1)),
+        ("1-2:30", timedelta(days=1, hours=2, minutes=30)),
+        ("1-2:30:15", timedelta(days=1, hours=2, minutes=30, seconds=15)),
+    ],
+    ids=["M", "M:S", "H:M:S", "D-H", "D-H:M", "D-H:M:S"],
+)
+def test_a_time_limit_reads_as_slurms_time_does(given: str, limit: timedelta) -> None:
+    assert time_limit(given) == limit
+
+
+@pytest.mark.parametrize(
+    "given",
+    ["2h", "1:2:3:4", "1-2:3:4:5", "-30", "1-", "", "0", "0-0:00"],
+    ids=[
+        "a unit",
+        "four fields",
+        "days and four",
+        "no days",
+        "no hours",
+        "empty",
+        "zero",
+        "zero days",
+    ],
+)
 def test_a_time_limit_slurm_would_not_read_is_refused(
     capsys: pytest.CaptureFixture[str],
+    given: str,
 ) -> None:
-    assert _refusal(["--headless", "--time", "2h"], capsys) == (
-        "argument --time: '2h' is no time limit, such as 120, 2:00:00 or 1-0"
+    assert _refusal(["--headless", f"--time={given}"], capsys) == (
+        f"argument --time: {given!r} is no time limit, such as 120, 2:00:00 or 1-0"
     )
 
 
