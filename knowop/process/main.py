@@ -52,11 +52,8 @@ import asyncio
 import contextlib
 import logging
 import os
-import queue
 import subprocess
 import sys
-import threading
-import time
 
 from sagent.runtime import types
 from sagent.session.jsonl import JournalInUseError
@@ -88,7 +85,6 @@ from trackinizer.wire.wire_science_chat import chat_session_id
 from trackinizer.wire.wire_session_relay import (
     Command,
     Hello,
-    ProcessLine,
     ProcessSpec,
     ServeSession,
     remote_flags_refused,
@@ -120,6 +116,7 @@ from knowop.process.host_follower import HostFollower, HostLister
 from knowop.process.publisher import Publisher
 from knowop.process.remote_commands import REMOTE_AGENT
 from knowop.process.server_relay import AgentMessenger, ServerRelay
+from knowop.process.start import slurm_time, start_args, started_process
 from knowop.service import knowop_version
 from knowop.tools.canvas import (
     CANVAS_DESCRIPTION,
@@ -129,6 +126,12 @@ from knowop.tools.canvas import (
     Picture,
     agent_settings,
     with_settings,
+)
+from knowop.tools.knowop import (
+    KNOWOP_DESCRIPTION,
+    KNOWOP_TOOL,
+    KnowOpClient,
+    KnowOpTools,
 )
 
 
@@ -152,7 +155,7 @@ if TYPE_CHECKING:
     from sagent.tui.slash import Allowed
     from trackinizer.trax.profile import Profile
     from trackinizer.wire.refs import Ref
-    from trackinizer.wire.wire_session_relay import Input, ViewerFrame
+    from trackinizer.wire.wire_session_relay import Input
     from treekle import PlainTree
 
     from knowop.agent.resume import JournalChoice
@@ -182,9 +185,6 @@ _GIVE_UP_SEC: Final = 600.0
 
 _STOPPED_SEC: Final = 30.0
 """How long a stopped process halts its turn and uploads before it ends."""
-
-_ATTACHED_SEC: Final = 120.0
-"""How long ``--on`` waits for the process it started to attach."""
 
 _EXITS: Final = {
     CLOSE_ENDED: 0,
@@ -246,7 +246,7 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
         # The server's own agents are remote agents, which take only some flags: checked
         # here too, by the rule the server keeps, so a start they refuse opens no session.
         if named is None and flags.on == "":
-            refused = remote_flags_refused(_start_args(flags, args))
+            refused = remote_flags_refused(start_args(flags.time_limit, args))
             if refused:
                 sys.stderr.write(f"Error: {refused}\n")
                 return 1
@@ -323,6 +323,7 @@ class ServeClient(
     SocketClient,
     AgentMessenger,
     CanvasClient,
+    KnowOpClient,
     Protocol,
 ):
     """The ``Client`` an agent process holds: the calls it makes, its server and key."""
@@ -392,7 +393,7 @@ async def serve(
                 given=given,
                 interactive=tui,
                 use_daemon=not remote,
-                tools=agent_tools(canvas),
+                tools=agent_tools(canvas, KnowOpTools(client, session_id=session_id)),
             ) as o:
                 if fresh:
                     effort_default(o.agent)
@@ -512,8 +513,8 @@ async def first_done[T](*awaited: Awaitable[T]) -> T:
     return next(task for task in tasks if task in done).result()
 
 
-def agent_tools(canvas: CanvasTools) -> list[Tool]:
-    """Make the Canvas tool a sagent tool, bound to ``canvas``.
+def agent_tools(canvas: CanvasTools, knowop: KnowOpTools) -> list[Tool]:
+    """Bind the Canvas and KnowOp tools to this process's session.
 
     Every agent of the process gets it, on a person's host and as a remote agent;
     sagent's ``--tools`` chooses it as one of its own. Its arguments are the shape of
@@ -523,9 +524,10 @@ def agent_tools(canvas: CanvasTools) -> list[Tool]:
 
     Args:
       canvas: The session's canvas tools.
+      knowop: The session's server tools.
 
     Returns:
-      tools: The one sagent tool, ``Canvas``.
+      tools: The ``Canvas`` and ``KnowOp`` tools.
 
     """
     made = tool(
@@ -534,7 +536,7 @@ def agent_tools(canvas: CanvasTools) -> list[Tool]:
         description=CANVAS_DESCRIPTION,
     )
     made.schema = with_settings(made.schema, canvas.settings)
-    return [made]
+    return [made, tool(knowop.act, name=KNOWOP_TOOL, description=KNOWOP_DESCRIPTION)]
 
 
 def effort_default(agent: Agent, effort: ThinkingEffort = KNOWOP_EFFORT) -> None:
@@ -626,13 +628,6 @@ def _last_told(records: Iterable[SessionRecord]) -> UUID | None:
     return told[-1] if told else None
 
 
-def _slurm_time(limit: timedelta) -> str:
-    """Write ``limit`` as Slurm's ``D-HH:MM:SS``."""
-    minutes, seconds = divmod(limit.seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{limit.days}-{hours:02}:{minutes:02}:{seconds:02}"
-
-
 def _served(url: str, args: Sequence[str], *, time_limit: timedelta | None) -> int:
     """Serve the one session a daemon hands on stdin, with the key it hands."""
     try:
@@ -686,7 +681,7 @@ async def _built(args: Sequence[str], *, client: Client) -> None:
         given=given,
         interactive=False,
         use_daemon=False,
-        tools=agent_tools(canvas),
+        tools=agent_tools(canvas, KnowOpTools(client, session_id=None)),
     ):
         pass
 
@@ -912,7 +907,7 @@ async def _timed_out(time_limit: timedelta) -> Ended:
         timer.cancel()
     return Ended(
         code=0,
-        reason=f"ended at its time limit, {_slurm_time(time_limit)}",
+        reason=f"ended at its time limit, {slurm_time(time_limit)}",
         stopped=True,
     )
 
@@ -1101,81 +1096,19 @@ def _started_on(
     cwd: str,
 ) -> int:
     """Start the session through ``host``'s daemon in ``cwd``; return once it attaches."""
-    frames: queue.Queue[ViewerFrame | ClientError] = queue.Queue()
-    threading.Thread(
-        target=_read_lines,
-        args=(client, session_id, frames),
-        name="lines",
-        daemon=True,
-    ).start()
-    deadline = time.monotonic() + _ATTACHED_SEC
     try:
-        # The stream opens before the start, so the line that says it attached is
-        # not missed.
-        _ = _next_frame(frames, deadline=deadline)
-        started = client.start_process(
-            session_id,
-            ProcessSpec(
+        _ = started_process(
+            client,
+            session_id=session_id,
+            spec=ProcessSpec(
                 host=host,
                 login_host=flags.login_host,
                 cwd=cwd,
-                args=_start_args(flags, args),
+                args=start_args(flags.time_limit, args),
             ),
         )
-        process = started
-        while process.state != "detached" and not (
-            process.state == "attached" and process.process_id == started.process_id
-        ):
-            frame = _next_frame(frames, deadline=deadline)
-            if (
-                isinstance(frame, ProcessLine)
-                and frame.process.process_id == started.process_id
-            ):
-                process = frame.process
     except (ClientError, TimeoutError) as error:
         sys.stderr.write(f"Error: {error}\n")
         return 1
-    if process.state == "detached":
-        sys.stderr.write(f"Error: the process did not start: {process.reason}\n")
-        return 1
     sys.stdout.write(f"{session_id}\n")
     return 0
-
-
-# The time limit is the process's own flag, so it goes on the line it is started with,
-# first, and runs from its start there.
-def _start_args(flags: Flags, args: Sequence[str]) -> tuple[str, ...]:
-    """Return the flags an ``--on`` start hands its process: its time limit, then sagent's."""
-    limit = flags.time_limit
-    timed = () if limit is None else ("--time", _slurm_time(limit))
-    return (*timed, *args)
-
-
-def _read_lines(
-    client: Client,
-    session_id: UUID,
-    frames: queue.Queue[ViewerFrame | ClientError],
-) -> None:
-    """Put each frame of the session's lines on ``frames``, then why they ended."""
-    try:
-        for frame in client.open_lines(session_id):
-            frames.put(frame)
-    except ClientError as error:
-        frames.put(error)
-
-
-def _next_frame(
-    frames: queue.Queue[ViewerFrame | ClientError],
-    *,
-    deadline: float,
-) -> ViewerFrame:
-    """Return the next frame, before ``deadline`` on the monotonic clock."""
-    try:
-        frame = frames.get(timeout=max(0.0, deadline - time.monotonic()))
-    except queue.Empty:
-        raise TimeoutError(
-            f"the process did not attach within {_ATTACHED_SEC:g} s",
-        ) from None
-    if isinstance(frame, ClientError):
-        raise frame
-    return frame
