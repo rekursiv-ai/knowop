@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from trackinizer.client.errors import ClientError
@@ -39,6 +39,9 @@ class _Client:
         self.resolved: list[SeqRef] = []
         self.stopped: list[UUID] = []
         self.stop_answer: AgentProcess | None = None
+        self.limits: list[PlainTree] | None = []
+        self.limits_refusal = 0
+        self.puts: list[tuple[str, object]] = []
 
     def start_process(self, session_id: UUID, spec: ProcessSpec) -> AgentProcess:
         assert session_id in (UUID(int=11), UUID(int=15))
@@ -65,6 +68,11 @@ class _Client:
 
     def get(self, path: str, *, timeout: float | None = None) -> PlainTree:
         del timeout
+        if path == "/api/addons/knowspend/limits":
+            if self.limits is None or self.limits_refusal:
+                status = self.limits_refusal or 404
+                raise ClientError(f"GET {path} -> {status}", status_code=status)
+            return {"account": "ada@x.test", "limits": self.limits}
         if path.startswith("/api/addons/"):
             return self.api.get(path)
         assert path in (
@@ -75,6 +83,10 @@ class _Client:
 
     def post(self, path: str, **options: object) -> PlainTree:
         return self.api.post(path, **options)
+
+    def put(self, path: str, *, body: object = None) -> PlainTree:
+        self.puts.append((path, body))
+        return None
 
     def terminal_hosts(self, *, owner: str | None = None) -> TerminalHosts:
         assert owner is None
@@ -103,23 +115,22 @@ def _tools(client: _Client) -> knowop.KnowOpTools:
 @pytest.mark.asyncio
 async def test_list_names_hosts_states_and_rental_availability() -> None:
     client = _Client()
-    said = await _tools(client).act(action="host.list")
-    assert "laptop" in said
-    assert "knowhost-0b5e9a101c2d" in said
-    assert "running" in said
-    assert "rents KnowHosts" in said
+    assert await _tools(client).act(action="host.list") == (
+        "laptop: online\nThis server rents KnowHosts.\nknowhost-0b5e9a101c2d: running"
+    )
     client.api.refuse = 404
-    assert "rents no KnowHosts" in await _tools(client).act(action="host.list")
-    client.api.refuse = None
-    client.api.knowhosts = []
-    assert "rents KnowHosts" in await _tools(client).act(action="host.list")
+    assert await _tools(client).act(action="host.list") == (
+        "laptop: online\nThis server rents no KnowHosts."
+    )
 
 
 @pytest.mark.asyncio
 async def test_start_sends_once_waits_150_seconds_and_names_online_host() -> None:
     client = _Client()
-    assert "knowhost-0b5e9a101c2d is running" in await _tools(client).act(
-        action="host.start",
+    client.api.answer["tools"] = False
+    assert await _tools(client).act(action="host.start") == (
+        "knowhost-0b5e9a101c2d is running: open its terminal from Hosts.\n"
+        "Its knowop serves terminals but no tools."
     )
     assert client.api.calls == [
         ("POST", "/api/addons/knowhost/hosts", {"timeout": 150.0, "retry_attempts": 1}),
@@ -136,8 +147,10 @@ async def test_pause_and_resume_resolve_names_and_say_when_memory_was_lost() -> 
     )
     client.api.answer["memory_kept"] = False
     said = await tools.act(action="host.resume", name="knowhost-0b5e9a101c2d")
-    assert "is running again" in said
-    assert "processes were lost" in said
+    assert said.splitlines()[1:] == [
+        "It rebooted from its files: its processes were lost.",
+    ]
+    assert said.startswith("knowhost-0b5e9a101c2d is running again.")
     assert client.api.calls[-1] == (
         "POST",
         "/api/addons/knowhost/hosts/0b5e9a10-1c2d-4e5f-8a9b-0c1d2e3f4a5b/resume",
@@ -264,7 +277,10 @@ async def test_stop_with_a_uuid_uses_it_without_an_inquiry_lookup() -> None:
 @pytest.mark.asyncio
 async def test_launch_requires_a_time_limit_before_opening_a_session() -> None:
     client = _Client()
-    assert "requires a time limit" in await _tools(client).act(action="session.launch")
+    assert (
+        await _tools(client).act(action="session.launch")
+        == "session.launch requires a time limit"
+    )
     assert client.starts == client.started == []
 
 
@@ -272,9 +288,9 @@ async def test_launch_requires_a_time_limit_before_opening_a_session() -> None:
 async def test_preflight_tool_has_no_caller_and_opens_no_session() -> None:
     client = _Client()
     tools = knowop.KnowOpTools(client, session_id=None)
-    assert "requires a caller session" in await tools.act(
-        action="session.launch",
-        time="20",
+    assert (
+        await tools.act(action="session.launch", time="20")
+        == "session.launch requires a caller session"
     )
     assert client.starts == client.started == []
 
@@ -294,12 +310,168 @@ async def test_launch_refuses_a_blank_label_before_opening_a_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_launch_defaults_only_the_label_and_optional_settings() -> None:
+async def test_launch_defaults_the_label_and_the_most_per_campaign() -> None:
     client = _Client()
     assert await _tools(client).act(action="session.launch", time="3") == "Agent#412"
     assert client.started == [
-        ProcessSpec(args=("--time", "0-00:03:00", "--name", "Agent")),
+        ProcessSpec(
+            args=(
+                "--time",
+                "0-00:03:00",
+                "--name",
+                "Agent",
+                "--max-budget-usd",
+                "5",
+            ),
+        ),
     ]
+
+
+_EACH_CAMPAIGN: Final[dict[str, PlainTree]] = {
+    "micros": 20_500_000,
+    "work": None,
+    "ref": "campaign/*",
+    "window": None,
+    "stops": True,
+    "model": "",
+    "lane": None,
+}
+
+_RATE: Final[dict[str, PlainTree]] = {
+    **_EACH_CAMPAIGN,
+    "window": {"every": 1, "unit": "hour", "calendar": False},
+}
+_MODEL: Final[dict[str, PlainTree]] = {
+    **_EACH_CAMPAIGN,
+    "work": "model",
+    "model": "sol",
+}
+_SET: Final[dict[str, PlainTree]] = {"micros": 30_000_000, "ref": "campaign/*"}
+
+_WHERE: Final = (
+    "The person sets it as Each campaign budget on the Usage page, Advanced."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limits", "said"),
+    [
+        (
+            [_EACH_CAMPAIGN],
+            f"The campaign limit is $20.5, the person's setting. {_WHERE}",
+        ),
+        (None, f"The campaign limit is $5, this site's default. {_WHERE}"),
+        # A rate on each campaign, the whole account's total, or one kind of work,
+        # model or lane's is not the most per campaign.
+        *(
+            (
+                [{**_EACH_CAMPAIGN, **other}],
+                f"The campaign limit is $5, this site's default. {_WHERE}",
+            )
+            for other in (
+                {"window": {"every": 1, "unit": "hour", "calendar": False}},
+                {"ref": ""},
+                {"work": "gpu"},
+                {"work": "model", "model": "sol"},
+                {"lane": "autonomy"},
+                {"stops": False},
+            )
+        ),
+    ],
+)
+async def test_budget_names_the_most_each_campaign_may_spend_and_where_it_is_set(
+    limits: list[PlainTree] | None,
+    said: str,
+) -> None:
+    client = _Client()
+    client.limits = limits
+    assert await _tools(client).act(action="session.budget") == said
+    assert client.starts == client.started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("limits", "sent"),
+    [
+        pytest.param(
+            [_RATE, _EACH_CAMPAIGN, _MODEL],
+            [_RATE, _SET, _MODEL],
+            id="replaces",
+        ),
+        pytest.param([_RATE, _MODEL], [_RATE, _MODEL, _SET], id="adds"),
+    ],
+)
+async def test_set_budget_changes_only_the_campaign_limit(
+    limits: list[PlainTree],
+    sent: list[PlainTree],
+) -> None:
+    client = _Client()
+    client.limits = limits
+    assert (
+        await _tools(client).act(action="session.set_budget", budget=30)
+        == "The campaign limit is now $30."
+    )
+    assert client.puts == [
+        (
+            "/api/addons/knowspend/limits",
+            {"account": "ada@x.test", "limits": sent},
+        ),
+    ]
+    assert client.starts == client.started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget", [None, -1])
+async def test_set_budget_needs_an_amount_and_changes_nothing(
+    budget: float | None,
+) -> None:
+    client = _Client()
+    assert (
+        await _tools(client).act(action="session.set_budget", budget=budget)
+        == "session.set_budget requires a budget of $0 or more"
+    )
+    assert client.puts == []
+
+
+@pytest.mark.asyncio
+async def test_set_budget_on_a_server_without_usage_changes_nothing() -> None:
+    client = _Client()
+    client.limits = None
+    assert (
+        await _tools(client).act(action="session.set_budget", budget=30)
+        == "This server keeps no campaign limit."
+    )
+    assert client.puts == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_limits_read_is_the_answer_and_starts_nothing() -> None:
+    client = _Client()
+    client.limits_refusal = 403
+    assert (
+        await _tools(client).act(action="session.launch", time="3")
+        == "the server answered 403."
+    )
+    assert client.starts == client.started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "name"),
+    [("session.launch", "lead"), ("session.continue", "lead#412")],
+)
+async def test_a_confirmed_budget_over_the_limit_starts_with_that_budget(
+    action: knowop.Action,
+    name: str,
+) -> None:
+    client = _Client()
+    client.limits = [_EACH_CAMPAIGN]
+    tools = _tools(client)
+    assert await tools.act(action=action, name=name, time="3") == "lead#412"
+    assert client.started[-1].args[-2:] == ("--max-budget-usd", "20.5")
+    assert await tools.act(action=action, name=name, time="3", budget=30) == "lead#412"
+    assert client.started[-1].args[-2:] == ("--max-budget-usd", "30")
 
 
 @pytest.mark.asyncio
@@ -308,9 +480,9 @@ async def test_status_reads_one_named_sessions_process(state: str) -> None:
     client = _Client()
     client.answer = _attached(state)
     said = await _tools(client).act(action="session.status", name="lead#412")
-    assert f"lead#412: {state}" in said
-    if state == "detached":
-        assert "it crashed" in said
+    assert said == f"lead#412: {state}" + (
+        "; it crashed" if state == "detached" else ""
+    )
     assert client.resolved == [SeqRef(kind="AgentSession", seq=412)]
     assert client.starts == client.started == []
 
@@ -319,22 +491,41 @@ async def test_status_reads_one_named_sessions_process(state: str) -> None:
 async def test_continue_restarts_the_same_session_with_a_new_time_limit() -> None:
     client = _Client()
     assert (
-        await _tools(client).act(action="session.continue", name="lead#412", time="3")
+        await _tools(client).act(
+            action="session.continue",
+            name="lead#412",
+            time="3",
+            model="sol",
+            effort="high",
+        )
         == "lead#412"
     )
     assert client.resolved == [SeqRef(kind="AgentSession", seq=412)]
     assert client.starts == []
     assert client.started == [
-        ProcessSpec(args=("--time", "0-00:03:00", "--name", "lead")),
+        ProcessSpec(
+            args=(
+                "--time",
+                "0-00:03:00",
+                "--name",
+                "lead",
+                "--model",
+                "sol",
+                "--model.thinking.effort",
+                "high",
+                "--max-budget-usd",
+                "5",
+            ),
+        ),
     ]
 
 
 @pytest.mark.asyncio
 async def test_continue_requires_a_new_time_limit_before_starting() -> None:
     client = _Client()
-    assert "new time limit" in await _tools(client).act(
-        action="session.continue",
-        name="lead#412",
+    assert (
+        await _tools(client).act(action="session.continue", name="lead#412")
+        == "continue requires a new time limit"
     )
     assert client.starts == client.started == []
 
