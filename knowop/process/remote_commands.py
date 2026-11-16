@@ -57,6 +57,7 @@ REMOTE_AGENT: Final = Allowed(
             "model.manage_context_server_side",
             # How its own calls wait, and how they show.
             "runtime.detach",
+            "runtime.detach.*",
             "runtime.retry",
             "tool.*.display.*",
             "screen.thinking",
