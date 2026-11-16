@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
@@ -21,10 +22,16 @@ from sagent.model.scripted import ScriptedProvider, call, reply
 from sagent.providers.catalog import ModelCatalog
 from sagent.runtime import types
 from sagent.session.jsonl import JsonlJournal
-from sagent.session.types import AgentToAgentMessage, UserMessage
+from sagent.session.types import (
+    AgentToAgentMessage,
+    ToolCall,
+    UncategorizedToolResult,
+    UserMessage,
+)
 from sagent.settings.harvest import harvest
 from sagent.tools.agent_spawn import AgentSpawn
-from sagent.tools.types import ToolContext
+from sagent.tools.display import ToolDisplay
+from sagent.tools.types import ToolContext, ToolOutput, whole_output
 from sagent.tui.prompt import Panes
 from sagent.tui.slash import Commands
 from sagent.tui.types import CommandOutput
@@ -38,6 +45,7 @@ from trackinizer.wire.wire_session_relay import (
     StateLine,
 )
 from trackinizer.wire.wire_sessions import SessionStart, SessionStartResponse
+from treekle import PlainTree
 
 import pytest
 
@@ -52,6 +60,7 @@ if TYPE_CHECKING:
 
     from sagent.model.scripted import Reply
     from sagent.session.types import SessionRecord
+    from sagent.tools.types import Tool, ToolStreamingResult
 
 
 _SESSION: Final = UUID(int=9)
@@ -171,6 +180,7 @@ async def _published(
     start: int = 0,
     store: _Store | None = None,
     children: Sequence[Reply] = (),
+    tools: Sequence[Tool] = (),
 ) -> AsyncGenerator[_Published]:
     """Publish a root agent; given ``children``, it spawns, and they answer them."""
     provider = ScriptedProvider(replies=replies)
@@ -184,7 +194,7 @@ async def _published(
     journal = JsonlJournal(tmp_path / _FOLDER / "session.jsonl")
     agent = Agent(
         model=provider["scripted"],
-        tools=[AgentSpawn(team=team)] if children else [],
+        tools=[*tools, *([AgentSpawn(team=team)] if children else [])],
         journal=journal,
         tool_context=ToolContext(cwd=tmp_path),
         system_prompt="S",
@@ -569,6 +579,164 @@ async def test_a_change_of_text_alone_goes_at_most_once_a_second(
     assert withheld == 0
     assert len(p.states()) == before + 1
     assert p.states()[-1].state.busy
+
+
+@dataclass(slots=True, kw_only=True)
+class _Waiting:
+    """A tool whose calls run until the test lets them end."""
+
+    name: str = "wait"
+    description: str = "Wait for tests."
+    schema: Mapping[str, PlainTree] = field(default_factory=dict[str, "PlainTree"])
+    display: ToolDisplay = field(default_factory=ToolDisplay)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def summary(self, arguments: Mapping[str, PlainTree]) -> str:
+        return f"wait for {arguments}"
+
+    def serialize_key(
+        self,
+        context: ToolContext,
+        arguments: Mapping[str, PlainTree],
+    ) -> str | None:
+        del context, arguments
+        return None
+
+    def call(
+        self,
+        context: ToolContext,
+        arguments: Mapping[str, PlainTree],
+    ) -> ToolStreamingResult[UncategorizedToolResult, object, object]:
+        del context, arguments
+        return whole_output(self._run())
+
+    async def _run(self) -> ToolOutput[UncategorizedToolResult, object, object]:
+        _ = await self.release.wait()
+        return ToolOutput(stdout=("done",), result=UncategorizedToolResult())
+
+
+@dataclass(slots=True, kw_only=True)
+class _Heard:
+    """An observer set once it hears an event of ``kind``."""
+
+    kind: type
+    seen: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __call__(self, event: types.RuntimeEvent) -> None:
+        if isinstance(event, self.kind):
+            self.seen.set()
+
+
+def _when(agent: Agent, kind: type) -> asyncio.Event:
+    """Return an event set once ``agent`` publishes an event of ``kind``."""
+    heard = _Heard(kind=kind)
+    agent.runtime.observers.append(heard)
+    return heard.seen
+
+
+@pytest.mark.asyncio
+async def test_a_background_job_goes_up_at_once_and_its_turn_ends_with_its_result(
+    tmp_path: Path,
+) -> None:
+    waiting = _Waiting()
+    async with _published(
+        tmp_path,
+        reply(calls=[call("wait", "w1", what="the build", background=True)]),
+        reply("started it"),
+        reply("it is built"),
+        tools=[waiting],
+    ) as p:
+        answered = _when(p.agent, types.ModelIdle)
+        turn = asyncio.create_task(p.agent.send("go"))
+        _ = await answered.wait()
+        running = p.states()[-1].state
+        waiting.release.set()
+        _ = await turn
+
+    [job] = running.jobs
+    assert (job.call_id, job.tool, job.title, job.agent, job.state) == (
+        "w1",
+        "wait",
+        "wait for {'what': 'the build'}",
+        "",
+        "running",
+    )
+    assert abs(job.started - datetime.now(UTC)) < timedelta(minutes=1)
+    assert (running.busy, running.working, running.turn_ended) == (False, True, None)
+    ended = p.states()[-1].state
+    assert (ended.jobs, ended.working) == ((), False)
+    assert ended.turn_ended is not None
+    assert ended.turn_ended > job.started
+
+
+def test_a_job_whose_tool_the_agent_no_longer_holds_is_titled_by_its_name() -> None:
+    """A call detached with its group may name a tool the agent does not hold."""
+    called = ToolCall(call_id="w1", name="gone", arguments={"what": "x"})
+
+    assert publisher_module._title(None, called) == "gone"
+
+
+@pytest.mark.asyncio
+async def test_a_delayed_job_goes_up_sleeping(tmp_path: Path) -> None:
+    async with _published(
+        tmp_path,
+        reply(calls=[call("wait", "w1", delay=3_600)]),
+        reply("later"),
+        tools=[_Waiting()],
+    ) as p:
+        answered = _when(p.agent, types.ModelIdle)
+        turn = asyncio.create_task(p.agent.send("go"))
+        _ = await answered.wait()
+        sleeping = p.states()[-1].state
+        turn.cancel()
+
+    assert [job.state for job in sleeping.jobs] == ["sleeping"]
+
+
+@pytest.mark.asyncio
+async def test_a_child_at_work_goes_up_by_its_label(tmp_path: Path) -> None:
+    async with _published(
+        tmp_path,
+        *_SPAWNS_KID,
+        children=_KID_SPAWNS_GRANDKID[1:],
+    ) as p:
+        _ = await p.agent.send("go")
+
+    agents = [s.state.agents for s in p.states()]
+    assert ("kid",) in agents
+    assert agents[-1] == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ending",
+    [
+        types.AgentIdle(),
+        types.ModelResponseError(exception=RuntimeError("down")),
+        types.ModelResponseCancelled(),
+    ],
+    ids=["idle", "failed", "halted"],
+)
+async def test_a_turn_ends_when_the_root_idles_after_a_call_fails_or_halts(
+    tmp_path: Path,
+    ending: types.RuntimeEvent,
+) -> None:
+    async with _published(tmp_path) as p:
+        p.publisher(types.AgentIdle())
+        p.publisher(types.ChildEvent(label="kid", inner=types.ModelCallStarted()))
+        p.publisher(types.ChildEvent(label="kid", inner=ending))
+        unended = p.states()[-1].state.turn_ended
+        p.publisher(types.ModelCallStarted())
+        before = datetime.now(UTC)
+        p.publisher(ending)
+        ended = p.states()[-1].state.turn_ended
+        p.publisher(types.AgentIdle())
+        again = p.states()[-1].state.turn_ended
+
+    assert unended is None
+    assert ended is not None
+    assert ended >= before
+    assert again == ended
 
 
 @pytest.mark.asyncio
