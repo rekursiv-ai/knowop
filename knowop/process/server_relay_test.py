@@ -17,8 +17,7 @@ from sagent.agent.agent import Agent
 from sagent.agent.team import MessageKind, Team
 from sagent.model.scripted import ScriptedProvider
 from sagent.providers.catalog import ModelCatalog
-from sagent.runtime import types
-from sagent.session.types import AgentToAgentMessage
+from sagent.session.types import AgentToAgentMessage, SystemMessage
 from sagent.tools.types import ToolContext
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.wire_sessions import SessionAgent
@@ -115,7 +114,7 @@ def _told(team: Team, label: str) -> list[tuple[str | None, str | None]]:
         if isinstance(m, AgentToAgentMessage)
         else (None, m.content)
         for m in team[label].runtime.inbox.drain_nowait()
-        if isinstance(m, (AgentToAgentMessage, types.Nudge))
+        if isinstance(m, (AgentToAgentMessage, SystemMessage))
     ]
 
 
