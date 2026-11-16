@@ -13,9 +13,14 @@ Operate on the person's KnowOp server: hosts and campaign lead sessions.
 
 ## Session
 
+- `session.budget`: the person's campaign limit, in USD: their Each campaign
+  budget on the Usage page, else this site's default.
+- `session.set_budget`: set the person's campaign limit to `budget` (USD),
+  only when the person asks; every other limit stays.
 - `session.launch`: start a campaign lead on our cloud, spawned by this
   session. `name` is its label; `time` is required, a Slurm time limit
-  (20 = 20 minutes). `model`, `effort`, and `budget` (USD) are optional.
+  (20 = 20 minutes). `model`, `effort`, and `budget` (USD) are optional;
+  `budget` defaults to the person's campaign limit (`session.budget`).
   Returns `LABEL#N` once attached; use that name with AgentSend.
 - `session.status`: inspect session `name` (`LABEL#N`, required); answer
   its process state (starting, attached, detached) and reason. The server

@@ -461,6 +461,9 @@ class _Server(_Client):
             raise ClientError("POST place -> 403", status_code=403)
         return {"workspace_id": str(_WORKSPACE), "canvas_id": str(_PLACED_ON)}
 
+    def put(self, path: str, *, body: object = None) -> PlainTree:
+        raise AssertionError(f"no agent here sets {path}: {body}")
+
     def read_session_parts(self, session_id: UUID) -> list[PartBody]:
         del session_id
         return self.parts
@@ -3019,6 +3022,7 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
         "rename_workspace": lambda c: c.rename_workspace(_ROW, title="x"),
         "get": lambda c: c.get("/api/me/preferences/agent"),
         "post": lambda c: c.post("/api/addons/knowhost/hosts", retry_attempts=1),
+        "put": lambda c: c.put("/api/addons/knowspend/limits", body={}),
         "start_process": lambda c: c.start_process(session_id, ProcessSpec()),
         "stop_process": lambda c: c.stop_process(session_id),
         "read_process": lambda c: c.read_process(session_id),
@@ -3027,6 +3031,7 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
     additional: list[Callable[[Client], object]] = [
         lambda c: c.get("/api/addons/knowhost/hosts"),
         lambda c: c.get(f"/api/inquiries/{session_id}"),
+        lambda c: c.get("/api/addons/knowspend/limits"),
         lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/pause"),
         lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/resume"),
     ]
