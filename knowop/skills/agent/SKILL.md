@@ -1,6 +1,6 @@
 ---
 name: knowop-run
-description: ALWAYS invoke this skill before running sagent with knowop run, starting it on a host, or continuing a stored session. Do not start an agent run, or tell a person which command reaches it, from memory -- invoke this skill first.
+description: ALWAYS invoke this skill before running sagent with knowop run, starting an agent headless, on a host or from another agent, or continuing a stored session. Do not start an agent run, or tell a person which command reaches it, from memory -- invoke this skill first.
 ---
 
 # knowop run -- sagent, live in Chat
@@ -21,8 +21,8 @@ trust the help.
 everything of sagent's after `--`, untouched.
 
 ```bash
-knowop run                          # sagent here, live in Chat
-knowop run --headless               # the same, with no screen
+knowop run                          # sagent here with its screen, live in Chat
+knowop run --headless               # no screen: this computer's daemon runs it
 knowop run --session ID             # continue session ID here
 knowop run --session AgentSession#412   # the same, by its number (or 412)
 knowop run --on lab --cwd ~/work    # start it on your host lab, through its daemon
@@ -42,15 +42,33 @@ knowop run -- --help                # sagent's own flags and actions
   sign-in made here is used by every later `knowop run` here.
 - Every sagent flag works but those that pick a journal (`--resume`, `--continue`,
   `--ephemeral`, `--session` and their kin): knowop keeps the session's journal.
-- `--on NAME` asks the host's daemon (`knowop connect` there) to start the agent,
-  waits for it to attach, prints the session's id and exits. With no name, the
-  server's own host runs it.
-- A run says so when this computer is not connected; a connected computer also
-  opens its terminal in Chat.
-- Exit codes: 0 after a stop or a quit; 1 for a start error, a refused key or a
-  session that is gone; 2 for a refused command; 3 when another process holds the
-  session; 4 when a headless run went 10 minutes without its socket; 130 on Ctrl-C.
-  An action exits as sagent's command does.
+- Only a screen runs in the `knowop run` process. A run with none (`--headless`,
+  or no terminal: an agent's tool call, a script, cron) asks this computer's
+  daemon to start the agent in this folder (`--cwd` names another), waits for it
+  to attach, prints the session's id and exits; the agent runs on until stopped.
+- `--on NAME` does the same through host NAME's daemon (`knowop connect` there),
+  in `~` unless `--cwd` names a folder. With no name, the server's own host runs it.
+- A run on this computer connects it first when it is not, as `knowop connect`
+  does, saying so and where its log is on stderr.
+- Exit codes: 0 after a stop or a quit, and once a daemon's start attaches; 1 for a
+  start error, a refused key or a session that is gone; 2 for a refused command; 3
+  when another process holds the session; 4 when a daemon's start went 10 minutes
+  without its socket; 130 on Ctrl-C. An action exits as sagent's command does.
+
+## Start an agent from an agent
+
+```bash
+knowop run --headless               # on this computer, in this folder
+knowop status                       # the hosts; this computer's says "(this computer)"
+knowop run --on HOST --cwd ~/work   # on another host
+```
+
+- Each returns within seconds with the new session's id; the host's daemon runs
+  the agent until it is stopped.
+- Leave the model and effort at knowop's defaults; pass a sagent setting after
+  `--` only when the person asked for it.
+- Name the new agent `Agent#N` (below) to message it; stop it with
+  `knowop run --stop ID`.
 
 ## Reach it
 

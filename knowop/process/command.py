@@ -5,7 +5,7 @@
     knowop run [KNOWOP FLAGS] -- [SAGENT ARGUMENTS]
 
     knowop run                                  sagent here: its screen at a terminal
-    knowop run --headless -- --effort high      no screen; sagent's setting after --
+    knowop run --headless -- --effort high      no screen: this computer's daemon runs it
     knowop run --on lab --cwd ~/work -- --model sol
     knowop run --on lab --name xyz              a chat named xyz, its agent on lab
     knowop run --session ID                     continue session ID here
@@ -15,7 +15,10 @@
     knowop run -- mcp list                      any of sagent's actions, on this computer
     knowop run -- --help                        sagent's own help
 
-A session is named by its UUID or its number, as Chat's ⋯ menu shows both.
+A session is named by its UUID or its number, as Chat's ⋯ menu shows both. Only a
+screen runs in this process: a run with none (``--headless``, or no terminal) is
+started through this computer's daemon, which ``knowop`` connects first when it is
+not, prints its session's id and returns, and the agent runs on until it is stopped.
 
 Before ``--``, only knowop's flags below; everything after it is sagent's, untouched:
 its settings as flags, or an action, which runs here and opens no session. Every sagent
@@ -60,7 +63,7 @@ class Flags(Protocol):
     headless: bool
     session: Ref | None
     on: str | None
-    cwd: str
+    cwd: str | None
     name: str | None
     login_host: str
     stop: Ref | None
@@ -179,7 +182,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="Run with no screen, at a terminal too.",
+        help="Run with no screen, through this computer's daemon, at a terminal too.",
     )
     parser.add_argument(
         "--session",
@@ -196,14 +199,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cwd",
-        default="~",
         metavar="DIR",
-        help="With --on, the folder there to start in (default: %(default)s).",
+        help="The folder to start in (default: ~ with --on, else this folder).",
     )
     parser.add_argument(
         "--name",
         type=_name,
-        metavar="NAME",
         help="Open the chat's tab in Chat, named NAME (else it opens closed).",
     )
     parser.add_argument(

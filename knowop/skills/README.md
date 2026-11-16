@@ -5,7 +5,8 @@ Each of knowop's packages keeps its instructions for an agent that drives it in
 run`, and `jobs/` for `knowop job`.
 
 `knowop skill install` will place them in an agent's skill folder. Until then they are
-read where they are. They still name the commands as they were before the move into
+read where they are; the monorepo's catalog links `agent/` as `knowop-run`
+(`.claude/skills/README.md`), so every agent started in the monorepo has it. They still name the commands as they were before the move into
 knowop.
 
 A skill documents what the command does, in the words of its `--help`. When a

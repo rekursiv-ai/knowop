@@ -1,9 +1,13 @@
 """The entry point of the agent process: one session's sagent, live in Trackinizer.
 
-``knowop run`` runs sagent's own agent in this process, with sagent's screen at a
-terminal or with none, and makes its session live: each event and the agent's state
-go up the session's socket, its journal goes up as records, and what a person sends
-from Chat comes down the socket into the runtime, as a key typed at the screen does.
+``knowop run`` at a terminal runs sagent's own agent in this process, with sagent's
+screen; with no screen (``--headless``, or no terminal) it starts the agent through
+this computer's daemon, as ``--on`` this host does, prints its session's id and
+returns, so the agent outlives whatever ran the command. The process that serves
+the agent, the screen's or the daemon's start, makes its session live: each event
+and the agent's state go up the session's socket, its journal goes up as records,
+and what a person sends from Chat comes down the socket into the runtime, as a key
+typed at the screen does.
 A slash line runs on the one ``Commands`` the screen runs typed lines on, so the
 terminal and Chat each show what the other ran.
 
@@ -19,18 +23,20 @@ A start the server placed for a remote agent opens without sagent's own daemon, 
 would otherwise start beside each agent and stay, and runs only the slash lines
 ``remote_commands.py`` lists.
 A run prints the session's id alone as its first line on stdout, once the server
-has its ``Hello``. A run started here, or from here ``--on`` a host once its agent is
-up, has the server place its chat in a workspace and a canvas, by the canvas it was
-started from (``TRAX_CANVAS``) and, run here, its checkout; its tools read where in
-``TRAX_WORKSPACE`` and ``TRAX_CANVAS``. ``--name`` names the chat's tab and opens it:
-a name another tab has is refused before a session opens, and a named run whose
-chat cannot be placed exits 1. An unnamed one that cannot be placed runs unplaced.
+has its ``Hello``. A run started from here has the server place its chat in a
+workspace and a canvas, by the canvas it was started from (``TRAX_CANVAS``) and, on
+this computer, the checkout it starts in; a screen's is placed before it starts, and
+its tools read where in ``TRAX_WORKSPACE`` and ``TRAX_CANVAS``; a daemon's start,
+once its agent is up. ``--name`` names the chat's tab and opens it: a name another
+tab has is refused before a session opens, and a named run whose chat cannot be
+placed exits 1. An unnamed one that cannot be placed runs unplaced.
 
-Exit codes: 0 after a stop, its time limit, a screen's quit or a ``/quit``; 1 for a start error, a
-refused key, a revoked host or a session that is gone; 2 for a refused command; 3
-when another process holds the session, continued it elsewhere, or holds its
-journal; 4 when headless and without a socket for 10 minutes; 130 on Ctrl+C or
-SIGTERM. An action exits as sagent's command does.
+Exit codes: 0 after a stop, its time limit, a screen's quit or a ``/quit``, and
+once a daemon's start attaches; 1 for a start error, a refused key, a revoked host or
+a session that is gone; 2 for a refused command; 3 when another process holds the
+session, continued it elsewhere, or holds its journal; 4 when a daemon's start went
+10 minutes without its socket; 130 on Ctrl+C or SIGTERM. An action exits as sagent's
+command does.
 """
 
 from __future__ import annotations
@@ -202,8 +208,8 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
 
     Returns:
       code: 0 after a stop or a quit; 1 for a start error, a refused key or a
-        session that is gone; 3 when another process holds the session; 4 when it
-        ran headless too long without its socket; an action's own code.
+        session that is gone; 3 when another process holds the session; 4 when a
+        daemon's start ran too long without its socket; an action's own code.
 
     """
     flags, args = parse_run(run_parser(), argv)
@@ -263,12 +269,34 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
             sys.stderr.write(f"Error: {error}\n")
             return 1
         if flags.on is not None:
-            return _placed_on(client, flags, args, session_id=session_id)
+            return _placed_on(
+                client,
+                flags,
+                args,
+                session_id=session_id,
+                host=flags.on,
+                cwd="~" if flags.cwd is None else flags.cwd,
+                checkout=None,
+            )
+        cwd = Path.cwd() if flags.cwd is None else Path(flags.cwd).expanduser()
+        # Only a screen runs in this process. An agent with none would end with
+        # whatever ran this command (a tool call's time limit, a closed ssh, a cron
+        # line), so this computer's daemon serves it, as ``--on`` this host does.
+        if not sys.stdin.isatty() or flags.headless:
+            return _placed_on(
+                client,
+                flags,
+                args,
+                session_id=session_id,
+                host=host_name(),
+                cwd=str(cwd),
+                checkout=cwd,
+            )
         placement = place_run(
             client,
             session_id=session_id,
             environ=os.environ,
-            cwd=Path.cwd(),
+            cwd=cwd,
             name=flags.name or "",
         )
         if flags.name is not None and placement is None:
@@ -281,7 +309,7 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
             session_id=session_id,
             process_id=uuid4(),
             client=client,
-            tui=sys.stdin.isatty() and not flags.headless,
+            tui=True,
             host=host_name(),
             time_limit=flags.time_limit,
             remote=False,
@@ -1024,23 +1052,35 @@ def _name_taken(client: Client, *, name: str, session: UUID | None) -> bool:
 
 
 # Placed once its agent is up, so a host that refuses it leaves no tab, nor a name
-# taken; its checkout is there, and this one's would place it by the wrong branch.
+# taken. Only this computer's daemon starts in a checkout this process can read
+# (``checkout``); another host's is there, and this one's would place it by the wrong
+# branch.
 def _placed_on(
     client: Client,
     flags: Flags,
     args: Sequence[str],
     *,
     session_id: UUID,
+    host: str,
+    cwd: str,
+    checkout: Path | None,
 ) -> int:
-    """Start the session on the host ``--on`` names, then place it; return its code."""
-    started = _started_on(client, flags, args, session_id=session_id)
+    """Start the session through ``host``'s daemon, then place it; return its code."""
+    started = _started_on(
+        client,
+        flags,
+        args,
+        session_id=session_id,
+        host=host,
+        cwd=cwd,
+    )
     if started:
         return started
     placement = place_run(
         client,
         session_id=session_id,
         environ=os.environ,
-        cwd=None,
+        cwd=checkout,
         name=flags.name or "",
     )
     if flags.name is not None and placement is None:
@@ -1057,8 +1097,10 @@ def _started_on(
     args: Sequence[str],
     *,
     session_id: UUID,
+    host: str,
+    cwd: str,
 ) -> int:
-    """Start the session on the host ``--on`` names; return once it attaches or not."""
+    """Start the session through ``host``'s daemon in ``cwd``; return once it attaches."""
     frames: queue.Queue[ViewerFrame | ClientError] = queue.Queue()
     threading.Thread(
         target=_read_lines,
@@ -1074,9 +1116,9 @@ def _started_on(
         started = client.start_process(
             session_id,
             ProcessSpec(
-                host=flags.on or "",
+                host=host,
                 login_host=flags.login_host,
-                cwd=flags.cwd,
+                cwd=cwd,
                 args=_start_args(flags, args),
             ),
         )

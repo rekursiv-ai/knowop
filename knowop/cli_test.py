@@ -1819,32 +1819,160 @@ def test_a_first_run_logs_in_to_the_default_server_then_runs(
     assert "logged in: profile alpha.knowop.ai (writer)" in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("launchd")
 @pytest.mark.parametrize(
-    ("here", "said"),
-    [("", True), ("offline", True), ("online", False)],
-    ids=["unregistered", "offline", "online"],
+    "argv",
+    [["--headless"], [], ["--on", "ada-mac"], ["--session", "412"]],
+    ids=["headless", "screen", "on-this-computer", "session"],
 )
-def test_a_run_says_to_connect_when_this_computer_is_not_online(
+@pytest.mark.parametrize("here", ["", "offline"], ids=["unregistered", "offline"])
+def test_a_run_here_connects_this_computer_first_and_says_so_on_stderr(
+    *,
     server: _Server,
     runners: _Runners,
+    host: _Host,
+    agents: Services,
     capsys: pytest.CaptureFixture[str],
     here: str,
-    said: bool,
+    argv: list[str],
 ) -> None:
+    """An agent's ``knowop run --headless`` needs this computer's daemon to serve it."""
     others = [_host("gpu1", status="online", owner=_EMAIL)]
     mine = [_host("ada-mac", status=here, owner=_EMAIL)] if here else []
     server.hosts = [*others, *mine]
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
-    assert _knowop("run") == 0
+    assert _knowop("run", *argv) == 0
 
-    hint = (
-        "knowop: this computer (ada-mac) is not connected; run knowop connect in "
-        "another terminal to open its terminal from Chat\n"
+    out, err = capsys.readouterr()
+    # Stdout is the run's alone: its first line is the session's id.
+    assert out == ""
+    assert err.splitlines() == [
+        (
+            f"knowop: this computer (ada-mac) is not connected to {_ACME}; connecting "
+            "it first: knowop connect"
+        ),
+        _CONNECTED,
+        "log:  knowop logs -f",
+        "stop: knowop disconnect",
+    ]
+    assert [s.join_only for s in host.connects] == [True]
+    assert agents.every() == [Connect(name="ada-mac", server=_ACME, flags=())]
+    assert runners.calls() == [("run", argv)]
+
+
+@pytest.mark.usefixtures("launchd")
+def test_a_run_here_connects_with_the_flags_its_service_was_given(
+    server: _Server,
+    runners: _Runners,
+    host: _Host,
+    agents: Services,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    agents.start(Connect(name="ada-mac", server=_ACME, flags=("--sandbox",)))
+    server.hosts = [_host("ada-mac", status="offline", owner=_EMAIL)]
+    capsys.readouterr()
+
+    assert _knowop("run", "--headless") == 0
+
+    assert "connecting it first: knowop connect --sandbox\n" in capsys.readouterr().err
+    assert [s.sandbox for s in host.connects] == [True]
+    assert agents.every() == [
+        Connect(name="ada-mac", server=_ACME, flags=("--sandbox",)),
+    ]
+    assert runners.calls() == [("run", ["--headless"])]
+
+
+@pytest.mark.usefixtures("launchd", "host")
+def test_a_run_connects_this_computer_to_the_server_its_profile_names(
+    server: _Server,
+    runners: _Runners,
+    agents: Services,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    # The login in use from now on, which the run's --profile is not.
+    assert _knowop("login", "http://127.0.0.1:8790") == 0
+    server.hosts = [_host("ada-mac", status="offline", owner=_EMAIL)]
+    capsys.readouterr()
+
+    assert _knowop("--profile", "acme.knowop.ai", "run", "--headless") == 0
+
+    assert f"not connected to {_ACME}; connecting" in capsys.readouterr().err
+    assert agents.every() == [Connect(name="ada-mac", server=_ACME, flags=())]
+    assert runners.calls() == [("run", ["--headless"])]
+
+
+@pytest.mark.usefixtures("host")
+def test_a_run_waits_for_this_computers_service_to_come_online(
+    server: _Server,
+    runners: _Runners,
+    launchd: _Launchd,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _knowop("login", "acme") == 0
+    server.hosts = [_host("ada-mac", status="offline", owner=_EMAIL)]
+    # The service starts, and shows online a heartbeat later.
+    monkeypatch.setattr(launchd, "_start", _not_online_yet)
+    waits: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        server.serves("ada-mac", pid=4243)
+
+    assert cli.main(["run", "--headless"], sleep=sleep, clock=time.monotonic) == 0
+
+    assert waits == [1.0]
+    assert runners.calls() == [("run", ["--headless"])]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [[], ["--on", "gpu1"], ["--stop", "412"]],
+    ids=["online", "another-host", "stop"],
+)
+def test_a_run_connects_nothing_when_this_computer_need_not_serve_it(
+    server: _Server,
+    runners: _Runners,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+) -> None:
+    online = "offline" if argv else "online"
+    server.hosts = [
+        _host("gpu1", status="online", owner=_EMAIL),
+        _host("ada-mac", status=online, owner=_EMAIL),
+    ]
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    # The real host would serve: ``connect_host`` is never run.
+    assert _knowop("run", *argv) == 0
+
+    assert capsys.readouterr().err == ""
+    assert runners.calls() == [("run", argv)]
+
+
+def test_a_run_with_no_service_manager_says_to_connect_and_runs_nothing(
+    server: _Server,
+    runners: _Runners,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "here", lambda: None)
+    server.hosts = [_host("ada-mac", status="offline", owner=_EMAIL)]
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("run", "--headless") == 1
+
+    assert capsys.readouterr().err == (
+        "knowop: this computer (ada-mac) is not connected, and no user service "
+        "manager answers here to keep it connected; run knowop connect --foreground "
+        "in another terminal, then run this again\n"
     )
-    assert capsys.readouterr().err == (hint if said else "")
-    assert runners.calls() == [("run", [])]
+    assert runners.calls() == []
 
 
 def test_a_run_says_nothing_of_connecting_when_the_hosts_cannot_be_listed(
@@ -3257,6 +3385,11 @@ def _at_terminal(monkeypatch: pytest.MonkeyPatch) -> _Terminal:
     screen = _Terminal()
     monkeypatch.setattr(sys, "stdout", screen)
     return screen
+
+
+def _not_online_yet(name: str) -> None:
+    """Start a service whose host the server does not yet show online."""
+    del name
 
 
 def _handler_before(signum: int, frame: object) -> None:

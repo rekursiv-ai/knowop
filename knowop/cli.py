@@ -45,6 +45,7 @@ import getpass
 import io
 import os
 import re
+import shlex
 import signal
 import sys
 import time
@@ -55,6 +56,7 @@ from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import config_dir, state_dir
 from trackinizer.trax.client_cache import close_clients
 from trackinizer.trax.connection import connect, connect_flags
+from trackinizer.trax.context import OUT_STREAM
 from trackinizer.trax.profile import Profile, del_profile, read_profile
 from trackinizer.trax.render import echo
 from treekle import from_plain, json_dumps
@@ -945,19 +947,22 @@ def _disconnect(name: str, *, named: str, sleep: Callable[[float], None]) -> Non
     )
 
 
-# At a terminal a user service serves it; elsewhere, or with ``--foreground``, this
-# process does, until it is released.
+# At a terminal, or for a run (``for_run``), a user service serves it; elsewhere, or
+# with ``--foreground``, this process does, until it is released.
 def _connect(
     flags: Flags,
     *,
     named: str,
     sleep: Callable[[float], None],
     clock: Callable[[], float],
+    for_run: bool = False,
 ) -> None:
     """Log in unless knowop already is, to that server; then serve this computer."""
     name = flags.name or host_name()
     check_name(name)
-    background = sys.stdout.isatty() and not (flags.foreground or flags.log_file)
+    background = for_run or (
+        sys.stdout.isatty() and not (flags.foreground or flags.log_file)
+    )
     if background and os.geteuid() == 0:
         raise ClientError(
             "knowop connect would install a service of root, which serves root's "
@@ -1290,28 +1295,65 @@ def _hand_off(
     if _saved(named) is None:
         _log_in(named=named, sleep=sleep, clock=clock)
     _, profile = _profile(named)
-    _say_whether_connected(profile)
-    # Sagent's own agent, in this process, live in Trackinizer: knowop's flags, then
-    # sagent's after ``--``.
+    flags, _ = process_command.parse_run(process_command.run_parser(), args)
+    if flags.stop is None and flags.on in {None, host_name()}:
+        _connected_here(profile, named=named, sleep=sleep)
+    # Sagent's own agent, live in Trackinizer: knowop's flags, then sagent's after
+    # ``--``.
     return process_main.main(args, profile=profile)
 
 
-# A run reaches Chat without this computer being connected; a connected one also opens
-# its terminal there.
-def _say_whether_connected(profile: Profile) -> None:
-    """Say to run ``knowop connect`` when this computer is not an online host."""
+# A run's agent on this computer needs its daemon: one with no screen is started
+# through it, and a screen's opens this computer's terminal in Chat by it. Its output
+# goes to stderr, since a run's first line on stdout is its session's id.
+def _connected_here(
+    profile: Profile,
+    *,
+    named: str,
+    sleep: Callable[[float], None],
+) -> None:
+    """Connect this computer as ``knowop connect`` does, unless it is an online host."""
+    here = host_name()
     try:
-        here = host_name()
         with Client(profile.url, api_key=profile.api_key) as http:
             listed = http.list_hosts()
     except ClientError:
         return
-    if not any(m.name == here and m.status == "online" for m in listed):
-        echo(
-            f"knowop: this computer ({here}) is not connected; run knowop connect "
-            "in another terminal to open its terminal from Chat",
-            err=True,
+    if any(m.name == here and m.status == "online" for m in listed):
+        return
+    services = service.here()
+    if services is None:
+        raise ClientError(
+            f"this computer ({here}) is not connected, and no user service manager "
+            "answers here to keep it connected; run knowop connect --foreground in "
+            "another terminal, then run this again",
         )
+    # Its own service's flags, if it has one, so a connect started here keeps them.
+    installed = next(
+        (c for c in services.every() if (c.name, c.server) == (here, profile.url)),
+        None,
+    )
+    words = ["connect", *(() if installed is None else installed.flags)]
+    echo(
+        f"knowop: this computer ({here}) is not connected to {profile.url}; "
+        f"connecting it first: knowop {shlex.join(words)}",
+        err=True,
+    )
+    parser = argparse.ArgumentParser()
+    _add_arguments(parser)
+    said = OUT_STREAM.set(sys.stderr)
+    try:
+        _connect(
+            cast(Flags, parser.parse_args(words)),
+            named=named,
+            sleep=sleep,
+            # The run's login was just accepted, so this connect never logs in, and
+            # never reads a login code's clock.
+            clock=time.monotonic,  # pragma: no mutate
+            for_run=True,
+        )
+    finally:
+        OUT_STREAM.reset(said)
 
 
 def _detail(http: Client, name: str) -> HostDetail | None:
