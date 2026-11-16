@@ -163,19 +163,43 @@ def test_a_run_asks_the_server_with_its_canvas_and_checkout(
     ]
 
 
+def test_a_run_on_another_host_asks_by_its_name_and_reads_no_checkout_here(
+    git_commands: Mock,
+) -> None:
+    client = _Client()
+
+    placed = place_run(
+        client,
+        session_id=_SESSION,
+        environ={"TRAX_CANVAS": str(_CANVAS)},
+        cwd=None,
+        name="paper review",
+    )
+
+    assert placed == SessionPlacement(workspace_id=UUID(int=2))
+    assert client.asked == [
+        (
+            f"/api/sessions/{_SESSION}/place",
+            {"canvas": str(_CANVAS), "name": "paper review"},
+        ),
+    ]
+    git_commands.assert_not_called()
+
+
 def test_a_failed_ask_warns_and_leaves_the_run_unplaced(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    placed = place_run(
-        _Client(fail=True),
-        session_id=_SESSION,
-        environ={},
-        cwd=tmp_path,
-    )
+    """A run from no canvas and no checkout sends no field, which an old server lacks."""
+    client = _Client(fail=True)
+
+    placed = place_run(client, session_id=_SESSION, environ={}, cwd=tmp_path)
 
     assert placed is None
-    assert "running unplaced" in capsys.readouterr().err
+    assert client.asked == [(f"/api/sessions/{_SESSION}/place", {})]
+    assert capsys.readouterr().err == (
+        "[knowop run] could not place this session (404 Not Found)\n"
+    )
 
 
 def test_a_placement_names_only_the_ids_the_server_gave() -> None:

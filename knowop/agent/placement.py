@@ -144,7 +144,8 @@ def place_run(
     *,
     session_id: UUID,
     environ: Mapping[str, str],
-    cwd: Path,
+    cwd: Path | None,
+    name: str = "",
 ) -> SessionPlacement | None:
     """Place the run's session; on a refusal warn once and return ``None``.
 
@@ -152,23 +153,29 @@ def place_run(
       client: The run's client.
       session_id: The session the run opened.
       environ: The process environment.
-      cwd: The run's working directory.
+      cwd: The run's working directory; ``None`` for a run on another host, whose
+        checkout this one cannot read.
+      name: The name its chat's tab opens with; empty leaves the tab as it is.
 
     Returns:
       placement: The server's answer, or ``None`` when it could not be had.
 
     """
-    body = PlaceSession(canvas=canvas_from_env(environ), git=git_ref(cwd))
+    body = PlaceSession(
+        canvas=canvas_from_env(environ),
+        git=None if cwd is None else git_ref(cwd),
+        name=name or None,
+    )
     try:
         answer = client.post(
             session_place_path(session_id),
-            body=body.model_dump(mode="json"),
+            # A server from before a field refuses it, so one left at its default
+            # is not sent.
+            body=body.model_dump(mode="json", exclude_defaults=True),
         )
         return SessionPlacement.model_validate(answer)
     except (ClientError, ValueError) as error:
-        sys.stderr.write(
-            f"[{PROGRAM}] could not place this session ({error}); running unplaced\n",
-        )
+        sys.stderr.write(f"[{PROGRAM}] could not place this session ({error})\n")
         return None
 
 

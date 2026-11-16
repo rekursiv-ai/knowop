@@ -7,6 +7,7 @@
     knowop run                                  sagent here: its screen at a terminal
     knowop run --headless -- --effort high      no screen; sagent's setting after --
     knowop run --on lab --cwd ~/work -- --model sol
+    knowop run --on lab --name xyz              a chat named xyz, its agent on lab
     knowop run --session ID                     continue session ID here
     knowop run --session AgentSession#412       the same, by its number (or 412)
     knowop run --stop ID                        stop session ID's agent, wherever it runs
@@ -37,6 +38,7 @@ import sys
 from sagent.tui.main import opened, parse_flags
 from trackinizer.trax.grammar import parse_ref
 from trackinizer.wire.refs import Ref, SeqRef
+from trackinizer.wire.wire_sessions import checked_canvas_name
 
 
 if TYPE_CHECKING:
@@ -59,6 +61,7 @@ class Flags(Protocol):
     session: Ref | None
     on: str | None
     cwd: str
+    name: str | None
     login_host: str
     stop: Ref | None
     time_limit: timedelta | None
@@ -198,6 +201,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         help="With --on, the folder there to start in (default: %(default)s).",
     )
     parser.add_argument(
+        "--name",
+        type=_name,
+        metavar="NAME",
+        help="Open the chat's tab in Chat, named NAME (else it opens closed).",
+    )
+    parser.add_argument(
         "--login-host",
         default="",
         metavar="NAME",
@@ -224,6 +233,16 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="URL",
         help="Serve the session a daemon hands on stdin, through the server at URL.",
     )
+
+
+# Read before a session opens: the server holds a canvas name to the same bounds, and a
+# name it refused after the start would leave a session behind.
+def _name(text: str) -> str:
+    """Read a chat's name as the server holds a canvas's."""
+    try:
+        return checked_canvas_name(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 def _session(text: str) -> Ref:

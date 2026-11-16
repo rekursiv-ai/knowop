@@ -172,6 +172,39 @@ class _Client:
         self._answer("get", (path, timeout))
         return self.schema
 
+    def list_canvases(self) -> list[dict[str, PlainTree]]:
+        self._answer("canvases", None)
+        return [
+            {
+                "id": "c1",
+                "name": "loose",
+                "workspace_id": None,
+                "session": {"seq": 412},
+            },
+            {"id": "c2", "name": "other", "workspace_id": "w1"},
+        ]
+
+    def list_workspaces(self) -> list[dict[str, PlainTree]]:
+        self._answer("workspaces", None)
+        return [{"id": "w1", "seq": 1, "title": "Scratch", "scratch": True}]
+
+    def rename_canvas(self, canvas_id: uuid.UUID, *, name: str) -> dict[str, PlainTree]:
+        self.calls.append(("rename", (canvas_id, name)))
+        if self.refusing is not None:
+            raise self.refusing
+        return {"name": name}
+
+    def rename_workspace(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        title: str,
+    ) -> dict[str, PlainTree]:
+        self.calls.append(("retitle", (workspace_id, title)))
+        if self.refusing is not None:
+            raise self.refusing
+        return {"id": str(workspace_id), "title": title}
+
     def _answer(
         self,
         name: str,
@@ -201,9 +234,16 @@ _ACTIONS: Final[tuple[Action, ...]] = (
     "capture",
     "mark",
     "unmark",
+    "chats",
+    "rename",
     "set",
 )
 """Every action, in the order the description says them."""
+
+_CANVAS_ACTIONS: Final = tuple(
+    each for each in _ACTIONS if each not in {"chats", "rename"}
+)
+"""The actions that act on this chat's canvas alone."""
 
 
 def _tools(
@@ -273,7 +313,7 @@ def test_the_description_says_each_action_in_a_line() -> None:
     ] == list(_ACTIONS)
 
 
-@pytest.mark.parametrize("action", _ACTIONS)
+@pytest.mark.parametrize("action", _CANVAS_ACTIONS)
 def test_with_no_canvas_named_yet_each_action_says_so_and_calls_nothing(
     action: Action,
 ) -> None:
@@ -1123,6 +1163,138 @@ def test_the_tool_offers_set_the_settings_the_server_gives() -> None:
         },
         "required": ["action"],
     }
+
+
+def test_the_chats_are_listed_by_workspace_as_the_command_lists_them_on_no_canvas() -> (
+    None
+):
+    client = _Client()
+    tools = _tools(client, canvas=None)
+
+    every = asyncio.run(tools.act(action="chats", context=_AGENT))
+    kept = asyncio.run(tools.act(action="chats", name=" LOOSE ", context=_AGENT))
+
+    assert every == "\n".join(
+        [
+            "Issue#1 Scratch (default)",
+            "  loose  canvas c1  AgentSession#412",
+            "  other  canvas c2  no chat",
+        ],
+    )
+    assert kept == "Issue#1 Scratch (default)\n  loose  canvas c1  AgentSession#412"
+    # Both are asked at once, in no set order.
+    assert sorted(client.calls) == [("canvases", None)] * 2 + [("workspaces", None)] * 2
+
+
+def test_chats_that_cannot_be_listed_say_why() -> None:
+    said = asyncio.run(
+        _tools(_Client(refusing=_REFUSED)).act(action="chats", context=_AGENT),
+    )
+
+    assert said == f"Could not list the chats: {_SAID_REFUSED}"
+
+
+def test_a_chat_is_renamed_by_its_canvas_this_one_unless_another_is_named() -> None:
+    client = _Client()
+
+    this = asyncio.run(
+        _tools(client).act(action="rename", name=" paper review ", context=_AGENT),
+    )
+    other = asyncio.run(
+        _tools(client, canvas=None).act(
+            action="rename",
+            target=f" {_OTHER} ",
+            name="Notes",
+            context=_AGENT,
+        ),
+    )
+
+    assert (this, other) == ("The chat is now paper review.", "The chat is now Notes.")
+    assert client.calls == [
+        ("rename", (_CANVAS, "paper review")),
+        ("rename", (_OTHER, "Notes")),
+    ]
+
+
+def test_a_workspace_is_renamed_by_its_issue_number() -> None:
+    client = _Client()
+
+    said = asyncio.run(
+        _tools(client, canvas=None).act(
+            action="rename",
+            target=" issue#12 ",
+            name="Papers",
+            context=_AGENT,
+        ),
+    )
+
+    assert said == "The workspace issue#12 is now Papers."
+    assert client.calls == [("resolve", "Issue#12"), ("retitle", (_ROW, "Papers"))]
+
+
+@pytest.mark.parametrize(
+    ("target", "name", "canvas", "said"),
+    [
+        ("", " ", _CANVAS, "Not renamed: give the new name."),
+        ("Issue#12", "", _CANVAS, "Not renamed: give the new name."),
+        (
+            "Belief#34",
+            "x",
+            _CANVAS,
+            "Not renamed: name a chat by its canvas id, or a workspace as Issue#N.",
+        ),
+        ("Issue#x", "x", _CANVAS, "Not renamed: cannot parse reference 'Issue#x'."),
+        ("", "x", None, _NO_CANVAS),
+    ],
+    ids=["blank-name", "no-name", "not-a-canvas-or-issue", "unparsed", "no-canvas"],
+)
+def test_a_rename_that_cannot_be_made_says_why_and_sends_nothing(
+    target: str,
+    name: str,
+    canvas: uuid.UUID | None,
+    said: str,
+) -> None:
+    client = _Client()
+
+    renamed = asyncio.run(
+        _tools(client, canvas=canvas).act(
+            action="rename",
+            target=target,
+            name=name,
+            context=_AGENT,
+        ),
+    )
+
+    assert (renamed, client.calls) == (said, [])
+
+
+@pytest.mark.parametrize(
+    ("target", "client", "said"),
+    [
+        ("", _Client(refusing=_REFUSED), f"Could not rename the chat: {_SAID_REFUSED}"),
+        (
+            "Issue#9",
+            _Client(),
+            "Could not rename Issue#9: the server answered 404: Issue#9 not found.",
+        ),
+        (
+            "Issue#12",
+            _Client(refusing=_REFUSED),
+            f"Could not rename Issue#12: {_SAID_REFUSED}",
+        ),
+    ],
+    ids=["chat-refused", "no-such-issue", "workspace-refused"],
+)
+def test_a_rename_the_server_refuses_says_why(
+    target: str,
+    client: _Client,
+    said: str,
+) -> None:
+    renamed = asyncio.run(
+        _tools(client).act(action="rename", target=target, name="x", context=_AGENT),
+    )
+
+    assert renamed == said
 
 
 if __name__ == "__main__":
