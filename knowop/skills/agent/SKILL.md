@@ -1,6 +1,6 @@
 ---
 name: knowop-run
-description: ALWAYS invoke this skill before running sagent with knowop run, starting an agent headless, on a host or from another agent, or continuing a stored session. Do not start an agent run, or tell a person which command reaches it, from memory -- invoke this skill first.
+description: ALWAYS invoke this skill when asked to spawn, start or launch an agent on a computer or host, run knowop run, or continue a stored session. Do not launch a bare agent or give launch commands from memory.
 ---
 
 # knowop run -- sagent, live in Chat
@@ -58,11 +58,17 @@ knowop run -- --help                # sagent's own flags and actions
 ## Start an agent from an agent
 
 ```bash
-knowop run --headless               # on this computer, in this folder
+knowop run --headless --name NAME   # named Chat tab, on this computer
 knowop status                       # the hosts; this computer's says "(this computer)"
-knowop run --on HOST --cwd ~/work   # on another host
+knowop run --on HOST --name NAME --cwd ~/work   # on another host
 ```
 
+- A request to spawn on a computer means a new session there, not an internal
+  child or a bare `sagent` in a Terminal window. Infer a short chat name when
+  none is given. Knowop's `--name` before `--` names and opens the Chat tab;
+  sagent's `--name` after `--` only labels the agent.
+- Verify the host's live run and the named tab with `knowop status` and
+  `Canvas(action="chats", name=NAME)` before reporting success.
 - Each returns within seconds with the new session's id; the host's daemon runs
   the agent until it is stopped.
 - Leave the model and effort at knowop's defaults; pass a sagent setting after
