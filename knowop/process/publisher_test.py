@@ -782,6 +782,8 @@ async def test_the_settings_go_when_assigned_and_again_only_when_they_change(
     sent = {s.name: s for s in first.settings}[source.name]
     assert (sent.help_long, sent.usage) == (source.help_long, source.usage)
     assert {s.name: s for s in second.settings}[("screen", "thinking")].value == "show"
+    model = {s.name: s for s in first.settings}[("model",)]
+    assert model.options == ("scripted/scripted",)
     login = {s.name: s for s in first.settings}[("login",)]
     assert (login.value, login.flags) == (
         None,

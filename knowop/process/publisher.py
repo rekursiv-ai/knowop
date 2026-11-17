@@ -482,6 +482,8 @@ def _at_work(agent: Agent) -> bool:
     )
 
 
+# ``model`` offers each model its catalog serves, as ``PROVIDER/MODEL``, which sagent's
+# own setting leaves to its help: Chat's Model picks among them.
 def _harvested(commands: Commands) -> tuple[Setting, ...]:
     """Return what a slash line can name now, as the wire carries it."""
     return tuple(
@@ -491,10 +493,20 @@ def _harvested(commands: Commands) -> tuple[Setting, ...]:
             help_long=s.help_long,
             usage=s.usage,
             value=None if s.value is None else s.value(),
-            options=tuple(s.options()),
+            options=_models(commands) if s.name == ("model",) else tuple(s.options()),
             flags=tuple(sorted(s.flags)),
         )
         for s in commands.reachable()
+    )
+
+
+def _models(commands: Commands) -> tuple[str, ...]:
+    """Return each model ``commands``' catalog serves, as ``PROVIDER/MODEL``."""
+    catalog = commands.catalog
+    return tuple(
+        f"{provider}/{model}"
+        for provider in catalog.factories
+        for model in catalog[provider]
     )
 
 
