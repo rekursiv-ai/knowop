@@ -154,7 +154,9 @@ def _told(said: UserMessage, *, canvas: UUID | None) -> str | None:
     how = (
         "Your Canvas tool (show, capture, mark and the rest) acts on it; with a "
         f"shell, `knowop canvas {canvas}` reads and changes it too, and `knowop canvas "
-        "--help` says how."
+        "--help` says how. On the first line from the person that says what this "
+        "chat is about, this one or a later one, `read` the canvas, and `rename` it "
+        "while its name is `unnamed-canvas#N`."
     )
     return f"{said.content or ''}{CONTEXT_TRAILER}{context}\n{how}"
 

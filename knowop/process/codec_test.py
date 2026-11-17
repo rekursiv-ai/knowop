@@ -192,7 +192,9 @@ def test_a_line_that_names_its_canvas_tells_the_agent_after_its_words() -> None:
             f'what is this?{CONTEXT_TRAILER}{{"canvas_id": "{canvas}"}}\n'
             "Your Canvas tool (show, capture, mark and the rest) acts on it; "
             f"with a shell, `knowop canvas {canvas}` reads and changes it too, and "
-            "`knowop canvas --help` says how."
+            "`knowop canvas --help` says how. On the first line from the person that "
+            "says what this chat is about, this one or a later one, `read` the canvas, "
+            "and `rename` it while its name is `unnamed-canvas#N`."
         ),
         sender="dan@example.com",
         extra={
