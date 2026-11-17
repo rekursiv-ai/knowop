@@ -7,8 +7,8 @@ dimmed while a connect service of this computer is not online, and a menu with e
 server knowop is logged in to: the account, its hosts and their live sessions, as
 ``knowop status`` shows them, and a line that opens the server's web app. Every 10 s it
 reads ``knowop status --json`` from a process of its own, so a slow server never holds
-the menu bar and a knowop upgraded since gives the next answer. Quit ends it until the
-next login or ``knowop connect``.
+the menu bar and a knowop upgraded since gives the next answer. Quit stops this
+computer's connect services, then itself, until the next login or ``knowop connect``.
 """
 
 from __future__ import annotations
@@ -204,6 +204,7 @@ def status() -> Report | None:
 # which alone may touch AppKit.
 def run(
     *,
+    stop: Callable[[], None],
     report: Callable[[], Report | None] = status,
     every: float = 10.0,
     spawn: Callable[[Callable[[], None]], None] = lambda work: threading.Thread(
@@ -214,6 +215,7 @@ def run(
     """Show knowop's status item, refreshed every ``every`` s, until Quit.
 
     Args:
+      stop: Stops this computer's connect services; Quit runs it, then ends this.
       report: Answers each refresh, off the main thread.
       every: Seconds from one answer shown to the next refresh.
       spawn: Runs a refresh off the main thread.
@@ -237,6 +239,7 @@ def run(
     menu = kit.NSMenu.alloc().init()
     item.setMenu_(menu)
     opener = _Opener(kit)
+    quitter = _Quitter(app, stop)
 
     def show(answer: Report | None) -> None:
         connected, lines = view(answer)
@@ -247,10 +250,10 @@ def run(
             menu.addItem_(_menu_item(kit, line, opener))
         leave = kit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit",
-            "terminate:",
+            "quit:",
             "q",
         )
-        leave.setTarget_(app)
+        leave.setTarget_(quitter)
         menu.addItem_(leave)
         helper.callLater(every, refresh)
 
@@ -292,6 +295,21 @@ class _Opener:
         self.kit.NSWorkspace.sharedWorkspace().openURL_(url)
 
 
+# Held by ``run``, as ``_Opener`` is. The services stop first: should that fail, the
+# menu bar stays, with the error in its log, rather than hide hosts left running.
+class _Quitter:
+    """The target of the menu's ``quit:`` line: it stops the services, then the app."""
+
+    def __init__(self, app: _Application, stop: Callable[[], None]) -> None:
+        self.app = app
+        self.stop = stop
+
+    def quit_(self, sender: _MenuItem) -> None:
+        """Stop this computer's connect services, then end the menu bar."""
+        self.stop()
+        self.app.terminate_(sender)
+
+
 class _Image(Protocol):
     def setSize_(self, size: tuple[float, float]) -> None: ...
     def setTemplate_(self, template: bool) -> None: ...
@@ -330,6 +348,7 @@ class _StatusBars(Protocol):
 
 class _Application(Protocol):
     def setActivationPolicy_(self, policy: int) -> bool: ...
+    def terminate_(self, sender: object) -> None: ...
 
 
 class _Applications(Protocol):

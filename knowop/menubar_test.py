@@ -201,6 +201,7 @@ class _Kit:
         self.menu: list[_Item] = []
         self.opened: list[str] = []
         self.iconed: list[tuple[object, str, int]] = []
+        self.done: list[str] = []
 
     def namespace(self) -> SimpleNamespace:
         kit = self
@@ -224,6 +225,10 @@ class _Kit:
     def setActivationPolicy_(self, policy: int) -> bool:  # noqa: N802 -- Mirrors AppKit.
         self.policy = policy
         return True
+
+    def terminate_(self, sender: object) -> None:
+        assert isinstance(sender, _Item)
+        self.done.append("terminate")
 
     def statusItemWithLength_(self, length: float) -> _Kit:  # noqa: N802 -- Mirrors AppKit.
         self.length = length
@@ -280,6 +285,12 @@ class _Opener(Protocol):
     def open_(self, sender: _Item, /) -> None: ...
 
 
+class _Quitter(Protocol):
+    """The target of the ``quit:`` line, as AppKit calls it."""
+
+    def quit_(self, sender: _Item, /) -> None: ...
+
+
 class _Helper:
     """Stands in for PyObjC's AppHelper: runs a call at once, and keeps a later one."""
 
@@ -309,7 +320,12 @@ def test_the_status_item_shows_the_mark_the_menu_and_refreshes_it(
     monkeypatch.setattr(menubar, "_helper", helper)
     answers = [_report(), _report(lab="offline")]
 
-    menubar.run(report=lambda: answers.pop(0), every=7.0, spawn=lambda work: work())
+    menubar.run(
+        report=lambda: answers.pop(0),
+        stop=lambda: kit.done.append("stop"),
+        every=7.0,
+        spawn=lambda work: work(),
+    )
 
     assert (kit.policy, kit.length, kit.size, kit.template) == (
         1,
@@ -324,7 +340,7 @@ def test_the_status_item_shows_the_mark_the_menu_and_refreshes_it(
     assert titles[:3] == ["knowop: connected", "-", f"{_ALPHA}: ada@example.com"]
     assert titles[-2:] == ["-", "Quit"]
     leave = kit.menu[-1]
-    assert (leave.action, leave.key, leave.target) == ("terminate:", "q", kit)
+    assert (leave.action, leave.key) == ("quit:", "q")
     assert not kit.menu[0].enabled
     (opens,) = [item for item in kit.menu if item.url == _LAB]
     assert opens.action == "open:"
@@ -337,6 +353,25 @@ def test_the_status_item_shows_the_mark_the_menu_and_refreshes_it(
     assert delay == 7.0
     assert (kit.disabled, kit.tip) == (True, "knowop: not connected")
     assert [item.title for item in kit.menu].count("Quit") == 1
+    assert kit.done == []
+
+
+def test_quit_stops_the_connect_services_then_ends_the_menu_bar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kit = _Kit()
+    monkeypatch.setattr(menubar, "_appkit", kit.namespace())
+    monkeypatch.setattr(menubar, "_helper", _Helper())
+    menubar.run(
+        report=_report,
+        stop=lambda: kit.done.append("stop"),
+        spawn=lambda work: work(),
+    )
+    leave = kit.menu[-1]
+
+    cast("_Quitter", leave.target).quit_(leave)
+
+    assert kit.done == ["stop", "terminate"]
 
 
 @pytest.mark.parametrize("present", [True, False], ids=["AppKit", "none"])

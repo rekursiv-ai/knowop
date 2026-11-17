@@ -549,6 +549,44 @@ def test_removing_an_agent_launchd_no_longer_holds_deletes_it_alone(
     assert list((tmp_path / "agents").iterdir()) == []
 
 
+def test_stopping_boots_out_each_connect_agent_and_keeps_its_definition(
+    tmp_path: Path,
+) -> None:
+    gpu = Connect(name="gpu1", server="https://other.example")
+    for each in (_ADA, gpu):
+        Services(manager="launchd", folder=tmp_path / "agents", run=_Manager()).start(
+            each,
+        )
+    kept = sorted((tmp_path / "agents").iterdir())
+    launchctl = _Manager()
+
+    Services(manager="launchd", folder=tmp_path / "agents", run=launchctl).stop()
+
+    targets = sorted(
+        f"gui/{os.getuid()}/ai.rekursiv.knowop.connect.{each.name}.{tag}"
+        for each, tag in ((_ADA, _TAG), (gpu, service.server_tag(gpu.server)))
+    )
+    assert launchctl.calls == [
+        call
+        for target in targets
+        for call in (
+            ["launchctl", "print", target],
+            ["launchctl", "bootout", target],
+        )
+    ]
+    assert launchctl.menubar == []
+    assert sorted((tmp_path / "agents").iterdir()) == kept
+
+
+def test_stopping_leaves_an_agent_launchd_no_longer_holds(tmp_path: Path) -> None:
+    Services(manager="launchd", folder=tmp_path / "agents", run=_Manager()).start(_ADA)
+    launchctl = _Manager(print=(113, ""))
+
+    Services(manager="launchd", folder=tmp_path / "agents", run=launchctl).stop()
+
+    assert [call[1] for call in launchctl.calls] == ["print"]
+
+
 def test_removing_a_unit_disables_and_stops_it_then_reloads_systemd(
     tmp_path: Path,
 ) -> None:
@@ -1201,10 +1239,10 @@ def test_a_servers_tag_ignores_a_trailing_slash_and_tells_servers_apart() -> Non
 
 @pytest.mark.parametrize(
     ("installed", "version"),
-    [({"knowop": "0.1.6"}, "0.1.6"), ({}, "unknown")],
+    [({"knowop": "0.1.6"}, "0.1.6"), ({}, "9f3c" * 10)],
     ids=["installed", "source checkout"],
 )
-def test_the_version_is_the_installed_knowops_or_unknown(
+def test_the_version_is_the_installed_knowops_or_the_checkouts_commit(
     monkeypatch: pytest.MonkeyPatch,
     installed: dict[str, str],
     version: str,
@@ -1214,6 +1252,7 @@ def test_the_version_is_the_installed_knowops_or_unknown(
         "version",
         partial(_installed_version, installed=installed),
     )
+    monkeypatch.setattr(service, "build_sha", lambda: "9f3c" * 10)
 
     assert service.knowop_version() == version
 

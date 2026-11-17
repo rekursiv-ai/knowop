@@ -92,6 +92,12 @@ All notable knowop changes are documented here. This project follows
 
 ### Changed
 
+- The menu bar's Quit stops this computer's connect services too, until the next
+  login or `knowop connect`. It once hid the mark alone, and the hosts went on
+  serving.
+- From a checkout, the version is the checkout's commit, not `unknown`, so
+  `knowop connect` after a `git pull` restarts a connect service that runs older
+  code. One left running older code could speak a sagent wire its server refuses.
 - **Breaking:** `knowop run [KNOWOP FLAGS] -- [SAGENT ARGUMENTS]`, as `trax run` was:
   sagent's settings and actions go after `--`, untouched. A sagent flag before `--` is
   refused, and the error shows the command with it after `--` (and `--profile`
