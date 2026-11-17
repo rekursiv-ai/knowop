@@ -339,6 +339,7 @@ def test_the_canvas_is_read_as_the_command_prints_it() -> None:
         state={
             "id": str(_CANVAS),
             "revision": 3,
+            "name": "unnamed-canvas#4",
             "page": "#/pulls",
             "visuals": [
                 {"id": str(_TILE), "type": "trax.subgraph", "placement": "side"},
@@ -352,6 +353,7 @@ def test_the_canvas_is_read_as_the_command_prints_it() -> None:
     assert said == "\n".join(
         [
             f"canvas {_CANVAS} revision 3 focused none",
+            "  name unnamed-canvas#4",
             "  page #/pulls",
             f"  trax.subgraph {_TILE} side",
             f"  box {_BOX} by person on no page covers: nothing",
