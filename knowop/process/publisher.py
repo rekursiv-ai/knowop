@@ -273,11 +273,7 @@ class Publisher:
     def _now(self, *, since: datetime) -> AgentState:
         """Return the agents' state now, ``busy`` last changed at ``since``."""
         line = self._status.line()
-        children = [
-            (label, self._team[label])
-            for label in self._team
-            if self._team[label] is not self._agent
-        ]
+        jobs, agents = team_work(self._team, self._agent, mask=self._masked)
         return AgentState(
             line=line,
             busy=self._status.frame() != line,
@@ -285,33 +281,10 @@ class Publisher:
             pending=tuple(
                 self._plain(m) for m in self._agent.runtime.pending_mid_stream()
             ),
-            jobs=(
-                *self._jobs(self._agent, label=""),
-                *(
-                    job
-                    for label, agent in children
-                    for job in self._jobs(agent, label=label)
-                ),
-            ),
-            agents=tuple(label for label, agent in children if _at_work(agent)),
+            jobs=jobs,
+            agents=agents,
             turn_ended=self._turn_ended,
         )
-
-    def _jobs(self, agent: Agent, *, label: str) -> list[BackgroundJob]:
-        """Return ``agent``'s background jobs, each title's secrets masked."""
-        runtime = agent.runtime
-        return [
-            BackgroundJob(
-                call_id=job.call.call_id,
-                tool=job.call.name,
-                title=self._masked(_title(runtime.tools.get(job.call.name), job.call)),
-                agent=label,
-                started=datetime.fromtimestamp(job.started, UTC),
-                state="sleeping" if job.state == "sleeping" else "running",
-            )
-            for job in runtime.jobs.values()
-            if job.state != "running"
-        ]
 
     def _masked(self, text: str) -> str:
         """Return ``text`` with each secret value masked."""
@@ -439,6 +412,90 @@ class _Part:
 
 class _NoSpawnerError(Exception):
     """A journal of the team whose spawner's journal this process does not upload."""
+
+
+def team_work(
+    team: Team,
+    root: Agent,
+    *,
+    mask: Callable[[str], str],
+) -> tuple[tuple[BackgroundJob, ...], tuple[str, ...]]:
+    """Return what ``team``'s agents have going: their jobs, and the children at work.
+
+    Args:
+      team: The agents of the session.
+      root: Its root agent, whose jobs come first.
+      mask: What each job's title is shown through, its secrets masked.
+
+    Returns:
+      jobs: Each background job of every agent, the root's first.
+      agents: The label of each child agent whose model call, tool calls or
+        compaction runs.
+
+    """
+    children = [(label, team[label]) for label in team if team[label] is not root]
+    jobs = (
+        *_jobs(root, label="", mask=mask),
+        *(
+            job
+            for label, agent in children
+            for job in _jobs(agent, label=label, mask=mask)
+        ),
+    )
+    return jobs, tuple(label for label, agent in children if _at_work(agent))
+
+
+def _jobs(
+    agent: Agent,
+    *,
+    label: str,
+    mask: Callable[[str], str],
+) -> list[BackgroundJob]:
+    """Return ``agent``'s background jobs, each title through ``mask``."""
+    runtime = agent.runtime
+    return [
+        BackgroundJob(
+            call_id=job.call.call_id,
+            tool=job.call.name,
+            title=mask(_title(runtime.tools.get(job.call.name), job.call)),
+            agent=label,
+            started=datetime.fromtimestamp(job.started, UTC),
+            state="sleeping" if job.state == "sleeping" else "running",
+        )
+        for job in runtime.jobs.values()
+        if job.state != "running"
+    ]
+
+
+def _title(tool: Tool | None, call: ToolCall) -> str:
+    """Return the tool's own label for ``call``, or its name for a tool not held."""
+    if tool is None:
+        return call.name
+    return tool.summary(without_controls(call.arguments))
+
+
+def _at_work(agent: Agent) -> bool:
+    """Return whether ``agent``'s model call, its tool calls or a compaction runs."""
+    runtime = agent.runtime
+    return bool(
+        runtime.model_call is not None or runtime.cohort or runtime.compact_task,
+    )
+
+
+def _harvested(commands: Commands) -> tuple[Setting, ...]:
+    """Return what a slash line can name now, as the wire carries it."""
+    return tuple(
+        Setting(
+            name=s.name,
+            help_short=s.help_short,
+            help_long=s.help_long,
+            usage=s.usage,
+            value=None if s.value is None else s.value(),
+            options=tuple(s.options()),
+            flags=tuple(sorted(s.flags)),
+        )
+        for s in commands.reachable()
+    )
 
 
 async def _part(part: _Part) -> _Part:
@@ -599,34 +656,3 @@ class _Journal:
             batch=batch,
             format="sagent",
         )
-
-
-def _title(tool: Tool | None, call: ToolCall) -> str:
-    """Return the tool's own label for ``call``, or its name for a tool not held."""
-    if tool is None:
-        return call.name
-    return tool.summary(without_controls(call.arguments))
-
-
-def _at_work(agent: Agent) -> bool:
-    """Return whether ``agent``'s model call, its tool calls or a compaction runs."""
-    runtime = agent.runtime
-    return bool(
-        runtime.model_call is not None or runtime.cohort or runtime.compact_task,
-    )
-
-
-def _harvested(commands: Commands) -> tuple[Setting, ...]:
-    """Return what a slash line can name now, as the wire carries it."""
-    return tuple(
-        Setting(
-            name=s.name,
-            help_short=s.help_short,
-            help_long=s.help_long,
-            usage=s.usage,
-            value=None if s.value is None else s.value(),
-            options=tuple(s.options()),
-            flags=tuple(sorted(s.flags)),
-        )
-        for s in commands.reachable()
-    )

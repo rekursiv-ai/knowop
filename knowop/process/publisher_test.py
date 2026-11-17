@@ -653,6 +653,7 @@ async def test_a_background_job_goes_up_at_once_and_its_turn_ends_with_its_resul
         waiting.release.set()
         _ = await turn
 
+    assert running.jobs is not None
     [job] = running.jobs
     assert (job.call_id, job.tool, job.title, job.agent, job.state) == (
         "w1",
@@ -690,7 +691,7 @@ async def test_a_delayed_job_goes_up_sleeping(tmp_path: Path) -> None:
         sleeping = p.states()[-1].state
         turn.cancel()
 
-    assert [job.state for job in sleeping.jobs] == ["sleeping"]
+    assert [job.state for job in sleeping.jobs or ()] == ["sleeping"]
 
 
 @pytest.mark.asyncio
