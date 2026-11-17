@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Final, Literal, override
 import getpass
 import io
 import os
+import re
 import select
 import signal
 import sys
@@ -2121,10 +2122,10 @@ def test_job_help_is_knowops(
 
 @pytest.mark.parametrize(
     ("installed", "printed"),
-    [({"knowop": "0.1.0"}, "knowop 0.1.0\n"), ({}, "knowop unknown\n")],
+    [({"knowop": "0.1.0"}, "knowop 0.1.0\n"), ({}, f"knowop {'9f3c' * 10}\n")],
     ids=["installed", "source checkout"],
 )
-def test_version_names_the_command_and_unknown_from_a_checkout(
+def test_version_names_the_command_and_the_commit_from_a_checkout(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     installed: dict[str, str],
@@ -2135,12 +2136,95 @@ def test_version_names_the_command_and_unknown_from_a_checkout(
         "version",
         partial(_installed_version, installed=installed),
     )
+    monkeypatch.setattr(service, "build_sha", lambda: "9f3c" * 10)
 
     with pytest.raises(SystemExit) as exited:
         _knowop("--version")
 
     assert exited.value.code == 0
     assert capsys.readouterr().out == printed
+
+
+@pytest.mark.parametrize(
+    "verb",
+    ["login", "logout", "status", "menubar", "logs", "disconnect", "job", "upload"],
+)
+def test_each_verbs_help_says_what_it_does_under_its_usage(
+    capsys: pytest.CaptureFixture[str],
+    verb: str,
+) -> None:
+    usage, said, *_ = _help(capsys, verb).split("\n\n")
+
+    assert usage.startswith(f"usage: knowop {verb}")
+    assert not said.startswith(("positional arguments:", "options:"))
+
+
+@pytest.mark.parametrize(
+    ("argv", "shown"),
+    [
+        (
+            (),
+            [
+                r"^usage: knowop \[-h\] \[--version\] VERB \.\.\.$",
+                r"^ +run +run sagent",
+            ],
+        ),
+        (
+            ("login",),
+            [r"^usage: knowop login \[-h\] \[ORG\|URL\]$", r"ORG means https"],
+        ),
+        (("logs",), [r" --lines N +print only its last N lines$"]),
+        (
+            ("job",),
+            [
+                r"^usage: knowop job submit\|logs\|results\|status\|cancel\|secrets\|secret \.\.\.$",
+            ],
+        ),
+    ],
+    ids=["knowop", "login", "logs", "job"],
+)
+def test_help_names_the_verbs_and_their_arguments(
+    capsys: pytest.CaptureFixture[str],
+    argv: tuple[str, ...],
+    shown: list[str],
+) -> None:
+    said = _help(capsys, *argv)
+
+    for line in shown:
+        assert re.search(line, said, re.MULTILINE), line
+
+
+@pytest.mark.parametrize(
+    ("verb", "field"),
+    [("login", "target"), ("logout", "name"), ("logs", "name"), ("disconnect", "name")],
+)
+def test_a_left_out_name_or_server_reads_as_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    verb: str,
+    field: str,
+) -> None:
+    parsed: list[cli.Flags] = []
+
+    def run(flags: cli.Flags, **_: object) -> None:
+        parsed.append(flags)
+
+    monkeypatch.setattr(cli, "_run", run)
+
+    assert _knowop(verb) == 0
+
+    assert getattr(parsed[0], field) == ""
+
+
+def test_flags_without_a_verb_are_refused_for_want_of_one(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as exited:
+        _knowop("--bogus")
+
+    assert exited.value.code == 2
+    assert capsys.readouterr().err.endswith(
+        "error: the following arguments are required: VERB\n",
+    )
 
 
 def test_bare_knowop_gives_the_first_step_without_logging_in(
@@ -2304,7 +2388,7 @@ def test_the_service_serves_with_the_flags_connect_was_given(
 
 
 @pytest.mark.parametrize(("platform", "code"), [("darwin", 0), ("linux", 1)])
-def test_the_menu_bar_runs_on_macos_alone(
+def test_the_menu_bar_runs_on_macos_alone_and_its_quit_stops_the_services(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     platform: str,
@@ -2312,11 +2396,21 @@ def test_the_menu_bar_runs_on_macos_alone(
 ) -> None:
     shown: list[str] = []
     monkeypatch.setattr(sys, "platform", platform)
-    monkeypatch.setattr(menubar, "run", lambda: shown.append("menu bar"))
+
+    def stop(self: Services) -> None:
+        shown.append(f"stop {self.manager}")
+
+    monkeypatch.setattr(Services, "stop", stop)
+
+    def run(*, stop: Callable[[], None]) -> None:
+        shown.append("menu bar")
+        stop()
+
+    monkeypatch.setattr(menubar, "run", run)
 
     assert _knowop("menubar") == code
 
-    assert shown == (["menu bar"] if code == 0 else [])
+    assert shown == (["menu bar", "stop launchd"] if code == 0 else [])
     assert capsys.readouterr().err == (
         "" if code == 0 else "knowop: knowop menubar runs on macOS alone\n"
     )
@@ -3370,6 +3464,14 @@ def test_disconnect_says_when_the_host_still_reads_online(
     assert capsys.readouterr().err == (
         "knowop: host gpu1 still reads online after 30 s\n"
     )
+
+
+def _help(capsys: pytest.CaptureFixture[str], *argv: str) -> str:
+    """Return what ``knowop ARGV --help`` prints."""
+    with pytest.raises(SystemExit) as exited:
+        _knowop(*argv, "--help")
+    assert exited.value.code == 0
+    return capsys.readouterr().out
 
 
 def _knowop(*argv: str) -> int:

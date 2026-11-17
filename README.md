@@ -68,7 +68,8 @@ on macOS, a `systemd --user` unit on Linux. It runs in the background, starts ag
 at login and after a crash, and returns once the server shows the computer online.
 `knowop logs -f` follows its log, `knowop status` lists it with its flags, and
 `knowop disconnect` stops and removes it. Running `knowop connect` again restarts it
-only when its flags, its environment or its knowop changed. The
+only when its flags, its environment or its knowop changed; from a checkout, its
+knowop is the checkout's commit, so a `git pull` counts. The
 service runs the knowop that installed it: an installed one in place, so after `uv
 tool upgrade knowop` run `knowop connect` again, and one `uvx` ran as `uvx
 knowop@VERSION`, which `uv cache clean` cannot take away; `uvx knowop@latest
@@ -86,8 +87,9 @@ Anywhere else, such as a pipe, a box or a service of your own, and with
 On macOS, `knowop connect` also shows the knowop mark in the menu bar: dimmed while
 a connect service here is not online, with a menu of each server you are logged in
 to, your hosts and their runs. It runs as one more launchd agent,
-`ai.rekursiv.knowop.menubar`, and goes with the last connect service. Quit hides it
-until the next login or `knowop connect`. It needs PyObjC, which installs with
+`ai.rekursiv.knowop.menubar`, and goes with the last connect service. Quit stops
+every connect service here, then the menu bar, until the next login or `knowop
+connect`; their hosts read offline meanwhile. It needs PyObjC, which installs with
 knowop on macOS; where this knowop's Python cannot import it (a checkout not synced
 since), `knowop connect` says so and installs no menu bar. `knowop status` says
 whether it runs, and why it fails when it does.
@@ -190,7 +192,7 @@ host, not the unit, and `knowop logs` reads only a user service's log: use
 |---|---|
 | `knowop login [ORG\|URL]` | Logs in with a code approved in a browser and saves the key. |
 | `knowop connect [ORG\|URL] [--name N] [--no-exec] [--sandbox] [--jobs [--job-results-max SIZE]] [--foreground] [--follow]` | Logs in first unless knowop is logged in to that server or a token is piped in, enrolling and confirming this computer in the same approval; then serves its terminal, and the assistant's commands unless `--no-exec`. At a terminal it serves from a user service that starts again at login, and `--follow` then follows its log; elsewhere, and with `--foreground`, until Ctrl-C. No server means knowop's own, else `https://alpha.knowop.ai`. `--sandbox` records that the computer is disposable. `--jobs` also runs your account's `knowop job submit --host` jobs, each under a memory cap; it needs systemd's user manager. |
-| `knowop menubar` | Shows the knowop mark in the macOS menu bar until Quit; `knowop connect` starts it at login. |
+| `knowop menubar` | Shows the knowop mark in the macOS menu bar until Quit, which stops this computer's connect services too; `knowop connect` starts it at login. |
 | `knowop logs [NAME] [-f] [-n N]` | Prints the log of NAME's connect service on this computer (default this computer's name), its last N lines, or follows it until Ctrl-C. A host connected from another computer keeps its log there. |
 | `knowop status [--json]` | Prints, for each server knowop is logged in to (the one its commands use first), the profile, the server, your account and role, your computers with whether each is online, the knowop version and process serving each one online, and the agent processes live on each; and this computer's connect services with their flags, and whether each is turned off (macOS Login Items). On macOS, the menu bar: running, stopped, or failing with its exit code and its last log line. `--json` prints the same as one JSON object, one entry per login. Exits 1 when not logged in, or when a server refuses its login's key. |
 | `knowop disconnect [NAME]` | Disconnects NAME (default this computer) on the server: its connect is revoked and every agent process on it stops. Removes NAME's connect service on this computer, and waits until the server shows NAME offline. `knowop connect` joins it again with no login. |
@@ -202,7 +204,7 @@ host, not the unit, and `knowop logs` reads only a user service's log: use
 | `knowop host start\|NAME pause\|NAME resume\|NAME del` | Rents a KnowHost, billed to your account, that joins as one of your hosts; it pauses after 30 minutes unused, `resume` wakes it, and `del` ends it. On a server that runs KnowHost. |
 | `knowop canvas [CANVAS_UUID] [show TYPE\|navigate ROUTE\|highlight UUID,...\|hide ID\|KEY to VALUE ...]` | Reads and changes a canvas with the grammar of `trax canvas`. Where `$TRAX_CANVAS` names a canvas, an agent drives the person's canvas with knowop alone. |
 | `knowop upload PATH... [--public] [--server ORG\|URL] [--format claude\|codex\|sagent] [--no-subagents] [--jobs N] [--dry-run]` | Sends finished Claude Code, Codex and sagent sessions, files or folders searched for them (`~/.claude`, `~/.codex/sessions`, sagent's projects, or a copy of any; Codex's compressed `.jsonl.zst` rollouts too), each as an AgentSession under the CLI's own id, started and ended when it was. Each sub-agent, a workflow's agents included, goes as an AgentSession of its own, in its spawner's audience, linked to it (`produced_by`). A new session is private unless `--public`; uploading again sends only the records the server lacks, and lands on the same AgentSession when the same login sends it. A session the server holds keeps the audience it has, whichever flag is given. `--server` uses knowop's saved login for that server; `--dry-run` lists what would go and contacts no server. Records are masked as a run's are (`TRAX_REDACT_NAMES`). Exits 1 when a session fails. |
-| `knowop --version` | Prints the version; `unknown` from a checkout. |
+| `knowop --version` | Prints the version; from a checkout, its commit. |
 
 Every command takes `--help`; `knowop run --help` and `knowop job submit --help`
 show the runner's own, and `knowop run -- --help` shows sagent's.

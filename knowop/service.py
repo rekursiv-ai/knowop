@@ -50,6 +50,7 @@ from trackinizer.lib.userdirs import (
     runtime_dir_variables,
     state_dir,
 )
+from trackinizer.server.version import build_sha
 from treekle import from_plain
 
 from knowop import macos_app, menubar
@@ -224,6 +225,20 @@ class Services:
                 launcher = data_dir() / "rekursiv-ai" / "knowop" / "launchers" / each
                 launcher.unlink(missing_ok=True)
         return True
+
+    # Booted out, not killed: a host ends 130 on SIGTERM, which KeepAlive restarts.
+    def stop(self) -> None:
+        """Stop every connect agent here until the next login or ``knowop connect``.
+
+        Launchd's alone: its one caller, the menu bar's Quit, runs on macOS. Each
+        definition stays, which login and ``knowop connect`` load again.
+
+        Raises:
+          ClientError: A ``bootout`` failed; the agents after it still run.
+
+        """
+        for path in sorted(self.folder.glob(_CONNECT_PLISTS)):
+            self._bootout(path)
 
     def every(self) -> list[Connect]:
         """Return each connect service installed here, by definition file name.
@@ -413,10 +428,14 @@ class Services:
 
     def _unload(self, path: Path) -> None:
         """Stop ``path``'s agent where launchd has it, and delete its definition."""
+        self._bootout(path)
+        path.unlink()
+
+    def _bootout(self, path: Path) -> None:
+        """Stop ``path``'s agent where launchd has it; its definition stays."""
         target = f"gui/{os.getuid()}/{path.stem}"
         if self.run(["launchctl", "print", target])[0] == 0:
             self._call("launchctl", "bootout", target)
-        path.unlink()
 
     def _disabled(self) -> set[str]:
         """Return the labels (launchd) or units (systemd) the person turned off."""
@@ -502,12 +521,14 @@ def server_tag(server: str) -> str:
     return hashlib.sha256(server.rstrip("/").encode()).hexdigest()[:8]
 
 
+# A checkout's commit, not a constant: ``knowop connect`` restarts a host whose
+# version differs, so after a ``git pull`` it replaces the one running older code.
 def knowop_version() -> str:
-    """Return the installed knowop's version; ``unknown`` from a source checkout."""
+    """Return the installed knowop's version; from a source checkout, its commit."""
     try:
         return metadata.version("knowop")
     except metadata.PackageNotFoundError:
-        return "unknown"
+        return build_sha()
 
 
 # Copied and emptied in place, never renamed: the service manager holds the log open

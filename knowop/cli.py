@@ -235,8 +235,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "login",
         help="log in with a code approved in a browser",
         description=(
-            "Log in with a code approved in a browser; knowop uses this login "
-            "from then on."
+            "Log in with a code approved in a browser; knowop uses this login "  # pragma: no mutate[diagnostic-text]
+            "from then on."  # pragma: no mutate[diagnostic-text]
         ),
     )
     verb.add_argument(
@@ -250,10 +250,10 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "logout",
         help="log this computer out, revoke knowop's key and delete its profile",
         description=(
-            "Log this computer's host out on the server, revoke knowop's key, "
-            "delete its profile and remove this computer's connect services. NAME "
-            "logs that host out alone, as the Hosts page does: its connect is "
-            "revoked, its runs stop, and the keys its logins made are revoked."
+            "Log this computer's host out on the server, revoke knowop's key, "  # pragma: no mutate[diagnostic-text]
+            "delete its profile and remove this computer's connect services. NAME "  # pragma: no mutate[diagnostic-text]
+            "logs that host out alone, as the Hosts page does: its connect is "  # pragma: no mutate[diagnostic-text]
+            "revoked, its runs stop, and the keys its logins made are revoked."  # pragma: no mutate[diagnostic-text]
         ),
     ).add_mutually_exclusive_group()
     logout.add_argument(
@@ -271,9 +271,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "status",
         help="show knowop's profile, server, account, role, hosts and their runs",
         description=(
-            "Show knowop's profile, server, account and role; each of your hosts, "
-            "online or not, with its knowop version and process while online, and "
-            "its live sessions; and this computer's connect services, with their flags."
+            "Show knowop's profile, server, account and role; each of your hosts, "  # pragma: no mutate[diagnostic-text]
+            "online or not, with its knowop version and process while online, and "  # pragma: no mutate[diagnostic-text]
+            "its live sessions; and this computer's connect services, with their flags."  # pragma: no mutate[diagnostic-text]
         ),
     ).add_argument(
         "--json",
@@ -284,19 +284,19 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "menubar",
         help="show this computer's connects in the macOS menu bar",
         description=(
-            "Show the knowop mark in the macOS menu bar, dimmed while a connect "
-            "service here is not online, with a menu of each server knowop is logged "
-            "in to and its hosts. knowop connect starts it at login beside its "
-            "connect services; Quit ends it until then."
+            "Show the knowop mark in the macOS menu bar, dimmed while a connect "  # pragma: no mutate[diagnostic-text]
+            "service here is not online, with a menu of each server knowop is logged "  # pragma: no mutate[diagnostic-text]
+            "in to and its hosts. knowop connect starts it at login beside its "  # pragma: no mutate[diagnostic-text]
+            "connect services; Quit stops them and it until then."  # pragma: no mutate[diagnostic-text]
         ),
     )
     logs = verbs.add_parser(
         "logs",
         help="print or follow the log of a host's connect on this computer",
         description=(
-            "Print the log the connect service of a host writes on this computer, "
-            "or follow it. A connect in the foreground prints to its terminal "
-            "instead, and a host connected elsewhere keeps its log there."
+            "Print the log the connect service of a host writes on this computer, "  # pragma: no mutate[diagnostic-text]
+            "or follow it. A connect in the foreground prints to its terminal "  # pragma: no mutate[diagnostic-text]
+            "instead, and a host connected elsewhere keeps its log there."  # pragma: no mutate[diagnostic-text]
         ),
     )
     logs.add_argument(
@@ -322,11 +322,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "disconnect",
         help="disconnect a host of yours on the server, stopping its runs",
         description=(
-            "Disconnect the host on the server: its connect is revoked, and every run "
-            "of yours that names it is stopped, here or anywhere. Its connect service "
-            "on this computer is removed, and it waits until the server shows the "
-            "host offline. knowop connect joins it again, with no login; knowop "
-            "logout also revokes this computer's key."
+            "Disconnect the host on the server: its connect is revoked, and every run "  # pragma: no mutate[diagnostic-text]
+            "of yours that names it is stopped, here or anywhere. Its connect service "  # pragma: no mutate[diagnostic-text]
+            "on this computer is removed, and it waits until the server shows the "  # pragma: no mutate[diagnostic-text]
+            "host offline. knowop connect joins it again, with no login; knowop "  # pragma: no mutate[diagnostic-text]
+            "logout also revokes this computer's key."  # pragma: no mutate[diagnostic-text]
         ),
     ).add_argument(
         "name",
@@ -357,18 +357,16 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         help="run sagent's agent here, or with --on on a host, live in Chat; "
         "sagent's arguments go after --",
     )
+    # Only ``job -h`` reaches argparse: ``main`` hands every other form to the runner.
     verbs.add_parser(
         "job",
         help="run, list and cancel jobs on a GPU node, and keep their secrets",
         description=(
-            "Run a job on a GPU node from this repository as knowop's account, read "
-            "its log and results, list and cancel jobs, and keep their secrets; its "
-            "arguments pass to the job runner unchanged."
+            "Run a job on a GPU node from this repository as knowop's account, read "  # pragma: no mutate[diagnostic-text]
+            "its log and results, list and cancel jobs, and keep their secrets; its "  # pragma: no mutate[diagnostic-text]
+            "arguments pass to the job runner unchanged."  # pragma: no mutate[diagnostic-text]
         ),
-    ).add_argument(
-        "args",
-        nargs=argparse.REMAINDER,
-        metavar="submit|logs|results|status|cancel|secrets|secret ...",
+        usage="knowop job submit|logs|results|status|cancel|secrets|secret ...",
     )
     # Only listed here: ``main`` hands every ``host`` form to its command.
     verbs.add_parser(
@@ -385,12 +383,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             "upload",
             help="send finished Claude Code, Codex and sagent sessions to the server",
             description=(
-                "Send finished Claude Code, Codex and sagent sessions to the server, "
-                "each as an AgentSession under the CLI's own id for it, started and "
-                "ended when it was. A folder is searched for session files; a "
-                "session's sub-agents go too, each linked to the session that spawned "
-                "it. Uploading a session again sends only what the server lacks, and "
-                "leaves it to the readers it has."
+                "Send finished Claude Code, Codex and sagent sessions to the server, "  # pragma: no mutate[diagnostic-text]
+                "each as an AgentSession under the CLI's own id for it, started and "  # pragma: no mutate[diagnostic-text]
+                "ended when it was. A folder is searched for session files; a "  # pragma: no mutate[diagnostic-text]
+                "session's sub-agents go too, each linked to the session that spawned "  # pragma: no mutate[diagnostic-text]
+                "it. Uploading a session again sends only what the server lacks, and "  # pragma: no mutate[diagnostic-text]
+                "leaves it to the readers it has."  # pragma: no mutate[diagnostic-text]
             ),
         ),
     )
@@ -542,7 +540,9 @@ def _run(
         case "menubar":
             if sys.platform != "darwin":
                 raise ClientError("knowop menubar runs on macOS alone")
-            menubar.run()
+            services = service.here()
+            assert isinstance(services, service.Services)
+            menubar.run(stop=services.stop)
         case "upload":
             _upload(cast(_UploadFlags, flags), named=named)
         case _:
