@@ -22,7 +22,7 @@ __all__ = [
 
 
 class NotResumableError(Exception):
-    """A stored part is not sagent's journal, so no journal here continues it."""
+    """No stored part holds a conversation, so no journal here continues it."""
 
 
 class CiphertextDroppedError(Exception):
