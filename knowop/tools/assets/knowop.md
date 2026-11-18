@@ -55,9 +55,9 @@ Commands:
 - `agentsession 12 records` prints a session's transcript. An agent a daemon
   or the cloud started reads only the transcripts of its own session and the
   sessions its agents spawned; another session's answers that it is refused.
-  `search-sessions` searches every transcript you may read.
-- Other reads: `recent --limit 10` (recent changes), `search-sessions "QUERY"`
-  (past agent sessions, by meaning and words), `next`, `blocked`,
+  `search "QUERY" --kind agentsession` searches every transcript you may read.
+- Other reads: `recent --limit 10` (recent changes), `search "QUERY"` (rows and
+  edge notes, by meaning and words; `--kind` narrows), `next`, `blocked`,
   `graph --open-only`, `board`, `cost issue 7`, `confidence belief 3`,
   `authority belief 3`, `version`.
 - `help`, `issue help` and `issue 7 help` explain any of these. Help lists

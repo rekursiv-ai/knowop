@@ -27,7 +27,8 @@ _READ_FORMS: Final = (
     "issue 7 description",
     "agentsession 3 records",
     "recent --limit 5",
-    'search-sessions "tile cache"',
+    'search "tile cache" --kind agentsession',
+    'search "tile cache"',
     "next",
     "blocked",
     "graph --open-only",
@@ -60,6 +61,7 @@ _BODIES: Final[dict[str, object]] = {
     },
     "/api/sessions/{session_id}/records": {"part": 0, "records": []},
     "/api/web/search_sessions": {"hits": [], "semantic": False, "degraded": False},
+    "/api/web/search_inquiries": {"hits": [], "semantic": False, "degraded": False},
     "/api/inquiries/next_issue": None,
     "/api/inquiries/{target_id}/cost": {},
     "/api/inquiries/{target_id}/confidence": {"confidence": 0.5},
@@ -104,7 +106,7 @@ def test_every_read_form_runs_and_between_them_they_call_every_listed_route() ->
 def test_splits_the_command_as_a_shell_would() -> None:
     transport = _Server()
 
-    _answer('search-sessions "tile cache" --limit 3', transport)
+    _answer('search "tile cache" --kind agentsession --limit 3', transport)
 
     assert transport.queries[0]["q"] == "tile cache"
 
@@ -223,7 +225,7 @@ def test_runs_every_reading_verb_and_names_each_it_refuses() -> None:
         for name in dispatcher.names
     }
 
-    assert {"recent", "search-sessions", "next", "blocked", "graph", "board"} <= names
+    assert {"recent", "search", "next", "blocked", "graph", "board"} <= names
     assert {"cost", "confidence", "authority", "id", "version", "help"} <= names
     assert refused == {"send", "export", "canvas", "doctor", "profile", "env"}
     assert all(f"`{name}`" in KNOWOP_DESCRIPTION for name in sorted(refused))

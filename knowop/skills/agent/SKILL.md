@@ -130,7 +130,7 @@ Every agent of the run reads Trackinizer's records with its KnowOp tool's
 `trax.read` action, with or without a shell: its `command` is a trax read command, as
 typed after `trax`
 (`KnowOp(action="trax.read", command="issue status is active title re cache")`,
-`issue 7 requires`, `recent`, `search-sessions "QUERY"`). It reads only, under any
+`issue 7 requires`, `recent`, `search "QUERY"`). It reads only, under any
 key: a command that would change a record, and `send`, `export`, `canvas`, `doctor`,
 `profile` and `env`, answer that they are not available, and nothing is written. A
 `-` or `@path` value reads nothing on this computer. For an agent a daemon or Our

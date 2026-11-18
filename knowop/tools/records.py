@@ -2,7 +2,7 @@
 
 The action takes a trax command line, as ``trax`` reads it: list and filter rows
 (``issue status is active title re cache``), show one (``issue 7``) and its relations
-(``issue 7 requires``), and the read verbs (``recent``, ``search-sessions``, ``next``,
+(``issue 7 requires``), and the read verbs (``recent``, ``search``, ``next``,
 ``blocked``, ``graph``, ``board``, ``cost``, ``confidence``, ``authority``, ``id``,
 ``version``, ``help``). The command is the verb: an action per read command would
 restate a part of a grammar the trax CLI and its skill already teach.

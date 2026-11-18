@@ -3020,7 +3020,7 @@ wheels = [
 [[package]]
 name = "sagent"
 version = "0.2.3"
-source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#1aafcae460f34eb1502a7608e069066fc5fe5ac3" }
+source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#89521533a606339e712b0560e85fe3bff3ac2c3e" }
 dependencies = [
     { name = "bashlex" },
     { name = "cachetools" },
@@ -3360,7 +3360,7 @@ wheels = [
 [[package]]
 name = "trackinizer"
 version = "0.1.13"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#f37e0925f4067dcdd6c64aec20ef212a399281dd" }
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#9f15fee7d7326a489dbbd340757ffa2516aaf36d" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
