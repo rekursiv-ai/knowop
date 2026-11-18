@@ -37,6 +37,7 @@ __all__ = [
     "DEFAULT_RESULTS_MAX",
     "Gpu",
     "Run",
+    "Scoping",
     "cap_problem",
     "gpus",
     "idle_gpus",
@@ -94,6 +95,40 @@ def run(argv: Sequence[str]) -> tuple[int, str]:
     except subprocess.TimeoutExpired:
         return 124, ""
     return done.returncode, done.stdout
+
+
+# Asked once, with a scope that runs nothing: a service manager the daemon runs under
+# stops the children in its own group with it, unless each has a scope.
+class Scoping:
+    """Puts a process the daemon starts in a scope of its own where systemd can.
+
+    Args:
+      run: Runs ``systemd-run`` once, to learn whether a process can have a scope.
+
+    """
+
+    def __init__(self, run: Run = run) -> None:
+        self._run = run
+        self._scoped: bool | None = None
+        """Whether a process gets a scope of its own; ``None`` until first asked."""
+
+    def argv(self, argv: list[str], *, unit: str) -> list[str]:
+        """Return ``argv`` run in the scope ``unit`` where ``systemd-run`` works.
+
+        Args:
+          argv: The command.
+          unit: The scope's name, ``NAME.scope``.
+
+        Returns:
+          argv: The whole command: ``argv`` itself where no scope can be had.
+
+        """
+        if self._scoped is None:
+            probe = scope_argv(memory_mb=None, argv=["true"])
+            self._scoped = self._run(probe)[0] == 0
+        if not self._scoped:
+            return argv
+        return scope_argv(unit=unit, memory_mb=None, argv=argv, run=self._run)
 
 
 def parse_size(text: str) -> int:

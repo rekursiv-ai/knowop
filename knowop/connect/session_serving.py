@@ -66,7 +66,7 @@ from trackinizer.wire.wire_session_relay import (
 from trackinizer.wire.wire_tools import WAIT_MAX_SEC
 from treekle import json_dumps, json_loads
 
-from knowop.connect.job_limits import Run, run, scope_argv
+from knowop.connect.job_limits import Run, Scoping, run
 from knowop.connect.terminal_serving import start_folder
 from knowop.connect.tool_serving import scrubbed_names
 from knowop.connect.wake import Listener
@@ -241,13 +241,11 @@ class SessionServing:
         # The session wait is held as the tool wait is, to the same longest hold.
         self._wait_sec = wait_sec or WAIT_MAX_SEC
         self._command = tuple(command)
-        self._run = run
+        self._scoping = Scoping(run)
         self._wake = wake
         self._stopper = stop
         self._running = running
         self._stop = threading.Event()
-        self._scoped: bool | None = None
-        """Whether a process gets a scope of its own; ``None`` until first asked."""
 
     def start(self, host_id: uuid.UUID, instance: uuid.UUID) -> None:
         """Start waiting for starts on a thread.
@@ -352,7 +350,7 @@ class SessionServing:
             held = _held(log.parent / _RECORD, host_id=host_id, owned=place.owned)
             try:
                 pid = spawn_detached(
-                    self._scoped_argv(
+                    self._scoping.argv(
                         [
                             *place.launcher,
                             *self._command,
@@ -408,17 +406,6 @@ class SessionServing:
                 reason=str(failure)[:MAX_REASON_CHARS],
             ),
         )
-
-    # Asked once, with a scope that runs nothing: a service manager the daemon runs
-    # under stops the children in its own group with it, unless each has a scope.
-    def _scoped_argv(self, argv: list[str], *, unit: str) -> list[str]:
-        """Return ``argv`` run in a scope of its own where ``systemd-run`` works."""
-        if self._scoped is None:
-            probe = scope_argv(memory_mb=None, argv=["true"])
-            self._scoped = self._run(probe)[0] == 0
-        if not self._scoped:
-            return argv
-        return scope_argv(unit=unit, memory_mb=None, argv=argv, run=self._run)
 
     def _adopt(self, record: Path, *, host_id: uuid.UUID) -> None:
         """Report the process ``record`` names if it ended; else wait for its end."""

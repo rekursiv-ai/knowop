@@ -24,9 +24,10 @@ It uses the host's own credential, never the profile's key, so it runs in the
 calling process rather than in traxd.
 
 A daemon serves terminals (``terminal_serving.py``) and sagent's tools (``tool_serving.py``) for
-as long as it stays connected. When the host is revoked it kills every shell and ends
-every running tool call; what a tool left running in the background goes on. It also
-starts agent processes (``session_serving.py``), which outlive it.
+as long as it stays connected. Its shells outlive it, for the next daemon of the host to
+take up; when the host is revoked it kills every shell and ends every running tool
+call, and what a tool left running in the background goes on. It also starts agent
+processes (``session_serving.py``), which outlive it.
 
 Each connect also records whether the person declared this computer a sandbox, a
 disposable computer where agents may act freely (:func:`is_sandbox`).
@@ -123,7 +124,7 @@ class Serving(Protocol):
         ...
 
     def stop(self) -> None:
-        """Stop listening and kill every shell."""
+        """Stop serving; what outlives the daemon is each server's to say."""
         ...
 
 

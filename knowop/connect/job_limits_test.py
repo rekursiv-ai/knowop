@@ -13,6 +13,7 @@ import pytest
 from knowop.connect.job_limits import (
     DEFAULT_RESULTS_MAX,
     Gpu,
+    Scoping,
     cap_problem,
     gpus,
     idle_gpus,
@@ -140,6 +141,36 @@ def test_a_dollar_reaches_the_command_as_written(
     assert ("--expand-environment=no" in argv) is verbatim
     assert argv[argv.index("--") + 1 :] == command
     assert fake.seen == [["systemd-run", "--version"]]
+
+
+def test_scoping_asks_systemd_once_and_scopes_each_command_where_it_can() -> None:
+    fake = _Run(systemd_run=(0, ""))
+    scoping = Scoping(fake)
+
+    first = scoping.argv(["a"], unit="knowop-terminal-1")
+    second = scoping.argv(["b"], unit="knowop-terminal-2")
+
+    assert fake.seen == [scope_argv(memory_mb=None, argv=["true"])]
+    assert first == scope_argv(unit="knowop-terminal-1", memory_mb=None, argv=["a"])
+    assert second[-2:] == ["--", "b"]
+
+
+def test_scoping_asks_its_own_systemd_whether_a_dollar_must_be_kept() -> None:
+    fake = _Run(systemd_run=(0, ""), version=(0, "systemd 255 (255.4)\n"))
+
+    argv = Scoping(fake).argv(["echo", "$HOME"], unit="u")
+
+    assert "--expand-environment=no" in argv
+    assert ["systemd-run", "--version"] in fake.seen
+
+
+def test_scoping_without_systemd_runs_each_command_as_it_is() -> None:
+    fake = _Run()
+    scoping = Scoping(fake)
+
+    assert scoping.argv(["a"], unit="u") == ["a"]
+    assert scoping.argv(["b"], unit="u") == ["b"]
+    assert len(fake.seen) == 1
 
 
 def test_a_command_without_a_dollar_asks_systemd_nothing() -> None:
