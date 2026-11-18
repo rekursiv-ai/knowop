@@ -83,7 +83,7 @@ def session_journal(
       choice: The journal, its part, and where that part's upload starts.
 
     Raises:
-      NotResumableError: A part is not sagent's journal, so none can hold it.
+      NotResumableError: No part has a native format.
       LossyConversionError: A part holds a cut record and ``lossy`` is false.
 
     """
@@ -130,15 +130,17 @@ def _restored(
     folder: Path,
 ) -> JournalChoice:
     """Write a new journal holding every stored part's records."""
-    foreign = sorted({part.format for part in parts} - {"sagent"})
-    if foreign:
+    # Any CLI's part resumes: its records are sagent's. A formatless part holds a
+    # capture's notes, never a conversation (``ManifestBody.format``).
+    native = [part for part in parts if part.format]
+    if not native:
         raise NotResumableError(
-            f"session {session_id} holds a part of {', '.join(foreign)}, which no "
-            "sagent journal continues; it stays readable",
+            f"session {session_id} holds no part with a native format, so there is "
+            "no conversation to continue; it stays readable",
         )
     records: list[SessionRecord] = []
     sealed: list[str | None] = []
-    for part in sorted(parts, key=lambda each: each.part):
+    for part in sorted(native, key=lambda each: each.part):
         read, seals = _captured(client, session_id, part, lossy=lossy)
         for record, seal in zip(read, seals, strict=True):
             if not (

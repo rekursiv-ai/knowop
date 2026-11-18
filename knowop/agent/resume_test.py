@@ -15,8 +15,12 @@ from trackinizer.sagent.session.jsonl import record_line
 from trackinizer.sagent.session.types import (
     AssistantMessage,
     BashResult,
+    ContextState,
     SessionRecord,
+    SystemMessage,
     Thinking,
+    TokenUsage,
+    ToolCall,
     ToolResult,
     TurnContext,
     UncategorizedRecord,
@@ -41,9 +45,11 @@ from knowop.agent.truncate import NOTE
 
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from trackinizer.client.conversation import PartReader
+    from treekle import PlainTree
 
 
 _SESSION_ID: Final = UUID(int=42)
@@ -250,20 +256,65 @@ class TestTheJournalAProcessWrites:
                 lossy=False,
             )
 
-    def test_a_part_of_another_format_is_refused(self) -> None:
+    def test_every_native_part_restores_as_stored_whichever_cli_wrote_it(
+        self,
+    ) -> None:
+        """The records are provider-neutral: sagent reads its turns from them as stored."""
+        claude: list[SessionRecord] = [
+            UserMessage(content="read it"),
+            Thinking(content="read", encrypted="c2ln", extra=_asked("a")),
+            TokenUsage(info=immutable({"output_tokens": 1})),
+            _call("1", "a"),
+            UncategorizedRecord(kind="queue-operation", payload=immutable({})),
+            _result("1"),
+            ContextState(kind="queued_command", content="a report"),
+        ]
+        codex: list[SessionRecord] = [AssistantMessage(content="from codex")]
         stored = _Stored(
             parts={
-                0: (f"{uuid4().hex}.jsonl", "sagent", [_SAID[0]]),
-                1: ("turn.jsonl", "assistant", [_SAID[1]]),
-                2: ("c.jsonl", "claude", [_SAID[0]]),
+                0: (f"{uuid4().hex}.jsonl", "sagent", list(_SAID)),
+                1: ("c.jsonl", "claude", claude),
+                2: ("rollout-1.jsonl", "codex", codex),
             },
         )
+
+        choice = session_journal(
+            _SESSION_ID,
+            stored.listed(),
+            client=stored,
+            lossy=False,
+        )
+
+        assert _journal_lines(choice.path) == [*_SAID, *claude, *codex]
+
+    def test_a_part_with_no_format_is_left_out(self) -> None:
+        notes: list[SessionRecord] = [SystemMessage(content="/effort high")]
+        stored = _Stored(
+            parts={
+                0: ("prompts-1", "", notes),
+                1: (f"{uuid4().hex}.jsonl", "sagent", list(_SAID)),
+            },
+        )
+
+        choice = session_journal(
+            _SESSION_ID,
+            stored.listed(),
+            client=stored,
+            lossy=False,
+        )
+
+        assert _journal_lines(choice.path) == list(_SAID)
+        assert [part for _, part, _ in stored.asked] == [1]
+
+    def test_a_session_of_only_parts_with_no_format_is_refused(self) -> None:
+        notes: list[SessionRecord] = [SystemMessage(content="/effort high")]
+        stored = _Stored(parts={0: ("prompts-1", "", notes)})
 
         with pytest.raises(
             NotResumableError,
             match=_whole(
-                f"session {_SESSION_ID} holds a part of assistant, claude, which no "
-                "sagent journal continues; it stays readable",
+                f"session {_SESSION_ID} holds no part with a native format, so there "
+                "is no conversation to continue; it stays readable",
             ),
         ):
             _ = session_journal(
@@ -313,6 +364,24 @@ class TestTheJournalAProcessWrites:
 def _text(record: SessionRecord) -> str:
     assert isinstance(record, UserMessage | AssistantMessage)
     return record.content or ""
+
+
+def _asked(request: str) -> Mapping[str, PlainTree]:
+    """Return the ``extra`` Claude's blocks of one reply share."""
+    return immutable({"requestId": f"req_{request}"})
+
+
+def _call(call_id: str, request: str) -> ToolCall:
+    return ToolCall(
+        call_id=call_id,
+        name="Read",
+        arguments=immutable({"file_path": call_id}),
+        extra=_asked(request),
+    )
+
+
+def _result(call_id: str) -> ToolResult:
+    return ToolResult(call_id=call_id, state="done", result=BashResult(command=("ls",)))
 
 
 def _whole(message: str) -> str:

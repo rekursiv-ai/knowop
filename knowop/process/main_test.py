@@ -1806,7 +1806,7 @@ async def test_a_session_that_cannot_continue_here_exits_1(
 ) -> None:
     def refused(*args: object, **kwargs: object) -> None:
         del args, kwargs
-        raise NotResumableError("a claude part")
+        raise NotResumableError("no native part")
 
     monkeypatch.setattr(main_module, "session_journal", refused)
     async with _relayed() as relay, _serving(relay) as (task, _):
