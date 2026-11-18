@@ -31,7 +31,6 @@ import itertools
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import threading
@@ -71,7 +70,11 @@ from trackinizer.client.session_socket import SessionSocket, SocketClient
 from trackinizer.trax.profile import Profile
 from trackinizer.wire.refs import Ref, SeqRef
 from trackinizer.wire.wire_capture import CaptureImage
-from trackinizer.wire.wire_process_keys import PROCESS_KEY_ROUTES, WEBSOCKET
+from trackinizer.wire.wire_process_keys import (
+    PROCESS_KEY_ROUTES,
+    WEBSOCKET,
+    listed_route,
+)
 from trackinizer.wire.wire_session_ir import ManifestBody, PartBody, RecordBody
 from trackinizer.wire.wire_session_relay import (
     SESSION_PROCESS_WS_PATH,
@@ -143,6 +146,12 @@ from knowop.tools.canvas import (
     CanvasTools,
     with_settings,
 )
+from knowop.tools.knowop import (
+    KNOWOP_DESCRIPTION,
+    KNOWOP_TOOL,
+    KnowOpTools,
+)
+from knowop.tools.records import RecordReads
 
 
 _THIS: Final[Path] = Path(__file__).resolve()
@@ -162,6 +171,7 @@ if TYPE_CHECKING:
     from websockets.http11 import Request, Response
 
     from knowop.tools.canvas import CanvasClient
+    from knowop.tools.knowop import KnowOpClient
 
 
 _SESSION: Final = UUID(int=11)
@@ -707,6 +717,28 @@ async def test_a_headless_run_says_hello_and_prints_its_session_first(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("opened")
+async def test_its_knowop_tool_acts_for_its_session_and_reads_under_its_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KnowOp acts over the process's client for its session; trax reads with its key."""
+    knowops: list[tuple[object, UUID | None, RecordReads]] = []
+    reads: list[tuple[str, str, RecordReads]] = []
+    monkeypatch.setattr(main_module, "KnowOpTools", partial(_knowop_tools, knowops))
+    monkeypatch.setattr(main_module, "RecordReads", partial(_record_reads, reads))
+
+    async with _relayed() as relay, _serving(relay) as (task, server):
+        _ = await relay.seen(_is("hello"))
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert [(base_url, key) for base_url, key, _ in reads] == [
+        (server.base_url, server.api_key),
+    ]
+    assert knowops == [(server, _SESSION, reads[0][2])]
+
+
+@pytest.mark.asyncio
 async def test_a_remote_agent_opens_without_sagents_daemon(opened: _Opened) -> None:
     async with _relayed() as relay, _serving(relay, remote=True) as (task, _):
         await relay.close(CLOSE_ENDED)
@@ -900,8 +932,14 @@ async def test_every_agent_acts_on_the_canvas_the_newest_line_from_chat_named(
 
     (given,) = opened.given_tools
     canvas, host_tool = given
-    assert host_tool.name == "KnowOp"
+    assert (host_tool.name, host_tool.description) == (KNOWOP_TOOL, KNOWOP_DESCRIPTION)
     assert (canvas.name, canvas.description) == (CANVAS_TOOL, CANVAS_DESCRIPTION)
+    knowop_args = from_plain(
+        host_tool.schema["properties"],
+        dict[str, dict[str, object]],
+    )
+    assert "trax.read" in from_plain(knowop_args["action"]["enum"], list[str])
+    assert "command" in knowop_args
     actions = from_plain(canvas.schema["properties"], dict[str, dict[str, object]])
     assert actions["action"]["enum"] == [
         "read",
@@ -2551,6 +2589,30 @@ def _canvas_tools(
     return CanvasTools(client, canvas_id=canvas_id, settings=settings)
 
 
+def _knowop_tools(
+    made: list[tuple[object, UUID | None, RecordReads]],
+    client: KnowOpClient,
+    *,
+    session_id: UUID | None,
+    records: RecordReads,
+) -> KnowOpTools:
+    """Make the KnowOp tools as the process does, keeping what they are made with."""
+    made.append((client, session_id, records))
+    return KnowOpTools(client, session_id=session_id, records=records)
+
+
+def _record_reads(
+    made: list[tuple[str, str, RecordReads]],
+    base_url: str,
+    *,
+    api_key: str,
+) -> RecordReads:
+    """Make the record reads as the process does, keeping their server and key."""
+    reads = RecordReads(base_url, api_key=api_key)
+    made.append((base_url, api_key, reads))
+    return reads
+
+
 def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2574,15 +2636,25 @@ def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
     monkeypatch.setattr(main_module, "opened", opened)
     canvases: list[object] = []
     monkeypatch.setattr(main_module, "CanvasTools", partial(_canvas_tools, canvases))
-    client = cast("Client", _Server(version=1))
+    knowops: list[tuple[object, UUID | None, RecordReads]] = []
+    reads: list[tuple[str, str, RecordReads]] = []
+    monkeypatch.setattr(main_module, "KnowOpTools", partial(_knowop_tools, knowops))
+    monkeypatch.setattr(main_module, "RecordReads", partial(_record_reads, reads))
+    server = _Server(version=1)
+    client = cast("Client", server)
 
     fine = main_module._unbuilt(["--effort", "high"], client=client)
     raised.append(StartError("--effortt names no setting; see /help"))
     refused = main_module._unbuilt(["--effortt", "high"], client=client)
 
     assert (fine, refused) == ("", "--effortt names no setting; see /help")
-    # The canvas tools a run would give the agent, over this process's own client.
+    # The tools a run would give the agent, over this process's own client and key,
+    # for no session.
     assert canvases == [client, client]
+    assert [(base_url, key) for base_url, key, _ in reads] == [
+        (server.base_url, server.api_key),
+    ] * 2
+    assert knowops == [(client, None, made) for _, _, made in reads]
     flags, given, interactive, use_daemon, tools = built[0]
     assert (flags.ephemeral, flags.session, list(given)) == (
         True,
@@ -3052,18 +3124,9 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
     ]
     assert members == {*calls, "base_url", "api_key"}
     assert len(sent) == len(calls) + len(additional)
-    assert all(
-        any(
-            method == listed and re.fullmatch(_template_pattern(path), url)
-            for listed, path in PROCESS_KEY_ROUTES
-        )
-        for method, url in routes
-    ), routes
-
-
-def _template_pattern(path: str) -> str:
-    """Return a pattern that each URL a route's template names matches in full."""
-    return re.sub(r"\\\{[a-z_]+\\\}", "[^/]+", re.escape(path))
+    assert [
+        route for route in routes if listed_route(*route, PROCESS_KEY_ROUTES) is None
+    ] == []
 
 
 def test_a_headless_start_loads_neither_sagents_screen_nor_the_mcp_sdk() -> None:

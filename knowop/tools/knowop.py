@@ -1,4 +1,4 @@
-"""The KnowOp tool for hosts and agent sessions."""
+"""The KnowOp tool for hosts, agent sessions and reading Trackinizer's records."""
 
 from __future__ import annotations
 
@@ -39,6 +39,8 @@ if TYPE_CHECKING:
     from trackinizer.wire.wire_terminals import TerminalHosts
     from treekle import PlainTree
 
+    from knowop.tools.records import RecordReads
+
 KNOWOP_TOOL: Final = "KnowOp"
 KNOWOP_DESCRIPTION: Final = (files(__package__) / "assets" / "knowop.md").read_text(
     encoding="utf-8",
@@ -58,6 +60,7 @@ type Action = Literal[
     "session.stop",
     "session.status",
     "session.continue",
+    "trax.read",
 ]
 
 
@@ -90,11 +93,18 @@ class KnowOpClient(KnowHostClient, ProcessClient, Protocol):
 
 
 class KnowOpTools:
-    """Operate on the caller's hosts and agent sessions."""
+    """Operate on the caller's hosts and agent sessions, and read its records."""
 
-    def __init__(self, client: KnowOpClient, *, session_id: UUID | None) -> None:
+    def __init__(
+        self,
+        client: KnowOpClient,
+        *,
+        session_id: UUID | None,
+        records: RecordReads,
+    ) -> None:
         self._client = client
         self._session_id = session_id
+        self._records = records
 
     async def act(
         self,
@@ -105,16 +115,19 @@ class KnowOpTools:
         model: str = "",
         effort: str = "",
         budget: float | None = None,
+        command: str = "",
     ) -> str:
-        """Operate on a host or launch or stop an agent session.
+        """Operate on a host or an agent session, or read Trackinizer's records.
 
         Args:
-          action: Operate hosts, or launch, stop, inspect or continue a session.
+          action: Operate hosts; launch, stop, inspect or continue a session; or
+            read records (trax.read).
           name: The host name, launch label, or required LABEL#N for session actions.
           time: Required launch/continue Slurm time limit (20 means 20 minutes).
           model: Launch model; empty keeps the server's default.
           effort: Launch thinking effort; empty keeps the default.
           budget: Launch budget in USD; omitted takes the person's campaign limit.
+          command: Required for trax.read: a trax read command, as typed after `trax`.
 
         Returns:
           answer: The result or the server's refusal.
@@ -129,6 +142,7 @@ class KnowOpTools:
                 model=model,
                 effort=effort,
                 budget=budget,
+                command=command,
             )
         except ClientError as error:
             return server_answer(error)
@@ -144,6 +158,7 @@ class KnowOpTools:
         model: str,
         effort: str,
         budget: float | None,
+        command: str,
     ) -> str:
         client = self._client
         match action:
@@ -221,6 +236,10 @@ class KnowOpTools:
                     effort=effort,
                     budget=budget,
                 )
+            case "trax.read":
+                if not command.strip():
+                    return "trax.read requires a command"
+                return self._records.read(command)
 
     def _started_session(
         self,

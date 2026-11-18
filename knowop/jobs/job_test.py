@@ -15,7 +15,8 @@ import time
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import data_dir
-from trackinizer.trax.context import CWD
+from trackinizer.trax.commands import TraxArgumentParser
+from trackinizer.trax.context import CWD, ERR_STREAM
 from trackinizer.wire.wire_job import (
     GrantStatus,
     StartBody,
@@ -126,6 +127,28 @@ def test_help_is_shown_without_running_anything(
     out = capsys.readouterr().out
     assert out.startswith("Usage: knowop job submit")
     assert seen == []
+
+
+def test_the_parser_writes_through_trax_echo(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Run inside another program, argparse's own writes would reach its terminal.
+
+    A verb's error comes from its subparser, which argparse builds from the same class.
+    """
+    parser = Job.make_parser()
+    err = io.StringIO()
+
+    token = ERR_STREAM.set(err)
+    try:
+        with pytest.raises(SystemExit):
+            parser.parse_args(["submit", "--gpus", "x"])
+    finally:
+        ERR_STREAM.reset(token)
+
+    assert isinstance(parser, TraxArgumentParser)
+    assert "knowop job submit: error: argument --gpus" in err.getvalue()
+    assert capsys.readouterr() == ("", "")
 
 
 def test_the_help_names_the_flags_that_choose_the_server(

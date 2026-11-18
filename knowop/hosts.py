@@ -28,7 +28,7 @@ import sys
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix import hostname
-from trackinizer.trax.commands import Command, HelpPage
+from trackinizer.trax.commands import Command, HelpPage, TraxArgumentParser
 from trackinizer.trax.context import cwd
 from trackinizer.trax.render import echo
 from treekle import from_plain
@@ -144,7 +144,7 @@ class Hosts(Command):
     @classmethod
     @override
     def make_parser(cls) -> argparse.ArgumentParser:
-        parser = argparse.ArgumentParser(
+        parser = TraxArgumentParser(
             prog=PROGRAM,
             description="List, show, set or delete the registered hosts.",
         )

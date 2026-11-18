@@ -38,7 +38,10 @@ dependencies = [
     # `knowop upload`, with the unreleased `record_bodies` that takes records,
     # `convert.sniff`, `transcripts`, `open_transcript` and `transcript_name`,
     # `zstd_compat.open_text`, `session_records.record_time`, and the server's
-    # `SessionStart.keep_audience`.
+    # `SessionStart.keep_audience`. KnowOp's `trax.read` action needs the unreleased
+    # `trax.invoke`, `trax.context.LOCAL_INPUT`, `trax.commands.TraxArgumentParser`,
+    # `parse_and_run(allowed=)`, `wire_process_keys.RECORDS_ROUTES` and
+    # `listed_route`, and `Client(routes=)`.
     "trackinizer>=0.1.12",
     # the agent: the tool host serves sagent's remote tools through sagent's own tool
     # server. `Server.adopt`, which serves a pipe the relay dialed, is unreleased;

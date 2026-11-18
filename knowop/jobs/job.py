@@ -22,7 +22,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, cast, override
 
-import argparse
 import codecs
 import io
 import re
@@ -32,7 +31,7 @@ import time
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import data_dir
-from trackinizer.trax.commands import Command, HelpPage
+from trackinizer.trax.commands import Command, HelpPage, TraxArgumentParser
 from trackinizer.trax.connection import server_dir
 from trackinizer.trax.context import cwd, out_stream
 from trackinizer.trax.render import echo
@@ -43,6 +42,8 @@ from knowop.jobs import job_records
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
     from typing import TextIO
+
+    import argparse
 
     from _typeshed import ReadableBuffer
     from trackinizer.client.client import Client
@@ -205,7 +206,7 @@ class Job(Command):
     @classmethod
     @override
     def make_parser(cls) -> argparse.ArgumentParser:
-        parser = argparse.ArgumentParser(
+        parser = TraxArgumentParser(
             prog=PROGRAM,
             description=cls.__doc__,
             add_help=False,
