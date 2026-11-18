@@ -72,7 +72,13 @@ class _Shell:
 
 
 class _World:
-    def __init__(self, *, peers: int = 1, ice_servers: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        peers: int = 1,
+        ice_servers: tuple[str, ...] = (),
+        start: int = 0,
+    ) -> None:
         self.relay: list[tuple[Frame, bytes]] = []
         self.relay_open = asyncio.Event()
         """Cleared, every send to the relay waits until it is set, as a slow one does."""
@@ -87,6 +93,7 @@ class _World:
             shell=self.shell,
             factory=self._make if peers else None,
             ice_servers=ice_servers,
+            start=start,
             clock=lambda: self.now,
             sleep=self._sleep,
         )
@@ -337,6 +344,26 @@ async def test_the_browsers_route_gets_an_ack_the_ring_from_its_offset_then_live
         (Frame.OUTPUT, b"gh"),
     ]
     assert [kind for kind, _ in world.relay] == [Frame.KEEPALIVE]
+
+
+async def test_a_router_taken_up_again_numbers_its_output_from_its_start() -> None:
+    """A browser asking from an offset before the start is resumed at the start."""
+    world = _World(start=100)
+    await world.router.output(b"abcdef")
+    await world.offer()
+    del world.relay[:]
+
+    world.dc(Frame.ROUTE, wire_terminals.encode_route(wire_terminals.ROUTE_DIRECT, 102))
+    await world.settle()
+    world.dc(Frame.ROUTE, wire_terminals.encode_route(wire_terminals.ROUTE_DIRECT, 0))
+    await world.settle()
+
+    assert world.peer.sent == [
+        (Frame.ACK, (102).to_bytes(8)),
+        (Frame.OUTPUT, b"cdef"),
+        (Frame.ACK, (100).to_bytes(8)),
+        (Frame.OUTPUT, b"abcdef"),
+    ]
 
 
 async def test_direct_frames_are_cut_to_the_size_a_data_channel_carries() -> None:

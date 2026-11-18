@@ -116,7 +116,6 @@ def _terminal_serving(
     *shell: str,
     client: _Client | None = None,
     trax_env: dict[str, str] | None = None,
-    drain_sec: float = 0.5,
     direct: PeerFactory | None = None,
 ) -> TerminalServing:
     return TerminalServing(
@@ -126,17 +125,29 @@ def _terminal_serving(
         credential_client=lambda _key: client or _Client([]),
         trax_env=trax_env or {},
         shell=shell,
-        drain_sec=drain_sec,
         direct=direct,
+        run=_no_systemd,
     )
 
 
-async def _terminal_run(daemon: TerminalServing, opened: TerminalWait) -> None:
+def _no_systemd(argv: Sequence[str]) -> tuple[int, str]:
+    """Answer as a computer without systemd: no shell's host gets a scope."""
+    del argv
+    return 127, ""
+
+
+async def _terminal_run(
+    daemon: TerminalServing,
+    opened: TerminalWait,
+    *,
+    resume: bool = False,
+) -> None:
     await asyncio.to_thread(
         daemon.serve,
         opened,
         host_id=_HOST,
         instance=_INSTANCE,
+        resume=resume,
     )
 
 
@@ -183,7 +194,10 @@ class _FakeSocket:
         messages: tuple[bytes, ...] = (),
         closes: bool = False,
         end_after_output: bool = False,
+        close_code: int | None = None,
     ) -> None:
+        self.close_code = close_code
+        """The code the server closed with, once ``closes`` ended the messages."""
         self.reply = reply
         self.send_error = send_error
         self.hang = hang
@@ -250,6 +264,8 @@ def _connector(
 
 async def _connect(
     opened: TerminalWait | None = None,
+    *,
+    resume: bool = False,
     **timing: float,
 ) -> object:
     daemon = _terminal_serving("http://box.invalid")
@@ -257,6 +273,7 @@ async def _connect(
         opened or _opened(),
         host_id=_HOST,
         instance=_INSTANCE,
+        resume=resume,
         **timing,
     )
 
