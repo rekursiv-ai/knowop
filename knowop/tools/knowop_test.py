@@ -17,6 +17,8 @@ import pytest
 from knowop.hosts_test import _KNOWHOST, _KnowHostApi
 from knowop.process.main_test import _attached
 from knowop.tools import knowop
+from knowop.tools.records import RecordReads
+from knowop.tools.records_test import _Server
 
 
 if TYPE_CHECKING:
@@ -108,8 +110,17 @@ class _Client:
         return SessionStartResponse(id=UUID(int=11), seq=0)
 
 
-def _tools(client: _Client) -> knowop.KnowOpTools:
-    return knowop.KnowOpTools(client, session_id=UUID(int=90))
+def _tools(client: _Client, server: _Server | None = None) -> knowop.KnowOpTools:
+    return knowop.KnowOpTools(
+        client,
+        session_id=UUID(int=90),
+        records=_reads(server or _Server()),
+    )
+
+
+def _reads(server: _Server) -> RecordReads:
+    """Return record reads over ``server``, under the agent's key."""
+    return RecordReads("https://records.test", api_key="agent-key", transport=server)
 
 
 @pytest.mark.asyncio
@@ -287,7 +298,7 @@ async def test_launch_requires_a_time_limit_before_opening_a_session() -> None:
 @pytest.mark.asyncio
 async def test_preflight_tool_has_no_caller_and_opens_no_session() -> None:
     client = _Client()
-    tools = knowop.KnowOpTools(client, session_id=None)
+    tools = knowop.KnowOpTools(client, session_id=None, records=_reads(_Server()))
     assert (
         await tools.act(action="session.launch", time="20")
         == "session.launch requires a caller session"
@@ -544,6 +555,50 @@ async def test_stop_with_no_process_does_not_report_success() -> None:
         await _tools(client).act(action="session.stop", name="lead#412")
         == "lead#412 has had no agent process"
     )
+
+
+@pytest.mark.asyncio
+async def test_trax_reads_records_with_the_agents_own_key() -> None:
+    """The command runs as trax reads it, over the reads' client, not KnowOp's."""
+    client = _Client()
+    server = _Server()
+
+    said = await _tools(client, server).act(action="trax.read", command="trax version")
+
+    assert said == "abc123\n"
+    assert server.sent == [("GET", "/api/version", "Bearer agent-key")]
+    assert client.starts == client.started == client.puts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [None, "", "  "])
+async def test_trax_requires_a_command_and_sends_nothing(command: str | None) -> None:
+    """None leaves ``command`` out, as a model that names no command does."""
+    server = _Server()
+    tools = _tools(_Client(), server)
+
+    said = await (
+        tools.act(action="trax.read")
+        if command is None
+        else tools.act(action="trax.read", command=command)
+    )
+
+    assert said == "trax.read requires a command"
+    assert (server.sent, server.closed) == ([], 0)
+
+
+@pytest.mark.asyncio
+async def test_trax_sends_no_write_and_says_so() -> None:
+    """A write the agent asks KnowOp for is refused before it leaves, as text."""
+    server = _Server()
+
+    said = await _tools(_Client(), server).act(
+        action="trax.read",
+        command="issue 7 status to complete",
+    )
+
+    assert "is not available to this client" in said
+    assert [method for method, _, _ in server.sent] == ["GET"]
 
 
 if __name__ == "__main__":

@@ -7,6 +7,15 @@ All notable knowop changes are documented here. This project follows
 
 ### Added
 
+- Every agent of `knowop run` reads Trackinizer's records with the KnowOp tool's
+  `trax.read` action, in trax's grammar:
+  `KnowOp(action="trax.read", command="issue status is active title re cache")`,
+  `issue 7 requires`, `recent`, `search-sessions "QUERY"`, `next`, `graph` and the
+  other read commands, run inside the agent's process. It reads only, under any key:
+  its client sends no request outside the read routes, a write command answers that
+  it is not available, and a `-` or `@path` value reads nothing local. `send`,
+  `export`, `canvas`, `doctor`, `profile` and `env` are refused by name, and metric
+  reads are not available. Remote agents have it too.
 - `knowop run` with no screen (`--headless`, or no terminal) starts the agent
   through this computer's connect, as `--on` this host does, in this folder unless
   `--cwd` names another, and returns with the session's id within seconds; the agent

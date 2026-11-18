@@ -12,6 +12,7 @@ import io
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix import hostname
+from trackinizer.trax.commands import TraxArgumentParser
 from trackinizer.wire.wire_hosts import (
     MAX_HOW_CHARS,
     NAME_PATTERN,
@@ -127,6 +128,11 @@ def _stdin(monkeypatch: pytest.MonkeyPatch, data: bytes) -> None:
 def test_verb_word_is_one_constant() -> None:
     assert Hosts.names == (HOST_WORD,)
     assert HOST_WORD == "host"
+
+
+def test_the_parser_writes_through_trax_echo() -> None:
+    """Run inside another program, argparse's own writes would reach its terminal."""
+    assert isinstance(Hosts.make_parser(), TraxArgumentParser)
 
 
 def test_bare_host_lists_name_role_labels_and_how(

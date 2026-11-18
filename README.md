@@ -232,12 +232,14 @@ computer. Terminals use the server relay when a direct link is unavailable.
 | `jobs/` | The job runner `knowop job` hands to. |
 | `hosts.py` | `knowop host`: the host registry, and KnowHosts through the server's KnowHost API. |
 | `canvas.py` | `knowop canvas`: trax's canvas command, named as knowop's. |
-| `tools/` | The tools every agent of `knowop run` is given, plain functions over the client: the canvas's (`tools/canvas.py`). |
+| `tools/` | The tools every agent of `knowop run` is given, plain functions over the client: the canvas's (`tools/canvas.py`), hosts, sessions and record reads (`tools/knowop.py`, whose `trax.read` action runs `tools/records.py`). |
 | `upload.py` | `knowop upload`: finds session files and sends each as an AgentSession. |
 | `skills/` | Each package's instructions for agents. |
 
-knowop calls the server through trackinizer's `Client`, as trax does, and never runs
-`trax`. `trax host` and `trax job` say they moved out of trax.
+knowop calls the server through trackinizer's `Client`, as trax does, and never
+starts a `trax` process. KnowOp's `trax.read` action runs an agent's trax read commands
+inside the agent's own process (`trax.invoke`), reads only, under the agent's key.
+`trax host` and `trax job` say they moved out of trax.
 
 ## Development
 

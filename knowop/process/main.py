@@ -133,6 +133,7 @@ from knowop.tools.knowop import (
     KnowOpClient,
     KnowOpTools,
 )
+from knowop.tools.records import RecordReads
 
 
 if TYPE_CHECKING:
@@ -393,7 +394,14 @@ async def serve(
                 given=given,
                 interactive=tui,
                 use_daemon=not remote,
-                tools=agent_tools(canvas, KnowOpTools(client, session_id=session_id)),
+                tools=agent_tools(
+                    canvas,
+                    KnowOpTools(
+                        client,
+                        session_id=session_id,
+                        records=RecordReads(client.base_url, api_key=client.api_key),
+                    ),
+                ),
             ) as o:
                 if fresh:
                     effort_default(o.agent)
@@ -516,11 +524,12 @@ async def first_done[T](*awaited: Awaitable[T]) -> T:
 def agent_tools(canvas: CanvasTools, knowop: KnowOpTools) -> list[Tool]:
     """Bind the Canvas and KnowOp tools to this process's session.
 
-    Every agent of the process gets it, on a person's host and as a remote agent;
-    sagent's ``--tools`` chooses it as one of its own. Its arguments are the shape of
-    :meth:`CanvasTools.act`, ``set``'s settings the schema ``canvas`` holds, which is
-    also all it sends; its description is ``CANVAS_DESCRIPTION``, and a picture it
-    answers with reaches the model as an attachment.
+    Every agent of the process gets them, on a person's host and as a remote agent;
+    sagent's ``--tools`` chooses each as one of its own. Canvas's arguments are the
+    shape of :meth:`CanvasTools.act`, ``set``'s settings the schema ``canvas`` holds,
+    which is also all it sends; its description is ``CANVAS_DESCRIPTION``, and a
+    picture it answers with reaches the model as an attachment. KnowOp's
+    ``trax.read`` action reads records, under the process's key.
 
     Args:
       canvas: The session's canvas tools.
@@ -681,7 +690,14 @@ async def _built(args: Sequence[str], *, client: Client) -> None:
         given=given,
         interactive=False,
         use_daemon=False,
-        tools=agent_tools(canvas, KnowOpTools(client, session_id=None)),
+        tools=agent_tools(
+            canvas,
+            KnowOpTools(
+                client,
+                session_id=None,
+                records=RecordReads(client.base_url, api_key=client.api_key),
+            ),
+        ),
     ):
         pass
 
