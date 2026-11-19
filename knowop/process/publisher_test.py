@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final
@@ -32,6 +32,7 @@ from sagent.settings.harvest import harvest
 from sagent.tools.agent_spawn import AgentSpawn
 from sagent.tools.display import ToolDisplay
 from sagent.tools.types import ToolContext, ToolOutput, whole_output
+from sagent.tui import status as status_module
 from sagent.tui.prompt import Panes
 from sagent.tui.slash import Commands
 from sagent.tui.types import CommandOutput
@@ -579,6 +580,88 @@ async def test_a_change_of_text_alone_goes_at_most_once_a_second(
     assert withheld == 0
     assert len(p.states()) == before + 1
     assert p.states()[-1].state.busy
+
+
+@dataclass(slots=True, kw_only=True)
+class _Clock:
+    """The status line's clock, which the test moves on."""
+
+    now: float = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return time.time()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Read:
+    """A read of the state the publisher armed, held back until the test fires it."""
+
+    delay_sec: float
+    handle: asyncio.TimerHandle
+    fire: Callable[[], object]
+
+
+def _held_reads(monkeypatch: pytest.MonkeyPatch) -> list[_Read]:
+    """Hold back each read of the state a publisher arms on the running loop."""
+    reads: list[_Read] = []
+    loop = asyncio.get_running_loop()
+    later = loop.call_later
+
+    def held(
+        delay: float,
+        callback: Callable[..., object],
+        *args: object,
+    ) -> asyncio.TimerHandle:
+        if not isinstance(getattr(callback, "__self__", None), Publisher):
+            return later(delay, callback, *args)
+        handle = later(3_600, callback, *args)
+        fire = functools.partial(callback, *args)
+        reads.append(_Read(delay_sec=delay, handle=handle, fire=fire))
+        return handle
+
+    monkeypatch.setattr(loop, "call_later", held)
+    return reads
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_streams_nothing_still_moves_the_line_until_idle_or_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(status_module, "time", clock)
+    reads = _held_reads(monkeypatch)
+    async with _published(tmp_path) as p:
+        idle = len(reads)
+        p.publisher(types.ModelCallStarted())
+        started = p.states()[-1].state.line
+        [first] = reads
+        clock.now += 20
+        monkeypatch.setattr(publisher_module, "_LINE_SEC", 0.0)
+        first.fire()
+        moved = p.states()[-1].state
+        p.publisher(types.ModelResponseCancelled())
+        reads[-1].fire()
+        after_idle = len(reads)
+        p.publisher(types.ModelCallStarted())
+        last = reads[-1]
+    p.publisher(types.ModelResponseCancelled())
+    # A read already under way as it closed arms no other, nor does a call after it.
+    last.fire()
+    p.publisher(types.ModelCallStarted())
+
+    assert (idle, first.delay_sec) == (0, 1.0)
+    assert "waiting on model." not in started
+    assert moved.busy
+    assert moved.line.startswith("[20s ")
+    assert moved.line.endswith("; waiting on model.]")
+    assert after_idle == 2
+    assert last.handle.cancelled()
+    assert len(reads) == 3
+    assert all(getattr(f, "__self__", None) is not p.publisher for f in p.team.changes)
 
 
 @dataclass(slots=True, kw_only=True)

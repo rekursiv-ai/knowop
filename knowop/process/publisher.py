@@ -4,7 +4,8 @@ One observer on the root agent's runtime. Each event goes up the session's socke
 it is published, and the root's journal goes up as records from each ``SaveSession``.
 What an agent sends ``user`` goes up as its ``AgentToAgentMessage``, Chat being the
 user. The agent's state is sagent's own status line, and what a slash line can name is
-sagent's own settings registry, each sent when it changes. A secret named in
+sagent's own settings registry, each sent when it changes; while the agent works, the
+line is read again each second, as sagent's screen polls it. A secret named in
 ``TRAX_REDACT_NAMES`` is masked in each line as it is in each record; a reply is
 masked piece by piece as it streams, so a value the model writes across two pieces
 is masked only in its record.
@@ -104,7 +105,8 @@ MAX_EVENT_BYTES: Final = 1 << 20
 over is not sent."""
 
 _LINE_SEC: Final = 1.0
-"""How often a state whose only change is its text goes up, at most."""
+"""How often a state whose only change is its text goes up: at most, and while the
+agent works, at least."""
 
 _GONE: Final = frozenset({401, 403, 404, 410})
 """What the server answers a key it refuses, or a session it no longer has."""
@@ -168,8 +170,11 @@ class Publisher:
         # The children whose events this publisher hears, by label.
         self._heard: dict[str, Agent] = {}
         # Whether the root called its model since its turn last ended.
-        self._worked = False
+        self._worked = False  # pragma: no mutate[truthiness]
         self._turn_ended: datetime | None = None
+        # The next read of the state while busy; none once closed.
+        self._tick: asyncio.TimerHandle | None = None
+        self._open = True
         team.changes.add(self._joined)
         self._sent(self._now(since=datetime.now(UTC)))
 
@@ -224,7 +229,10 @@ class Publisher:
             await each.caught_up()
 
     async def aclose(self) -> None:
-        """Stop each upload running, and hear of no more agents."""
+        """Stop each upload running and the state's reads, and hear of no more agents."""
+        self._open = False  # pragma: no mutate[truthiness]
+        if self._tick is not None:
+            self._tick.cancel()
         self._team.changes.discard(self._joined)
         for child in self._heard.values():
             child.runtime.observers.remove(self._child_heard)
@@ -303,6 +311,20 @@ class Publisher:
         self._state = state
         self._state_sent_sec = time.monotonic()
         self._send(StateLine(state=state))
+        self._arm()
+
+    # A model call that streams nothing publishes nothing until it ends, so a line read
+    # only at events stood still for minutes, its wait unnamed, as if the agent hung.
+    def _arm(self) -> None:
+        """Read the state again in ``_LINE_SEC`` while busy, unless a read is due."""
+        if self._open and self._state.busy and self._tick is None:
+            self._tick = asyncio.get_running_loop().call_later(_LINE_SEC, self._ticked)
+
+    def _ticked(self) -> None:
+        """Read the state, and arm the next read while it stays busy."""
+        self._tick = None
+        self._check_state()
+        self._arm()
 
     # A child joins before its journal opens (``AgentSpawn._start``), so its first save
     # is heard; one with no journal, a far caller's, has nothing to send.
