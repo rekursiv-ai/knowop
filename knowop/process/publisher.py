@@ -488,7 +488,7 @@ def team_work(
         TeamMember(
             label=label,
             parent=parent or "",
-            busy=_at_work(team[label]),
+            busy=team[label].runtime.at_work,
             spend_usd=team[label].spend_usd,
             session=sessions(team[label]),
         )
@@ -548,14 +548,6 @@ def _title(tool: Tool | None, call: ToolCall) -> str:
     if tool is None:
         return call.name
     return tool.summary(without_controls(call.arguments))
-
-
-def _at_work(agent: Agent) -> bool:
-    """Return whether ``agent``'s model call, its tool calls or a compaction runs."""
-    runtime = agent.runtime
-    return bool(
-        runtime.model_call is not None or runtime.cohort or runtime.compact_task,
-    )
 
 
 # ``model`` offers each model its catalog serves, as ``PROVIDER/MODEL``, which sagent's
