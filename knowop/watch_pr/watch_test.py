@@ -201,6 +201,23 @@ def test_the_switch_wins_over_the_preference() -> None:
     assert len(server.lines) == 1
 
 
+def test_anothers_pull_request_is_fixed_only_when_its_switch_asks() -> None:
+    for login in (GhOutput(returncode=0, stdout="grace\n", stderr=""), None):
+        server = Server()
+        row = server.row()
+        gh = Gh()
+        if login is not None:
+            gh.login = login
+        else:
+            gh.login = GhOutput(returncode=1, stdout="", stderr="not logged in")
+        _ = watch(server, gh).sweep()
+        assert server.lines == []
+        assert row.pr["told"] == []
+        row.app = {"knowop": {"pr": row.pr | {"autofix": True}}}
+        _ = watch(server, gh).sweep()
+        assert len(server.lines) == 1
+
+
 LOGGED_OUT: Final = GhOutput(returncode=4, stdout="", stderr="gh auth login")
 
 

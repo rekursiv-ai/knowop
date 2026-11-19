@@ -209,11 +209,14 @@ class Watch:
         if (login := self._gh_login()) is not None:
             new["authored"] = pull_request.author == login
         switch = from_plain(kept.get("autofix"), bool, default=None)
+        # Another's pull request, in a repository the person may not push to, is fixed
+        # only when its switch asks.
+        authored = new.get("authored") is True
         told, found = news(
             pull_request,
             kept=kept,
             told=from_plain(kept.get("told"), list[str], default=list[str]()),
-            autofix=default if switch is None else switch,
+            autofix=default and authored if switch is None else switch,
             first_seen=self._first_seen(pull_request),
             now=self._clock(),
         )

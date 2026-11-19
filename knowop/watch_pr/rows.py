@@ -13,7 +13,7 @@ Chat's x writes too. Chat's pill, and the Pull requests page (the server's
 - ``error``: why the last read failed; ``None`` once one succeeds.
 - ``authored``: whether the person opened it, once their GitHub login is known.
 - ``autofix``: the person's switch: true, false, or absent for their ``autofix``
-  preference.
+  preference, which a pull request they did not open never takes.
 - ``fixer``: the session whose agent fixes it; the others are told who does.
 - ``told``: ``head_sha:name`` of each piece of news already told, for the head now.
 - ``automerge_ask``, ``automerge_done``, ``automerge_error``: the person's
