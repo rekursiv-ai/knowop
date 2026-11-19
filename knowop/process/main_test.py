@@ -8,7 +8,7 @@ standing in for the one sagent's ``opened`` builds.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from functools import partial
 from http import HTTPStatus
@@ -40,7 +40,7 @@ from sagent.agent.agent import Agent
 from sagent.agent.agents_md import AgentsMdConfig
 from sagent.agent.team import Team
 from sagent.model.scripted import Reply, ScriptedProvider, call, reply
-from sagent.providers import openai
+from sagent.providers import anthropic, openai
 from sagent.providers.catalog import ModelCatalog, ModelMemory
 from sagent.providers.table import ModelTags, models
 from sagent.session.jsonl import JournalInUseError, JsonlJournal
@@ -796,6 +796,18 @@ async def test_knowops_effort_is_high_where_the_model_offers_it_and_stands_at_on
     assert (
         ModelTags.parse(from_plain(stood["model"], ModelMemory).model).effort == effort
     )
+
+
+def test_knowops_effort_turns_thinking_on_where_it_cannot_be_off(
+    tmp_path: Path,
+) -> None:
+    """Opus 5 takes thinking off only at ``high`` effort or below."""
+    provider = ScriptedProvider(models=models(anthropic, section="anthropic"))
+    agent = Agent(model=provider["opus-5.0"], tool_context=ToolContext(cwd=tmp_path))
+    agent.model.settings = replace(agent.model.settings, thinking_budget="none")
+    main_module.effort_default(agent, "max")
+    settings = agent.model.settings
+    assert (settings.thinking_effort, settings.thinking_budget) == ("max", "auto")
 
 
 @pytest.mark.asyncio

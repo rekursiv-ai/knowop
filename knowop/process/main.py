@@ -562,7 +562,10 @@ def effort_default(agent: Agent, effort: ThinkingEffort = KNOWOP_EFFORT) -> None
     """
     model = agent.model
     if effort in model.capability.values("thinking_effort"):
-        model.settings = model.settings.with_value("thinking_effort", effort)
+        model.settings = model.capability.with_choices(
+            model.settings,
+            {"thinking_effort": effort},
+        )
         # The open stood the model as it was; left to the first turn's save, a
         # process killed before that turn leaves its next process the catalog's.
         agent.runtime.publish(types.SaveSession())
