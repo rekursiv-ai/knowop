@@ -44,6 +44,7 @@ from knowop.watch_pr.github import (
 )
 from knowop.watch_pr.news import Audience, News, news, unreadable
 from knowop.watch_pr.rows import (
+    Profile,
     PullRequestRows,
     RowsClient,
     Stored,
@@ -127,8 +128,7 @@ class Watch:
         """
         profile = self._rows.profile()
         me = profile["email"]
-        autofix = profile["preferences"].get("autofix", True)
-        automerge = profile["preferences"].get("automerge") is True
+        autofix, automerge = _preferences(profile)
         rows = self._rows.listed(me, status="active")
         if self._passes % CLOSED_PASSES == 0:
             rows += self._rows.listed(me, status="abandoned")
@@ -143,6 +143,11 @@ class Watch:
                 self._say(f"could not write {stored.url}: {error}")
             read += 1
         return read
+
+    def read(self, stored: Stored) -> None:
+        """Read one watched pull request now, as the next pass would, so it shows at once."""
+        autofix, automerge = _preferences(self._rows.profile())
+        self.refresh(stored, autofix=autofix, automerge=automerge)
 
     def refresh(self, stored: Stored, *, autofix: bool, automerge: bool) -> None:
         """Read one pull request, write what changed, and tell its watchers the news.
@@ -372,6 +377,12 @@ def _fixer(kept: Mapping[str, object], *, stored: Stored) -> str | None:
     named = from_plain(kept.get("fixer"), str, default="")
     watching = [str(each.session) for each in stored.watchers]
     return named if named in watching else next(iter(watching), None)
+
+
+def _preferences(profile: Profile) -> tuple[bool, bool]:
+    """Return the person's ``autofix`` preference, on unless set, and ``automerge``."""
+    preferences = profile["preferences"]
+    return preferences.get("autofix", True), preferences.get("automerge") is True
 
 
 def _read_at(kept: Mapping[str, object]) -> datetime:

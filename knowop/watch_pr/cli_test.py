@@ -76,6 +76,8 @@ class Run:
         return 4242
 
     def _gh(self, args: Sequence[str]) -> GhOutput:
+        if args[0] == "api":
+            return GhOutput(returncode=0, stdout="ada\n", stderr="")
         assert args[:3] == ["pr", "view", URL]
         return self.gh_answer
 
@@ -89,7 +91,7 @@ def run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Run:
     return Run(tmp_path, monkeypatch)
 
 
-def test_add_makes_the_row_watches_it_and_starts_this_hosts_serve(
+def test_add_makes_the_row_watches_it_reads_it_and_starts_this_hosts_serve(
     run: Run,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -97,6 +99,12 @@ def test_add_makes_the_row_watches_it_and_starts_this_hosts_serve(
     row = run.row()
     assert (row.title, row.url) == ("acme/app#7 Fix the loader", URL)
     assert row.peers == [Peer(session=FIXER, note="lead")]
+    # Read at once, as a pass would, so Chat shows it before the serve's next pass.
+    assert (row.pr["state"], row.pr["read_by"], row.pr["authored"]) == (
+        "OPEN",
+        "laptop",
+        True,
+    )
     [command] = run.detached
     assert command[1:4] == ["-P", "-m", "knowop"]
     assert command[4:] == ["--profile", "lab", "watch-pr", "serve"]
