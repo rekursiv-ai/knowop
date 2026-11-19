@@ -31,6 +31,21 @@ reading Trackinizer's records.
   SAME session and journal, with a new `time` limit (required). Optional
   `model`, `effort`, and `budget` work as for launch. Returns `LABEL#N`
   once attached. Messaging remains AgentSend to that name.
+- `session.self`: your own `LABEL#UUID`, as `--session` takes it.
+
+## Pull requests
+
+After you open or push a GitHub pull request, watch it:
+`knowop watch-pr add URL --session LABEL#UUID` (your `session.self`), on a
+host whose `gh` is logged in. It starts that host's `knowop watch-pr serve`,
+which tells you when checks fail, it conflicts, it merges, or a draft's
+checks all pass; Chat shows it over the session. One watching agent fixes:
+the others are told who, and must not push. `knowop watch-pr status` says
+who watches, who fixes, and when a serve last read it; if no serve read it
+for minutes (its host went away), run `knowop watch-pr serve --detach` on
+another host with `gh`. When `add` is refused or a `<knowop-unreadable>` line
+arrives (`gh` missing or logged out), tell the person which host and what
+fixes it. `knowop watch-pr --help` has the rest.
 
 ## Records
 

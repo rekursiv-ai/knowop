@@ -2,7 +2,7 @@
 
 Each of knowop's packages keeps its instructions for an agent that drives it in
 `skills/<package>/SKILL.md`: `shell/` for `knowop connect`, `agent/` for `knowop
-run`, and `jobs/` for `knowop job`.
+run`, `jobs/` for `knowop job`, and `watch-pr/` for `knowop watch-pr`.
 
 `knowop skill install` will place them in an agent's skill folder. Until then they are
 read where they are; the monorepo's catalog links `agent/` as `knowop-run`

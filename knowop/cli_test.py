@@ -69,6 +69,7 @@ _PROD: Final = Profile(url="https://prod.example", api_key="trax_" + "p" * 43)
 _CANVAS: Final = "11111111-1111-4111-8111-1111111111c1"
 _RECORD: Final = "22222222-2222-4222-8222-2222222222c2"
 _VISUAL: Final = "33333333-3333-4333-8333-3333333333c3"
+_SESSION: Final = "44444444-4444-4444-8444-4444444444c4"
 
 
 class _Server:
@@ -176,6 +177,8 @@ class _Server:
             return httpx2.Response(200, json={"ok": True})
         if route == ("GET", "/api/hosts"):
             return httpx2.Response(200, json={"hosts": self.hosts})
+        if route == ("GET", f"/api/inquiries/{_SESSION}"):
+            return httpx2.Response(200, json={"id": str(_SESSION), "seq": 412})
         if route == ("GET", f"/api/canvases/{_CANVAS}"):
             return httpx2.Response(200, json={"id": _CANVAS, "revision": 3})
         if route == ("POST", f"/api/canvases/{_CANVAS}/operations"):
@@ -1391,6 +1394,85 @@ def test_canvas_refuses_without_a_login_before_any_request(
 
     assert server.requests == []
     assert capsys.readouterr().err == "knowop: not logged in; run knowop login\n"
+
+
+def test_session_names_the_agents_session_by_number(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TRAX_SESSION", _SESSION)
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("session") == 0
+
+    assert server.paths()[-1] == f"/api/inquiries/{_SESSION}"
+    assert capsys.readouterr().out == f"AgentSession#412 {_SESSION}\n"
+
+
+def test_session_outside_an_agents_tools_says_to_ask_the_tool(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("TRAX_SESSION", raising=False)
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+    requests = len(server.requests)
+
+    assert _knowop("session") == 1
+
+    assert len(server.requests) == requests
+    assert "KnowOp tool's session.self" in capsys.readouterr().err
+
+
+def test_session_help_says_where_the_session_comes_from(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        _ = _knowop("--help")
+    listed = " ".join(capsys.readouterr().out.split())
+    with pytest.raises(SystemExit):
+        _ = _knowop("session", "--help")
+    said = " ".join(capsys.readouterr().out.split())
+
+    assert "session show the session whose agent runs this command" in listed
+    assert (
+        "Show the session whose agent runs this command, as $TRAX_SESSION names it: "
+        "its number and its UUID. knowop run sets it for its agent's tools; an agent "
+        "whose tools run on another host asks its KnowOp tool's session.self instead."
+    ) in said
+    assert server.requests == []
+
+
+def test_watch_pr_help_needs_no_login(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        _ = _knowop("watch-pr", "--help")
+
+    assert raised.value.code == 0
+    assert capsys.readouterr().out.startswith("usage: knowop watch-pr")
+    assert server.requests == []
+
+
+def test_watch_pr_asks_knowops_server_with_knowops_key(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+    requests = len(server.requests)
+
+    # The scripted profile names no preferences, which the command refuses.
+    assert _knowop("watch-pr", "status") == 1
+
+    assert server.netlocs() == {"acme.knowop.ai"}
+    assert server.paths()[requests:] == ["/api/me/profile"]
+    assert capsys.readouterr().err.startswith("knowop watch-pr: ")
 
 
 @dataclass(slots=True, kw_only=True)

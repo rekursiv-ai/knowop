@@ -375,6 +375,10 @@ async def serve(
         name == "model" or name.endswith("effort") for name, _ in given
     )
     hello = Hello(process_id=process_id, version=knowop_version(), host=host)
+    # Each tool the agent runs here inherits it: ``knowop watch-pr`` and ``knowop
+    # session`` read the session from it. A host's daemon strips every ``TRAX_*`` from
+    # the tools it runs for another host's agent, which asks ``session.self`` instead.
+    os.environ["TRAX_SESSION"] = str(session_id)
     canvas = CanvasTools(
         client,
         canvas_id=canvas_from_env(os.environ),
