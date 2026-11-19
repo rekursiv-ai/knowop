@@ -15,7 +15,7 @@ reading Trackinizer's records.
 ## Session
 
 - `session.budget`: the person's campaign limit, in USD: their Each campaign
-  budget on the Usage page, else this site's default.
+  budget under Budgets and alerts on the Usage page, else this site's default.
 - `session.set_budget`: set the person's campaign limit to `budget` (USD),
   only when the person asks; every other limit stays.
 - `session.launch`: start a campaign lead on our cloud, spawned by this
