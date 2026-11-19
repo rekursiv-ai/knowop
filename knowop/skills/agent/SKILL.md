@@ -149,9 +149,11 @@ stored parts. A part another agent than sagent wrote is not continued; it stays
 readable with `trax agentsession N records`.
 
 To move this session, run `knowop run --session ID --on HOST` with its existing
-ID. A different host stops the old process and uses normal resume; an unspecified
-or unchanged host leaves it running. Do not create a new session or pass `--name`.
-The resumed agent takes its next input normally.
+ID. A different host requests a normal stop, retires the old process's scoped key,
+and resumes the stored session; the retired process cannot rejoin on reconnect.
+An unspecified or unchanged host leaves a live process running. Foreground terminal
+agents must exit first: their personal login key is not revoked. Do not create a
+new session or pass `--name`. The resumed agent takes its next input normally.
 
 ## Rules
 
