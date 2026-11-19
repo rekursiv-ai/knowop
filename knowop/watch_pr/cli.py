@@ -55,7 +55,7 @@ from knowop.watch_pr.serve import (
     serve_files,
     serving,
 )
-from knowop.watch_pr.watch import WatchClient
+from knowop.watch_pr.watch import Watch, WatchClient
 
 
 if TYPE_CHECKING:
@@ -229,6 +229,8 @@ def _session_command(
                 ) from error
             row = rows.made(url, me=me, title=f"{read.name} {read.title}")
             rows.watch(row, watcher=watcher)
+            # Read now, not at the serve's next pass, so Chat shows it at once.
+            Watch(client=client, host=host, gh=gh).read(_stored(rows, url, me=me))
             echo(f"watching {url} for session {watcher.session}")
             if read.state != "OPEN":
                 echo(f"it is {read.state.lower()}: no news of it will come")

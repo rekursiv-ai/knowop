@@ -193,6 +193,21 @@ def test_auto_fix_off_by_switch_or_preference_tells_no_failure() -> None:
     assert server.lines == []
 
 
+def test_one_pull_request_is_read_at_once_as_a_pass_reads_it_by_the_preferences() -> (
+    None
+):
+    server = Server()
+    server.preferences = {"autofix": False}
+    row = server.row()
+    watch(server, Gh()).read(stored_row(server, row))
+    assert (row.pr["read_by"], row.pr["told"]) == ("laptop", [])
+    assert server.lines == []
+    server = Server()
+    row = server.row()
+    watch(server, Gh()).read(stored_row(server, row))
+    assert len(server.lines) == 1
+
+
 def test_the_switch_wins_over_the_preference() -> None:
     server = Server()
     server.preferences = {"autofix": False}

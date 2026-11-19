@@ -71,6 +71,7 @@ from trackinizer.wire.wire_session_relay import (
     Setting,
     SettingsLine,
     StateLine,
+    TeamMember,
 )
 from trackinizer.wire.wire_sessions import SessionStart
 
@@ -141,6 +142,7 @@ class Publisher:
     ) -> None:
         self._agent = agent
         self._team = team
+        self._session_id = session_id
         self._send = send
         self._status = Status(agent.runtime, spend=agent.spend_usd)
         self._commands: Commands | None = None
@@ -281,7 +283,12 @@ class Publisher:
     def _now(self, *, since: datetime) -> AgentState:
         """Return the agents' state now, ``busy`` last changed at ``since``."""
         line = self._status.line()
-        jobs, agents = team_work(self._team, self._agent, mask=self._masked)
+        jobs, team = team_work(
+            self._team,
+            self._agent,
+            mask=self._masked,
+            sessions=self._session,
+        )
         return AgentState(
             line=line,
             busy=self._status.frame() != line,
@@ -290,9 +297,16 @@ class Publisher:
                 self._plain(m) for m in self._agent.runtime.pending_mid_stream()
             ),
             jobs=jobs,
-            agents=agents,
+            team=team,
             turn_ended=self._turn_ended,
         )
+
+    def _session(self, agent: Agent) -> UUID | None:
+        """Return the session ``agent``'s records go to: the root's, or a child's once opened."""
+        if agent is self._agent:
+            return self._session_id
+        journal = self._journals.get(agent.session.journal.path)
+        return None if journal is None else journal.stored_session
 
     def _masked(self, text: str) -> str:
         """Return ``text`` with each secret value masked."""
@@ -441,32 +455,62 @@ def team_work(
     root: Agent,
     *,
     mask: Callable[[str], str],
-) -> tuple[tuple[BackgroundJob, ...], tuple[str, ...]]:
-    """Return what ``team``'s agents have going: their jobs, and the children at work.
+    sessions: Callable[[Agent], UUID | None],
+) -> tuple[tuple[BackgroundJob, ...], tuple[TeamMember, ...]]:
+    """Return what ``team``'s agents have going, as sagent's tree screen shows it.
 
     Args:
       team: The agents of the session.
       root: Its root agent, whose jobs come first.
       mask: What each job's title is shown through, its secrets masked.
+      sessions: The session each agent's records are stored in, if one is yet.
 
     Returns:
       jobs: Each background job of every agent, the root's first.
-      agents: The label of each child agent whose model call, tool calls or
-        compaction runs.
+      members: Each agent of the team: each root, then those it spawned, depth
+        first, in the order they joined.
 
     """
-    children = [(label, team[label]) for label in team if team[label] is not root]
+    under: dict[str | None, list[str]] = {}
+    for label in team:
+        under.setdefault(team.parent(label), []).append(label)
+    walked = _depth_first(under, None)
     jobs = (
         *_jobs(root, label="", mask=mask),
         *(
             job
-            for label, agent in children
-            for job in _jobs(agent, label=label, mask=mask)
+            for label, _ in walked
+            if team[label] is not root
+            for job in _jobs(team[label], label=label, mask=mask)
         ),
     )
-    return jobs, tuple(label for label, agent in children if _at_work(agent))
+    return jobs, tuple(
+        TeamMember(
+            label=label,
+            parent=parent or "",
+            busy=_at_work(team[label]),
+            spend_usd=team[label].spend_usd,
+            session=sessions(team[label]),
+        )
+        for label, parent in walked
+    )
 
 
+def _depth_first(
+    under: dict[str | None, list[str]],
+    parent: str | None,
+) -> list[tuple[str, str | None]]:
+    """Return each agent ``parent`` spawned, and its parent, each before its own."""
+    return [
+        each
+        for label in under.get(parent, [])
+        for each in ((label, parent), *_depth_first(under, label))
+    ]
+
+
+# As sagent's tree screen lists them: a call the model waits on shows in its turn, a
+# spawn's child is a member of its own, and a call that manages jobs is no job, one
+# that waits for a job marking it awaited.
 def _jobs(
     agent: Agent,
     *,
@@ -475,6 +519,14 @@ def _jobs(
 ) -> list[BackgroundJob]:
     """Return ``agent``'s background jobs, each title through ``mask``."""
     runtime = agent.runtime
+    held = runtime.jobs.values()
+    awaited = {
+        waited
+        for job in held
+        if job.call.name == "BackgroundTask"
+        and job.call.arguments.get("operation") == "foreground"
+        and isinstance(waited := job.call.arguments.get("id"), str)
+    }
     return [
         BackgroundJob(
             call_id=job.call.call_id,
@@ -483,9 +535,11 @@ def _jobs(
             agent=label,
             started=datetime.fromtimestamp(job.started, UTC),
             state="sleeping" if job.state == "sleeping" else "running",
+            awaited=job.call.call_id in awaited,
         )
-        for job in runtime.jobs.values()
+        for job in held
         if job.state != "running"
+        and job.call.name not in {"AgentSpawn", "BackgroundTask"}
     ]
 
 
@@ -585,6 +639,11 @@ class _Journal:
         if self._part is None:
             raise _NoSpawnerError("the session of its spawner was not stored")
         return self._part.session_id
+
+    @property
+    def stored_session(self) -> UUID | None:
+        """The session its records are stored in; ``None`` until its first upload opens it."""
+        return None if self._part is None else self._part.session_id
 
     def saved(self, event: types.RuntimeEvent) -> None:
         """Upload at the agent's own ``SaveSession``."""

@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Final
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Final, cast
+from unittest.mock import Mock
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import asyncio
@@ -30,6 +32,7 @@ from sagent.session.types import (
 )
 from sagent.settings.harvest import harvest
 from sagent.tools.agent_spawn import AgentSpawn
+from sagent.tools.background_task import BackgroundTask
 from sagent.tools.display import ToolDisplay
 from sagent.tools.types import ToolContext, ToolOutput, whole_output
 from sagent.tui import status as status_module
@@ -41,9 +44,12 @@ from trackinizer.client.session_upload import send_batches
 from trackinizer.wire.wire_session_ir import ManifestBody, PartBody, RecordBody
 from trackinizer.wire.wire_session_relay import (
     STALE_PART,
+    AgentState,
+    BackgroundJob,
     EventLine,
     SettingsLine,
     StateLine,
+    TeamMember,
 )
 from trackinizer.wire.wire_sessions import SessionStart, SessionStartResponse
 from treekle import PlainTree
@@ -753,11 +759,174 @@ async def test_a_background_job_goes_up_at_once_and_its_turn_ends_with_its_resul
     assert ended.turn_ended > job.started
 
 
-def test_a_job_whose_tool_the_agent_no_longer_holds_is_titled_by_its_name() -> None:
-    """A call detached with its group may name a tool the agent does not hold."""
-    called = ToolCall(call_id="w1", name="gone", arguments={"what": "x"})
+@pytest.mark.asyncio
+async def test_a_job_its_agent_waits_for_goes_up_awaited_and_the_wait_is_no_job(
+    tmp_path: Path,
+) -> None:
+    waiting = _Waiting()
+    async with _published(
+        tmp_path,
+        reply(calls=[call("wait", "w1", what="the build", background=True)]),
+        reply(calls=[call("BackgroundTask", "f1", operation="foreground", id="w1")]),
+        reply("it is built"),
+        tools=[waiting, BackgroundTask()],
+    ) as p:
+        says = _StateSays(published=p)
+        p.agent.runtime.observers.append(says)
+        turn = asyncio.create_task(p.agent.send("go"))
+        async with asyncio.timeout(5):
+            _ = await says.seen.wait()
+        awaited = next(line.state for line in p.states() if _awaits(line.state))
+        waiting.release.set()
+        _ = await turn
 
-    assert publisher_module._title(None, called) == "gone"
+    assert [(job.call_id, job.awaited) for job in awaited.jobs or ()] == [("w1", True)]
+
+
+def _awaits(state: AgentState) -> bool:
+    """Return whether ``state`` says a job is awaited."""
+    return any(job.awaited for job in state.jobs or ())
+
+
+@dataclass(slots=True, kw_only=True)
+class _StateSays:
+    """An observer heard after the publisher: set once a state it sent awaits a job."""
+
+    published: _Published
+    seen: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __call__(self, event: types.RuntimeEvent) -> None:
+        del event
+        if any(_awaits(line.state) for line in self.published.states()):
+            self.seen.set()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Lineage:
+    """A team as the tree reads it: its agents by label, and who spawned whom."""
+
+    agents: dict[str, Agent]
+    parents: dict[str, str | None]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.agents)
+
+    def __getitem__(self, label: str) -> Agent:
+        return self.agents[label]
+
+    def parent(self, label: str) -> str | None:
+        return self.parents[label]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Held:
+    """A job as a runtime lists it."""
+
+    call: ToolCall
+    started: float
+    state: str
+
+
+def _job(
+    call_id: str,
+    state: str,
+    name: str = "Bash",
+    **arguments: PlainTree,
+) -> _Held:
+    """Return a job of ``name``'s, asked for at 10 s past the epoch."""
+    return _Held(
+        call=ToolCall(call_id=call_id, name=name, arguments=arguments),
+        started=10.0,
+        state=state,
+    )
+
+
+def _member(
+    *held: _Held,
+    spend_usd: float = 0.0,
+    tools: Mapping[str, object] | None = None,
+) -> Agent:
+    """Return an agent running ``held``, those ``running`` in its turn, holding ``tools``."""
+    runtime = SimpleNamespace(
+        jobs={job.call.call_id: job for job in held},
+        model_call=None,
+        compact_task=None,
+        cohort={job.call.call_id for job in held if job.state == "running"},
+        tools=dict(tools or {}),
+    )
+    return cast("Agent", SimpleNamespace(runtime=runtime, spend_usd=spend_usd))
+
+
+def test_spawns_and_job_management_are_no_jobs_and_a_wait_marks_the_job_it_waits_for() -> (
+    None
+):
+    summary = Mock(return_value="Bash make")
+    root = _member(
+        _job("w1", "detached", command="make", background=True),
+        _job("w2", "sleeping", "gone"),
+        _job("s1", "detached", "AgentSpawn"),
+        _job("f1", "detached", "BackgroundTask", operation="foreground", id="w1"),
+        _job("l1", "detached", "BackgroundTask", operation="list"),
+        tools={"Bash": SimpleNamespace(summary=summary)},
+    )
+    team = _Lineage(agents={"Agent": root}, parents={"Agent": None})
+
+    jobs, _ = publisher_module.team_work(
+        cast("Team", team),
+        root,
+        mask=str,
+        sessions=lambda _: None,
+    )
+
+    assert [(job.call_id, job.title, job.state, job.awaited) for job in jobs] == [
+        ("w1", "Bash make", "running", True),
+        # A call detached with its group may name a tool the agent does not hold.
+        ("w2", "gone", "sleeping", False),
+    ]
+    summary.assert_called_once_with({"command": "make"})
+
+
+# Away from UTC, so a job's start read as local time would show another instant.
+@pytest.mark.usefixtures("five_hours_east_of_utc")
+def test_each_agent_s_jobs_go_up_by_its_label_masked_those_its_turn_waits_on_left_out() -> (
+    None
+):
+    root = _member(_job("r1", "detached"), spend_usd=1.5)
+    kid = _member(_job("k1", "sleeping"), _job("k2", "running"))
+    team = _Lineage(
+        agents={"Agent": root, "kid": kid},
+        parents={"Agent": None, "kid": "Agent"},
+    )
+
+    jobs, members = publisher_module.team_work(
+        cast("Team", team),
+        root,
+        mask=str.lower,
+        sessions=lambda agent: _SESSION if agent is root else None,
+    )
+
+    started = datetime.fromtimestamp(10.0, UTC)
+    assert jobs == (
+        BackgroundJob(
+            call_id="r1",
+            tool="Bash",
+            title="bash",
+            started=started,
+            state="running",
+        ),
+        BackgroundJob(
+            call_id="k1",
+            tool="Bash",
+            title="bash",
+            agent="kid",
+            started=started,
+            state="sleeping",
+        ),
+    )
+    assert members == (
+        TeamMember(label="Agent", busy=False, spend_usd=1.5, session=_SESSION),
+        TeamMember(label="kid", parent="Agent", busy=True),
+    )
 
 
 @pytest.mark.asyncio
@@ -778,17 +947,30 @@ async def test_a_delayed_job_goes_up_sleeping(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_child_at_work_goes_up_by_its_label(tmp_path: Path) -> None:
+async def test_the_team_goes_up_as_sagent_s_tree_each_agent_with_its_session(
+    tmp_path: Path,
+) -> None:
     async with _published(
         tmp_path,
         *_SPAWNS_KID,
         children=_KID_SPAWNS_GRANDKID[1:],
     ) as p:
         _ = await p.agent.send("go")
+        await p.publisher.caught_up()
+        # The kid's session opened at its first save; the next event takes it up.
+        p.publisher(types.AgentIdle())
+        kid = p.team["kid"].session.journal.path
 
-    agents = [s.state.agents for s in p.states()]
-    assert ("kid",) in agents
-    assert agents[-1] == ()
+    assert kid is not None
+    teams = [
+        [(m.label, m.parent, m.busy, m.session) for m in line.state.team or ()]
+        for line in p.states()
+    ]
+    assert [("Agent", "", True, _SESSION), ("kid", "Agent", True, None)] in teams
+    assert teams[-1] == [
+        ("Agent", "", False, _SESSION),
+        ("kid", "Agent", False, uuid5(NAMESPACE_URL, f"{_FOLDER}/{kid.parent.name}")),
+    ]
 
 
 @pytest.mark.asyncio
