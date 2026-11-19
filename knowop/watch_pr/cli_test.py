@@ -390,6 +390,108 @@ def test_help_reads_no_login() -> None:
     assert raised.value.code == 0
 
 
+def test_help_run_with_docstrings_stripped_has_no_description(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli, "__doc__", None)
+    with pytest.raises(SystemExit):
+        _ = cli.main(["--help"], login=login, connect=connect_none)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1:3] == ["", "positional arguments:"]
+
+
+def test_no_command_is_refused_as_argparse_refuses(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        _ = cli.main([], login=login, connect=connect_none)
+    assert raised.value.code == 2
+    assert "the following arguments are required: COMMAND" in capsys.readouterr().err
+
+
+# The help is what an agent reads to use the command (the skill defers to it), so each
+# screen says what each command does now.
+@pytest.mark.parametrize(
+    ("command", "said"),
+    [
+        (
+            [],
+            [
+                "usage: knowop watch-pr [-h] COMMAND ...",
+                "``knowop watch-pr``: watch GitHub pull requests for agent sessions.",
+                (
+                    "reads each watched pull request every minute, until stopped or nothing "
+                    "is watched for 3 hours, and tells each watching session's agent"
+                ),
+                "knowop watch-pr serve --detach",
+                "add watch a pull request for a session; start this host's serve",
+                "remove let a session go of a pull request, as Chat's x does",
+                "fix make a watching session the one whose agent fixes it",
+                "status list the watched pull requests, and whether this host serves",
+                (
+                    "serve read every watched pull request each minute, until stopped or "
+                    "idle"
+                ),
+                "stop stop this host's serve",
+            ],
+        ),
+        (
+            ["add"],
+            [
+                "usage: knowop watch-pr add [-h] [--session SESSION] url",
+                "Watch a pull request for a session; start this host's serve.",
+                "url https://github.com/OWNER/REPO/pull/N",
+                (
+                    "--session SESSION LABEL#N, AgentSession#N, N or a UUID; default "
+                    "$TRAX_SESSION"
+                ),
+            ],
+        ),
+        (
+            ["status"],
+            [
+                "usage: knowop watch-pr status [-h] [url]",
+                "positional arguments: url one pull request alone",
+                (
+                    "List each open pull request a session watches (or the one named, open "
+                    "or not): its checks, who watches it, who fixes it, and when a serve "
+                    "last read it; and whether a serve runs on this host."
+                ),
+                "url one pull request alone",
+            ],
+        ),
+        (
+            ["serve"],
+            [
+                "usage: knowop watch-pr serve [-h] [--detach]",
+                (
+                    "Read every pull request a session of yours watches through this host's "
+                    "gh, each minute; write what GitHub says to its row, and tell each "
+                    "watching agent the news. One serve runs per host; one on another host "
+                    "tells nothing twice. It ends once nothing is watched for 3 hours; the "
+                    "next add starts one again."
+                ),
+                "--detach run in the background, outliving this command; print its pid",
+            ],
+        ),
+        (["stop"], ["usage: knowop watch-pr stop [-h]"]),
+    ],
+)
+def test_each_help_screen_says_what_its_command_does(
+    command: list[str],
+    said: list[str],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("COLUMNS", "88")
+    with pytest.raises(SystemExit):
+        _ = cli.main([*command, "--help"], login=login, connect=connect_none)
+    shown = " ".join(capsys.readouterr().out.split())
+    for each in said:
+        assert each in shown
+
+
 if __name__ == "__main__":
     from knowop.lib.testing.runner import test_main
 

@@ -5,8 +5,11 @@ Each pass reads every open pull request a session watches (a closed one every
 It writes what GitHub says to the row with a compare-and-set, and the news that write
 named in ``told`` goes to each watching session's agent as a line, as a person's line
 goes (``POST /api/sessions/ID/inputs``). A session with no agent running is told
-nothing: the line is dropped, as a message to a stopped agent is. A pull request this
-host's ``gh`` cannot read is news too, so the agents tell the person.
+nothing: the line is dropped, as a message to a stopped agent is. One with none for
+:data:`AWAY_DAYS` lets go of what it watches, as a subscription with no subscriber
+expires; the row's ``away`` keeps since when, so a serve that restarts or moves to
+another host times it on. A pull request this host's ``gh`` cannot read is news too,
+so the agents tell the person.
 
 Only the write that names news in ``told`` tells it, so a second watch, on this host
 or another, that read the same state tells nothing twice. A watch that stopped leaves
@@ -22,7 +25,7 @@ reviews allow; a draft's ask waits until it is marked ready.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from typing import TYPE_CHECKING, Final, Protocol, TypedDict
@@ -55,10 +58,20 @@ from knowop.watch_pr.rows import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
+    from trackinizer.wire.wire_session_relay import AgentProcess
+
     from knowop.watch_pr.github import GhRunner, PullRequest
 
 
-__all__ = ["CLOSED_PASSES", "HEARTBEAT_SEC", "POLL_SEC", "Watch", "WatchClient"]
+__all__ = [
+    "AWAY_DAYS",
+    "AWAY_SEC",
+    "CLOSED_PASSES",
+    "HEARTBEAT_SEC",
+    "POLL_SEC",
+    "Watch",
+    "WatchClient",
+]
 
 _logger = logging.getLogger(__name__)
 
@@ -72,15 +85,32 @@ HEARTBEAT_SEC: Final = 600.0
 """Seconds after which a row is written again though nothing changed, so ``read_at``
 says a watch still reads it."""
 
+AWAY_DAYS: Final = 31
+"""Days a watching session keeps its watches with no agent running, as long as Pub/Sub
+keeps a subscription no subscriber touched (31 days by default).
+
+One window for every reason an agent is not running, as the relay tells them apart too
+little to time them apart: it forgets an ended process once its key is gone, and reads
+that session as one with none; it keeps processes in memory, so knows none after the
+server restarts; and one only disconnected (a host asleep) may say ``Hello`` again as
+the same process (``trackinizer/server/session_relay.py``)."""
+
+AWAY_SEC: Final = AWAY_DAYS * 24 * 3600.0
+"""Seconds of :data:`AWAY_DAYS`."""
+
 _STATUS: Final = {"OPEN": "active", "MERGED": "complete", "CLOSED": "abandoned"}
 """A pull request row's status for each state GitHub gives it."""
 
 
 class WatchClient(RowsClient, Protocol):
-    """What a watch asks of the server: the rows', and a line to a session's agent."""
+    """What a watch asks of the server: the rows', and a session's agent."""
 
     def send_input(self, session_id: UUID, new: NewInput) -> UUID:
         """Send a session's root agent a line; return its id."""
+        ...
+
+    def read_process(self, session_id: UUID) -> AgentProcess | None:
+        """Return the agent process serving a session, or the last that did."""
         ...
 
 
@@ -122,6 +152,9 @@ class Watch:
     def sweep(self) -> int:
         """Read and write each watched pull request once; one that fails is skipped.
 
+        Every :data:`CLOSED_PASSES` passes, each watching session's agent is asked
+        after first, once a pass, and one with none for :data:`AWAY_DAYS` lets go.
+
         Returns:
           read: How many pull requests this pass read.
 
@@ -130,18 +163,24 @@ class Watch:
         me = profile["email"]
         autofix, automerge = _preferences(profile)
         rows = self._rows.listed(me, status="active")
-        if self._passes % CLOSED_PASSES == 0:
+        checked = self._passes % CLOSED_PASSES == 0
+        if checked:
             rows += self._rows.listed(me, status="abandoned")
         self._passes += 1
+        running: dict[UUID, bool | None] = {}
         read = 0
-        for stored in rows:
-            if not stored.watchers or not stored.url:
+        for listed in rows:
+            if not listed.watchers or not listed.url:
                 continue
+            stored = listed
             try:
-                self.refresh(stored, autofix=autofix, automerge=automerge)
+                if checked:
+                    stored = self._let_go(listed, running=running)
+                if stored.watchers:
+                    self.refresh(stored, autofix=autofix, automerge=automerge)
             except ClientError as error:
-                self._say(f"could not write {stored.url}: {error}")
-            read += 1
+                self._say(f"could not write {listed.url}: {error}")
+            read += bool(stored.watchers)
         return read
 
     def read(self, stored: Stored) -> None:
@@ -273,6 +312,59 @@ class Watch:
             return new | {"read_at": written.isoformat(), "read_by": self._host}
         return new
 
+    # The first pass to find a watcher's agent not running marks when, on the row
+    # (``away``), so the time is kept across serves, hosts and restarts.
+    def _let_go(self, stored: Stored, *, running: dict[UUID, bool | None]) -> Stored:
+        """Let each watcher with no agent for :data:`AWAY_SEC` go of the PR."""
+        marked = from_plain(stored.pr.get("away"), dict[str, str], default={})
+        now = datetime.fromtimestamp(self._wall(), UTC)
+        away: dict[str, str] = {}
+        staying: list[Watcher] = []
+        for each in stored.watchers:
+            if each.session not in running:
+                running[each.session] = self._running(each.session)
+            key, runs, gone = str(each.session), running[each.session], False
+            if runs is True:
+                mark = None
+            elif runs is None:
+                mark = marked.get(key)
+            else:
+                mark = marked.get(key, now.isoformat())
+                gone = now - datetime.fromisoformat(mark) >= timedelta(seconds=AWAY_SEC)
+            if not (gone and self._dismissed(stored, each.session)):
+                staying.append(each)
+                if mark is not None:
+                    away[key] = mark
+        # The pass's own write next finds the row changed and reads it again.
+        if away != marked:
+            _ = self._rows.write_pr(stored, partial(_marked, away=away))
+        return replace(stored, watchers=tuple(staying))
+
+    # Its agent is gone, so a line saying so would be dropped: the log says it.
+    def _dismissed(self, stored: Stored, session: UUID) -> bool:
+        """Let ``session`` go of the PR, as Chat's x does; return whether it did."""
+        try:
+            self._rows.dismiss(stored.row, session=session)
+        except ClientError as error:
+            self._say(f"could not let session {session} go: {error}")
+            return False
+        _logger.info(
+            "knowop watch-pr: session %s, with no agent for %d days, let go of %s",
+            session,
+            AWAY_DAYS,
+            stored.url,
+        )
+        return True
+
+    def _running(self, session: UUID) -> bool | None:
+        """Return whether ``session`` runs an agent now; ``None`` when unread."""
+        try:
+            process = self._client.read_process(session)
+        except ClientError as error:
+            self._say(f"could not read session {session}'s agent: {error}")
+            return None
+        return process is not None and process.state != "detached"
+
     def _send(self, session: UUID, text: str) -> None:
         """Send ``text`` to the session's agent; one with none running is told nothing."""
         line = NewInput(
@@ -377,6 +469,11 @@ def _fixer(kept: Mapping[str, object], *, stored: Stored) -> str | None:
     named = from_plain(kept.get("fixer"), str, default="")
     watching = [str(each.session) for each in stored.watchers]
     return named if named in watching else next(iter(watching), None)
+
+
+def _marked(stored: Stored, *, away: dict[str, str]) -> tuple[dict[str, object], None]:
+    """Return the row's ``app.knowop.pr`` with ``away`` as its marks."""
+    return stored.pr | {"away": away}, None
 
 
 def _preferences(profile: Profile) -> tuple[bool, bool]:

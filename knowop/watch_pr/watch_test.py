@@ -7,6 +7,8 @@ from uuid import UUID
 
 from trackinizer.client.errors import ClientError
 
+import pytest
+
 from knowop.watch_pr.github import GhOutput
 from knowop.watch_pr.github_test import URL, check, printed, view
 from knowop.watch_pr.news import unreadable
@@ -16,15 +18,21 @@ from knowop.watch_pr.rows_test import (
     OTHER,
     Peer,
     Server,
+    process,
     stored_row,
 )
-from knowop.watch_pr.watch import CLOSED_PASSES, HEARTBEAT_SEC, Watch
+from knowop.watch_pr.watch import (
+    AWAY_SEC,
+    CLOSED_PASSES,
+    HEARTBEAT_SEC,
+    Watch,
+)
 
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    import pytest
+    from trackinizer.wire.wire_session_relay import AgentProcess
 
 
 LOGIN: Final = GhOutput(returncode=0, stdout="ada\n", stderr="")
@@ -509,6 +517,91 @@ def test_a_session_is_named_by_its_number_read_once() -> None:
     _ = watching.sweep()
     assert server.gets.count(f"/api/inquiries/{UUID(int=1)}") == 1
     assert len(server.lines) == 4
+
+
+NOW: Final = "1970-01-12T13:46:40+00:00"
+"""When :class:`Clock` starts, as a row's ``away`` writes it."""
+
+LONG_AGO: Final = "1970-01-01T00:00:00+00:00"
+
+
+# Not running, whatever the reason: ended (the relay forgets it once its key is gone,
+# so it reads as none), disconnected (a host asleep, which may say Hello again), or
+# none known (the relay keeps processes in memory, so knows none after a restart).
+@pytest.mark.parametrize(
+    "gone",
+    [
+        process(FIXER, state="detached", since=0.0, reason="exited with code 0"),
+        process(FIXER, state="detached", since=0.0, reason="disconnected"),
+        None,
+    ],
+)
+def test_a_session_with_no_agent_is_marked_on_the_row_and_lets_go_a_month_on(
+    gone: AgentProcess | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server = Server()
+    row = server.row(peers=TWO)
+    server.processes[FIXER] = gone
+    clock = Clock()
+    _ = watch(server, Gh(), clock).sweep()
+    assert row.pr["away"] == {str(FIXER): NOW}
+    # Each pass a new serve: what it found is on the row, not in a serve's memory.
+    clock.now += AWAY_SEC - 1
+    _ = watch(server, Gh(), clock).sweep()
+    assert row.peers[0].labels == [LABEL]
+    clock.now += 1
+    caplog.set_level("INFO")
+    _ = watch(server, Gh(), clock).sweep()
+    assert row.peers[0].labels == [LABEL, DISMISSED]
+    assert row.pr["away"] == {}
+    assert row.pr["fixer"] == str(OTHER)
+    assert (
+        f"knowop watch-pr: session {FIXER}, with no agent for 31 days, let go of {URL}"
+        in [each.getMessage() for each in caplog.records]
+    )
+
+
+def test_a_session_whose_agent_runs_again_is_no_longer_marked() -> None:
+    server = Server()
+    away = {str(FIXER): LONG_AGO, str(OTHER): LONG_AGO}
+    row = server.row(peers=TWO, app={"knowop": {"pr": {"away": away}}})
+    server.processes[OTHER] = process(OTHER, state="starting", since=0.0)
+    _ = watch(server, Gh()).sweep()
+    assert [peer.labels for peer in row.peers] == [[LABEL], [LABEL]]
+    assert row.pr["away"] == {}
+
+
+def test_a_session_whose_agent_cannot_be_read_or_let_go_keeps_its_watch_and_mark(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server = Server()
+    row = server.row(app={"knowop": {"pr": {"away": {str(FIXER): LONG_AGO}}}})
+    server.process_refusal = ClientError("GET process -> 403", status_code=403)
+    assert watch(server, Gh()).sweep() == 1
+    assert (row.peers[0].labels, row.pr["away"]) == ([LABEL], {str(FIXER): LONG_AGO})
+    server.process_refusal = None
+    server.processes[FIXER] = None
+    server.edge_refusal = ClientError("PATCH labels -> 503", status_code=503)
+    clock = Clock()
+    clock.now = AWAY_SEC
+    assert watch(server, Gh(), clock).sweep() == 1
+    assert (row.peers[0].labels, row.pr["away"]) == ([LABEL], {str(FIXER): LONG_AGO})
+    said = [each.getMessage() for each in caplog.records]
+    assert said == [
+        f"knowop watch-pr: could not read session {FIXER}'s agent: GET process -> 403",
+        f"knowop watch-pr: could not let session {FIXER} go: PATCH labels -> 503",
+    ]
+
+
+def test_a_session_is_asked_after_once_a_pass_and_only_on_the_checking_pass() -> None:
+    server = Server()
+    _ = server.row(peers=TWO)
+    _ = server.row(url="https://github.com/acme/app/pull/8", peers=TWO)
+    watching = watch(server, Gh())
+    for _ in range(CLOSED_PASSES + 1):
+        _ = watching.sweep()
+    assert server.processes_read == [FIXER, OTHER, FIXER, OTHER]
 
 
 if __name__ == "__main__":

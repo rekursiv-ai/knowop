@@ -14,6 +14,7 @@ from trackinizer.client.errors import ClientError
 
 import pytest
 
+from knowop.watch_pr import serve as serve_module
 from knowop.watch_pr.rows_test import Server
 from knowop.watch_pr.serve import (
     ServeFiles,
@@ -92,6 +93,41 @@ def test_a_pass_that_fails_costs_one_pass(
     assert [each.getMessage() for each in caplog.records].count(
         "knowop watch-pr: pass failed: GET -> 502",
     ) == 2
+
+
+def test_a_serve_with_nothing_watched_for_long_ends_and_frees_its_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    reads = iter([1, 0, 0])
+
+    class Counted:
+        def __init__(self, *, client: Server, host: str) -> None:
+            del client, host
+
+        def sweep(self) -> int:
+            return next(reads)
+
+    times = iter([0.0, 100.0, 200.0, 250.0])
+    monkeypatch.setattr(serve_module, "Watch", Counted)
+    held = files(tmp_path)
+    stop = Stop(passes=10)
+    caplog.set_level("INFO")
+    serve(
+        Server,
+        files=held,
+        host="laptop",
+        stop=stop,
+        idle_sec=150.0,
+        clock=lambda: next(times),
+    )
+    assert len(stop.waits) == 2
+    assert not stop.is_set()
+    assert serving(held) is None
+    assert caplog.records[-1].getMessage() == (
+        "knowop watch-pr: nothing watched for 150 s; the serve ends"
+    )
 
 
 def test_a_second_serve_on_this_host_is_refused(tmp_path: Path) -> None:

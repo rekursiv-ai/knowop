@@ -15,6 +15,8 @@ Chat's x writes too. Chat's pill, and the Pull requests page (the server's
 - ``autofix``: the person's switch: true, false, or absent for their ``autofix``
   preference, which a pull request they did not open never takes.
 - ``fixer``: the session whose agent fixes it; the others are told who does.
+- ``away``: each watching session found with no agent running, and since when, as
+  ISO time; gone once its agent runs again, or once it lets go.
 - ``told``: ``head_sha:name`` of each piece of news already told, for the head now.
 - ``automerge_ask``, ``automerge_done``, ``automerge_error``: the person's
   Auto-merge box (``on`` and the ``at`` that names the ask), the ask the watch did,

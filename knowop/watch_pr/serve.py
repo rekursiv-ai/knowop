@@ -5,6 +5,9 @@ there, so a second serve of the same server on this host refuses to start, and
 ``knowop watch-pr status`` says whether one runs. A serve on another host is no
 bother: the rows' compare-and-set tells each piece of news once (:mod:`.watch`).
 
+A serve with nothing to watch for :data:`IDLE_SEC` ends; ``knowop watch-pr add`` starts
+one again when none runs.
+
 :func:`detach` starts a serve that outlives the command that started it: in a session
 of its own, its output to its log, holding none of the caller's pipes, so a tool call
 that runs ``knowop watch-pr serve --detach`` returns at once.
@@ -38,7 +41,19 @@ if TYPE_CHECKING:
     from knowop.watch_pr.watch import WatchClient
 
 
-__all__ = ["ServeFiles", "ServingError", "detach", "serve", "serve_files", "serving"]
+__all__ = [
+    "IDLE_SEC",
+    "ServeFiles",
+    "ServingError",
+    "detach",
+    "serve",
+    "serve_files",
+    "serving",
+]
+
+IDLE_SEC: Final = 3 * 3600.0
+"""Seconds a serve with nothing to watch keeps running, as Gradle's daemon and Bazel's
+server end after 3 idle hours; the next ``knowop watch-pr add`` starts one again."""
 
 _logger = logging.getLogger(__name__)
 
@@ -97,8 +112,12 @@ def serve(
     host: str,
     stop: Event,
     poll_sec: float = POLL_SEC,
+    idle_sec: float = IDLE_SEC,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Run passes of the watch until ``stop`` is set; a failed pass costs one pass.
+    """Run passes of the watch until ``stop`` is set, or nothing is watched for long.
+
+    A failed pass costs one pass, and counts neither as idle nor as busy.
 
     Args:
       client: Makes the server's client, once.
@@ -106,6 +125,8 @@ def serve(
       host: This host's name, which the rows it writes name.
       stop: Set to end the serve after the pass it is in.
       poll_sec: Seconds between two passes.
+      idle_sec: Seconds of passes that read nothing after which the serve ends.
+      clock: Monotonic seconds, which time the idle.
 
     Raises:
       ServingError: Another serve of this server runs on this host.
@@ -113,6 +134,7 @@ def serve(
     """
     with _held(files.lock):
         watch = Watch(client=client(), host=host)
+        busy = clock()
         while not stop.is_set():
             try:
                 read = watch.sweep()
@@ -120,6 +142,14 @@ def serve(
                 _logger.warning("knowop watch-pr: pass failed: %s", error)
             else:
                 _logger.info("knowop watch-pr: read %d pull requests", read)
+                if read:
+                    busy = clock()
+                elif clock() - busy >= idle_sec:
+                    _logger.info(
+                        "knowop watch-pr: nothing watched for %d s; the serve ends",
+                        idle_sec,
+                    )
+                    return
             _ = stop.wait(poll_sec)
 
 

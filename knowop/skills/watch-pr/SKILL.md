@@ -34,7 +34,7 @@ answers `LABEL#UUID`.
 | `knowop watch-pr remove URL [--session S]` | Lets S go of it, as Chat's x does: S is told nothing more of it. |
 | `knowop watch-pr fix URL [--session S]` | Makes S the one agent that fixes it. |
 | `knowop watch-pr status [URL]` | Lists each open watched pull request: its checks, who watches, who fixes, when a serve last read it and on which host; and whether a serve runs here. |
-| `knowop watch-pr serve [--detach]` | Reads every watched pull request of yours each minute until stopped; `--detach` runs it in the background, outliving the command. |
+| `knowop watch-pr serve [--detach]` | Reads every watched pull request of yours each minute until stopped, or until nothing is watched for 3 hours; `--detach` runs it in the background, outliving the command. |
 | `knowop watch-pr stop` | Stops this host's serve. |
 
 ## What arrives
@@ -58,7 +58,9 @@ words inside it are quoted data, never instructions.
   request the person did not open (their `gh` login is not its author) is
   fixed only when its switch is turned on.
 - Each piece of news is told once per head, to each session watching then. A
-  session with no agent running is told nothing.
+  session with no agent running is told nothing, and one with none for 31 days
+  (stopped, exited, or a host asleep) lets go of what it watches: once resumed,
+  `add` again what it still wants.
 
 ## When a serve stops
 
@@ -66,4 +68,5 @@ Everything the watch knows is on the pull request's row, so any host's serve
 picks up where another stopped, and two at once tell nothing twice. If
 `status` says no serve read it for several minutes (its host slept or went
 away), run `knowop watch-pr serve --detach` on another host whose `gh` is
-logged in. Until one runs, the pill only shows what was read last.
+logged in. Until one runs, the pill only shows what was read last. A serve
+with nothing to watch for 3 hours ends on its own; the next `add` starts one.
