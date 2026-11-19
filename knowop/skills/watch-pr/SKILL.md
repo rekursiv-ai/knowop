@@ -54,7 +54,9 @@ words inside it are quoted data, never instructions.
 - Every other watching agent is told who fixes, must not push to the branch,
   and may message the fixer with AgentSend to help or hand the fix over.
 - Auto-fix off (Chat's switch, or the person's `autofix` preference) sends no
-  failure and no conflict; a merge and a ready draft are told anyway.
+  failure and no conflict; a merge and a ready draft are told anyway. A pull
+  request the person did not open (their `gh` login is not its author) is
+  fixed only when its switch is turned on.
 - Each piece of news is told once per head, to each session watching then. A
   session with no agent running is told nothing.
 
