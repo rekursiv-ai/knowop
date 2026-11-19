@@ -849,9 +849,7 @@ def _member(
     """Return an agent running ``held``, those ``running`` in its turn, holding ``tools``."""
     runtime = SimpleNamespace(
         jobs={job.call.call_id: job for job in held},
-        model_call=None,
-        compact_task=None,
-        cohort={job.call.call_id for job in held if job.state == "running"},
+        at_work=any(job.state == "running" for job in held),
         tools=dict(tools or {}),
     )
     return cast("Agent", SimpleNamespace(runtime=runtime, spend_usd=spend_usd))

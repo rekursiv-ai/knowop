@@ -949,7 +949,7 @@ async def _quit_at_screen(screen: Awaitable[None]) -> Ended:
 
 # As sagent's own ``clear`` waits for its event: the halt takes effect at the runtime
 # loop's next drain, which publishes it, and what it wrote is journaled by then. Tool
-# calls keep running, so waiting for the agent to idle could wait on them.
+# calls keep running, detached, so waiting for the agent to idle could wait on them.
 async def _halted(agent: Agent) -> None:
     """Halt the turn; return once the runtime has taken the halt."""
     taken = asyncio.Event()
