@@ -1228,8 +1228,8 @@ async def test_a_socket_closed_before_the_shell_starts_runs_nothing_and_logs_a_c
 
 async def test_the_shells_output_ends_the_pump_and_a_closed_relay_says_so() -> None:
     """Whatever the shell still writes has nowhere to go; the pump says the relay closed."""
-    gone = DirectRouter(relay=_relay_gone, shell=_Shell(), factory=None)
-    kept = DirectRouter(relay=_relay_kept, shell=_Shell(), factory=None)
+    gone = DirectRouter(relay=_relay_gone, shell=_Shell(), factory=None, start=0)
+    kept = DirectRouter(relay=_relay_kept, shell=_Shell(), factory=None, start=0)
 
     assert not await _pump(cast("attach.RemoteTerminal", _Output(b"late")), gone)
     assert await _pump(cast("attach.RemoteTerminal", _Output(b"late")), kept)
@@ -1252,7 +1252,7 @@ async def test_the_server_socket_is_read_until_a_stop_what_is_no_frame_or_its_cl
     ends: bool,
 ) -> None:
     shell = _Shell()
-    router = DirectRouter(relay=_relay_gone, shell=shell, factory=None)
+    router = DirectRouter(relay=_relay_gone, shell=shell, factory=None, start=0)
 
     read = await _read(
         router,

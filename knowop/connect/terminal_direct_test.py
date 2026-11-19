@@ -457,6 +457,26 @@ async def test_input_over_the_channel_is_capped_per_second_and_the_cap_is_inclus
     assert b"over" not in world.shell.written
 
 
+async def test_the_first_input_window_starts_empty_at_the_clocks_zero() -> None:
+    world = _World()
+    world.now = 0.5
+    await world.upgraded()
+    big = b"x" * wire_terminals.MAX_INPUT_FRAME_BYTES
+    frames = wire_terminals.MAX_INPUT_BYTES_PER_SEC // len(big)
+
+    for _ in range(frames):
+        world.dc(Frame.INPUT, big)
+    await world.settle()
+    assert not world.peer.closed
+
+    world.now = 1.0
+    world.dc(Frame.INPUT, b"next")
+    await world.settle()
+
+    assert not world.peer.closed
+    assert world.shell.written == [big] * frames + [b"next"]
+
+
 async def test_a_malformed_frame_on_the_channel_closes_it() -> None:
     world = _World()
     await world.upgraded()

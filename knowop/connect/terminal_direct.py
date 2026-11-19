@@ -105,9 +105,9 @@ class DirectRouter:
       relay: Sends one encoded frame to the server.
       shell: The pty the input is written to.
       factory: Makes a peer for an offer; ``None`` when no WebRTC library is installed.
-      ice_servers: The STUN URLs the server named for this terminal.
       start: The offset of the first byte it is handed: a daemon that takes up a
         shell again continues the stream where the shell's host resumed it.
+      ice_servers: The STUN URLs the server named for this terminal.
       clock: Monotonic seconds.
       sleep: Waits the given seconds; only the keepalive uses it.
 
@@ -119,8 +119,8 @@ class DirectRouter:
         relay: Callable[[bytes], Awaitable[None]],
         shell: Shell,
         factory: PeerFactory | None,
+        start: int,
         ice_servers: tuple[str, ...] = (),
-        start: int = 0,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
@@ -131,7 +131,7 @@ class DirectRouter:
         self._clock = clock
         self._sleep = sleep
         self._ring = Ring(capacity=wire_terminals.RING_BYTES)
-        self._ring.reset(start)
+        self._ring.seek(start)
         self._route = wire_terminals.ROUTE_RELAY
         self._sent = start
         """Output up to here has gone to the browser by the current route."""
@@ -139,7 +139,7 @@ class DirectRouter:
         self._send_lock = asyncio.Lock()
         self._peer: DirectPeer | None = None
         self._gen = 0
-        self._fenced = False
+        self._fenced = False  # pragma: no mutate[truthiness]
         """The browser's relay fence came before it switched the route."""
 
         self._last_input = clock()
