@@ -1,6 +1,6 @@
 ---
 name: knowop-run
-description: ALWAYS invoke this skill when asked to spawn, start or launch an agent on a computer or host, run knowop run, or continue a stored session. Do not launch a bare agent or give launch commands from memory.
+description: ALWAYS invoke this skill when asked to spawn, start, launch or move an agent on a computer or host, run knowop run, or continue a stored session. Do not launch a bare agent or give launch commands from memory.
 ---
 
 # knowop run -- sagent, live in Chat
@@ -147,6 +147,11 @@ or `412`); Chat's ⋯ menu copies either (Copy session #, Copy UUID).
 newest part when this host holds it whole, else in a new journal restored from the
 stored parts. A part another agent than sagent wrote is not continued; it stays
 readable with `trax agentsession N records`.
+
+To move this session, run `knowop run --session ID --on HOST` with its existing
+ID. A different host stops the old process and uses normal resume; an unspecified
+or unchanged host leaves it running. Do not create a new session or pass `--name`.
+The resumed agent takes its next input normally.
 
 ## Rules
 

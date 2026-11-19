@@ -113,7 +113,7 @@ from websockets.exceptions import ConnectionClosed
 import httpx2
 import pytest
 
-from knowop.agent import placement
+from knowop.agent import placement, resume
 from knowop.agent.errors import NotResumableError
 from knowop.agent.resume import JournalChoice
 from knowop.connect.session_serving import SERVE_COMMAND
@@ -486,7 +486,7 @@ class _Server(_Client):
         plaintext_only: bool = False,
     ) -> list[RecordBody]:
         del session_id, part, plaintext_only
-        return []
+        return self.stored
 
     def append_records(
         self,
@@ -667,6 +667,8 @@ async def _serving(
     server: _Server | None = None,
     time_limit: timedelta | None = None,
     remote: bool = False,
+    host: str = _HOST,
+    process_id: UUID = _PROCESS,
 ) -> AsyncGenerator[tuple[asyncio.Task[int], _Server]]:
     """Run ``serve`` in a task against ``relay``; yield it and the fake server."""
     server = server if server is not None else _Server(version=1)
@@ -676,10 +678,10 @@ async def _serving(
             serve(
                 args,
                 session_id=_SESSION,
-                process_id=_PROCESS,
+                process_id=process_id,
                 client=server,
                 tui=tui,
-                host=_HOST,
+                host=host,
                 time_limit=time_limit,
                 # Left at its default unless set, which is a person's own host.
                 **({"remote": True} if remote else {}),
@@ -1587,6 +1589,84 @@ async def test_a_stop_halts_the_turn_and_uploads_what_the_journal_holds(
     assert journal is not None
     lines = [line for line in journal.read_bytes().splitlines() if line.strip()]
     assert sorted({r.idx for r in server.stored}) == list(range(len(lines)))
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_stop_and_resume_answers_on_another_host(
+    opened: _Opened,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    loaded = await asyncio.to_thread(Path(main_module.__file__).resolve)
+    assert loaded == _THIS.with_name("main.py")
+    async with _relayed() as source, _serving(source) as (source_task, server):
+        _ = await source.seen(_is("settings"))
+        assert opened.agent is not None
+        source_agent = opened.agent
+        source_agent.session.append(UserMessage(content="latest before transfer"))
+        _ = list(source_agent.session.history())
+        journal = source_agent.session.journal.path
+        assert journal is not None
+        await source.close(CLOSE_ENDED)
+        assert await _exited(source_task) == 0
+        assert source.live is not None
+        await source.live.wait_closed()
+        assert source_task.done()
+        assert source.live.close_code == CLOSE_ENDED
+        count = len(
+            [line for line in journal.read_bytes().splitlines() if line.strip()],
+        )
+        assert sorted({record.idx for record in server.stored}) == list(range(count))
+    destination = _Server(
+        version=1,
+        parts=[
+            PartBody(
+                part=0,
+                name=f"{journal.parent.name}.jsonl",
+                format="sagent",
+                records=count,
+            ),
+        ],
+        stored=list(server.stored),
+    )
+    monkeypatch.setattr(resume, "state_dir", lambda: tmp_path / "destination-state")
+    opened.replies = [reply("answered on destination")]
+    async with (
+        _relayed() as target,
+        _serving(
+            target,
+            server=destination,
+            host="destination",
+            process_id=UUID(int=93),
+        ) as (target_task, _),
+    ):
+        _ = await target.seen(_is("settings"))
+        hello = Hello.model_validate(await target.seen(_is("hello")))
+        assert (hello.host, hello.process_id) == ("destination", UUID(int=93))
+        assert target.paths == [f"/api/sessions/{_SESSION}/process/ws"]
+        assert opened.agent is not None
+        history = list(opened.agent.session)
+        assert (
+            sum(
+                isinstance(record, UserMessage)
+                and record.content == "latest before transfer"
+                for record in history
+            )
+            == 1
+        )
+        assert target.found(_is("event", event="ModelCallStarted")) is None
+        _ = await target.send("UserMessage", _line("Continue on this host."))
+        _ = await target.seen(_is("event", event="ModelResponseComplete"))
+        assert (
+            sum(
+                isinstance(record, AssistantMessage)
+                and record.content == "answered on destination"
+                for record in opened.agent.session
+            )
+            == 1
+        )
+        await target.close(CLOSE_ENDED)
+        assert await _exited(target_task) == 0
 
 
 @pytest.mark.asyncio
