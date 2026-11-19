@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Final, cast
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Final, Literal, cast
 from uuid import UUID, uuid4
 
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.refs import SeqRef
+from trackinizer.wire.wire_session_relay import AgentProcess
 
 import pytest
 
@@ -99,6 +101,10 @@ class Server:
       status_refusal: What every status write raises, when set.
       down: What every ``GET`` raises, when set.
       gets: Each path read.
+      processes: Each session's agent process; one not named runs now.
+      processes_read: Each session whose process was read, in order.
+      process_refusal: What every read of a process raises, when set.
+      edge_refusal: What every edge write raises, when set.
 
     """
 
@@ -106,6 +112,10 @@ class Server:
         self.rows: dict[UUID, Row] = {}
         self.lines: list[tuple[UUID, str]] = []
         self.asleep: set[UUID] = set()
+        self.processes: dict[UUID, AgentProcess | None] = {}
+        self.processes_read: list[UUID] = []
+        self.process_refusal: ClientError | None = None
+        self.edge_refusal: ClientError | None = None
         self.preferences: dict[str, bool] = {}
         self.writes = 0
         self.racers: list[dict[str, object] | None] = []
@@ -147,6 +157,8 @@ class Server:
         _, _, _, row, kind, session, _ = path.split("/")
         assert kind == "produced_by"
         assert body == {"op": "add", "value": DISMISSED, "actor": ACTOR}
+        if self.edge_refusal is not None:
+            raise self.edge_refusal
         for peer in self.rows[UUID(row)].peers:
             if peer.session == UUID(session):
                 peer.labels.append(DISMISSED)
@@ -239,9 +251,35 @@ class Server:
         self.lines.append((session_id, str(new.payload["content"])))
         return uuid4()
 
+    def read_process(self, session_id: UUID) -> AgentProcess | None:
+        self.processes_read.append(session_id)
+        if self.process_refusal is not None:
+            raise self.process_refusal
+        if session_id in self.processes:
+            return self.processes[session_id]
+        return process(session_id, state="attached", since=0.0)
+
     def resolve_id(self, ref: Ref) -> tuple[Inquiry.InquiryKind, UUID]:
         assert isinstance(ref, SeqRef)
         return "AgentSession", UUID(int=ref.seq - 400)
+
+
+def process(
+    session: UUID,
+    *,
+    state: Literal["starting", "attached", "detached"],
+    since: float,
+    reason: str = "",
+) -> AgentProcess:
+    """Return a session's agent process, in ``state`` since ``since`` (epoch seconds)."""
+    return AgentProcess(
+        session_id=session,
+        process_id=uuid4(),
+        host="laptop",
+        state=state,
+        reason=reason,
+        since=datetime.fromtimestamp(since, UTC),
+    )
 
 
 def _matches(row: Row, each: Filter) -> bool:

@@ -1,8 +1,8 @@
 """``knowop watch-pr``: watch GitHub pull requests for agent sessions.
 
 A session watches a pull request with ``add``; ``serve``, on any host whose ``gh`` is
-logged in, reads each watched pull request every minute and tells each watching
-session's agent when checks fail, it conflicts with its base, it merges, or a draft's
+logged in, reads each watched pull request every minute, until stopped or nothing is
+watched for 3 hours, and tells each watching session's agent when checks fail, it conflicts with its base, it merges, or a draft's
 checks all pass. One agent fixes; ``fix`` names another. Chat shows the pull requests
 over the session, as the pill.
 
@@ -90,6 +90,7 @@ class WatchPrClient(WatchClient, Protocol):
 class _Flags(Protocol):
     command: str
     url: str
+    one: str | None
     session: str
     detach: bool
 
@@ -171,15 +172,16 @@ def _parser() -> argparse.ArgumentParser:
             "read it; and whether a serve runs on this host."
         ),
     )
-    status.add_argument("url", nargs="?", default="", help="one pull request alone")
+    status.add_argument("one", nargs="?", metavar="url", help="one pull request alone")
     commands.add_parser(
         "serve",
-        help="read every watched pull request each minute, until stopped",
+        help="read every watched pull request each minute, until stopped or idle",
         description=(
             "Read every pull request a session of yours watches through this host's "
             "gh, each minute; write what GitHub says to its row, and tell each "
             "watching agent the news. One serve runs per host; one on another host "
-            "tells nothing twice."
+            "tells nothing twice. It ends once nothing is watched for 3 hours; the "
+            "next add starts one again."
         ),
     ).add_argument(
         "--detach",
@@ -212,7 +214,8 @@ def _session_command(
     rows = PullRequestRows(client=client, actor=_ACTOR)
     me = rows.profile()["email"]
     if flags.command == "status":
-        _status(rows, me=me, url=link(flags.url) if flags.url else "", files=files)
+        one = flags.one
+        _status(rows, me=me, url="" if one is None else link(one), files=files)
         return
     url = link(flags.url)
     watcher = _watcher(flags.session, client=client)
