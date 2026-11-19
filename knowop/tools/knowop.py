@@ -224,7 +224,7 @@ class KnowOpTools:
                 most, source = self._campaign_most()
                 return (
                     f"The campaign limit is ${most:g}, {source}. The person sets it "
-                    "as Each campaign budget on the Usage page, Advanced."
+                    "as Each campaign budget under Budgets and alerts on the Usage page."
                 )
             case "session.set_budget":
                 return self._set_campaign_most(budget)

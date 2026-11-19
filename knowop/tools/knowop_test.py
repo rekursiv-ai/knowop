@@ -360,9 +360,7 @@ _MODEL: Final[dict[str, PlainTree]] = {
 }
 _SET: Final[dict[str, PlainTree]] = {"micros": 30_000_000, "ref": "campaign/*"}
 
-_WHERE: Final = (
-    "The person sets it as Each campaign budget on the Usage page, Advanced."
-)
+_WHERE: Final = "The person sets it as Each campaign budget under Budgets and alerts on the Usage page."
 
 
 @pytest.mark.asyncio
