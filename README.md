@@ -203,6 +203,9 @@ host, not the unit, and `knowop logs` reads only a user service's log: use
 | `knowop host [NAME ...]` | Lists, shows, sets, labels and deletes the hosts campaigns may run on, then lists your KnowHosts. |
 | `knowop host start\|NAME pause\|NAME resume\|NAME del` | Rents a KnowHost, billed to your account, that joins as one of your hosts; it pauses after 30 minutes unused, `resume` wakes it, and `del` ends it. On a server that runs KnowHost. |
 | `knowop canvas [CANVAS_UUID] [show TYPE\|navigate ROUTE\|highlight UUID,...\|hide ID\|KEY to VALUE ...]` | Reads and changes a canvas with the grammar of `trax canvas`. Where `$TRAX_CANVAS` names a canvas, an agent drives the person's canvas with knowop alone. |
+| `knowop watch-pr add\|remove\|fix URL [--session S]` | Watches a GitHub pull request for session S (default `$TRAX_SESSION`), lets S go of it, or makes S the one agent that fixes it. `add` starts this host's serve when none runs. |
+| `knowop watch-pr status [URL]\|serve [--detach]\|stop` | Lists the watched pull requests and who watches, fixes and last read each; reads every one each minute through this host's `gh`, writing what GitHub says to its row and telling each watching agent the news; stops this host's serve. |
+| `knowop session` | Prints the session `$TRAX_SESSION` names, which `knowop run` sets for its agent's tools: its number and its UUID. |
 | `knowop upload PATH... [--public] [--server ORG\|URL] [--format claude\|codex\|sagent] [--no-subagents] [--jobs N] [--dry-run]` | Sends finished Claude Code, Codex and sagent sessions, files or folders searched for them (`~/.claude`, `~/.codex/sessions`, sagent's projects, or a copy of any; Codex's compressed `.jsonl.zst` rollouts too), each as an AgentSession under the CLI's own id, started and ended when it was. Each sub-agent, a workflow's agents included, goes as an AgentSession of its own, in its spawner's audience, linked to it (`produced_by`). A new session is private unless `--public`; uploading again sends only the records the server lacks, and lands on the same AgentSession when the same login sends it. A session the server holds keeps the audience it has, whichever flag is given. `--server` uses knowop's saved login for that server; `--dry-run` lists what would go and contacts no server. Records are masked as a run's are (`TRAX_REDACT_NAMES`). Exits 1 when a session fails. |
 | `knowop --version` | Prints the version; from a checkout, its commit. |
 
@@ -230,6 +233,7 @@ computer. Terminals use the server relay when a direct link is unavailable.
 | `process/` | The agent process `knowop run` runs: sagent in-process, live in Chat. |
 | `agent/` | What the agent process needs to continue a stored session here. |
 | `jobs/` | The job runner `knowop job` hands to. |
+| `watch_pr/` | `knowop watch-pr`: pull request rows, their news, and the serve that reads them through `gh`. |
 | `hosts.py` | `knowop host`: the host registry, and KnowHosts through the server's KnowHost API. |
 | `canvas.py` | `knowop canvas`: trax's canvas command, named as knowop's. |
 | `tools/` | The tools every agent of `knowop run` is given, plain functions over the client: the canvas's (`tools/canvas.py`), hosts, sessions and record reads (`tools/knowop.py`, whose `trax.read` action runs `tools/records.py`). |

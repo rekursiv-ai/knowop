@@ -24,6 +24,9 @@ Examples:
   knowop host             list your hosts, where campaigns may run, and KnowHosts
   knowop host start       rent a KnowHost that joins as one of your hosts
   knowop canvas           read the canvas a run sits on; --help shows how to change it
+  knowop watch-pr add URL --session Agent#412
+                          tell session 412's agent when the pull request's checks fail
+  knowop session          the session whose agent runs this command
   knowop upload ~/.claude send finished Claude Code, Codex and sagent sessions
   knowop status           profile, server, account, hosts, their runs, services
   knowop logs -f          follow this computer's connect
@@ -37,7 +40,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, Final, NoReturn, Protocol, TypedDict, cast
 
 import argparse
 import functools
@@ -86,6 +89,7 @@ if TYPE_CHECKING:
         command as process_command,
         main as process_main,
     )
+    from knowop.watch_pr import cli as watch_pr_cli
 else:
     from wrapt import lazy_import
 
@@ -94,6 +98,7 @@ else:
     # pay at every start. Only ``canvas`` reaches trax's verbs, ~20 ms more.
     canvas = lazy_import("knowop.canvas")
     jobs_cli = lazy_import("knowop.jobs.cli")
+    watch_pr_cli = lazy_import("knowop.watch_pr.cli")
     job_limits = lazy_import("knowop.connect.job_limits")
     login = lazy_import("trackinizer.trax.login")
     # The agent process ``run`` hands to, and its command line; each brings sagent.
@@ -109,6 +114,9 @@ _DEFAULT_SERVER: Final = "https://alpha.knowop.ai"
 
 _CANVAS_WORD: Final = "canvas"
 """The verb trax's canvas command runs under, on knowop's login."""
+
+_WATCH_PR_WORD: Final = "watch-pr"
+"""The verb ``watch_pr/cli.py`` runs under, on knowop's login."""
 
 
 def main(
@@ -143,7 +151,7 @@ def main(
         # Everything after ``run`` or ``job`` belongs to the runner, ``--help`` and
         # every other flag included; argparse would read them as knowop's own. Every
         # ``run``, ``host`` and ``canvas`` form is that verb's, its help pages too.
-        if args[:1] in (["run"], [HOST_WORD], [_CANVAS_WORD]) or (
+        if args[:1] in (["run"], [HOST_WORD], [_CANVAS_WORD], [_WATCH_PR_WORD]) or (
             args[:1] == ["job"] and args[1:] not in (["-h"], ["--help"])
         ):
             return _hand_off(args[0], args[1:], named=named, sleep=sleep, clock=clock)
@@ -378,6 +386,21 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         _CANVAS_WORD,
         help="read and change the canvas an agent run sits on, as trax canvas does",
     )
+    # And every ``watch-pr`` form to its commands.
+    verbs.add_parser(
+        _WATCH_PR_WORD,
+        help="watch GitHub pull requests for agent sessions, and tell their agents",
+    )
+    verbs.add_parser(
+        "session",
+        help="show the session whose agent runs this command",
+        description=(
+            "Show the session whose agent runs this command, as $TRAX_SESSION names "
+            "it: its number and its UUID. knowop run sets it for its agent's tools; "
+            "an agent whose tools run on another host asks its KnowOp tool's "
+            "session.self instead."
+        ),
+    )
     _add_upload_arguments(
         verbs.add_parser(
             "upload",
@@ -545,10 +568,36 @@ def _run(
             menubar.run(stop=services.stop)
         case "upload":
             _upload(cast(_UploadFlags, flags), named=named)
+        case "session":
+            _session(named=named)
         case _:
             # ``connect``: ``main`` hands ``run`` and ``job`` off before parsing, and
             # argparse refuses any other word.
             _connect(flags, named=named, sleep=sleep, clock=clock)
+
+
+def _session(*, named: str) -> None:
+    """Print the session ``$TRAX_SESSION`` names: its number and its UUID."""
+    text = os.environ.get("TRAX_SESSION", "")
+    if not text:
+        raise ClientError(
+            "no agent's session runs this command ($TRAX_SESSION is unset); an agent "
+            "whose tools run on another host asks its KnowOp tool's session.self",
+        )
+    session = uuid.UUID(text)
+    _, profile = _profile(named)
+    with Client(profile.url, api_key=profile.api_key) as http:
+        number = from_plain(http.get(f"/api/inquiries/{session}"), _Numbered)["seq"]
+    echo(f"AgentSession#{number} {session}")
+
+
+class _Numbered(TypedDict):
+    seq: int
+
+
+def _client(profile: Profile) -> Client:
+    """Return a client of the server ``profile`` logged in to, with its key."""
+    return Client(profile.url, api_key=profile.api_key)
 
 
 # A session that fails is said on its line, and the batch goes on; then the command
@@ -1287,6 +1336,13 @@ def _hand_off(
     if verb == "job":
         name, _ = _profile(named)
         return jobs_cli.main(["--profile", name, *args])
+    if verb == _WATCH_PR_WORD:
+        # Read only once the command asks the server: a help page needs no login.
+        return watch_pr_cli.main(
+            args,
+            login=functools.partial(_profile, named),
+            connect=_client,
+        )
     # A refused command is refused here, before a login. A daemon's start is handed
     # the server's address and a key of its own on stdin; a help page and an action
     # of sagent's ask the server nothing. None reads a profile, and none logs in.

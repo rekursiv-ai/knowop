@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
@@ -546,6 +547,39 @@ async def test_status_requires_a_named_session() -> None:
     client = _Client()
     assert "names no agent" in await _tools(client).act(action="session.status")
     assert client.starts == client.started == []
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Agent:
+    label: str
+
+
+@pytest.mark.asyncio
+async def test_self_names_the_calling_agent_and_its_session() -> None:
+    client = _Client()
+    tools = knowop.KnowOpTools(
+        client,
+        session_id=UUID(int=11),
+        records=_reads(_Server()),
+    )
+    said = await tools.act(action="session.self", context=_Agent(label="lead"))
+    assert said == (
+        f"lead#{UUID(int=11)}: you, the agent lead of session {UUID(int=11)}. "
+        f"Pass it as --session lead#{UUID(int=11)} to knowop watch-pr."
+    )
+    assert (await tools.act(action="session.self")).startswith(
+        f"Agent#{UUID(int=11)}: ",
+    )
+    assert client.starts == client.started == []
+
+
+@pytest.mark.asyncio
+async def test_self_without_a_session_says_so() -> None:
+    tools = knowop.KnowOpTools(_Client(), session_id=None, records=_reads(_Server()))
+    assert (
+        await tools.act(action="session.self")
+        == "session.self requires a caller session"
+    )
 
 
 @pytest.mark.asyncio

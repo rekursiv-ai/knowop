@@ -647,6 +647,8 @@ def this_host(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run on a host of a known name, placed on no canvas; try a failed upload again at once."""
     monkeypatch.delenv("TRAX_CANVAS", raising=False)
     monkeypatch.delenv("LC_TRAX_CANVAS", raising=False)
+    # Unset, so what a serve writes of it is undone with the test.
+    monkeypatch.delenv("TRAX_SESSION", raising=False)
     monkeypatch.setattr(main_module, "host_name", lambda: _HOST)
     monkeypatch.setattr(publisher, "retry_delays", lambda: itertools.repeat(0.0))
 
@@ -714,6 +716,7 @@ async def test_a_headless_run_says_hello_and_prints_its_session_first(
     assert capsys.readouterr().out.splitlines()[0] == str(_SESSION)
     assert code == 0
     assert opened.interactive == [False]
+    assert os.environ["TRAX_SESSION"] == str(_SESSION)
     # sagent's own daemon starts beside it, as for any agent a person runs.
     assert opened.use_daemon == [True]
 

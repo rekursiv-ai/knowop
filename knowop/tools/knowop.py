@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from importlib.resources import files
 from typing import TYPE_CHECKING, Final, Literal, Protocol, TypedDict
 from uuid import UUID, uuid4
@@ -60,8 +61,28 @@ type Action = Literal[
     "session.stop",
     "session.status",
     "session.continue",
+    "session.self",
     "trax.read",
 ]
+
+
+class Caller(Protocol):
+    """The agent that calls the tool: an agent framework's context, such as sagent's."""
+
+    @property
+    def label(self) -> str:
+        """Its label in its session, as ``LABEL#N`` names it; empty for the default."""
+        ...
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Unnamed:
+    """The caller of a tool that names none: the session's root agent."""
+
+    label: str = ""
+
+
+_UNNAMED: Final = _Unnamed()
 
 
 class KnowOpClient(KnowHostClient, ProcessClient, Protocol):
@@ -116,6 +137,7 @@ class KnowOpTools:
         effort: str = "",
         budget: float | None = None,
         command: str = "",
+        context: Caller = _UNNAMED,
     ) -> str:
         """Operate on a host or an agent session, or read Trackinizer's records.
 
@@ -128,6 +150,8 @@ class KnowOpTools:
           effort: Launch thinking effort; empty keeps the default.
           budget: Launch budget in USD; omitted takes the person's campaign limit.
           command: Required for trax.read: a trax read command, as typed after `trax`.
+          context: The calling agent, whose label ``session.self`` answers with; the
+            agent framework passes it, and it is no argument of the model's.
 
         Returns:
           answer: The result or the server's refusal.
@@ -143,6 +167,7 @@ class KnowOpTools:
                 effort=effort,
                 budget=budget,
                 command=command,
+                label=context.label or "Agent",
             )
         except ClientError as error:
             return server_answer(error)
@@ -159,9 +184,20 @@ class KnowOpTools:
         effort: str,
         budget: float | None,
         command: str,
+        label: str,
     ) -> str:
         client = self._client
         match action:
+            # Named by UUID: a process key reads no inquiry of its own session, only
+            # of the sessions its agents spawned.
+            case "session.self":
+                if self._session_id is None:
+                    return "session.self requires a caller session"
+                named = f"{label}#{self._session_id}"
+                return (
+                    f"{named}: you, the agent {label} of session {self._session_id}. "
+                    f"Pass it as --session {named} to knowop watch-pr."
+                )
             case "host.list":
                 registered = client.terminal_hosts().hosts
                 rented = listed_knowhosts(client)
@@ -277,11 +313,14 @@ class KnowOpTools:
             session_id=session_id,
             spec=ProcessSpec(args=built),
         )
-        number = from_plain(
+        return f"{label}#{self._number(session_id)}"
+
+    def _number(self, session_id: UUID) -> int:
+        """Return the session's number, as ``AgentSession#N`` and ``LABEL#N`` name it."""
+        return from_plain(
             self._client.get(f"/api/inquiries/{session_id}"),
             _Numbered,
         )["seq"]
-        return f"{label}#{number}"
 
     # The campaign limit is the person's Each campaign budget on the Usage page: their
     # total on each campaign, on every kind of work, model and lane. A server without
