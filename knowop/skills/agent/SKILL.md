@@ -109,7 +109,10 @@ takes, and the rest of its arguments are what the verb needs:
 - `show` opens a `visual` (`trax.record`, `trax.subgraph`, `trax.timeline`,
   `trax.files`, `trax.terminal` and the rest) on a `record`, with its `params`;
   `hide` closes one. `chat` is a visual too: hide it to have the person look.
-- `navigate` moves the page to a `route`, such as `#/pulls`.
+- `navigate` moves the page to a `route`, such as `#/pulls`. `#/graph`, the page a
+  new workspace opens on unless the person chose an empty `home`, draws the graph
+  of this workspace and of the records the person worked on last: it is "the
+  graph" when no record is named; a record's graph is `trax.subgraph`.
 - `highlight` points at records; `mark` and `unmark` draw and take away a red box;
   `capture` sees the canvas as the person does, as a picture.
 - `set` changes how the app looks for the person: font, text sizes, theme, skin,
