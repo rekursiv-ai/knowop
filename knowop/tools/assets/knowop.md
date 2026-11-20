@@ -16,6 +16,9 @@ reading Trackinizer's records.
 
 - `session.budget`: the person's campaign limit, in USD: their Each campaign
   budget under Budgets and alerts on the Usage page, else this site's default.
+  With `name` a campaign's brief (`Issue#N`): what that campaign spent, in the
+  last hour, of its budget if it has one, and how many of its GPU jobs still
+  run; the figure is not final while any do.
 - `session.set_budget`: set the person's campaign limit to `budget` (USD),
   only when the person asks; every other limit stays.
 - `session.launch`: start a campaign lead on our cloud, spawned by this

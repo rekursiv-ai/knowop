@@ -37,6 +37,7 @@ from knowop.jobs.conftest import (
     _Time,
     allowed,
     outs,
+    scratches,
     snapshotted,
 )
 from knowop.jobs.job import JOB_WORD, Job, Rig, results_dir
@@ -74,6 +75,7 @@ def _submit(
     follow: bool = False,
     include_untracked: bool = False,
     node: str | None = None,
+    campaign: str = "",
 ) -> None:
     Job.run_submit(
         world.rig,
@@ -84,6 +86,7 @@ def _submit(
         follow=follow,
         include_untracked=include_untracked,
         node=node,
+        campaign=campaign,
     )
 
 
@@ -229,8 +232,22 @@ def test_submit_defaults_to_one_gpu_and_ten_minutes(
     Job.dispatch(JOB_WORD, ["submit", "--", "true"], _no_client)
 
     args = seen[0]
-    names = ("gpus", "minutes", "label", "follow", "include_untracked")
-    assert [getattr(args, name) for name in names] == [1, 10, "", False, False]
+    names = ("gpus", "minutes", "label", "follow", "include_untracked", "campaign")
+    assert [getattr(args, name) for name in names] == [1, 10, "", False, False, ""]
+
+
+def test_submit_names_its_campaign_by_its_brief(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _capture_run(monkeypatch)
+
+    Job.dispatch(
+        JOB_WORD,
+        ["submit", "--campaign", "Issue#7", "--", "true"],
+        _no_client,
+    )
+
+    assert vars(cast("argparse.Namespace", seen[0]))["campaign"] == "Issue#7"
 
 
 def test_node_and_host_are_mutually_exclusive() -> None:
@@ -338,13 +355,15 @@ def test_secrets_lists_the_names_the_server_holds(
 # -- submit.
 
 
-@pytest.mark.parametrize("node", [None, "gpu-node"])
+@pytest.mark.parametrize(("node", "campaign"), [(None, ""), ("gpu-node", "Issue#7")])
 def test_submit_uploads_the_bundle_starts_the_job_and_prints_only_its_id(
     world: _Rig,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    *,
     node: str | None,
+    campaign: str,
 ) -> None:
     bundled = _fake_source(monkeypatch, tmp_path, base=_BASE)
     world.node.bases = [_BASE]
@@ -356,7 +375,14 @@ def test_submit_uploads_the_bundle_starts_the_job_and_prints_only_its_id(
     saved.mkdir(parents=True)
 
     with _caller_in(tmp_path):
-        _submit(world, command=("python", "x.py"), label="try", gpus=2, node=node)
+        _submit(
+            world,
+            command=("python", "x.py"),
+            label="try",
+            gpus=2,
+            node=node,
+            campaign=campaign,
+        )
 
     assert snapshotted == [tmp_path]
     captured = capsys.readouterr()
@@ -377,7 +403,7 @@ def test_submit_uploads_the_bundle_starts_the_job_and_prints_only_its_id(
     assert (submit.gpus, submit.minutes, submit.label) == (2, 10, "try")
     assert (submit.argv, submit.commit) == (["python", "x.py"], _COMMIT)
     assert submit.public_key == _PUBLIC
-    assert submit.node == node
+    assert (submit.node, submit.campaign) == (node, campaign)
     assert world.server.calls[1:3] == [("grant", (7, 25)), ("grant", (7, 25))]
     start = cast("tuple[int, StartBody]", world.server.calls[3][1])
     assert start[0] == 7
@@ -386,8 +412,10 @@ def test_submit_uploads_the_bundle_starts_the_job_and_prints_only_its_id(
     assert world.server.calls[4] == ("job", 7)
     assert bundled == [[_BASE]]
     assert outs == ["thin.bundle"]
+    assert scratches[0].startswith("job-")
     assert world.node.uploaded == [b"b" * 12]
     assert [words[0] for words in world.node.words] == ["bases", "upload"]
+    assert [each.name for each in saved.iterdir()] == ["src.bundle"]
     assert (saved / "src.bundle").read_bytes() == b"b" * 12
     assert not world.node.keygen_dirs[0].exists()
     assert world.time.slept == [2]
@@ -591,6 +619,22 @@ def test_a_bad_argument_is_named_by_its_position(
         match=r"^invalid job: argv\.1: String should match",
     ):
         _submit(world, command=("python", "a\x00b"))
+
+
+def test_a_campaign_that_is_not_a_brief_is_refused_before_any_job_is_asked_for(
+    world: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _ = _fake_source(monkeypatch, tmp_path)
+
+    with pytest.raises(
+        ClientError,
+        match=r"^invalid job: campaign: String should match",
+    ):
+        _submit(world, campaign="campaign/Issue#7")
+
+    assert world.server.calls == []
 
 
 def test_a_refused_grant_prints_the_reason_and_exits_one_without_uploading(
@@ -1273,6 +1317,10 @@ def test_submit_with_a_host_caps_its_memory_at_32g_unless_told(
         (
             ["submit", "--host", "gx10", "--memory", "lots", "--", "x"],
             "--memory: 'lots' is not a size",
+        ),
+        (
+            ["submit", "--host", "gx10", "--campaign", "Issue#7", "--", "x"],
+            "a job on your own computer is charged to no campaign",
         ),
     ],
 )

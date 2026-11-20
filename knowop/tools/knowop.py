@@ -5,13 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from importlib.resources import files
 from typing import TYPE_CHECKING, Final, Literal, Protocol, TypedDict
+from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 import argparse
 import asyncio
+import re
 
 from trackinizer.client.errors import ClientError, server_answer
 from trackinizer.wire.refs import SeqRef
+from trackinizer.wire.wire_job import TERMINAL_STATES
 from trackinizer.wire.wire_science_chat import chat_session_id
 from trackinizer.wire.wire_session_relay import ProcessSpec, remote_flags_refused
 from trackinizer.wire.wire_sessions import SessionAgent, SessionStart
@@ -28,6 +31,7 @@ from knowop.hosts import (
     start_knowhost,
     started_lines,
 )
+from knowop.jobs.job_records import NOT_HERE
 from knowop.process.command import time_limit
 from knowop.process.start import ProcessClient, start_args, started_process
 
@@ -35,6 +39,7 @@ from knowop.process.start import ProcessClient, start_args, started_process
 if TYPE_CHECKING:
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.wire.refs import Ref
+    from trackinizer.wire.wire_job import JobList
     from trackinizer.wire.wire_session_relay import AgentProcess
     from trackinizer.wire.wire_sessions import SessionStartResponse
     from trackinizer.wire.wire_terminals import TerminalHosts
@@ -112,6 +117,10 @@ class KnowOpClient(KnowHostClient, ProcessClient, Protocol):
         """Replace a server resource."""
         ...
 
+    def job_list(self) -> JobList:
+        """List the person's GPU jobs."""
+        ...
+
 
 class KnowOpTools:
     """Operate on the caller's hosts and agent sessions, and read its records."""
@@ -144,7 +153,8 @@ class KnowOpTools:
         Args:
           action: Operate hosts; launch, stop, inspect or continue a session; or
             read records (trax.read).
-          name: The host name, launch label, or required LABEL#N for session actions.
+          name: The host name, launch label, required LABEL#N for session actions, or
+            for ``session.budget`` a campaign's brief, Issue#N, to read its spend.
           time: Required launch/continue Slurm time limit (20 means 20 minutes).
           model: Launch model; empty keeps the server's default.
           effort: Launch thinking effort; empty keeps the default.
@@ -220,6 +230,8 @@ class KnowOpTools:
                         resume_knowhost(client, named_knowhost(client, name)),
                     ),
                 )
+            case "session.budget" if name:
+                return self._campaign_spend(name)
             case "session.budget":
                 most, source = self._campaign_most()
                 return (
@@ -356,6 +368,55 @@ class KnowOpTools:
         )
         return f"The campaign limit is now ${budget:g}."
 
+    # A job's spend is charged while it runs, so the sum grows until each job of the
+    # campaign is in a state it never leaves.
+    def _campaign_spend(self, name: str) -> str:
+        """Return what campaign ``name`` (``Issue#7``) spent, and if that is final."""
+        if re.fullmatch(r"Issue#[1-9][0-9]*", name) is None:
+            return (
+                "session.budget names a campaign by its brief, Issue#N; or nothing, "
+                "for the campaign limit."
+            )
+        ref = f"campaign/{name}"
+        try:
+            [spend] = from_plain(
+                self._client.get(
+                    f"/api/addons/knowspend/campaigns?{urlencode({'ref': ref})}",
+                ),
+                list[_CampaignSpend],
+            )
+        except ClientError as error:
+            if error.status_code != 404:
+                raise
+            return "This server keeps no campaign spend."
+        spent, hour = spend["spent"] / 1_000_000, spend["last_hour"] / 1_000_000
+        said = (
+            f"{ref} spent ${spent:.2f}, ${hour:.2f} of it in the last hour; it has no "
+            "budget."
+            if spend["budget"] is None
+            else f"{ref} spent ${spent:.2f} of its ${spend['budget'] / 1_000_000:.2f} "
+            f"budget, ${hour:.2f} of it in the last hour."
+        )
+        return f"{said} {self._unfinished_jobs(name)}"
+
+    def _unfinished_jobs(self, name: str) -> str:
+        """Say how many of campaign ``name``'s GPU jobs have not ended."""
+        try:
+            jobs = self._client.job_list().jobs
+        except ClientError as error:
+            if error.status_code not in NOT_HERE:
+                raise
+            return "This server runs no GPU jobs."
+        running = sum(
+            each.campaign == name and each.state not in TERMINAL_STATES for each in jobs
+        )
+        if not running:
+            return "None of its GPU jobs runs."
+        return (
+            f"{running} of its GPU jobs still {'runs' if running == 1 else 'run'}, so "
+            "the figure is not final."
+        )
+
     def _limits(self) -> _Limits | None:
         """Return the person's limits; ``None`` from a server without usage."""
         try:
@@ -380,6 +441,12 @@ def _is_each_campaign(limit: _Limit) -> bool:
 
 class _Numbered(TypedDict):
     seq: int
+
+
+class _CampaignSpend(TypedDict):
+    spent: int
+    budget: int | None
+    last_hour: int
 
 
 class _Limit(TypedDict):

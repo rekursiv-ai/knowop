@@ -8,11 +8,17 @@ tools: Bash, Read
 
 # knowop job -- GPU jobs from your computer
 
-`knowop job submit [--gpus N] [--minutes M] [--label TEXT] [--follow]
-[--include-untracked] -- CMD...` runs CMD on a GPU node from the repository you
-are in, and prints the job id. Everything after the first `--` is the job's
-command, even `--help`. `--gpus` is 1 to 8 (default 1) and `--minutes` is 1 to
-360 (default 10).
+`knowop job submit [--gpus N] [--minutes M] [--campaign Issue#N] [--label TEXT]
+[--follow] [--include-untracked] -- CMD...` runs CMD on a GPU node from the
+repository you are in, and prints the job id. Everything after the first `--` is
+the job's command, even `--help`. `--gpus` is 1 to 8 (default 1) and `--minutes`
+is 1 to 360 (default 10).
+
+`--campaign Issue#N` charges the job to the campaign of brief Issue#N, and its
+limits hold it; without it the job is yours alone. The brief must be yours: the
+server refuses one held by another account, or that does not exist, with 403
+before anything is charged. A job on your own computer (`--host`) is charged to
+nothing, so it takes no `--campaign`.
 
 Core rule: `knowop job submit --help` is the source of truth. If this skill
 disagrees with it, trust the help.

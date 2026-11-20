@@ -83,7 +83,8 @@ PROGRAM: Final = "knowop job"
 
 _SUBMIT: Final = (
     f"{PROGRAM} submit [--host NAME [--memory SIZE]] [--gpus N] [--minutes M] "
-    "[--node NAME] [--label TEXT] [--follow] [--include-untracked] -- CMD..."
+    "[--node NAME] [--campaign Issue#N] [--label TEXT] [--follow] "
+    "[--include-untracked] -- CMD..."
 )
 _UNTRACKED_SHOWN: Final = 10
 _MEMORY: Final = "32G"
@@ -156,6 +157,13 @@ class Job(Command):
             ),
             ("--label TEXT", "a short name for the job"),
             ("--node NAME", "require a broker node; fail instead of falling back"),
+            (
+                "--campaign Issue#N",
+                (
+                    "with submit: charge the job to the campaign of brief Issue#N, "
+                    "which must be yours; not with --host"
+                ),
+            ),
             ("--follow", "with submit: stream the log until the job ends"),
             (
                 "--include-untracked",
@@ -220,6 +228,7 @@ class Job(Command):
             include_untracked=False,
             host="",
             node=None,
+            campaign="",
             memory=None,
             job=None,
             to=None,
@@ -230,6 +239,7 @@ class Job(Command):
         submit = verbs.add_parser("submit", add_help=False)
         submit.add_argument("--host", default="")
         submit.add_argument("--node", default=None)
+        submit.add_argument("--campaign", default="")
         submit.add_argument("--memory", default=None)
         submit.add_argument("--gpus", type=int, default=1)
         submit.add_argument("--minutes", type=int, default=10)
@@ -290,6 +300,11 @@ class Job(Command):
         job = flags.job
         if flags.host and flags.node is not None:
             raise ClientError("choose --host or --node, not both")
+        if flags.host and flags.campaign:
+            raise ClientError(
+                "a job on your own computer is charged to no campaign: "
+                "drop --campaign, or --host to run on a GPU node",
+            )
         match flags.action:
             case "submit" if flags.host:
                 cls.run_host_submit(
@@ -317,6 +332,7 @@ class Job(Command):
                     label=flags.label,
                     follow=flags.follow,
                     include_untracked=flags.include_untracked,
+                    campaign=flags.campaign,
                 )
             case "status":
                 job_records.run_status(client_factory(), job)
@@ -436,6 +452,7 @@ class Job(Command):
         follow: bool,
         include_untracked: bool,
         node: str | None = None,
+        campaign: str = "",
     ) -> None:
         """Snapshot the repository, upload it to a node, and start the job.
 
@@ -451,6 +468,8 @@ class Job(Command):
           include_untracked: Send untracked files named like secrets, which the
             snapshot refuses otherwise.
           node: Required broker node, or automatic placement.
+          campaign: The brief of the campaign the job is charged to, ``Issue#7``;
+            empty for none.
 
         """
         with tempfile.TemporaryDirectory(prefix="job-") as scratch:
@@ -476,6 +495,7 @@ class Job(Command):
                     label=label,
                     commit=snap.commit,
                     node=node,
+                    campaign=campaign,
                 )
                 job = rig.client.job_submit(body)
                 echo(f"job {job.id}: requested, waiting for a node", err=True)
@@ -577,6 +597,7 @@ class _Flags(Protocol):
     command: tuple[str, ...]
     host: str
     node: str | None
+    campaign: str
     memory: str | None
     gpus: int
     minutes: int
@@ -674,6 +695,7 @@ def _submit_body(
     label: str,
     commit: str,
     node: str | None = None,
+    campaign: str = "",
 ) -> wire_job.SubmitBody:
     """Build the submit request, or raise an error naming each bad field."""
     try:
@@ -686,6 +708,7 @@ def _submit_body(
                 "argv": list(command),
                 "commit": commit,
                 "node": node,
+                "campaign": campaign,
             },
         )
     except pydantic.ValidationError as err:
