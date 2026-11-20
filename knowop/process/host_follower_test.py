@@ -29,7 +29,8 @@ from sagent.host.wire import (
 )
 from sagent.session.types import BashResult, ToolResult
 from sagent.tools.bash import Bash
-from sagent.tools.remote import Link, RemoteSession
+from sagent.tools.remote import Link, RemoteSession, RemoteTool
+from sagent.tools.types import ToolContext
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.wire_terminals import (
     HostsVersion,
@@ -67,6 +68,7 @@ def slept(monkeypatch: pytest.MonkeyPatch) -> list[float]:
             Task=asyncio.Task,
             create_task=asyncio.create_task,
             get_running_loop=asyncio.get_running_loop,
+            timeout=asyncio.timeout,
             sleep=_Sleep(delays=delays),
         ),
     )
@@ -329,16 +331,6 @@ async def _follower(
         client.change(closed=True)
 
 
-async def _until(
-    remote: RemoteSession,
-    name: str,
-    holds: Callable[[bool], bool] = lambda up: up,
-) -> None:
-    endpoint = remote.endpoints()[name]
-    async with asyncio.timeout(5):
-        await endpoint.until(lambda e: holds(e.up))
-
-
 @pytest.mark.asyncio
 async def test_it_follows_the_hosts_the_person_may_use() -> None:
     client = _Client(
@@ -351,19 +343,87 @@ async def test_it_follows_the_hosts_the_person_may_use() -> None:
             _host("laptop"),
         ],
     )
-    async with RemoteSession([]) as remote, _follower(client, remote):
-        # Whether a host is up is its link's to find; the listing says who may use it.
-        assert list(remote.endpoints()) == ["gx10", "asleep", "laptop"]
-        # Each is reached through the server it was listed by.
-        assert {e.where for e in remote.endpoints().values()} == {
-            "https://relay.example",
+    async with RemoteSession([]) as remote, _follower(client, remote) as follower:
+        assert follower.unconnected == {
+            "gx10": "online",
+            "asleep": "offline",
+            "laptop": "online",
         }
+        assert not remote.endpoints()
         assert client.asked == ["ada@x.y"]
 
         client.bump([_host("laptop"), _host("mini")])
         await _listed(client, 2)
 
-        assert list(remote.endpoints()) == ["laptop", "mini"]
+        assert list(follower.unconnected) == ["laptop", "mini"]
+
+
+@pytest.mark.asyncio
+async def test_discovering_hosts_does_not_open_tool_links(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _Client(hosts=[_host("gx10"), _host("laptop")])
+    async with (
+        _daemons(monkeypatch, "gx10", "laptop") as daemons,
+        RemoteSession([], retry_sec=0.01) as remote,
+        _follower(client, remote) as follower,
+    ):
+        await _waiting(client, 1)
+        tool = follower.tool(RemoteTool(remote=remote))
+        context = ToolContext()
+        listed = await tool.call(context, {}).result
+        assert all(name in listed.text() for name in ("gx10", "laptop"))
+        assert "gx10 (online; on demand)" in tool.reminder(context)
+        assert daemons.dialed == []
+
+        shown, schema = await asyncio.gather(
+            tool.call(context, {"endpoint": "gx10"}).result,
+            tool.call(context, {"endpoint": "gx10", "tool": "Bash"}).result,
+        )
+        assert "gx10  up" in shown.text()
+        assert "Schema:" in schema.text()
+        assert list(remote.endpoints()) == ["gx10"]
+        assert [host for _, _, host, _ in daemons.dialed] == ["gx10"]
+
+        mixed = await tool.call(context, {}).result
+        assert "gx10  up" in mixed.text()
+        assert "laptop  online: opens on first use" in mixed.text()
+        assert "gx10 (up:" in tool.reminder(context)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_host_does_not_dial_and_a_silent_host_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def silent(*args: object, **kwargs: object) -> Streams:
+        del args, kwargs
+        return await _never_answered()
+
+    def immediately(seconds: float) -> asyncio.Timeout:
+        assert seconds == 10.0
+        return asyncio.timeout(0)
+
+    monkeypatch.setattr(host_follower, "dial_tools", silent)
+    monkeypatch.setattr(
+        "knowop.process.host_follower.asyncio.timeout",
+        immediately,
+    )
+    client = _Client(hosts=[_host("slow")])
+    async with RemoteSession([]) as remote, _follower(client, remote) as follower:
+        tool = follower.tool(RemoteTool(remote=remote))
+        context = ToolContext()
+        with pytest.raises(ValueError, match="Use AgentSend directly"):
+            _ = await tool.call(context, {"tool": "AgentSend"}).result
+        with pytest.raises(ValueError, match="No endpoint 'absent'"):
+            _ = await tool.call(context, {"endpoint": "absent"}).result
+        with pytest.raises(ValueError, match="Use AgentSend directly"):
+            _ = await tool.call(
+                context,
+                {"endpoint": "slow", "tool": "AgentSend"},
+            ).result
+        assert not remote.endpoints()
+        with pytest.raises(ValueError, match="tool link to slow did not connect"):
+            _ = await tool.call(context, {"endpoint": "slow"}).result
 
 
 @pytest.mark.asyncio
@@ -374,9 +434,9 @@ async def test_with_no_asker_it_follows_the_keys_own_account_and_dials_as_it(
     async with (
         _daemons(monkeypatch, "gx10") as daemons,
         RemoteSession([], retry_sec=0.01) as remote,
-        _follower(client, remote, asker=None),
+        _follower(client, remote, asker=None) as follower,
     ):
-        await _until(remote, "gx10")
+        await follower.activate("gx10")
 
     assert (client.asked, client.waited[0]) == ([None], (None, None))
     assert daemons.dialed == [("https://relay.example", "assistant-key", "gx10", None)]
@@ -391,17 +451,20 @@ async def test_sagents_own_links_are_kept_beside_the_hosts_and_through_a_refusal
     client = _Client(hosts=[_host("gx10")])
     async with (
         RemoteSession([], retry_sec=3600) as remote,
-        _follower(client, remote, keep=[own], retry_sec=0.01),
+        _follower(client, remote, keep=[own], retry_sec=0.01) as follower,
     ):
-        assert list(remote.endpoints()) == [own.name, "gx10"]
+        assert list(remote.endpoints()) == [own.name]
+        assert list(follower.unconnected) == ["gx10"]
 
         client.bump([_host("mini")])
         await _listed(client, 2)
-        assert list(remote.endpoints()) == [own.name, "mini"]
+        assert list(remote.endpoints()) == [own.name]
+        assert list(follower.unconnected) == ["mini"]
 
         client.change(refusing=401)
         await _waiting(client, 3)
         assert list(remote.endpoints()) == [own.name]
+        assert not follower.unconnected
 
 
 @pytest.mark.asyncio
@@ -409,22 +472,22 @@ async def test_the_host_the_agent_runs_on_is_left_to_its_local_link() -> None:
     client = _Client(hosts=[_host("gx10"), _host("laptop")])
     async with (
         RemoteSession([]) as remote,
-        _follower(client, remote, own_host="laptop"),
+        _follower(client, remote, own_host="laptop") as follower,
     ):
-        assert list(remote.endpoints()) == ["gx10"]
+        assert list(follower.unconnected) == ["gx10"]
 
 
 @pytest.mark.asyncio
 async def test_a_host_that_joins_mid_session_shows_up_without_a_poll() -> None:
     client = _Client(hosts=[_host("gx10")])
-    async with RemoteSession([]) as remote, _follower(client, remote):
+    async with RemoteSession([]) as remote, _follower(client, remote) as follower:
         await _waiting(client, 1)
         started = asyncio.get_running_loop().time()
 
         client.bump([_host("gx10"), _host("laptop")])
         await _listed(client, 2)
 
-        assert list(remote.endpoints()) == ["gx10", "laptop"]
+        assert list(follower.unconnected) == ["gx10", "laptop"]
         # Its waits hold for an hour, and the host came in well under a second.
         assert asyncio.get_running_loop().time() - started < 1
         assert client.waited == [(None, "ada@x.y"), (7, "ada@x.y"), (8, "ada@x.y")]
@@ -446,14 +509,14 @@ async def test_an_idle_follower_asks_once_per_wait_and_lists_nothing_more() -> N
 @pytest.mark.asyncio
 async def test_a_restarted_server_converges_on_its_own_version() -> None:
     client = _Client(hosts=[_host("gx10")])
-    async with RemoteSession([]) as remote, _follower(client, remote):
+    async with RemoteSession([]) as remote, _follower(client, remote) as follower:
         await _waiting(client, 1)
 
         # A restart forgets the versions: the new process holds one of its own.
         client.change(version=4_000, hosts=[_host("mini")])
         await _listed(client, 2)
 
-        assert list(remote.endpoints()) == ["mini"]
+        assert list(follower.unconnected) == ["mini"]
         assert client.waited[-1] == (4_000, "ada@x.y")
 
 
@@ -463,13 +526,16 @@ async def test_an_outage_keeps_the_links_and_asks_again_only_after_its_delay(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = _Client(hosts=[_host("gx10")])
-    async with RemoteSession([]) as remote, _follower(client, remote, retry_sec=0.01):
+    async with (
+        RemoteSession([]) as remote,
+        _follower(client, remote, retry_sec=0.01) as follower,
+    ):
         await _waiting(client, 1)
 
         client.change(down=True)
         await _waiting(client, 4)
 
-        assert list(remote.endpoints()) == ["gx10"]
+        assert list(follower.unconnected) == ["gx10"]
         assert client.asked == ["ada@x.y"]
         # Three asks into the outage, each after the delay: not a tight loop.
         asked_again = len(client.waited) - 2
@@ -505,19 +571,22 @@ async def test_the_servers_refusal_ends_the_links_and_they_come_back_with_access
     code: str,
 ) -> None:
     client = _Client(hosts=[_host("gx10")])
-    async with RemoteSession([]) as remote, _follower(client, remote, retry_sec=0.01):
+    async with (
+        RemoteSession([]) as remote,
+        _follower(client, remote, retry_sec=0.01) as follower,
+    ):
         await _waiting(client, 1)
 
         client.change(refusing=status, refusing_code=code)
         await _waiting(client, 2)
-        assert list(remote.endpoints()) == []
+        assert not follower.unconnected
         # The wait after the refused one names no version at all.
         assert client.waited[2] == (None, "ada@x.y")
 
         # Refused, it no longer holds a version, so its next wait answers at once.
         client.change(refusing=None)
         await _listed(client, 2)
-        assert list(remote.endpoints()) == ["gx10"]
+        assert list(follower.unconnected) == ["gx10"]
 
 
 @pytest.mark.parametrize(
@@ -531,13 +600,16 @@ async def test_anything_but_the_servers_refusal_is_an_outage_and_keeps_the_links
 ) -> None:
     """A 403 from the edge in front of the server must not end every running call."""
     client = _Client(hosts=[_host("gx10")])
-    async with RemoteSession([]) as remote, _follower(client, remote, retry_sec=0.01):
+    async with (
+        RemoteSession([]) as remote,
+        _follower(client, remote, retry_sec=0.01) as follower,
+    ):
         await _waiting(client, 1)
 
         client.change(refusing=status, refusing_code=code)
         await _waiting(client, 3)
 
-        assert list(remote.endpoints()) == ["gx10"]
+        assert list(follower.unconnected) == ["gx10"]
 
 
 @pytest.mark.parametrize("failing", ["version", "listing"])
@@ -563,9 +635,9 @@ async def test_a_listing_with_no_change_disturbs_nothing(
     async with (
         _daemons(monkeypatch, "gx10") as daemons,
         RemoteSession([], retry_sec=0.01) as remote,
-        _follower(client, remote),
+        _follower(client, remote) as follower,
     ):
-        await _until(remote, "gx10")
+        await follower.activate("gx10")
         endpoint = remote.endpoints()["gx10"]
         endpoint.tools = {"Bash": _BASH.digest}
         running = asyncio.create_task(
@@ -604,9 +676,9 @@ async def test_a_host_that_goes_is_removed_and_its_calls_fail(
     async with (
         _daemons(monkeypatch, "gx10", "laptop", "mini") as daemons,
         RemoteSession([], retry_sec=0.01) as remote,
-        _follower(client, remote),
+        _follower(client, remote) as follower,
     ):
-        await _until(remote, "gx10")
+        await follower.activate("gx10")
         endpoint = remote.endpoints()["gx10"]
         endpoint.tools = {"Bash": _BASH.digest}
         waiting = asyncio.create_task(
@@ -623,10 +695,11 @@ async def test_a_host_that_goes_is_removed_and_its_calls_fail(
         client.bump([_host("laptop"), _host("mini")])
         await _listed(client, 2)
 
-        assert list(remote.endpoints()) == ["laptop", "mini"]
+        assert not remote.endpoints()
+        assert list(follower.unconnected) == ["laptop", "mini"]
         failure = await asyncio.wait_for(waiting, 5)
         assert "gx10 was removed from this session" in failure.text()
-        await _until(remote, "mini")
+        await follower.activate("mini")
         assert daemons.connects["mini"] == 1
 
 

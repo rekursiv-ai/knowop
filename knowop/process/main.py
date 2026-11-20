@@ -63,6 +63,7 @@ from sagent.session.types import (
     UncategorizedToolResult,
 )
 from sagent.tools.function import tool
+from sagent.tools.remote import RemoteTool
 from sagent.tools.types import ToolOutput
 from sagent.tui.main import StartError, opened, parse_flags, run, signals
 from sagent.tui.prompt import Panes
@@ -829,7 +830,7 @@ async def _live(
                 remote=o.remote,
                 keep=o.links,
                 own_host=host,
-            ),
+            ) as hosts,
             relay,
             delivering(
                 socket.inputs(),
@@ -841,6 +842,10 @@ async def _live(
                 canvas=canvas,
             ) as quit_ran,
         ):
+            for member in {o.agent, *o.team.values()}:
+                tool_ = member.tools.get("RemoteTool")
+                if isinstance(tool_, RemoteTool):
+                    member.runtime.tools[tool_.name] = hosts.tool(tool_)
             screen = (
                 [
                     _quit_at_screen(

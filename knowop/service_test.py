@@ -203,6 +203,27 @@ def test_a_service_keeps_provider_selection_but_no_other_sagent_variables(
     assert "OPENAI_API_KEY" not in env
 
 
+@pytest.mark.parametrize("manager", ["launchd", "systemd"])
+def test_a_service_keeps_only_the_explicit_tool_capacity_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manager: Literal["launchd", "systemd"],
+) -> None:
+    limits = {
+        "KNOWOP_TOOL_ACTIVE_CALLS": "64",
+        "KNOWOP_TOOL_QUEUED_CALLS": "512",
+        "KNOWOP_TOOL_QUEUED_MIB": "256",
+    }
+    for name, value in limits.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("KNOWOP_TOOLS_TOKEN", "not-retained")
+    Services(manager=manager, folder=tmp_path / "agents", run=_Manager()).start(_ADA)
+    env = _definition_environment(_installed(tmp_path, manager), manager)
+    assert {
+        name: val for name, val in env.items() if name.startswith("KNOWOP_TOOL")
+    } == limits
+
+
 def test_a_systemd_unit_restarts_on_failure_within_limits_and_appends_to_the_log(
     tmp_path: Path,
 ) -> None:

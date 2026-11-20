@@ -2195,12 +2195,11 @@ async def test_a_local_model_runs_a_tool_on_another_host_with_remote_tools_only(
     ):
         _ = await relay.seen(_is("settings"))
         assert opened.remote is not None
-        assert list(opened.remote.endpoints()) == ["lab-box"]
-        endpoint = opened.remote.endpoints()["lab-box"]
-        async with asyncio.timeout(5):
-            await endpoint.until(lambda e: e.up)
+        assert not opened.remote.endpoints()
+        assert not daemons.dialed
         assert opened.agent is not None
         assert await opened.agent.send("which host?") == "it is lab-box"
+        assert list(opened.remote.endpoints()) == ["lab-box"]
         results = [
             r for r in opened.agent.session.history() if isinstance(r, ToolResult)
         ]

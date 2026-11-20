@@ -174,9 +174,7 @@ def connect_host(
             sleep=sleep,
             joined_terminals=terminals,
             tools_for=(
-                (lambda joined: _tool_serving(name, server, joined, wake=wake))
-                if tools
-                else None
+                (lambda joined: _tool_serving(name, server, joined)) if tools else None
             ),
             jobs_for=jobs_for,
             job_facts=None if offer is None else offer.facts,
@@ -255,17 +253,13 @@ def _tool_serving(
     name: str,
     url: str,
     joined: JoinResponse,
-    *,
-    wake: Wake | None = None,
 ) -> tool_serving.ToolServing:
     """Make the tool server for a joined host."""
     return tool_serving.ToolServing(
         url,
         credential=joined.credential,
         name=name,
-        client_for=lambda key: Client(url, api_key=key),
         dirs=tool_serving.tool_dirs(name, server=url),
-        wake=wake,
     )
 
 
