@@ -33,7 +33,7 @@ from trackinizer.trax.connection import server_dir
 from trackinizer.trax.render import echo
 from trackinizer.wire.wire_daemon import HEARTBEAT_SEC
 from websockets.asyncio.client import connect
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 
 if TYPE_CHECKING:
@@ -292,6 +292,7 @@ class ToolServing:
         instance: uuid.UUID,
     ) -> None:
         path = wire_tools.HOST_TOOLS_MUX_PATH.format(host_id=host_id)
+        last = None  # pragma: no mutate[truthiness]
         while not self._stop.is_set():
             try:
                 async with connect(
@@ -303,11 +304,23 @@ class ToolServing:
                     close_timeout=self._close_sec,
                 ) as socket:
                     await self._mux_socket(server, socket)
+            except InvalidStatus as error:
+                event = "failed", "http_status", error.response.status_code
             except Exception as error:  # noqa: BLE001 -- Retry a failed daemon connection.
+                event = "failed", "error", type(error).__name__
+            else:
+                event = "closed", "close_code", socket.close_code
+            if event != last:
+                action, field, value = event
                 _logger.warning(
-                    "daemon tool mux failed: error=%s",
-                    type(error).__name__,
+                    "daemon tool mux %s: host=%s instance=%s %s=%s",
+                    action,
+                    self._name,
+                    instance,
+                    field,
+                    value,
                 )
+                last = event
             await asyncio.sleep(self._retry_sec)
 
     async def _mux_socket(self, server: Server, socket: ClientConnection) -> None:

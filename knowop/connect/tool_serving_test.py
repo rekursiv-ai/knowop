@@ -64,12 +64,15 @@ from trackinizer.wire.wire_tools import (
     ToolMux,
 )
 from treekle import PlainTree
+from websockets.datastructures import Headers
 from websockets.exceptions import (
     ConnectionClosed,
     ConnectionClosedError,
     ConnectionClosedOK,
+    InvalidStatus,
 )
 from websockets.frames import Close, CloseCode
+from websockets.http11 import Response
 from wrapt import lazy_import
 
 import pytest
@@ -702,15 +705,17 @@ async def test_stop_closes_the_server_and_joins_the_mux(
     assert stopped.is_set()
 
 
+@pytest.mark.parametrize("http_refusal", [False, True], ids=["network", "http"])
 async def test_mux_retries_a_failed_dial_with_the_same_daemon_identity(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     relays: _Board,
+    http_refusal: bool,
 ) -> None:
     async with _relay(relays) as relay:
         daemon = _daemon(relay, retry_sec=0, dial_sec=2)
         server = Mock(spec=sagent_host_server.Server)
-        socket = Mock()
+        socket = Mock(close_code=4403, close_reason="private close reason")
         attempts = 0
         closed = False
 
@@ -718,7 +723,11 @@ async def test_mux_retries_a_failed_dial_with_the_same_daemon_identity(
         async def dial(*_args: object, **_kwargs: object) -> AsyncGenerator[Mock]:
             nonlocal attempts, closed
             attempts += 1
-            if attempts == 1:
+            if attempts <= 2:
+                if http_refusal:
+                    raise InvalidStatus(
+                        Response(403, "private status phrase", Headers()),
+                    )
                 raise OSError("private dial detail")
             try:
                 yield socket
@@ -734,8 +743,12 @@ async def test_mux_retries_a_failed_dial_with_the_same_daemon_identity(
             await daemon._mux_loop(server, _HOST, _INSTANCE)
 
     assert closed
-    assert connect.call_count == 2
-    assert connect.call_args_list[0] == connect.call_args_list[1]
+    assert connect.call_count == 3
+    assert (
+        connect.call_args_list[0]
+        == connect.call_args_list[1]
+        == connect.call_args_list[2]
+    )
     connect.assert_called_with(
         relay.url.replace("http", "ws", 1)
         + HOST_TOOLS_MUX_PATH.format(host_id=_HOST)
@@ -747,7 +760,15 @@ async def test_mux_retries_a_failed_dial_with_the_same_daemon_identity(
         close_timeout=0.05,
     )
     serve_socket.assert_awaited_once_with(server, socket)
-    assert caplog.messages == ["daemon tool mux failed: error=OSError"]
+    failed, disconnected = caplog.messages
+    assert failed.startswith("daemon tool mux failed:")
+    assert disconnected.startswith("daemon tool mux closed:")
+    for message in (failed, disconnected):
+        assert f"host={_NAME} instance={_INSTANCE}" in message
+    assert failed.endswith("http_status=403" if http_refusal else "error=OSError")
+    assert disconnected.endswith("close_code=4403")
+    assert "private" not in caplog.text
+    assert _CREDENTIAL not in caplog.text
 
 
 @pytest.mark.parametrize("relay_left", [False, True], ids=["delivered", "relay-left"])

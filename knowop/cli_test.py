@@ -1156,18 +1156,23 @@ def test_ctrl_c_stops_connect_with_130(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize("ending", [signal.SIGTERM, signal.SIGHUP])
 def test_a_stop_or_a_hangup_ends_connect_like_ctrl_c_and_is_then_forgotten(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
     ending: signal.Signals,
 ) -> None:
     """``systemctl stop`` sends one, a closed ssh session the other: both release."""
-    monkeypatch.setattr(serve, "connect_host", _Host(ending=ending))
+    rotated: list[Path] = []
+    monkeypatch.setattr(service, "rotate_log", rotated.append)
+    monkeypatch.setattr(serve, "connect_host", _Host(ending=ending, waits=1))
     assert _knowop("login", "acme") == 0
     original = signal.signal(ending, _handler_before)
     try:
         assert _knowop("connect") == 130
 
+        assert f"knowop: connect stopped by {ending.name}" in capsys.readouterr().err
         assert signal.getsignal(ending) is _handler_before
     finally:
         signal.signal(ending, original)
+    assert not rotated
 
 
 def test_connect_leaves_no_client_open_for_a_later_command(

@@ -1222,12 +1222,20 @@ def _serve(
             results_max=_size(flags.job_results_max),
             join_only=join_only,
         )
+    except _ConnectInterrupted as stopped:
+        echo(f"knowop: connect stopped by {stopped}", err=True)
+        raise
     except ClientError as error:
-        status = error.status_code or 0
+        status = error.status_code
         # A service's own run exits 0 on a refusal no restart can change (a revoked
         # login, another account's host), so its manager starts nothing again;
         # 408 and 429 ask to try again later.
-        if flags.log_file and 400 <= status < 500 and status not in {408, 429}:
+        if (
+            flags.log_file
+            and status is not None
+            and 400 <= status < 500
+            and status not in {408, 429}
+        ):
             echo(f"knowop: {error}", err=True)
             echo("knowop: stopped; knowop connect starts it again", err=True)
             return
@@ -1307,10 +1315,14 @@ def _size(text: str) -> int:
         raise ClientError(f"--job-results-max: {error}") from None
 
 
+class _ConnectInterrupted(KeyboardInterrupt):
+    """A signal to report once the connect has released the host."""
+
+
 def _interrupt(signum: int, frame: FrameType | None) -> NoReturn:
     """End the connect as Ctrl-C does."""
-    del signum, frame
-    raise KeyboardInterrupt
+    del frame
+    raise _ConnectInterrupted(signal.Signals(signum).name)
 
 
 def _hand_off(
