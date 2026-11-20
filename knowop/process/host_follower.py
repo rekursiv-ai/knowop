@@ -1,13 +1,10 @@
-"""Keep a sagent session linked to the connected hosts of an account.
+"""Discover eligible hosts and connect a run to only the ones its tools use.
 
-The server lists the hosts of the key's own account, or, for the configured
-assistant, of the person it answers as, and each confirmed one that serves tools and
-is not revoked is a ``Link`` in the ``RemoteSession``: the hosts that account may use.
-Whether one is up now is its link's to find out, so a host the listing shows offline
-keeps its link, and a call running on it goes on. ``set_links`` keeps a host by name,
-so a listing that changes nothing disturbs nothing: the host is not redialled and the
-calls waiting on it go on. A host that leaves the list (removed, revoked, unconfirmed,
-or no longer serving tools) is dropped by the next listing, which says ``Bye``.
+The server lists the hosts of the key's account, or those of an assistant's asker.
+Listing needs no tool link. Selecting a host adds a native sagent link that stays
+until the host becomes ineligible or the run ends. A host marked offline still
+keeps an existing link so a pending call can survive a disconnect. An unchanged
+listing does not redial a kept link. Losing access removes it and ends pending calls.
 
 ``set_links`` replaces the whole set, so the links sagent built itself, this machine's
 and each saved host's, are passed in as ``keep`` and set again with every listing.
@@ -28,7 +25,7 @@ Typical usage example:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Final, Protocol, cast, override
 
@@ -38,7 +35,9 @@ import logging
 import threading
 
 from sagent.host.wire import MAX_LINE_BYTES
-from sagent.tools.remote import Link
+from sagent.session.types import RemoteToolResult, ToolResult
+from sagent.tools.remote import Link, RemoteTool
+from sagent.tools.types import parse
 from sagent.types import AsyncResource
 from trackinizer.client.errors import ClientError
 from trackinizer.client.tool_bridge import dial_tools
@@ -46,10 +45,12 @@ from trackinizer.wire import wire_terminals
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from sagent.tools.remote import RemoteSession
+    from sagent.tools.types import Stream, ToolContext
     from trackinizer.wire.wire_terminals import HostsVersion, TerminalHosts
+    from treekle import PlainTree
 
 
 __all__ = ["HostFollower", "HostLister"]
@@ -126,6 +127,8 @@ class HostFollower(AsyncResource):
         self._remote = remote
         self._keep = tuple(keep)
         self._own_host = own_host
+        self._listed: dict[str, str] = {}
+        self._active: set[str] = set()
         self._version: int | None = None
         """The version of the list the links were last set from; ``None`` for none."""
 
@@ -151,6 +154,54 @@ class HostFollower(AsyncResource):
         with contextlib.suppress(asyncio.CancelledError):
             await self._task
 
+    def tool(self, native: RemoteTool) -> RemoteTool:
+        """Bind a listing-aware tool to this run's host discovery.
+
+        Args:
+          native: The run's sagent tool, with its local tool schemas.
+
+        Returns:
+          tool: The same tool interface, with connection on first use.
+
+        """
+        return _HostedTool(
+            remote=native.remote,
+            local=native.local,
+            display=native.display,
+            hosts=self,
+        )
+
+    @property
+    def unconnected(self) -> dict[str, str]:
+        """List eligible hosts that do not already have an endpoint."""
+        connected = self._remote.endpoints()
+        return {
+            name: status
+            for name, status in self._listed.items()
+            if name not in connected
+        }
+
+    async def activate(self, name: str) -> None:
+        """Connect just the selected host, retaining it until it leaves the list.
+
+        Args:
+          name: A host to activate if it belongs to the account's list.
+
+        """
+        if name not in self._listed:
+            return
+        if name not in self._remote.endpoints():
+            self._active.add(name)
+            self._apply()
+        endpoint = self._remote.endpoints()[name]
+        try:
+            async with asyncio.timeout(10.0):
+                await endpoint.until(lambda remote: remote.tried)
+        except TimeoutError as error:
+            raise ValueError(
+                f"The tool link to {name} did not connect in time.",
+            ) from error
+
     # A server that cannot be reached leaves the links as they were. One that refuses
     # has ended the account's access, and each pipe's redial would be refused too, with
     # calls left waiting, so the relayed links end and those calls fail. Only the
@@ -168,7 +219,9 @@ class HostFollower(AsyncResource):
                     error.status_code == _REVOKED
                     or error.code == wire_terminals.TERMINAL_FORBIDDEN
                 ):
-                    self._remote.set_links(self._keep)
+                    self._listed.clear()
+                    self._active.clear()
+                    self._apply()
                     # Listed again the moment access comes back, whatever the version.
                     self._version = None
                 await asyncio.sleep(self.config.retry_sec)
@@ -188,7 +241,21 @@ class HostFollower(AsyncResource):
         listed = await _off_loop(
             partial(self._client.terminal_hosts, owner=self._asker),
         )
-        # Which hosts the account may use; whether each is up is its link's to find.
+        self._listed = {
+            m.name: m.status
+            for m in listed.hosts
+            if m.status != "revoked"
+            and m.confirmed
+            and m.tools
+            and m.name != self._own_host
+        }
+        self._active.intersection_update(self._listed)
+        self._apply()
+        # Kept only once listed: a change while it listed moves the version again, and
+        # the next wait answers at once.
+        self._version = changed.version
+
+    def _apply(self) -> None:
         self._remote.set_links(
             [
                 *self._keep,
@@ -198,24 +265,64 @@ class HostFollower(AsyncResource):
                             dial_tools,
                             self._url,
                             api_key=self._api_key,
-                            host=m.name,
+                            host=name,
                             asker=self._asker,
                             limit=MAX_LINE_BYTES,
                         ),
-                        name=m.name,
+                        name=name,
                         where=self._url,
                     )
-                    for m in listed.hosts
-                    if m.status != "revoked"
-                    and m.confirmed
-                    and m.tools
-                    and m.name != self._own_host
+                    for name in self._listed
+                    if name in self._active
                 ),
             ],
         )
-        # Kept only once listed: a change while it listed moves the version again, and
-        # the next wait answers at once.
-        self._version = changed.version
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _HostedTool(RemoteTool):
+    hosts: HostFollower
+
+    @override
+    def reminder(self, context: ToolContext) -> str:
+        native = super(_HostedTool, self).reminder(context)
+        listed = ", ".join(
+            f"{name} ({status}; on demand)"
+            for name, status in self.hosts.unconnected.items()
+        )
+        return "; ".join(
+            part
+            for part in (native, f"remote hosts: {listed}" if listed else "")
+            if part
+        )
+
+    @override
+    async def _run(
+        self,
+        context: ToolContext,
+        arguments: Mapping[str, PlainTree],
+        streams: Mapping[str, Stream[object]],
+    ) -> ToolResult:
+        asked = parse(arguments, RemoteTool.Arguments)
+        if asked.endpoint:
+            if asked.tool != "AgentSend":
+                await self.hosts.activate(asked.endpoint)
+            return await super(_HostedTool, self)._run(context, arguments, streams)
+        listed = self.hosts.unconnected
+        if not listed or asked.tool == "AgentSend":
+            return await super(_HostedTool, self)._run(context, arguments, streams)
+        available = "\n".join(
+            f"{name}  {status}: opens on first use" for name, status in listed.items()
+        )
+        if not self.remote.endpoints():
+            return ToolResult(
+                call_id="",
+                state="done",
+                stdout=(available,),
+                result=RemoteToolResult(),
+            )
+        native = await super(_HostedTool, self)._run(context, arguments, streams)
+        return replace(native, stdout=(*native.stdout, available))
 
 
 # Not ``asyncio.to_thread``: the event loop's executor is joined as it closes, so a wait

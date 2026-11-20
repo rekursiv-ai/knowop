@@ -563,9 +563,17 @@ _CONNECT_PLISTS: Final = "ai.rekursiv.knowop.connect.*.plist"
 """The connect agents' definitions, by file name."""
 
 _SHELL_ENVIRONMENT_VARIABLES: Final = frozenset(
-    {"PATH", "LANG", "SAGENT_PROVIDER", "SAGENT_ALLOW_PROVIDERS"},
+    {
+        "PATH",
+        "LANG",
+        "SAGENT_PROVIDER",
+        "SAGENT_ALLOW_PROVIDERS",
+        "KNOWOP_TOOL_ACTIVE_CALLS",
+        "KNOWOP_TOOL_QUEUED_CALLS",
+        "KNOWOP_TOOL_QUEUED_MIB",
+    },
 )
-"""Non-secret shell variables that affect which CLIs and sagent providers run."""
+"""Non-secret shell variables for CLI selection, providers, and tool limits."""
 
 
 # The end alone: a crash loop writes its traceback every 10 s.
@@ -588,9 +596,9 @@ def _log(connect: Connect) -> Path:
     )
 
 
-# No TRAX_*, KNOWOP_* or keys: the host reads its own login from the userdirs.
+# Do not inherit login keys: the host reads its own login from the userdirs.
 def _environment() -> dict[str, str]:
-    """Return the shell's selected CLIs, locale and sagent provider settings."""
+    """Return the shell's selected non-secret service settings."""
     shell = {
         name: value
         for name, value in os.environ.items()

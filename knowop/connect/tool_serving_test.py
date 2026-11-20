@@ -1,23 +1,14 @@
-"""ToolServing over an in-memory websocket, each session's sagent host in this process.
-
-A stand-in relay answers each dial with one end of an in-memory websocket, and each
-daemon's stop waits out no retry, so no test opens a port or waits real time. The
-same checks over real sockets, real children and real timeouts are hand-run:
-``private/tool_serving_parity.py``. A real child is sagent's to test
-(``daemon/server_test.py``, ``tools/bash_test.py``); here, ``scrubbed_host`` is pinned
-by the command it starts the child with.
-"""
+"""ToolServing over an in-memory mux, with sagent workers in the daemon's process."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, ClassVar, Final, Protocol, Self, cast, override
-from unittest.mock import ANY, AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import asyncio
 import contextlib
@@ -39,11 +30,14 @@ from sagent.host.testing import Gate, LocalHost
 from sagent.host.wire import (
     MAX_LINE_BYTES,
     VERSION,
+    Bye,
     Call,
+    Cancel,
     Describe,
     Described,
     Hello,
     Note,
+    Ping,
     Refused,
     Result,
     Welcome,
@@ -58,17 +52,16 @@ from sagent.tools.display import ToolDisplay
 from sagent.tools.read import Read
 from sagent.tools.types import ToolOutput, whole_output
 from trackinizer.client import tool_bridge
-from trackinizer.client.errors import ClientError
 from trackinizer.lib.userdirs import state_dir
 from trackinizer.trax.connection import server_dir
 from trackinizer.trax.render import echo
-from trackinizer.wire import wire_terminals
 from trackinizer.wire.wire_daemon import HEARTBEAT_SEC
 from trackinizer.wire.wire_tools import (
     FRAME_BYTES,
-    HOST_TOOLS_WS_PATH,
-    WAIT_MAX_SEC,
-    ToolOffer,
+    HOST_TOOLS_MUX_PATH,
+    MUX_FRAME_BYTES,
+    MuxStream,
+    ToolMux,
 )
 from treekle import PlainTree
 from websockets.exceptions import (
@@ -82,13 +75,11 @@ from wrapt import lazy_import
 import pytest
 
 from knowop.connect import tool_serving
-from knowop.connect.conftest import _status
 from knowop.connect.tool_serving import (
     ToolServing,
     scrubbed_host,
     tool_dirs,
 )
-from knowop.connect.wake import Wake
 from knowop.lib.testing.import_graph import Counted, import_graph
 
 
@@ -98,8 +89,6 @@ _CWD: Final = _THIS.parent
 if TYPE_CHECKING:
     from collections.abc import (
         AsyncGenerator,
-        AsyncIterator,
-        Callable,
         Coroutine,
         Generator,
         Sequence,
@@ -116,17 +105,22 @@ pytestmark = pytest.mark.asyncio
 _HOST: Final = uuid.UUID(int=1)
 _INSTANCE: Final = uuid.UUID(int=2)
 _CREDENTIAL: Final = "trax_machine_" + "0" * 32 + "_" + "c" * 43
-_REVOKED: Final = ClientError("-> 410", status_code=410)
 _NAME: Final = "box-1"
 _CLEAN_CODES: Final = frozenset({CloseCode.NORMAL_CLOSURE, CloseCode.GOING_AWAY})
 """The close codes websockets ends a read on quietly; any other raises."""
+
+_CALL_LIMIT_ENV: Final = (
+    "KNOWOP_TOOL_ACTIVE_CALLS",
+    "KNOWOP_TOOL_QUEUED_CALLS",
+    "KNOWOP_TOOL_QUEUED_MIB",
+)
 
 _ROOT: Final = _THIS.parents[__name__.count(".")]
 """The directory holding this package's top level, as an import finds it."""
 
 _FIRST_PARTY: Final = frozenset(
     module.split(".")[0]
-    for module in (__name__, ClientError.__module__, ServeDirs.__module__)
+    for module in (__name__, ServeDirs.__module__, tool_bridge.__name__)
 )
 """The packages of knowop, trackinizer and sagent: an import graph walks these alone."""
 
@@ -137,6 +131,13 @@ def _empty_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+
+
+@pytest.fixture(autouse=True)
+def _clean_call_limit_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's call budgets from affecting the tests."""
+    for name in _CALL_LIMIT_ENV:
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)
@@ -158,81 +159,6 @@ def relays(monkeypatch: pytest.MonkeyPatch) -> _Board:
         SimpleNamespace(Event=board.stop, Thread=threading.Thread),
     )
     return board
-
-
-class _Client:
-    """The ``Client`` calls a daemon makes: each wait takes the next answer put here.
-
-    A wait with no answer to take is held until one is put, or for ``hold_sec``;
-    after :meth:`release`, every wait is answered with nothing at once, as a held
-    request a stop leaves behind ends.
-
-    Args:
-      hold_sec: How long a wait is held for; ``None`` holds it until an answer.
-
-    """
-
-    def __init__(self, *, hold_sec: float | None = None) -> None:
-        self.waits: list[tuple[uuid.UUID, uuid.UUID, float]] = []
-        self.keys: list[str] = []
-        self.closed = threading.Event()
-        self.changed = threading.Condition()
-        """Notified as each wait is asked or answer put; the daemon asks from its
-        listener thread."""
-        self._answers: list[ToolOffer | Exception | None] = []
-        self._released = False
-        self._hold_sec = hold_sec
-
-    def __call__(self, key: str) -> _Client:
-        self.keys.append(key)
-        return self
-
-    def put(self, answer: ToolOffer | Exception | None) -> None:
-        """Answer the next wait with ``answer``: an offer, a failure, or nothing."""
-        with self.changed:
-            self._answers.append(answer)
-            self.changed.notify_all()
-
-    def release(self) -> None:
-        """Answer every wait, held or to come, with nothing."""
-        with self.changed:
-            self._released = True
-            self.changed.notify_all()
-
-    def wait_tools(
-        self,
-        host_id: uuid.UUID,
-        *,
-        instance: uuid.UUID,
-        wait_sec: float,
-    ) -> ToolOffer | None:
-        self.asked(host_id, instance, wait_sec)
-        with self.changed:
-            _ = self.changed.wait_for(
-                lambda: self._answers or self._released,
-                timeout=self._hold_sec,
-            )
-            answer = self._answers.pop(0) if self._answers else None
-        if isinstance(answer, Exception):
-            raise answer
-        return answer
-
-    def close(self) -> None:
-        self.closed.set()
-
-    def asked(self, host_id: uuid.UUID, instance: uuid.UUID, wait_sec: float) -> None:
-        """Record one wait and wake whoever waits for it."""
-        with self.changed:
-            self.waits.append((host_id, instance, wait_sec))
-            self.changed.notify_all()
-
-    async def reached(self, count: int) -> None:
-        """Return once ``count`` waits were asked."""
-        assert await asyncio.to_thread(self._reached, count), f"never asked {count}"
-
-    def _reached(self, count: int) -> bool:
-        with self.changed:
-            return self.changed.wait_for(lambda: len(self.waits) >= count, timeout=10)
 
 
 class _Waits(threading.Event):
@@ -333,20 +259,16 @@ class _End:
     async def wait_closed(self) -> None:
         _ = await self._ended.wait()
 
-    def __aiter__(self) -> AsyncIterator[bytes]:
-        return self._messages()
+    async def read(self) -> bytes | None:
+        try:
+            return await self.recv()
+        except ConnectionClosed:
+            return None
 
     def deliver(self, item: bytes | Close) -> None:
         """Hand ``item`` to this end from any thread; an end whose loop ended drops it."""
         with contextlib.suppress(RuntimeError):
             _ = self._loop.call_soon_threadsafe(self._take, item)
-
-    async def _messages(self) -> AsyncIterator[bytes]:
-        while True:
-            try:
-                yield await self.recv()
-            except ConnectionClosedOK:
-                return
 
     def _take(self, item: bytes | Close) -> None:
         if isinstance(item, Close):
@@ -367,7 +289,7 @@ class _End:
 class _Socket:
     """The server's end of one daemon socket."""
 
-    def __init__(self, websocket: _End) -> None:
+    def __init__(self, websocket: MuxStream) -> None:
         self.websocket = websocket
         self._held = b""
 
@@ -376,11 +298,11 @@ class _Socket:
 
     async def next(self) -> Message | None:
         """Return the next line, or ``None`` when the daemon closed its socket."""
-        try:
-            while b"\n" not in self._held:
-                self._held += await asyncio.wait_for(self.websocket.recv(), 10)
-        except ConnectionClosed:
-            return None
+        while b"\n" not in self._held:
+            frame = await asyncio.wait_for(self.websocket.read(), 10)
+            if frame is None:
+                return None
+            self._held += frame
         line, _, self._held = self._held.partition(b"\n")
         reader = asyncio.StreamReader()
         reader.feed_data(line + b"\n")
@@ -395,66 +317,62 @@ class _Socket:
 
 
 class _Relay:
-    """The server's side of a daemon: its offers, and an in-memory socket for each dial.
-
-    Args:
-      url: The server's URL, which names this relay alone.
-
-    """
+    """Open logical streams on the daemon's one outbound mux."""
 
     def __init__(self, url: str) -> None:
         self.url = url
-        self.client = _Client()
-        self.sockets: asyncio.Queue[_Socket] = asyncio.Queue()
         self.dials: list[tuple[str, str]] = []
         self.ends: list[_End] = []
-        """The daemon's end of each socket dialed, oldest first."""
-        self.refusing = False
         self.silent = False
         self.dialing = threading.Event()
-        """Set once the daemon has begun to dial."""
         self.offered: list[uuid.UUID] = []
         self.daemon_loop: asyncio.AbstractEventLoop | None = None
-        """The daemon's event loop, once it has dialed."""
         self._loop = asyncio.get_running_loop()
+        self._accepted: asyncio.Queue[_End] = asyncio.Queue()
+        self._sockets: list[tuple[_End, asyncio.Task[None]]] = []
+        self._mux: ToolMux | None = None
 
-    async def dial(self, path: str, *, authorization: str) -> _End:
-        """Answer a dial on the daemon's loop as the server would; return its end."""
+    @asynccontextmanager
+    async def dial(self, path: str, *, authorization: str) -> AsyncGenerator[_End]:
+        """Answer a dial on the daemon's loop as the server would."""
         self.daemon_loop = asyncio.get_running_loop()
         self.dialing.set()
         if self.silent:
-            # Answers no handshake, as a server too busy to.
             _ = await asyncio.Event().wait()
-        if self.refusing:
-            self.refusing = False
-            raise _status(HTTPStatus.FORBIDDEN)
         self.dials.append((path, authorization))
         near, far = _End(self.daemon_loop), _End(self._loop)
         near.peer, far.peer = far, near
         self.ends.append(near)
-        _ = self._loop.call_soon_threadsafe(self.sockets.put_nowait, _Socket(far))
-        return near
+        _ = self._loop.call_soon_threadsafe(self._accepted.put_nowait, far)
+        try:
+            yield near
+        finally:
+            await near.close()
 
-    def offer(self) -> None:
-        self.offered.append(uuid.uuid4())
-        self.client.put(ToolOffer(connection_id=self.offered[-1]))
+    async def ready(self) -> None:
+        """Wait for the daemon to connect and start routing its replies."""
+        if self._mux is None:
+            far = await asyncio.wait_for(self._accepted.get(), 10)
+            self._mux = ToolMux(far.send)
+            self._sockets.append((far, asyncio.create_task(self._mux.run(far.read))))
 
     async def socket(self) -> _Socket:
-        """Offer a tool connection and return the socket the daemon dials back for it."""
-        self.offer()
-        return await asyncio.wait_for(self.sockets.get(), 10)
+        """Open a stream, not a new physical websocket."""
+        await self.ready()
+        assert self._mux is not None
+        self.offered.append(uuid.uuid4())
+        return _Socket(await self._mux.open(self.offered[-1]))
+
+    async def close(self) -> None:
+        """Close the fake relay and finish routing."""
+        for far, task in self._sockets:
+            await far.close()
+            await task
 
     async def on_daemon[T](self, awaited: Coroutine[None, None, T]) -> T:
-        """Return what ``awaited`` returns, run on the daemon's own event loop."""
+        """Run an awaitable on the daemon's own event loop."""
         assert self.daemon_loop is not None
         return await _on(self.daemon_loop, awaited)
-
-
-class _Relaying(Protocol):
-    """What a daemon is made from: a server's URL and the client it waits on."""
-
-    url: str
-    client: _Client
 
 
 class _Board:
@@ -466,6 +384,7 @@ class _Board:
         self._said: list[str] = []
         self._changed = threading.Condition()
 
+    @asynccontextmanager
     async def connect(
         self,
         url: str,
@@ -474,16 +393,19 @@ class _Board:
         max_size: int,
         ping_interval: float,
         close_timeout: float,
-    ) -> _End:
+        open_timeout: float | None,
+    ) -> AsyncGenerator[_End]:
         """Stand in for websockets' ``connect``: the relay ``url`` names answers."""
-        del max_size, ping_interval, close_timeout
+        del max_size, ping_interval, close_timeout, open_timeout
         for relay in self.relays:
             base = relay.url.replace("http", "ws", 1)
             if url.startswith(f"{base}/"):
-                return await relay.dial(
+                async with relay.dial(
                     url.removeprefix(base),
                     authorization=additional_headers["Authorization"],
-                )
+                ) as socket:
+                    yield socket
+                return
         raise ConnectionRefusedError(url)
 
     def stop(self) -> _Waits:
@@ -517,53 +439,48 @@ async def _relay(board: _Board) -> AsyncGenerator[_Relay]:
     try:
         yield relay
     finally:
-        # A daemon stopped by hand leaves its listener in a held wait.
-        relay.client.release()
+        await relay.close()
+
+
+class _RelayAddress(Protocol):
+    @property
+    def url(self) -> str: ...
 
 
 def _daemon(
-    relay: _Relaying,
+    relay: _RelayAddress,
     *,
     dirs: ServeDirs | None = None,
     lock_wait_sec: float = 0.0,
     retry_sec: float = 0.005,
-    wait_sec: float = 0.0,
-    max_connections: int = 16,
     dial_sec: float | None = None,
     line_bytes: int = 0,
-    wake: Wake | None = None,
 ) -> ToolServing:
     return ToolServing(
         relay.url,
         credential=_CREDENTIAL,
         name=_NAME,
-        client_for=relay.client,
         dirs=dirs or _dirs(relay),
         retry_sec=retry_sec,
         lock_wait_sec=lock_wait_sec,
         # A close this relay cannot answer, as its loop is blocked, ends at once.
         close_sec=0.05,
-        wait_sec=wait_sec,
-        max_connections=max_connections,
         dial_sec=dial_sec,
         line_bytes=line_bytes,
-        wake=wake,
     )
 
 
 @asynccontextmanager
 async def _serving(
-    relay: _Relaying,
+    relay: _RelayAddress,
     *,
     lock_wait_sec: float = 0.0,
-    max_connections: int = 16,
     dial_sec: float | None = None,
     line_bytes: int = 0,
 ) -> AsyncGenerator[ToolServing]:
     daemon = _daemon(
         relay,
         lock_wait_sec=lock_wait_sec,
-        max_connections=max_connections,
         dial_sec=dial_sec,
         line_bytes=line_bytes,
     )
@@ -572,10 +489,9 @@ async def _serving(
         yield daemon
     finally:
         await asyncio.to_thread(daemon.stop)
-        relay.client.release()
 
 
-def _dirs(relay: _Relaying) -> ServeDirs:
+def _dirs(relay: _RelayAddress) -> ServeDirs:
     return tool_dirs(_NAME, server=relay.url)
 
 
@@ -590,10 +506,6 @@ async def _on[T](
 ) -> T:
     """Return what ``awaited`` returns, run on ``loop``: another thread's."""
     return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(awaited, loop))
-
-
-async def _nothing() -> None:
-    """Do nothing: run on a loop, it returns after every callback queued before it."""
 
 
 def _joined() -> None:
@@ -642,17 +554,50 @@ def _threads() -> set[str]:
     return {t.name for t in threading.enumerate() if t.name.startswith("tool-")}
 
 
-async def test_each_offer_dials_back_and_serves_a_read(
+async def test_activated_sessions_get_their_own_workers_and_tool_specs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    relays: _Board,
+) -> None:
+    workers = LocalHost(tools={"Read": Read()})
+    monkeypatch.setattr(tool_serving, "scrubbed_host", workers)
+    readme = tmp_path / "readme.txt"
+    readme.write_text("from this host\n")
+    async with _relay(relays) as relay, _serving(relay):
+        first, other = await relay.socket(), await relay.socket()
+        welcome, idle_welcome = await asyncio.gather(
+            first.open_session("first"),
+            other.open_session("idle"),
+        )
+        assert isinstance(welcome, Welcome)
+        assert isinstance(idle_welcome, Welcome)
+        assert len(workers.started) == 2
+        assert all(not worker.task.done() for worker in workers.started)
+        await other.say(Describe(id="d", tool="Read"))
+        described = await other.next()
+        assert isinstance(described, Described)
+        assert described.spec is not None
+        assert welcome.tools == idle_welcome.tools == {"Read": described.spec.digest}
+
+        await first.say(_call("first", "Read", file_path=str(readme)))
+        assert "from this host" in _content(await _result(first, "first"))
+        assert len(workers.started) == 2
+        await first.say(_call("repeat", "Read", file_path=str(readme)))
+        assert "unchanged since last read" in _content(await _result(first, "repeat"))
+        assert len(workers.started) == 2
+
+
+async def test_one_mux_serves_multiple_sessions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     relays: _Board,
 ) -> None:
     _local(monkeypatch, Read=Read())
     dialed = Mock(wraps=relays.connect)
-    adopted = AsyncMock(wraps=tool_serving._adopted)
+    adopted = AsyncMock(wraps=tool_serving._adopted_stream)
     served: list[tuple[str, Grant]] = []
     monkeypatch.setattr(tool_serving, "connect", dialed)
-    monkeypatch.setattr(tool_serving, "_adopted", adopted)
+    monkeypatch.setattr(tool_serving, "_adopted_stream", adopted)
     monkeypatch.setattr(sagent_host_server.Server, "adopt", _recorded_adopt(served))
     readme = tmp_path / "readme.txt"
     readme.write_text("from this host\n")
@@ -666,21 +611,18 @@ async def test_each_offer_dials_back_and_serves_a_read(
             assert "from this host" in _content(await _result(socket, "1"))
             await socket.websocket.close()
 
-    assert relay.client.keys == [_CREDENTIAL]
-    assert relay.client.waits[0] == (_HOST, _INSTANCE, WAIT_MAX_SEC)
-    assert [path for path, _ in relay.dials] == [
-        HOST_TOOLS_WS_PATH.format(host_id=_HOST, connection_id=connection_id)
-        + f"?instance={_INSTANCE}"
-        for connection_id in relay.offered
+    assert relay.dials == [
+        (
+            HOST_TOOLS_MUX_PATH.format(host_id=_HOST) + f"?instance={_INSTANCE}",
+            f"Bearer {_CREDENTIAL}",
+        ),
     ]
-    assert {authorization for _, authorization in relay.dials} == {
-        f"Bearer {_CREDENTIAL}",
-    }
-    dialed.assert_called_with(
+    dialed.assert_called_once_with(
         ANY,
         additional_headers={"Authorization": f"Bearer {_CREDENTIAL}"},
-        max_size=FRAME_BYTES,
+        max_size=MUX_FRAME_BYTES,
         ping_interval=20,
+        open_timeout=None,
         close_timeout=0.05,
     )
     adopted.assert_awaited_with(
@@ -728,61 +670,158 @@ def _recorded_adopt(served: list[tuple[str, Grant]]) -> _Adopt:
     return recorded
 
 
-async def test_a_daemon_with_its_defaults_dials_sagents_wire_as_the_server_names_it(
+async def test_stop_closes_the_server_and_joins_the_mux(
     monkeypatch: pytest.MonkeyPatch,
     relays: _Board,
 ) -> None:
-    _local(monkeypatch, Read=Read())
-    websocket = SimpleNamespace(close_code=1000, close_reason="")
-    dialed = AsyncMock(return_value=websocket)
-    served = threading.Event()
+    close_server = AsyncMock()
+    server = Mock(spec=sagent_host_server.Server, aclose=close_server)
+    started, stopped = asyncio.Event(), asyncio.Event()
 
-    def serve(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        served.set()
+    async def run_mux(*_args: object) -> None:
+        try:
+            started.set()
+            await asyncio.Future[None]()
+        finally:
+            stopped.set()
 
-    adopted = AsyncMock(side_effect=serve)
-    stops = relays.stops
-    monkeypatch.setattr(tool_serving, "connect", dialed)
-    monkeypatch.setattr(tool_serving, "_adopted", adopted)
-    client = _Client()
-    # ``http`` twice, a trailing slash, and a last letter ``rstrip`` might take too.
-    url = "http://http.X/"
-    daemon = ToolServing(
-        url,
-        credential=_CREDENTIAL,
-        name=_NAME,
-        client_for=client,
-        dirs=tool_dirs(_NAME, server=url),
-    )
-    connection = uuid.UUID(int=3)
-    client.put(ToolOffer(connection_id=connection))
-    client.put(None)
-    daemon.start(_HOST, _INSTANCE)
-    # The next wait, answered at once, waits the default before it asks again.
-    await stops[0].entered(5.0, 1)
-    # The offer's connection runs on the daemon's loop, apart from the listener.
-    assert await asyncio.to_thread(served.wait, 10)
-    await asyncio.to_thread(daemon.stop)
-    client.release()
+    mux_loop = AsyncMock(side_effect=run_mux)
+    async with _relay(relays) as relay:
+        daemon = _daemon(relay)
+        monkeypatch.setattr(daemon, "_opened_server", AsyncMock(return_value=server))
+        monkeypatch.setattr(daemon, "_mux_loop", mux_loop)
+        serving = asyncio.create_task(daemon._serve(_HOST, _INSTANCE))
+        try:
+            await asyncio.wait_for(started.wait(), 10)
+        finally:
+            daemon.stop()
+            await serving
 
-    assert client.waits[0][2] == WAIT_MAX_SEC
-    dialed.assert_awaited_once_with(
-        "ws://http.X"
-        + HOST_TOOLS_WS_PATH.format(host_id=_HOST, connection_id=connection)
+    mux_loop.assert_awaited_once_with(server, _HOST, _INSTANCE)
+    close_server.assert_awaited_once_with()
+    assert stopped.is_set()
+
+
+async def test_mux_retries_a_failed_dial_with_the_same_daemon_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    relays: _Board,
+) -> None:
+    async with _relay(relays) as relay:
+        daemon = _daemon(relay, retry_sec=0, dial_sec=2)
+        server = Mock(spec=sagent_host_server.Server)
+        socket = Mock()
+        attempts = 0
+        closed = False
+
+        @asynccontextmanager
+        async def dial(*_args: object, **_kwargs: object) -> AsyncGenerator[Mock]:
+            nonlocal attempts, closed
+            attempts += 1
+            if attempts == 1:
+                raise OSError("private dial detail")
+            try:
+                yield socket
+            finally:
+                closed = True
+                daemon.stop()
+
+        connect = Mock(side_effect=dial)
+        serve_socket = AsyncMock()
+        monkeypatch.setattr(tool_serving, "connect", connect)
+        monkeypatch.setattr(daemon, "_mux_socket", serve_socket)
+        async with asyncio.timeout(10):
+            await daemon._mux_loop(server, _HOST, _INSTANCE)
+
+    assert closed
+    assert connect.call_count == 2
+    assert connect.call_args_list[0] == connect.call_args_list[1]
+    connect.assert_called_with(
+        relay.url.replace("http", "ws", 1)
+        + HOST_TOOLS_MUX_PATH.format(host_id=_HOST)
         + f"?instance={_INSTANCE}",
         additional_headers={"Authorization": f"Bearer {_CREDENTIAL}"},
-        max_size=FRAME_BYTES,
+        max_size=MUX_FRAME_BYTES,
         ping_interval=20,
-        close_timeout=1.0,
+        open_timeout=2,
+        close_timeout=0.05,
     )
+    serve_socket.assert_awaited_once_with(server, socket)
+    assert caplog.messages == ["daemon tool mux failed: error=OSError"]
+
+
+@pytest.mark.parametrize("relay_left", [False, True], ids=["delivered", "relay-left"])
+async def test_mux_socket_adopts_and_drains_streams(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    relays: _Board,
+    relay_left: bool,
+) -> None:
+    stream_id = uuid.UUID(int=3)
+    closed = ConnectionClosedOK(None, None)
+    wrote, finished = asyncio.Event(), asyncio.Event()
+    offered = False
+    failures: list[ConnectionError] = []
+
+    async def read() -> bytes:
+        nonlocal offered
+        if not offered:
+            offered = True
+            return b"O" + stream_id.bytes
+        await wrote.wait()
+        raise closed
+
+    async def adopt(server: Server, stream: MuxStream, **_kwargs: object) -> None:
+        del server
+        try:
+            await stream.send(b"result")
+        except ConnectionError as error:
+            failures.append(error)
+            raise
+        finally:
+            wrote.set()
+        await stream.wait_closed()
+        finished.set()
+
+    send = AsyncMock(side_effect=closed if relay_left else None)
+    socket = Mock(recv=AsyncMock(side_effect=read), send=send)
+    adopted = AsyncMock(side_effect=adopt)
+    monkeypatch.setattr(tool_serving, "_adopted_stream", adopted)
+    server = Mock(spec=sagent_host_server.Server)
+    async with _relay(relays) as relay:
+        daemon = _daemon(relay, line_bytes=4096)
+        async with asyncio.timeout(10):
+            await daemon._mux_socket(server, socket)
+
     adopted.assert_awaited_once_with(
+        server,
         ANY,
-        websocket,
-        peer=f"relay:{connection}",
+        peer=f"relay:{stream_id}",
         end_sec=5.0,
-        line_bytes=MAX_LINE_BYTES,
+        line_bytes=4096,
     )
+    send.assert_awaited_once_with(b"D" + stream_id.bytes + b"result")
+    if relay_left:
+        [error] = failures
+        assert str(error) == "the relay left"
+        assert error.__cause__ is closed
+        assert caplog.messages == [
+            f"daemon tool stream failed: stream={stream_id} error=ConnectionError",
+        ]
+    else:
+        assert finished.is_set()
+        assert caplog.messages == []
+
+
+async def test_mux_socket_rejects_text_frames(relays: _Board) -> None:
+    receive = AsyncMock(return_value="not a binary frame")
+    socket = Mock(recv=receive)
+    server = Mock(spec=sagent_host_server.Server)
+    async with _relay(relays) as relay:
+        daemon = _daemon(relay)
+        with pytest.raises(TypeError, match="daemon tool frames must be binary"):
+            await daemon._mux_socket(server, socket)
+    receive.assert_awaited_once_with()
 
 
 async def test_stopping_a_daemon_never_started_returns_at_once() -> None:
@@ -790,7 +829,6 @@ async def test_stopping_a_daemon_never_started_returns_at_once() -> None:
         "http://h",
         credential=_CREDENTIAL,
         name=_NAME,
-        client_for=_Client(),
         dirs=tool_dirs(_NAME, server="http://h"),
     )
 
@@ -805,54 +843,10 @@ async def test_no_thread_of_the_tools_keeps_the_process_alive(
 ) -> None:
     _local(monkeypatch, Read=Read())
     async with _relay(relays) as relay, _serving(relay):
-        # The listener asks from its thread, which the daemon's thread started.
-        await relay.client.reached(1)
-        assert {"tool-daemon", "tool-listener"} <= _threads()
+        await relay.ready()
+        assert _threads() == {"tool-daemon"}
         threads = [t for t in threading.enumerate() if t.name.startswith("tool-")]
         assert all(thread.daemon for thread in threads)
-
-
-async def test_a_410_stops_the_daemon(
-    monkeypatch: pytest.MonkeyPatch,
-    relays: _Board,
-) -> None:
-    gate = Gate()
-    _local(monkeypatch, Bash=gate)
-    async with _relay(relays) as relay:
-        daemon = _daemon(relay)
-        daemon.start(_HOST, _INSTANCE)
-        socket = await relay.socket()
-        assert isinstance(await socket.open_session(), Welcome)
-        await socket.say(_call("1", "Bash"))
-        _ = await relay.on_daemon(gate.started.wait())
-
-        relay.client.put(_REVOKED)
-
-        await socket.closed()
-        await asyncio.to_thread(_joined)
-        assert gate.stopped.is_set()
-        assert relay.client.closed.is_set()
-        # Nothing was left to stop, and the state's lock is free for a next daemon.
-        await asyncio.to_thread(daemon.stop)
-        _assert_lock_free(_dirs(relay))
-
-
-async def test_a_wait_that_fails_is_retried_and_says_so(
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-    async with _relay(relays) as relay, _serving(relay):
-        relay.client.put(ClientError("-> 503", status_code=503))
-        relay.client.put(ValueError("no json\nsecond line"))
-        socket = await relay.socket()
-        assert isinstance(await socket.open_session(), Welcome)
-    # Each failure waits its retry before the next ask.
-    assert relays.stops[0].waited.count(0.005) == 2
-    said = capsys.readouterr().err.splitlines()
-    assert sum("tool wait failed" in line for line in said) == 2
-    assert not any(line.startswith("second line") for line in said)
 
 
 async def test_stop_ends_running_tools(
@@ -880,11 +874,553 @@ async def test_stop_ends_running_tools(
         assert gate.stopped.is_set()
         for socket in (running, idle, silent):
             await socket.closed()
-        # The wait the server held at the stop ends, with nothing.
-        relay.client.release()
         await asyncio.to_thread(_joined)
-        assert relay.client.closed.is_set()
         _assert_lock_free(_dirs(relay))
+
+
+async def test_daemon_call_limit_defaults() -> None:
+    permits = _daemon(_Relay("http://h"))._permits
+
+    assert permits._active_limit == 32
+    assert permits._queued_limit == 256
+    assert permits._queued_byte_limit == 128 << 20
+    assert tool_serving._QUEUE_SEC == 30.0
+
+
+async def test_daemon_call_limits_are_read_once_per_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relay = _Relay("http://h")
+    for name, value in zip(_CALL_LIMIT_ENV, ("2", "3", "4"), strict=True):
+        monkeypatch.setenv(name, value)
+    first = _daemon(relay)._permits
+    for name, value in zip(_CALL_LIMIT_ENV, ("5", "6", "7"), strict=True):
+        monkeypatch.setenv(name, value)
+    second = _daemon(relay)._permits
+
+    assert (first._active_limit, first._queued_limit, first._queued_byte_limit) == (
+        2,
+        3,
+        4 << 20,
+    )
+    assert (second._active_limit, second._queued_limit, second._queued_byte_limit) == (
+        5,
+        6,
+        7 << 20,
+    )
+
+
+@pytest.mark.parametrize("invalid", ["", "0", "-1", "1.5", "many"])
+async def test_invalid_daemon_call_limits_use_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    invalid: str,
+) -> None:
+    for name in _CALL_LIMIT_ENV:
+        monkeypatch.setenv(name, invalid)
+
+    permits = _daemon(_Relay("http://h"))._permits
+
+    assert permits._active_limit == 32
+    assert permits._queued_limit == 256
+    assert permits._queued_byte_limit == 128 << 20
+    assert caplog.messages == [
+        f"{name} must be a positive integer; using {default}"
+        for name, default in zip(_CALL_LIMIT_ENV, (32, 256, 128), strict=True)
+    ]
+
+
+async def _barrier(socket: _Socket) -> None:
+    """Wait until the Server has relayed the earlier lines on this stream."""
+    await socket.say(Describe(id="barrier", tool="Bash"))
+    assert isinstance(await socket.next(), Described)
+
+
+class _HeldStop:
+    """Delay a real worker's stop so the test can observe its occupied slot."""
+
+    def __init__(
+        self,
+        host: Host,
+        *,
+        entered: asyncio.Event,
+        reap: asyncio.Event,
+    ) -> None:
+        self.reader, self.writer = host.reader, host.writer
+        self._host, self._entered, self._reap = host, entered, reap
+
+    async def stop(self) -> None:
+        self._entered.set()
+        await self._reap.wait()
+        await self._host.stop()
+
+
+async def test_resident_cap_refuses_new_sessions_without_resetting_an_older_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    relays: _Board,
+) -> None:
+    monkeypatch.setattr(tool_serving, "_RESIDENT_WORKERS", 1)
+    readme = tmp_path / "readme.txt"
+    readme.write_text("from this host\n")
+    workers = LocalHost(tools={"Read": Read()})
+    stopping, reap = asyncio.Event(), asyncio.Event()
+
+    async def start(tools: Sequence[str], directory: Path) -> Host:
+        host = await workers(tools, directory)
+        if directory.name == "first":
+            return _HeldStop(host, entered=stopping, reap=reap)
+        return host
+
+    monkeypatch.setattr(tool_serving, "scrubbed_host", start)
+    async with _relay(relays) as relay, _serving(relay):
+        first = await relay.socket()
+        assert isinstance(await first.open_session("first"), Welcome)
+        assert relay.daemon_loop is not None
+        try:
+            await first.say(_call("read", "Read", file_path=str(readme)))
+            assert "from this host" in _content(await _result(first, "read"))
+            await _assert_busy(relay, "next")
+            await first.say(_call("repeat", "Read", file_path=str(readme)))
+            assert "unchanged since last read" in _content(
+                await _result(first, "repeat"),
+            )
+            [worker] = workers.started
+            assert not worker.task.done()
+
+            await first.say(Bye())
+            await relay.on_daemon(stopping.wait())
+            await _assert_busy(relay, "next")
+            assert not worker.task.done()
+        finally:
+            relay.daemon_loop.call_soon_threadsafe(reap.set)
+
+        await first.closed()
+        assert worker.task.done()
+        fresh = await relay.socket()
+        welcome = await fresh.open_session("next")
+        assert isinstance(welcome, Welcome)
+        assert not welcome.resumed
+        await fresh.say(_call("fresh", "Read", file_path=str(readme)))
+        assert "from this host" in _content(await _result(fresh, "fresh"))
+
+
+async def _assert_busy(relay: _Relay, session_id: str) -> None:
+    socket = await relay.socket()
+    refusal = await socket.open_session(session_id)
+    assert isinstance(refusal, Refused)
+    assert "busy" in refusal.reason
+    await socket.closed()
+
+
+async def test_detached_call_keeps_its_permit_until_result_and_resumes_at_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    relays: _Board,
+) -> None:
+    monkeypatch.setattr(tool_serving, "_RESIDENT_WORKERS", 2)
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    monkeypatch.setenv("KNOWOP_TOOL_QUEUED_CALLS", "1")
+    readme = tmp_path / "readme.txt"
+    readme.write_text("from this host\n")
+    gate = Gate()
+    workers = LocalHost(tools={"Bash": gate, "Read": Read()})
+    monkeypatch.setattr(tool_serving, "scrubbed_host", workers)
+    async with _relay(relays) as relay, _serving(relay):
+        first, second = await relay.socket(), await relay.socket()
+        assert isinstance(await first.open_session("first"), Welcome)
+        assert isinstance(await second.open_session("second"), Welcome)
+        await first.say(_call("running", "Bash"))
+        await relay.on_daemon(gate.started.wait())
+        await first.websocket.close()
+
+        await _assert_busy(relay, "fresh")
+        await second.say(_call("queued", "Read", file_path=str(readme)))
+        await second.say(_call("overflow", "Read", file_path=str(readme)))
+        refused = await _result(second, "overflow")
+        assert refused.record.stderr == ("The tool call queue is full.",)
+        assert not gate.stopped.is_set()
+        assert relay.daemon_loop is not None
+        relay.daemon_loop.call_soon_threadsafe(gate.opened.set)
+        assert "from this host" in _content(await _result(second, "queued"))
+
+        resumed = await relay.socket()
+        welcome = await resumed.open_session("first")
+        assert isinstance(welcome, Welcome)
+        assert welcome.resumed
+        assert welcome.calls == ("running",)
+        assert "open for" in _content(await _result(resumed, "running"))
+        assert len(workers.started) == 2
+        await resumed.say(Bye())
+        await resumed.closed()
+        fresh = await relay.socket()
+        assert isinstance(await fresh.open_session("fresh"), Welcome)
+
+
+async def test_a_single_permit_dispatches_queued_calls_in_arrival_order(
+    monkeypatch: pytest.MonkeyPatch,
+    relays: _Board,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    monkeypatch.setenv("KNOWOP_TOOL_QUEUED_CALLS", "2")
+    gates = {name: Gate() for name in ("a", "b", "c")}
+
+    async def start(tools: Sequence[str], directory: Path) -> Host:
+        return await LocalHost(tools={"Bash": gates[directory.name]})(tools, directory)
+
+    monkeypatch.setattr(tool_serving, "scrubbed_host", start)
+    async with _relay(relays) as relay, _serving(relay):
+        a, b, c = [await relay.socket() for _ in range(3)]
+        for socket, name in zip((a, b, c), gates, strict=True):
+            assert isinstance(await socket.open_session(name), Welcome)
+        await a.say(_call("same", "Bash"))
+        await relay.on_daemon(gates["a"].started.wait())
+        await b.say(_call("same", "Bash"))
+        await b.say(_call("same", "Bash"))
+        await _barrier(b)
+        await c.say(_call("same", "Bash"))
+        await _barrier(c)
+        await c.say(_call("overflow", "Bash"))
+        refused = await _result(c, "overflow")
+        assert refused.record.state == "failed"
+        assert refused.record.stderr == ("The tool call queue is full.",)
+        assert not any(gates[name].started.is_set() for name in ("b", "c"))
+
+        await a.say(Cancel(id="same"))
+        assert (await _result(a, "same")).record.state == "cancelled"
+        await relay.on_daemon(gates["b"].started.wait())
+        assert not gates["c"].started.is_set()
+        await c.say(_call("overflow", "Bash"))
+        await _barrier(c)
+        assert relay.daemon_loop is not None
+        relay.daemon_loop.call_soon_threadsafe(gates["b"].opened.set)
+        assert "open for" in _content(await _result(b, "same"))
+        await relay.on_daemon(gates["c"].started.wait())
+        relay.daemon_loop.call_soon_threadsafe(gates["c"].opened.set)
+        assert "open for" in _content(await _result(c, "same"))
+        assert "open for" in _content(await _result(c, "overflow"))
+
+
+async def test_an_expired_or_cancelled_queued_call_never_reaches_its_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    relays: _Board,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    gate = Gate()
+    workers = LocalHost(tools={"Bash": gate})
+    monkeypatch.setattr(tool_serving, "scrubbed_host", workers)
+    async with _relay(relays) as relay, _serving(relay):
+        running, waiting = await relay.socket(), await relay.socket()
+        assert isinstance(await running.open_session("running"), Welcome)
+        assert isinstance(await waiting.open_session("waiting"), Welcome)
+        await running.say(_call("running", "Bash"))
+        await relay.on_daemon(gate.started.wait())
+        await waiting.say(_call("cancelled", "Bash"))
+        await _barrier(waiting)
+        await waiting.say(Cancel(id="cancelled"))
+        assert (await _result(waiting, "cancelled")).record.state == "cancelled"
+        monkeypatch.setattr(tool_serving, "_QUEUE_SEC", 0.0)
+        await waiting.say(_call("expired", "Bash"))
+        expired = await _result(waiting, "expired")
+        assert expired.record.state == "failed"
+        assert expired.record.stderr == ("The tool call queue wait expired.",)
+        assert not gate.stopped.is_set()
+        await running.say(Cancel(id="running"))
+        assert (await _result(running, "running")).record.state == "cancelled"
+        await _barrier(waiting)
+        assert len(workers.started) == 2
+
+
+async def test_worker_exit_releases_its_permits_and_discards_its_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    relays: _Board,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    gate = Gate()
+    workers = LocalHost(tools={"Bash": gate})
+    monkeypatch.setattr(tool_serving, "scrubbed_host", workers)
+    async with _relay(relays) as relay, _serving(relay):
+        first, second = await relay.socket(), await relay.socket()
+        assert isinstance(await first.open_session("first"), Welcome)
+        assert isinstance(await second.open_session("second"), Welcome)
+        await first.say(_call("running", "Bash"))
+        await relay.on_daemon(gate.started.wait())
+        await first.say(_call("abandoned", "Bash"))
+        await _barrier(first)
+        await second.say(_call("next", "Bash"))
+        await _barrier(second)
+        assert relay.daemon_loop is not None
+        worker = workers.started[0]
+        relay.daemon_loop.call_soon_threadsafe(worker.writer.close)
+        await first.closed()
+        relay.daemon_loop.call_soon_threadsafe(gate.opened.set)
+        assert "open for" in _content(await _result(second, "next"))
+
+
+class _WorkerWrites(asyncio.WriteTransport):
+    """Keep lines written to a test worker and end its stream when closed."""
+
+    def __init__(self, reader: asyncio.StreamReader) -> None:
+        super().__init__()
+        self.lines: list[bytes] = []
+        self._closed = False
+        self._reader = reader
+
+    @override
+    def write(self, data: bytes | bytearray | memoryview) -> None:
+        self.lines.append(bytes(data))
+
+    @override
+    def is_closing(self) -> bool:
+        return self._closed
+
+    @override
+    def close(self) -> None:
+        self._closed = True
+        self._reader.feed_eof()
+
+
+class _HeldWorker:
+    """A worker whose stop is confirmed only when the test releases it."""
+
+    def __init__(self) -> None:
+        self.reader = asyncio.StreamReader()
+        self.output = _WorkerWrites(self.reader)
+        self.writer = asyncio.StreamWriter(
+            self.output,
+            asyncio.Protocol(),
+            None,
+            asyncio.get_running_loop(),
+        )
+        self.stopping, self.stopped = asyncio.Event(), asyncio.Event()
+
+    async def stop(self) -> None:
+        self.stopping.set()
+        await self.stopped.wait()
+
+
+async def test_worker_start_failure_releases_its_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+    relays: _Board,
+) -> None:
+    monkeypatch.setattr(tool_serving, "_RESIDENT_WORKERS", 1)
+    started, fail = asyncio.Event(), asyncio.Event()
+    workers = LocalHost(tools={"Read": Read()})
+
+    async def start(tools: Sequence[str], directory: Path) -> Host:
+        if directory.name == "broken":
+            started.set()
+            await fail.wait()
+            raise OSError("Could not spawn worker.")
+        return await workers(tools, directory)
+
+    monkeypatch.setattr(tool_serving, "scrubbed_host", start)
+    async with _relay(relays) as relay, _serving(relay):
+        broken = await relay.socket()
+        await broken.say(_hello("broken"))
+        assert relay.daemon_loop is not None
+        try:
+            await relay.on_daemon(started.wait())
+            await _assert_busy(relay, "fresh")
+        finally:
+            relay.daemon_loop.call_soon_threadsafe(fail.set)
+        assert await broken.next() is None
+        fresh = await relay.socket()
+        assert isinstance(await fresh.open_session("fresh"), Welcome)
+        assert len(workers.started) == 1
+
+
+async def test_cancelled_start_stops_the_child_before_releasing_its_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(tool_serving, "_RESIDENT_WORKERS", 1)
+    started, spawned = asyncio.Event(), asyncio.Event()
+    child = _HeldWorker()
+
+    async def start(tools: Sequence[str], directory: Path) -> Host:
+        del tools, directory
+        started.set()
+        await spawned.wait()
+        return child
+
+    monkeypatch.setattr(tool_serving, "scrubbed_host", start)
+    permits = tool_serving._CallPermits()
+    opening = asyncio.create_task(permits.start_host(("Read",), tmp_path))
+    try:
+        async with asyncio.timeout(2):
+            await started.wait()
+            opening.cancel()
+            spawned.set()
+            await child.stopping.wait()
+            assert not opening.done()
+            with pytest.raises(ConnectionError, match="busy"):
+                await permits.start_host(("Read",), tmp_path)
+    finally:
+        spawned.set()
+        child.stopped.set()
+        with pytest.raises(asyncio.CancelledError):
+            await opening
+    assert child.writer.is_closing()
+
+    fresh = _HeldWorker()
+    fresh.stopped.set()
+    monkeypatch.setattr(tool_serving, "scrubbed_host", AsyncMock(return_value=fresh))
+    worker = await permits.start_host(("Read",), tmp_path)
+    await worker.stop()
+    worker.writer.close()
+
+
+async def test_shutdown_while_starting_stops_the_new_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started, spawned = asyncio.Event(), asyncio.Event()
+    child = _HeldWorker()
+    child.stopped.set()
+
+    async def start(tools: Sequence[str], directory: Path) -> Host:
+        del tools, directory
+        started.set()
+        await spawned.wait()
+        return child
+
+    monkeypatch.setattr(tool_serving, "scrubbed_host", start)
+    permits = tool_serving._CallPermits()
+    opening = asyncio.create_task(permits.start_host(("Read",), tmp_path))
+    async with asyncio.timeout(2):
+        await started.wait()
+        permits.close()
+        spawned.set()
+        with pytest.raises(ConnectionError, match="serving is stopping"):
+            await opening
+    assert child.stopping.is_set()
+    assert child.writer.is_closing()
+    with pytest.raises(ConnectionError, match="serving is stopping"):
+        await permits.start_host(("Read",), tmp_path)
+
+
+async def test_byte_saturation_recovers_when_a_queued_call_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    monkeypatch.setenv("KNOWOP_TOOL_QUEUED_CALLS", "2")
+    monkeypatch.setenv("KNOWOP_TOOL_QUEUED_MIB", "1")
+    permits = tool_serving._CallPermits()
+    active, waiting = _HeldWorker(), _HeldWorker()
+    first = tool_serving._PermittedHost(active, permits=permits)
+    second = tool_serving._PermittedHost(waiting, permits=permits)
+    rejected = Mock()
+    monkeypatch.setattr(second, "reject", rejected)
+    base = encoded(_call("large", "Bash", payload=""))
+    large = encoded(_call("large", "Bash", payload="x" * ((1 << 20) - len(base))))
+    retry = encoded(_call("retry", "Bash"))
+    assert len(large) == 1 << 20
+    first.writer.write(encoded(_call("active", "Bash")))
+    second.writer.write(large)
+    second.writer.write(retry)
+
+    rejected.assert_called_once_with(
+        "retry",
+        outcome="failed",
+        reason="The tool call queue is full.",
+    )
+    assert waiting.output.lines == []
+    rejected.reset_mock()
+
+    second.writer.write(encoded(Cancel(id="large")))
+    second.writer.write(retry)
+    permits.completed(first, "active")
+
+    rejected.assert_called_once_with(
+        "large",
+        outcome="cancelled",
+        reason="Cancelled before starting.",
+    )
+    assert waiting.output.lines == [retry]
+
+
+@pytest.mark.parametrize("closing_daemon", [False, True], ids=["worker", "daemon"])
+async def test_stopping_discards_queued_calls_and_rejects_new_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    closing_daemon: bool,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    permits = tool_serving._CallPermits()
+    active, waiting = _HeldWorker(), _HeldWorker()
+    first = tool_serving._PermittedHost(active, permits=permits)
+    second = tool_serving._PermittedHost(waiting, permits=permits)
+    first.writer.write(encoded(_call("running", "Bash")))
+    second.writer.write(encoded(_call("queued", "Bash")))
+
+    if closing_daemon:
+        permits.close()
+    else:
+        second.fence()
+    permits.completed(first, "running")
+    second.writer.write(encoded(_call("new", "Bash")))
+
+    assert waiting.output.lines == []
+    waiting.reader.feed_eof()
+    refused = await received(second.reader)
+    assert isinstance(refused, Result)
+    assert (refused.id, refused.record.state) == ("new", "failed")
+    assert await received(second.reader) is None
+
+
+async def test_dispatch_expires_queued_calls_before_their_timer_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    monkeypatch.setattr(tool_serving, "_QUEUE_SEC", 0.0)
+    permits = tool_serving._CallPermits()
+    active, waiting = _HeldWorker(), _HeldWorker()
+    first = tool_serving._PermittedHost(active, permits=permits)
+    second = tool_serving._PermittedHost(waiting, permits=permits)
+    first.writer.write(encoded(_call("running", "Bash")))
+    second.writer.write(encoded(_call("expired", "Bash")))
+
+    # The permit is freed before the expired call's timer can run on this loop.
+    permits.completed(first, "running")
+    next_line = encoded(_call("next", "Bash"))
+    second.writer.write(next_line)
+
+    assert waiting.output.lines == [next_line]
+    waiting.reader.feed_eof()
+    expired = await received(second.reader)
+    assert isinstance(expired, Result)
+    assert (expired.id, expired.record.state) == ("expired", "failed")
+    assert await received(second.reader) is None
+
+
+async def test_unreadable_worker_keeps_its_permit_until_stop_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    permits = tool_serving._CallPermits()
+    broken, waiting = _HeldWorker(), _HeldWorker()
+    monkeypatch.setattr(
+        tool_serving,
+        "scrubbed_host",
+        AsyncMock(side_effect=(broken, waiting)),
+    )
+    first = await permits.start_host(("Bash",), tmp_path)
+    second = await permits.start_host(("Bash",), tmp_path)
+    first.writer.write(encoded(_call("first", "Bash")))
+    second_line = encoded(_call("second", "Bash"))
+    second.writer.write(second_line)
+    broken.reader.set_exception(OSError("worker output failed"))
+    with pytest.raises(OSError, match="worker output failed"):
+        await first.reader.readline()
+    stopping = asyncio.create_task(first.stop())
+    await broken.stopping.wait()
+    try:
+        assert waiting.output.lines == []
+    finally:
+        broken.stopped.set()
+        await stopping
+    assert waiting.output.lines == [second_line]
 
 
 async def test_stop_returns_once_each_bridge_has_closed(
@@ -903,7 +1439,7 @@ async def test_stop_returns_once_each_bridge_has_closed(
         # Called on this loop, which runs nothing of the relay's until it returns.
         daemon.stop()
 
-        assert [end.closed for end in relay.ends] == [True, True]
+        assert [end.closed for end in relay.ends] == [True]
         for socket in sockets:
             await socket.closed()
 
@@ -929,112 +1465,43 @@ async def test_stop_waits_for_a_close_the_relay_is_slow_to_answer(
         await stopping
 
         assert end.closed
-        # The bridge closed it, and the daemon closed it again once the bridge ended.
-        assert end.closes == 2
+        assert end.closes == 1
         await socket.closed()
     assert "tools: stopped" not in capsys.readouterr().err
 
 
-async def test_an_offer_handed_over_as_the_daemon_stops_dials_nothing(
+@pytest.mark.parametrize("raised", [AttributeError, OSError, RecursionError, TypeError])
+async def test_worker_start_failure_ends_only_its_connection_and_allows_retry(
     monkeypatch: pytest.MonkeyPatch,
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-
-    class _LateOffer(_Client):
-        """Its wait, still held at the stop, answers with an offer only after it."""
-
-        @override
-        def wait_tools(
-            self,
-            host_id: uuid.UUID,
-            *,
-            instance: uuid.UUID,
-            wait_sec: float,
-        ) -> ToolOffer | None:
-            self.asked(host_id, instance, wait_sec)
-            _ = daemon_stopped.wait(10)
-            return ToolOffer(connection_id=uuid.uuid4())
-
-    daemon_stopped = threading.Event()
-    async with _relay(relays) as relay:
-        relay.client = _LateOffer()
-        daemon = _daemon(relay)
-        daemon.start(_HOST, _INSTANCE)
-        await relay.client.reached(1)
-        await asyncio.to_thread(daemon.stop)
-        daemon_stopped.set()
-        await asyncio.to_thread(_joined)
-        assert relay.dials == []
-
-
-@pytest.mark.parametrize("raised", [AttributeError, RecursionError, TypeError])
-async def test_what_a_connection_raises_ends_only_that_connection(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
     raised: type[Exception],
     relays: _Board,
 ) -> None:
     gate = Gate()
     local = LocalHost(tools={"Bash": gate})
-    loops: list[asyncio.AbstractEventLoop] = []
+    failed = False
 
     async def start(tools: Sequence[str], directory: Path) -> Host:
-        loops.append(asyncio.get_running_loop())
-        if directory.name == "bad":
-            raise raised("hostile\n" + "x" * 10_000)
+        nonlocal failed
+        if directory.name == "bad" and not failed:
+            failed = True
+            raise raised("Worker startup failed.")
         return await local(tools, directory)
 
     monkeypatch.setattr(tool_serving, "scrubbed_host", start)
     async with _relay(relays) as relay, _serving(relay):
-        other = await relay.socket()
-        assert isinstance(await other.open_session("s1"), Welcome)
+        other, bad = await relay.socket(), await relay.socket()
+        assert isinstance(await other.open_session("good"), Welcome)
         await other.say(_call("1", "Bash"))
-        _ = await _on(loops[0], gate.started.wait())
+        await relay.on_daemon(gate.started.wait())
+        assert await bad.open_session("bad") is None
 
-        bad = await relay.socket()
-        bad_id = relay.offered[-1]
-        await bad.say(_hello("bad"))
-        await bad.closed()
-
-        # The other tool connection's call goes on, and the daemon still takes offers.
-        loops[0].call_soon_threadsafe(gate.opened.set)
+        assert relay.daemon_loop is not None
+        relay.daemon_loop.call_soon_threadsafe(gate.opened.set)
         assert "open for" in _content(await _result(other, "1"))
-        after = await relay.socket()
-        assert isinstance(await after.open_session("s2"), Welcome)
-
-    said = [
-        line
-        for line in capsys.readouterr().err.splitlines()
-        if "tool connection failed" in line
-    ]
-    # The type alone: what a hostile line raises may hold its text.
-    assert said == [
-        f"knowop: tool connection failed: connection={bad_id} error={raised.__name__}",
-    ]
-
-
-async def test_a_connection_says_once_when_it_is_adopted_and_once_how_it_ended(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-    async with _relay(relays) as relay, _serving(relay):
-        socket = await relay.socket()
-        connection_id = relay.offered[-1]
-        assert isinstance(await socket.open_session(), Welcome)
-        await socket.websocket.close(wire_terminals.CLOSE_ENDED, "the agent left")
-        await relays.heard("tool connection ended")
-    said = capsys.readouterr().err.splitlines()
-
-    assert [line for line in said if "tool connection" in line] == [
-        f"knowop: tool connection adopted: connection={connection_id}",
-        (
-            f"knowop: tool connection ended: connection={connection_id} code={wire_terminals.CLOSE_ENDED} "
-            "reason='the agent left'"
-        ),
-    ]
+        retried = await relay.socket()
+        assert isinstance(await retried.open_session("bad"), Welcome)
+        await retried.say(_call("retry", "Bash"))
+        assert "open for" in _content(await _result(retried, "retry"))
 
 
 async def test_a_line_too_deep_to_decode_ends_only_its_connection(
@@ -1064,21 +1531,6 @@ async def test_a_refusal_reaches_the_server_before_the_socket_closes(
         await socket.closed()
 
 
-async def test_a_refused_dial_is_one_line_and_the_daemon_goes_on(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-    async with _relay(relays) as relay, _serving(relay):
-        relay.refusing = True
-        relay.offer()
-        await relays.heard("tool connection")
-        assert "tool connection failed" in capsys.readouterr().err
-        socket = await relay.socket()
-        assert isinstance(await socket.open_session(), Welcome)
-
-
 async def test_a_held_lock_says_so_once_and_serves_when_it_frees(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1098,7 +1550,7 @@ async def test_a_held_lock_says_so_once_and_serves_when_it_frees(
             tried = stops[0].waited.count(0.005)
             await stops[0].entered(0.005, tried + 3)
             assert capsys.readouterr().err == ""
-            assert relay.client.waits == []
+            assert relay.dials == []
 
             holder.close()
 
@@ -1122,7 +1574,7 @@ async def test_a_lock_freed_within_the_wait_serves_after_all(
         async with _serving(relay, lock_wait_sec=30):
             # Retried twice on the held lock, and asked for nothing meanwhile.
             await stops[0].entered(0.005, 2)
-            assert relay.client.waits == []
+            assert relay.dials == []
             holder.close()
             socket = await relay.socket()
             assert isinstance(await socket.open_session(), Welcome)
@@ -1163,7 +1615,7 @@ async def test_a_state_folder_it_cannot_make_is_one_line_and_no_tools(
         daemon.start(_HOST, _INSTANCE)
         await relays.heard("tools: off")
         await asyncio.to_thread(daemon.stop)
-        assert relay.client.waits == []
+        assert relay.dials == []
     [off] = capsys.readouterr().err.splitlines()
     assert off.startswith("knowop: tools: off: NotADirectoryError(")
 
@@ -1195,11 +1647,15 @@ async def test_it_serves_sagents_defaults_and_the_web_and_paper_tools(
 ) -> None:
     """A remote agent reaches the web and papers through a host alone."""
     _local(monkeypatch, Read=Read())
-    made = Mock(wraps=sagent_host_server.Server)
-    monkeypatch.setattr(sagent_host_server, "Server", made)
-    async with _relay(relays) as relay, _serving(relay):
-        # The listener starts once the tool server is open.
-        await relay.client.reached(1)
+    with patch.object(
+        sagent_host_server.Server,
+        "__init__",
+        autospec=True,
+        side_effect=sagent_host_server.Server.__init__,
+    ) as made:
+        async with _relay(relays) as relay, _serving(relay):
+            # The mux connects once the tool server is open.
+            await relay.ready()
 
     assert made.call_args.kwargs["tools"] == (
         *DEFAULT_TOOLS,
@@ -1374,203 +1830,33 @@ async def test_a_session_host_that_will_not_start_says_so(
     assert sum("did not start" in line for line in said) == 1
 
 
-async def test_connections_stop_at_the_cap_and_a_slot_frees_when_one_ends(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-    caplog.set_level(logging.WARNING, logger=tool_serving.__name__)
-    async with _relay(relays) as relay, _serving(relay, max_connections=2):
-        sockets = [await relay.socket() for _ in range(2)]
-
-        relay.offer()
-
-        refused = (
-            f"tool connection refused: connection={relay.offered[-1]} open=2 max=2"
-        )
-        # The listener hands the offer to the daemon's loop before it asks again, and
-        # the loop runs what was handed to it in order.
-        await relay.client.reached(4)
-        await relay.on_daemon(_nothing())
-        assert [r.getMessage() for r in caplog.records] == [refused]
-        assert len(relay.dials) == 2
-
-        await sockets[0].websocket.close()
-        await relays.heard("tool connection ended")
-        # The ended connection's task gives back its slot once it is done.
-        await relay.on_daemon(_nothing())
-
-        socket = await relay.socket()
-        assert isinstance(await socket.open_session(), Welcome)
-        assert len(relay.dials) == 3
-
-
-async def test_a_dial_back_the_server_does_not_answer_ends_at_its_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-    # A timeout of none at all: the dial times out as soon as it waits.
-    async with _relay(relays) as relay, _serving(relay, dial_sec=0):
-        relay.silent = True
-        relay.offer()
-
-        await relays.heard("TimeoutError")
-    assert (
-        f"knowop: tool connection failed: connection={relay.offered[-1]} "
-        "error=TimeoutError"
-    ) in capsys.readouterr().err.splitlines()
-    assert relay.dials == []
-
-
-class _AnsweredAtOnce(_Client):
-    """A server that does not hold its first three waits; it holds the rest."""
-
-    @override
-    def wait_tools(
-        self,
-        host_id: uuid.UUID,
-        *,
-        instance: uuid.UUID,
-        wait_sec: float,
-    ) -> ToolOffer | None:
-        if len(self.waits) >= 3:
-            return super().wait_tools(host_id, instance=instance, wait_sec=wait_sec)
-        self.asked(host_id, instance, wait_sec)
-        return None
-
-
-async def test_a_wait_answered_at_once_is_not_asked_again_at_once(
+async def test_session_worker_with_invalid_greeting_is_stopped_and_frees_its_slot(
     monkeypatch: pytest.MonkeyPatch,
     relays: _Board,
 ) -> None:
-    _local(monkeypatch, Read=Read())
-    stops = relays.stops
-    async with _relay(relays) as relay:
-        relay.client = _AnsweredAtOnce()
-        daemon = _daemon(relay, retry_sec=0.01)
-        daemon.start(_HOST, _INSTANCE)
-        await relay.client.reached(3)
-        await asyncio.to_thread(daemon.stop)
-        # Each ask answered at once is followed by a wait of retry_sec before the next.
-        asked = len(relay.client.waits)
-        assert stops[0].waited.count(0.01) >= asked - 1
+    monkeypatch.setattr(tool_serving, "_RESIDENT_WORKERS", 1)
+    workers = LocalHost(tools={"Read": Read()})
+    broken: list[_HeldWorker] = []
 
+    async def start(tools: Sequence[str], directory: Path) -> Host:
+        if directory.name == "broken":
+            child = _HeldWorker()
+            child.stopped.set()
+            child.reader.feed_data(encoded(Ping()))
+            broken.append(child)
+            return child
+        return await workers(tools, directory)
 
-async def test_a_wait_held_to_its_end_is_asked_again_at_once(
-    monkeypatch: pytest.MonkeyPatch,
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-
-    class _Held(_Client):
-        @override
-        def wait_tools(
-            self,
-            host_id: uuid.UUID,
-            *,
-            instance: uuid.UUID,
-            wait_sec: float,
-        ) -> ToolOffer | None:
-            if len(self.waits) >= 3:
-                return super().wait_tools(host_id, instance=instance, wait_sec=wait_sec)
-            self.asked(host_id, instance, wait_sec)
-            # A long-poll held for all of its wait, on the clock the daemon reads.
-            clock.now += wait_sec
-            return None
-
-    clock = _Clock()
-    monkeypatch.setattr(tool_serving, "time", SimpleNamespace(monotonic=clock))
-    async with _relay(relays) as relay:
-        relay.client = _Held()
-        async with asyncio.timeout(10):
-            daemon = _daemon(relay, retry_sec=60, wait_sec=0.01)
-            daemon.start(_HOST, _INSTANCE)
-            await relay.client.reached(3)
-            await asyncio.to_thread(daemon.stop)
-        assert {wait_sec for _, _, wait_sec in relay.client.waits} == {0.01}
-
-
-class _HeldFor(_Client):
-    """A server that holds each of its first waits for a time it is given, then all.
-
-    Args:
-      clock: The daemon's clock, which each wait moves on by its time.
-      held_sec: How long each of the first waits is held, in order.
-
-    """
-
-    def __init__(self, clock: _Clock, *held_sec: float) -> None:
-        super().__init__()
-        self._clock = clock
-        self._held_sec = list(held_sec)
-
-    @override
-    def wait_tools(
-        self,
-        host_id: uuid.UUID,
-        *,
-        instance: uuid.UUID,
-        wait_sec: float,
-    ) -> ToolOffer | None:
-        if not self._held_sec:
-            return super().wait_tools(host_id, instance=instance, wait_sec=wait_sec)
-        self.asked(host_id, instance, wait_sec)
-        self._clock.now += self._held_sec.pop(0)
-        return None
-
-
-async def test_a_wait_held_under_half_its_time_waits_before_it_asks_again(
-    monkeypatch: pytest.MonkeyPatch,
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-    clock = _Clock()
-    monkeypatch.setattr(tool_serving, "time", SimpleNamespace(monotonic=clock))
-    async with _relay(relays) as relay:
-        # Held for under half of its 2 s, then for half exactly.
-        relay.client = _HeldFor(clock, 0.75, 1.0)
-        daemon = _daemon(relay, retry_sec=60, wait_sec=2.0)
-        daemon.start(_HOST, _INSTANCE)
-        await relay.client.reached(3)
-        await asyncio.to_thread(daemon.stop)
-    assert relays.stops[0].waited.count(60) == 1
-
-
-async def test_a_closed_connection_whose_relay_never_answers_closes_after_its_end(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    closed_writer = Mock()
-    writer = Mock(close=closed_writer)
-
-    async def bridged(websocket: Websocket, *, limit: int) -> tuple[object, Mock]:
-        del websocket, limit
-        return asyncio.StreamReader(), writer
-
-    monkeypatch.setattr(tool_bridge, "bridged", bridged)
-    adopt = AsyncMock()
-    closed = AsyncMock()
-    # A relay that answers no close: its socket never says it closed.
-    socket = Mock(wait_closed=AsyncMock(side_effect=asyncio.Event().wait), close=closed)
-
-    async with asyncio.timeout(1):
-        await tool_serving._adopted(
-            Mock(adopt=adopt),
-            socket,
-            peer="p",
-            end_sec=0,
-            line_bytes=8,
-        )
-
-    adopt.assert_awaited_once_with(
-        (ANY, writer),
-        peer="p",
-        grant=Grant(id="relay", sha256="", tools=None, added=""),
-    )
-    closed_writer.assert_called_once_with()
-    closed.assert_awaited_once_with()
+    monkeypatch.setattr(tool_serving, "scrubbed_host", start)
+    async with _relay(relays) as relay, _serving(relay):
+        failed = await relay.socket()
+        assert await failed.open_session("broken") is None
+        [child] = broken
+        assert child.stopping.is_set()
+        assert child.writer.is_closing()
+        assert child.output.lines == []
+        fresh = await relay.socket()
+        assert isinstance(await fresh.open_session("fresh"), Welcome)
 
 
 async def test_stop_cancels_a_dial_the_server_has_not_answered(
@@ -1585,138 +1871,16 @@ async def test_stop_cancels_a_dial_the_server_has_not_answered(
             relay.url,
             credential=_CREDENTIAL,
             name=_NAME,
-            client_for=relay.client,
             dirs=_dirs(relay),
             stop_sec=1.0,
         )
         daemon.start(_HOST, _INSTANCE)
-        relay.offer()
         assert await asyncio.to_thread(relay.dialing.wait, 10)
 
         await asyncio.to_thread(daemon.stop)
 
         assert "still stopping" not in capsys.readouterr().err
-        relay.client.release()
         await asyncio.to_thread(_joined)
-
-
-async def test_a_wake_from_a_pause_asks_again_at_once_beside_the_dead_wait(
-    monkeypatch: pytest.MonkeyPatch,
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-    dead = threading.Event()
-    cut = threading.Event()
-    anew = threading.Event()
-    listeners: list[threading.Thread] = []
-
-    # Each listener is known by the thread its waits come from, not by a count of
-    # threads or waits, which other tests' threads and the scheduler would sway.
-    class _DeadFirst(_Client):
-        @override
-        def wait_tools(
-            self,
-            host_id: uuid.UUID,
-            *,
-            instance: uuid.UUID,
-            wait_sec: float,
-        ) -> ToolOffer | None:
-            self.asked(host_id, instance, wait_sec)
-            here = threading.current_thread()
-            if not listeners:
-                listeners.append(here)
-                cut.set()
-                # A wait a pause cut: its socket answers nothing until released.
-                assert dead.wait(10)
-                return None
-            if here is not listeners[0]:
-                listeners.append(here)
-                anew.set()
-                # Held like any wait the server holds, until the test ends.
-                return super().wait_tools(host_id, instance=instance, wait_sec=wait_sec)
-            return None
-
-    wall = [0.0]
-    wake = Wake(wall=lambda: wall[0], clock=lambda: 0.0)
-    async with _relay(relays) as relay:
-        relay.client = _DeadFirst()
-        daemon = _daemon(relay, wake=wake)
-        try:
-            async with asyncio.timeout(10):
-                daemon.start(_HOST, _INSTANCE)
-                assert await asyncio.to_thread(cut.wait, 10)
-                wall[0] += 30.0
-                # Called on this thread, which is no daemon: the new listener is one anyway.
-                assert wake.check()
-                assert await asyncio.to_thread(anew.wait, 10)
-                old, new = listeners[0], listeners[1]
-                assert (new.name, new.daemon, old.is_alive()) == (
-                    "tool-listener",
-                    True,
-                    True,
-                )
-                # The listener the wake replaced ends once its cut wait returns.
-                dead.set()
-                await asyncio.to_thread(old.join, 10)
-                assert (old.is_alive(), new.is_alive()) == (False, True)
-        finally:
-            dead.set()
-            await asyncio.to_thread(daemon.stop)
-        wall[0] += 30.0
-        assert wake.check()
-
-
-@pytest.mark.parametrize("text", ["-> 403 stale", ""])
-async def test_a_wait_failing_the_same_way_is_said_once(
-    capsys: pytest.CaptureFixture[str],
-    monkeypatch: pytest.MonkeyPatch,
-    relays: _Board,
-    text: str,
-) -> None:
-    """A failure is said once while it lasts, and again after a wait that worked."""
-    _local(monkeypatch, Read=Read())
-    # Even a failure with no text is said, once.
-    refused = ClientError(text, status_code=403)
-    async with _relay(relays) as relay, _serving(relay):
-        for _ in range(3):
-            relay.client.put(refused)
-        await relay.client.reached(3)
-        socket = await relay.socket()
-        assert isinstance(await socket.open_session(), Welcome)
-        # A failure after a wait that worked is news again.
-        relay.client.put(refused)
-        await relays.heard("tool wait failed", 2)
-    said = capsys.readouterr().err.splitlines()
-    assert sum("tool wait failed" in line for line in said) == 2
-    # Each names the failure by its type and text.
-    assert said.count(f"knowop: tool wait failed: ClientError({text!r})") == 2
-
-
-class _NoClient(_Client):
-    """A credential no client can be made for."""
-
-    @override
-    def __call__(self, key: str) -> _Client:
-        raise ClientError(f"no client for {key}")
-
-
-async def test_a_client_that_cannot_be_made_is_one_line_and_ends_the_tools(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    relays: _Board,
-) -> None:
-    _local(monkeypatch, Read=Read())
-    async with _relay(relays) as relay:
-        relay.client = _NoClient()
-        daemon = _daemon(relay)
-        daemon.start(_HOST, _INSTANCE)
-        await asyncio.to_thread(_joined)
-        # The line names what failed.
-        assert "knowop: tools: off: ClientError('no client for trax_machine_" in (
-            capsys.readouterr().err
-        )
-        await asyncio.to_thread(daemon.stop)
-        _assert_lock_free(_dirs(relay))
 
 
 class _Failing(ToolServing):
@@ -1746,7 +1910,6 @@ async def test_stop_says_so_when_the_tools_outlast_its_wait(
             relay.url,
             credential=_CREDENTIAL,
             name=_NAME,
-            client_for=relay.client,
             dirs=_dirs(relay),
             # Its wait is out at once: the serving thread is still alive after it.
             stop_sec=0,
@@ -1762,7 +1925,7 @@ async def test_stop_says_so_when_the_tools_outlast_its_wait(
             await asyncio.to_thread(_joined)
 
 
-async def test_a_serving_loop_that_raises_says_so_and_ends_the_listener(
+async def test_a_serving_loop_that_raises_reports_the_failure(
     capsys: pytest.CaptureFixture[str],
     relays: _Board,
 ) -> None:
@@ -1771,7 +1934,6 @@ async def test_a_serving_loop_that_raises_says_so_and_ends_the_listener(
             relay.url,
             credential=_CREDENTIAL,
             name=_NAME,
-            client_for=relay.client,
             dirs=_dirs(relay),
         )
         daemon.start(_HOST, _INSTANCE)
@@ -1780,62 +1942,6 @@ async def test_a_serving_loop_that_raises_says_so_and_ends_the_listener(
             capsys.readouterr().err
         )
         await asyncio.to_thread(daemon.stop)
-
-
-class _OfferedAsStopped(ToolServing):
-    """A daemon whose listener hands over an offer in the same breath as the stop."""
-
-    @override
-    def _listen(
-        self,
-        host_id: uuid.UUID,
-        instance: uuid.UUID,
-        loop: asyncio.AbstractEventLoop,
-        start_connection: Callable[[ToolOffer], None],
-        current: Callable[[], bool],
-    ) -> None:
-        del current
-        # The loop is held while the offer and the stop are queued, so the offer
-        # is always started after the stop: an offer racing a stop is made certain.
-        held = threading.Event()
-        _ = loop.call_soon_threadsafe(held.wait, 10)
-        _ = loop.call_soon_threadsafe(
-            start_connection,
-            ToolOffer(connection_id=uuid.uuid4()),
-        )
-        self._stop.set()
-        held.set()
-
-
-async def test_an_offer_started_after_the_stop_opens_no_connection(
-    monkeypatch: pytest.MonkeyPatch,
-    relays: _Board,
-) -> None:
-    opened: list[ToolOffer] = []
-
-    def connection(
-        self: ToolServing,
-        server: object,
-        offer: ToolOffer,
-        **_: object,
-    ) -> Coroutine[None, None, None]:
-        del self, server
-        opened.append(offer)
-        return asyncio.sleep(0)
-
-    monkeypatch.setattr(ToolServing, "_pipe", connection)
-    async with _relay(relays) as relay:
-        daemon = _OfferedAsStopped(
-            relay.url,
-            credential=_CREDENTIAL,
-            name=_NAME,
-            client_for=relay.client,
-            dirs=_dirs(relay),
-        )
-        daemon.start(_HOST, _INSTANCE)
-        await asyncio.to_thread(_joined)
-        await asyncio.to_thread(daemon.stop)
-    assert opened == []
 
 
 @pytest.mark.parametrize("raised", [OSError, asyncio.CancelledError])
@@ -1874,7 +1980,7 @@ async def test_a_line_over_the_limit_ends_its_connection(
     async with _relay(relays) as relay, _serving(relay, line_bytes=limit):
         socket = await relay.socket()
         frame = b"x" * FRAME_BYTES
-        with contextlib.suppress(ConnectionClosed):
+        with contextlib.suppress(ConnectionError):
             for _ in range(limit // FRAME_BYTES + 2):
                 await socket.websocket.send(frame)
         await socket.closed()
@@ -2387,7 +2493,7 @@ _HOSTILE: Final = {
 
 async def _send_framed(socket: _Socket, raw: bytes) -> None:
     """Send ``raw`` in frames a daemon's websocket takes; a tool connection already ended is fine."""
-    with contextlib.suppress(ConnectionClosed):
+    with contextlib.suppress(ConnectionError):
         for start in range(0, len(raw), FRAME_BYTES):
             await socket.websocket.send(raw[start : start + FRAME_BYTES])
 
@@ -2488,23 +2594,12 @@ async def test_importing_the_tool_serving_does_not_load_sagents_daemon() -> None
         counted=Counted.IMPORT_TIME,
     )
     reached = {*graph, *(name for names in graph.values() for name in names)}
-    assert ClientError.__module__ in reached
     daemon = ServeDirs.__module__.rpartition(".")[0]
     assert sorted(name for name in reached if name.startswith(daemon)) == []
 
 
 def _first_party(module: str) -> bool:
     return module.split(".", maxsplit=1)[0] in _FIRST_PARTY
-
-
-class _Clock:
-    """A monotonic clock that moves only when a test moves it."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
 
 
 class _HeldLock:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -9,7 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Final, cast
 from unittest.mock import Mock
+from urllib.parse import urlsplit
 
+import asyncio
 import io
 import os
 import select
@@ -40,6 +43,7 @@ from trackinizer.wire.wire_device import (
 )
 from trackinizer.wire.wire_host_job import HOST_WORK_PATH
 from trackinizer.wire.wire_session_relay import HOST_SESSIONS_WAIT_PATH
+from trackinizer.wire.wire_tools import HOST_TOOLS_MUX_PATH
 from treekle import json_loads
 from wrapt import lazy_import
 
@@ -61,7 +65,7 @@ from knowop.connect.wake import Wake
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import AsyncGenerator, Callable, Mapping
 
     from trackinizer.mock_test_support import MockProtocol
 
@@ -76,6 +80,7 @@ _ENROLLMENT: Final = "enr_" + "0" * 32 + "_" + "e" * 43
 _LOGIN_KEY: Final = "trax_" + "k" * 43
 _PROFILE_KEY: Final = "trax_" + "p" * 43
 _BOB_KEY: Final = "trax_" + "b" * 43
+_TOOL_MUX_PATH: Final = HOST_TOOLS_MUX_PATH.format(host_id=_HOST_ID)
 _HOST_PATH: Final = f"/api/hosts/{_HOST_ID}"
 _ACCOUNTS: Final = {
     f"Bearer {_LOGIN_KEY}": "ada@example.com",
@@ -174,9 +179,6 @@ class _Server:
         if path.endswith("/heartbeat"):
             beat = HeartbeatResponse(server_time=datetime(2030, 1, 1, tzinfo=UTC))
             return httpx2.Response(200, content=beat.model_dump_json())
-        if path.endswith("/tools/wait"):
-            self.over.wait(0.02)
-            return httpx2.Response(200, content=b"null")
         if path == wire_terminals.HOST_TERMINAL_WAIT_PATH.format(
             host_id=_HOST_ID,
         ):
@@ -189,6 +191,26 @@ class _Server:
             self.over.wait(0.02)
             return httpx2.Response(200, content=b"null")
         raise AssertionError(f"unexpected request {method} {path}")
+
+    @asynccontextmanager
+    async def mux(
+        self,
+        url: str,
+        *,
+        additional_headers: Mapping[str, str],
+        **options: object,
+    ) -> AsyncGenerator[_MuxSocket]:
+        """Record the outbound tools websocket handshake and leave its peer idle."""
+        del options
+        target = urlsplit(url)
+        assert target.scheme == "wss"
+        assert target.query.startswith("instance=")
+        with self.requested:
+            self.requests.append(
+                ("WS", target.path, additional_headers["Authorization"], {}),
+            )
+            self.requested.notify_all()
+        yield _MuxSocket()
 
     def asked(self, *suffixes: str) -> Callable[[float], bool]:
         """Return a wait until every path ending in one of ``suffixes`` was requested."""
@@ -203,6 +225,12 @@ class _Server:
 
     def calls(self, suffix: str) -> list[tuple[str, str, str, dict[str, object]]]:
         return [call for call in self.requests if call[1].endswith(suffix)]
+
+
+class _MuxSocket:
+    async def recv(self) -> bytes:
+        """Wait until the daemon closes its idle tools connection."""
+        return await asyncio.Future[bytes]()
 
 
 def _never(timeout: float) -> bool:
@@ -282,6 +310,7 @@ def _on(server: _Server, monkeypatch: pytest.MonkeyPatch) -> None:
         return httpx2.MockTransport(server)
 
     monkeypatch.setattr(httpx2, "HTTPTransport", transport)
+    monkeypatch.setattr(tool_serving, "connect", server.mux)
 
 
 def _connect(
@@ -327,7 +356,7 @@ def test_a_computer_with_no_login_logs_in_joins_with_the_returned_token_and_serv
     _on(server, monkeypatch)
     _stdin(monkeypatch, "")
 
-    _connect(_Waits(server.asked("/tools/wait", "/terminals/wait")))
+    _connect(_Waits(server.asked(_TOOL_MUX_PATH, "/terminals/wait")))
 
     [code] = server.calls("/auth/device/code")
     assert code[3] == {"client": "knowop", "hostname": "Dev_box", "host": "dev-box"}
@@ -338,7 +367,7 @@ def test_a_computer_with_no_login_logs_in_joins_with_the_returned_token_and_serv
     facts = join[3]["facts"]
     assert isinstance(facts, dict)
     assert (facts["terminal"], facts["tools"]) == (True, True)
-    assert server.calls("/tools/wait")
+    assert server.calls(_TOOL_MUX_PATH)
     assert server.calls("/terminals/wait")
     # The key the login returned is saved, so the next run needs no browser.
     assert [name for name, _ in list_profiles()] == ["know.example"]
@@ -363,7 +392,7 @@ def test_a_computer_that_runs_jobs_offers_its_capped_memory_and_its_own_gpus(
         ],
     )
 
-    _connect(_Waits(server.asked("/tools/wait", "/work")), jobs=True)
+    _connect(_Waits(server.asked(_TOOL_MUX_PATH, "/work")), jobs=True)
 
     [join] = server.calls("/api/hosts/join")
     facts = join[3]["facts"]
@@ -454,7 +483,7 @@ def test_each_serving_and_the_daemon_get_one_wake_the_host_and_the_server(
     monkeypatch.setattr(daemon, "connect", connected)
 
     _connect(
-        _Waits(server.asked("/tools/wait", "/sessions/wait", "/work")),
+        _Waits(server.asked(_TOOL_MUX_PATH, "/sessions/wait", "/work")),
         signed_in=lambda: Client(_SERVER, api_key=_PROFILE_KEY),
         jobs=True,
     )
@@ -463,7 +492,7 @@ def test_each_serving_and_the_daemon_get_one_wake_the_host_and_the_server(
     assert isinstance(wake, Wake)
     assert all(
         made[each].call_args.kwargs["wake"] is wake
-        for each in ("terminals", "tools", "sessions")
+        for each in ("terminals", "sessions")
     )
     terminals = made["terminals"].call_args.kwargs
     assert (terminals["name"], terminals["server_url"]) == ("dev-box", _SERVER)
@@ -763,7 +792,7 @@ def test_a_computer_disconnected_since_its_last_connect_joins_again_with_no_logi
     _stdin(monkeypatch, "")
     keyed = Client(_SERVER, api_key=_PROFILE_KEY)
 
-    _connect(_Waits(server.asked("/tools/wait")), signed_in=lambda: keyed)
+    _connect(_Waits(server.asked(_TOOL_MUX_PATH)), signed_in=lambda: keyed)
 
     assert server.calls("/auth/device/code") == []
     [enroll] = server.calls("/api/hosts/enroll")
@@ -798,7 +827,7 @@ def test_no_exec_serves_no_tools_and_does_not_say_it_does(
     assert "tools" not in facts
     assert "sessions" not in facts
     assert facts["terminal"] is True
-    assert server.calls("/tools/wait") == []
+    assert server.calls(_TOOL_MUX_PATH) == []
     assert server.calls("/sessions/wait") == []
     assert server.calls("/terminals/wait")
 
@@ -828,23 +857,25 @@ def test_an_install_without_what_tools_need_serves_none_and_does_not_say_it_does
     assert isinstance(facts, dict)
     assert "tools" not in facts
     assert facts["terminal"] is True
-    assert server.calls("/tools/wait") == []
+    assert server.calls(_TOOL_MUX_PATH) == []
     captured = capsys.readouterr()
     # An agent process is this install's own, which needs no sagent host.
     assert "(terminals and agents)" in captured.out
     assert sum("tools: off" in line for line in captured.err.splitlines()) == 1
 
 
-def test_the_tool_serving_asks_with_the_host_credential(
+def test_the_tool_mux_dials_with_the_host_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = _Server()
     _on(server, monkeypatch)
     _stdin(monkeypatch, f"{_ENROLLMENT}\n")
 
-    _connect(_Waits(server.asked("/tools/wait")))
+    _connect(_Waits(server.asked(_TOOL_MUX_PATH)))
 
-    assert server.calls("/tools/wait")[0][2] == f"Bearer {_CREDENTIAL}"
+    assert server.calls(_TOOL_MUX_PATH) == [
+        ("WS", _TOOL_MUX_PATH, f"Bearer {_CREDENTIAL}", {}),
+    ]
     tools = state_dir() / "rekursiv-ai" / "knowop" / "tools" / server_dir(_SERVER)
     tools /= "dev-box"
     assert stat.S_IMODE(tools.stat().st_mode) == 0o700
@@ -1070,7 +1101,7 @@ def test_the_direct_link_can_be_switched_off_though_the_library_is_installed(
     )
 
 
-def test_each_server_is_made_for_this_host_with_the_one_wake(
+def test_each_server_is_made_for_this_host_and_terminals_get_the_wake(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = _Server()
@@ -1106,7 +1137,7 @@ def test_each_server_is_made_for_this_host_with_the_one_wake(
         (factory, args[0], kwargs.get("wake")) for factory, args, kwargs in made
     ] == [
         ("_terminal_serving", "gx10", wake),
-        ("_tool_serving", "gx10", wake),
+        ("_tool_serving", "gx10", None),
         ("_job_serving", "gx10", None),
     ]
     assert made[2][2]["results_max"] == 7
