@@ -73,6 +73,7 @@ __all__ = [
     "_view",
     "allowed",
     "outs",
+    "scratches",
     "snapshotted",
 ]
 
@@ -487,6 +488,10 @@ snapshotted: list[Path] = []
 """The directories the fake snapshotter was asked to snapshot."""
 
 
+scratches: list[str] = []
+"""The names of the directories the fake bundler was asked to write in."""
+
+
 allowed: list[bool] = []
 """Whether each fake snapshot was told to send secret-named untracked files."""
 
@@ -504,6 +509,7 @@ def _fake_source(
     """Replace git: the snapshot is a commit, the bundle a 12-byte file."""
     bundled: list[list[str]] = []
     outs.clear()
+    scratches.clear()
     snapshotted.clear()
     allowed.clear()
     private = tmp_path / "private"
@@ -531,6 +537,7 @@ def _fake_source(
         if snap.commit != _COMMIT:
             raise ValueError("Expected snap.commit == _COMMIT.")
         outs.append(out.name)
+        scratches.append(out.parent.name)
         bundled.append(list(bases))
         data = b"b" * size
         out.write_bytes(data)

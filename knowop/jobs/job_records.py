@@ -31,12 +31,20 @@ else:
     wire_job = lazy_import("trackinizer.wire.wire_job")
 
 
-__all__ = ["host_view", "run_cancel", "run_secret", "run_secrets", "run_status"]
+__all__ = [
+    "NOT_HERE",
+    "host_view",
+    "run_cancel",
+    "run_secret",
+    "run_secrets",
+    "run_status",
+]
 
-_NOT_HERE: Final = frozenset({404, 503})
-"""The answers of a server that holds no such job of the kind asked, or runs none."""
+NOT_HERE: Final = frozenset({404, 503})
+"""The answers of a server that holds no such job of the kind asked, or runs none:
+the jobs add-on answers 503 on every route while a deployment has it off."""
 
-_NO_HOST_JOB: Final = _NOT_HERE | {401}
+_NO_HOST_JOB: Final = NOT_HERE | {401}
 """Those, and the 401 a campaign box's credential gets on the host-job routes,
 which take only a person's key; a key refused everywhere fails on the GPU job's call."""
 
@@ -176,25 +184,25 @@ def _show(fields: dict[str, object]) -> None:
 
 def _list_jobs(client: Client) -> None:
     """Print one line per job, newest first: id, state, where, the command cut to 60."""
-    rows = [
-        (each.id, each.state, each.node or "-", each.argv)
-        for each in _listed(lambda: client.job_list().jobs, not_here=_NOT_HERE)
-    ] + [
-        (each.id, each.state, each.host, each.argv)
+    # A GPU job and a host job never share an id, so one map holds both kinds.
+    by_id = {
+        each.id: (each.state, each.node or "-", each.argv)
+        for each in _listed(lambda: client.job_list().jobs, not_here=NOT_HERE)
+    } | {
+        each.id: (each.state, each.host, each.argv)
         for each in _listed(
             lambda: client.host_job_list().jobs,
             not_here=_NO_HOST_JOB,
         )
-    ]
-    if not rows:
+    }
+    if not by_id:
         echo("(no jobs)")
         return
-    rows.sort(key=lambda row: row[0], reverse=True)
-    heads = [(str(job), state, where) for job, state, where, _ in rows]
-    widths = [max(len(head[col]) for head in heads) for col in range(3)]
-    for head, (*_, argv) in zip(heads, rows, strict=True):
-        padded = [cell.ljust(widths[col]) for col, cell in enumerate(head)]
-        echo("  ".join((*padded, " ".join(argv)[:60])))
+    heads = {job: (str(job), state, where) for job, (state, where, _) in by_id.items()}
+    widths = [max(len(head[col]) for head in heads.values()) for col in range(3)]
+    for job in sorted(by_id, reverse=True):
+        padded = [cell.ljust(widths[col]) for col, cell in enumerate(heads[job])]
+        echo("  ".join((*padded, " ".join(by_id[job][2])[:60])))
 
 
 def _listed[T](

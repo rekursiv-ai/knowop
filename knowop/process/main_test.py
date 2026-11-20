@@ -167,6 +167,7 @@ if TYPE_CHECKING:
     from sagent.tui.types import CommandOutput
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.wire.json_types import JSON
+    from trackinizer.wire.wire_job import JobList
     from trackinizer.wire.wire_session_relay import InputKind
     from websockets.http11 import Request, Response
 
@@ -473,6 +474,9 @@ class _Server(_Client):
 
     def put(self, path: str, *, body: object = None) -> PlainTree:
         raise AssertionError(f"no agent here sets {path}: {body}")
+
+    def job_list(self) -> JobList:
+        raise AssertionError("no agent here reads GPU jobs")
 
     def read_session_parts(self, session_id: UUID) -> list[PartBody]:
         del session_id
@@ -3193,11 +3197,13 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
         "stop_process": lambda c: c.stop_process(session_id),
         "read_process": lambda c: c.read_process(session_id),
         "lines_stream": lambda c: c.lines_stream(session_id).__enter__(),
+        "job_list": lambda c: c.job_list(),
     }
     additional: list[Callable[[Client], object]] = [
         lambda c: c.get("/api/addons/knowhost/hosts"),
         lambda c: c.get(f"/api/inquiries/{session_id}"),
         lambda c: c.get("/api/addons/knowspend/limits"),
+        lambda c: c.get("/api/addons/knowspend/campaigns?ref=campaign%2FIssue%237"),
         lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/pause"),
         lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/resume"),
     ]

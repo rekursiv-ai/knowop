@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.refs import SeqRef
+from trackinizer.wire.wire_job import JobList, JobView
 from trackinizer.wire.wire_session_relay import Opened, ProcessSpec
 from trackinizer.wire.wire_sessions import SessionStart, SessionStartResponse
 from trackinizer.wire.wire_terminals import TerminalHost, TerminalHosts
@@ -27,6 +29,7 @@ if TYPE_CHECKING:
 
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.wire.refs import Ref
+    from trackinizer.wire.wire_job import JobState
     from trackinizer.wire.wire_session_relay import AgentProcess, ViewerFrame
     from treekle import PlainTree
 
@@ -45,6 +48,19 @@ class _Client:
         self.limits: list[PlainTree] | None = []
         self.limits_refusal = 0
         self.puts: list[tuple[str, object]] = []
+        self.campaigns: list[PlainTree] = []
+        self.campaigns_refusal = 0
+        self.campaigns_asked: list[str] = []
+        self.jobs: list[JobView] = []
+        self.jobs_refusal = 0
+
+    def job_list(self) -> JobList:
+        if self.jobs_refusal:
+            raise ClientError(
+                f"GET /api/addons/jobs/jobs -> {self.jobs_refusal}",
+                status_code=self.jobs_refusal,
+            )
+        return JobList(jobs=self.jobs)
 
     def start_process(self, session_id: UUID, spec: ProcessSpec) -> AgentProcess:
         assert session_id in (UUID(int=11), UUID(int=15))
@@ -76,6 +92,12 @@ class _Client:
                 status = self.limits_refusal or 404
                 raise ClientError(f"GET {path} -> {status}", status_code=status)
             return {"account": "ada@x.test", "limits": self.limits}
+        if path.startswith("/api/addons/knowspend/campaigns?"):
+            self.campaigns_asked.append(path)
+            if self.campaigns_refusal:
+                status = self.campaigns_refusal
+                raise ClientError(f"GET {path} -> {status}", status_code=status)
+            return self.campaigns
         if path.startswith("/api/addons/"):
             return self.api.get(path)
         assert path in (
@@ -464,6 +486,126 @@ async def test_a_refused_limits_read_is_the_answer_and_starts_nothing() -> None:
         == "the server answered 403."
     )
     assert client.starts == client.started == []
+
+
+def _job(state: JobState, *, campaign: str = "Issue#7") -> JobView:
+    return JobView(
+        id=1,
+        state=state,
+        node=None,
+        gpus=1,
+        minutes=5,
+        label="",
+        argv=["true"],
+        commit="0" * 40,
+        bundle_sha256=None,
+        created_at=datetime(2026, 11, 17, tzinfo=UTC),
+        started_at=None,
+        ended_at=None,
+        usd=None,
+        reason="",
+        upload_serial=None,
+        campaign=campaign,
+    )
+
+
+def _spent(budget: int | None) -> list[PlainTree]:
+    """Return usage's answer for Issue#7, as the route sends it."""
+    spent: dict[str, PlainTree] = {
+        "ref": "campaign/Issue#7",
+        "spent": 2_500_000,
+        "budget": budget,
+        "last_hour": 400_000,
+        "reaches_at": None,
+        "alerts": [],
+    }
+    return [spent]
+
+
+_NO_BUDGET: Final = (
+    "campaign/Issue#7 spent $2.50, $0.40 of it in the last hour; it has no budget."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("budget", "jobs", "said"),
+    [
+        pytest.param(
+            20_000_000,
+            [
+                _job("running"),
+                _job("queued"),
+                _job("completed"),
+                _job("running", campaign="Issue#8"),
+                _job("running", campaign=""),
+            ],
+            "campaign/Issue#7 spent $2.50 of its $20.00 budget, $0.40 of it in the "
+            "last hour. 2 of its GPU jobs still run, so the figure is not final.",
+            id="running",
+        ),
+        pytest.param(
+            None,
+            [_job("starting"), _job("cancelled")],
+            f"{_NO_BUDGET} 1 of its GPU jobs still runs, so the figure is not final.",
+            id="one",
+        ),
+        pytest.param(
+            None,
+            [_job("failed"), _job("running", campaign="Issue#8")],
+            f"{_NO_BUDGET} None of its GPU jobs runs.",
+            id="settled",
+        ),
+    ],
+)
+async def test_budget_of_a_campaign_reads_its_spend_and_its_unfinished_gpu_jobs(
+    budget: int | None,
+    jobs: list[JobView],
+    said: str,
+) -> None:
+    client = _Client()
+    client.campaigns = _spent(budget)
+    client.jobs = jobs
+    assert await _tools(client).act(action="session.budget", name="Issue#7") == said
+    assert client.campaigns_asked == [
+        "/api/addons/knowspend/campaigns?ref=campaign%2FIssue%237",
+    ]
+    assert client.puts == client.starts == client.started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("campaigns", "jobs", "said"),
+    [
+        (404, 0, "This server keeps no campaign spend."),
+        (403, 0, "the server answered 403."),
+        (0, 404, f"{_NO_BUDGET} This server runs no GPU jobs."),
+        (0, 503, f"{_NO_BUDGET} This server runs no GPU jobs."),
+        (0, 403, "the server answered 403."),
+    ],
+)
+async def test_budget_of_a_campaign_says_what_a_server_without_it_or_a_refusal_says(
+    campaigns: int,
+    jobs: int,
+    said: str,
+) -> None:
+    client = _Client()
+    client.campaigns = _spent(None)
+    client.campaigns_refusal = campaigns
+    client.jobs_refusal = jobs
+    assert await _tools(client).act(action="session.budget", name="Issue#7") == said
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["campaign/Issue#7", "Issue#0", "Issue#07", "lead#4"])
+async def test_budget_of_anything_but_one_brief_reads_nothing(name: str) -> None:
+    client = _Client()
+    assert (
+        await _tools(client).act(action="session.budget", name=name)
+        == "session.budget names a campaign by its brief, Issue#N; "
+        "or nothing, for the campaign limit."
+    )
+    assert client.campaigns_asked == []
 
 
 @pytest.mark.asyncio
