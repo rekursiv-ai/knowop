@@ -65,6 +65,10 @@ _ALLOWED: Final = (
 # an import would fail on a public install.
 _PROCESS_ALLOWED: Final = ("sagent",)
 
+# ToolServing builds the records sagent's tool wire carries, so the export names its
+# session types as sagent's own: the wire refuses trackinizer's copy of a record.
+_TOOL_SERVING_ALLOWED: Final = ("sagent.session.types",)
+
 
 def _shipped() -> list[Path]:
     """Return the modules the wheel ships: no tests, conftests or test support."""
@@ -85,7 +89,13 @@ def _shipped() -> list[Path]:
 def test_a_shipped_module_imports_only_the_client_trackinizer_and_the_stdlib(
     path: Path,
 ) -> None:
-    also = _PROCESS_ALLOWED if path.relative_to(_CWD).parts[0] == "process" else ()
+    also = (
+        _PROCESS_ALLOWED
+        if path.relative_to(_CWD).parts[0] == "process"
+        else _TOOL_SERVING_ALLOWED
+        if path == _CWD / "connect" / "tool_serving.py"
+        else ()
+    )
 
     assert [name for name in _imports(path) if not _allowed(name, also=also)] == []
 
