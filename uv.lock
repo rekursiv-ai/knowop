@@ -431,8 +431,8 @@ wheels = [
 
 [[package]]
 name = "codedoctor"
-version = "0.1.15.dev1+g689b2e03a"
-source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#689b2e03a94d866f5a7d5a6a34078e0f27b53f24" }
+version = "0.1.15.dev2+g0dd7bd518"
+source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#0dd7bd51802ca5c3bd16d753dea3b94a07d62d8e" }
 dependencies = [
     { name = "pyyaml" },
     { name = "rignore" },
@@ -2778,8 +2778,8 @@ wheels = [
 
 [[package]]
 name = "rekursiv-ai-typings"
-version = "0.1.28.dev1+g26747f4b0"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#26747f4b0fcf57ea2d76e492fd0305be27a3b7c4" }
+version = "0.1.28.dev2+g2e6ca5130"
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#2e6ca51304398ed07db7492201d7a346d4ca6d4c" }
 
 [[package]]
 name = "requests"
@@ -3020,8 +3020,8 @@ wheels = [
 
 [[package]]
 name = "sagent"
-version = "0.2.6.dev2+gf7bdf0a5f"
-source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#f7bdf0a5f44cc04a9a59ec17a1da971f38c95f02" }
+version = "0.2.6.dev3+g699e8905f"
+source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#699e8905f05e3a1d8cd70259b0d1ab3d84bfaf95" }
 dependencies = [
     { name = "bashlex" },
     { name = "cachetools" },
@@ -3351,8 +3351,8 @@ wheels = [
 
 [[package]]
 name = "trackinizer"
-version = "0.1.16.dev3+g48aa02a16"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#48aa02a16925fb1de7684e11d670e26927ac4710" }
+version = "0.1.16.dev4+g5040aaa00"
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#5040aaa00d8a92808f41b8a5e94b7d4b550f1e08" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
@@ -3700,8 +3700,8 @@ wheels = [
 
 [[package]]
 name = "wesearch"
-version = "0.1.21.dev2+g5cd0d291a"
-source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#5cd0d291a519444a72618f4d6a83213c54dcb893" }
+version = "0.1.21.dev3+g76e0a45e7"
+source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#76e0a45e74a31f7a5ffabe5c7420b3ef10c272e1" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "brotli" },
