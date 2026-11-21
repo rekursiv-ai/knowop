@@ -2,7 +2,7 @@ Show the person what you mean on their canvas: the pages and visuals beside Chat
 
 Actions:
 - `read` -- what the canvas holds: its name, its page, each visual with its id, and the red boxes with theirs.
-- `show` -- open `visual` in a tab, on `record` when it shows one, with its `params`; `placement` (`main`, `left`, `side`, `floating`) puts it, else it goes where the visual goes. `visual: chat` shows Chat again.
+- `show` -- open `visual` in a tab, on `record` when it shows one, with its `params`; `placement` (`main`, `left`, `side`, `floating`) puts it, else it goes where the visual goes. `visual: chat` shows Chat again; with `record` an `AgentSession#N` your chat spawned, it adds that agent's tab to Chat, which the person opens.
 - `hide` -- close `visual`: a type on the canvas (the first such), a visual's id from `read`, or `chat`, to hide Chat so the person looks at what you showed.
 - `navigate` -- move the page to `route`: `#/console` (sessions), `#/hosts`, `#/pulls`, `#/usage`, `#/leaderboards`, `#/settings`, or another of the app's routes. `#/graph` is the graph page, which a new workspace opens on unless the person chose an empty `home`: the graph of this workspace (its chat's session and the records open on it) and of the records the person worked on last. Open it when they ask for "the graph" or "graph view" and name no record; a second ask goes back to it. A record's graph is `show` `trax.subgraph`.
 - `highlight` -- mark the rows `record` names wherever the page draws them, at most 50; it draws no box. A new call replaces the marks; an empty `record` clears them.

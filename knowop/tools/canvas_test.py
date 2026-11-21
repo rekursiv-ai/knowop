@@ -572,6 +572,55 @@ def test_chat_is_shown_or_hidden_as_a_visual_of_the_tab(
     assert kept == f"Chat is as it was: {_SAID_REFUSED}"
 
 
+def test_an_agent_of_the_chat_is_shown_in_a_tab_of_chat_by_its_session() -> None:
+    session = uuid.uuid4()
+    client = _Client(rows={("AgentSession", 9): session})
+
+    said = asyncio.run(
+        _tools(client).act(
+            action="show",
+            visual="chat",
+            record="AgentSession#9",
+            context=_AGENT,
+        ),
+    )
+    refused = asyncio.run(
+        _tools(_Client(rows={("AgentSession", 9): session}, refusing=_REFUSED)).act(
+            action="show",
+            visual="chat",
+            record="AgentSession#9",
+            context=_AGENT,
+        ),
+    )
+
+    assert said == "Showing AgentSession#9 in a tab of Chat."
+    assert client.calls == [
+        ("resolve", "AgentSession#9"),
+        ("apply", {"kind": "agent", "session": str(session)}),
+    ]
+    assert refused == f"Could not show AgentSession#9 in Chat: {_SAID_REFUSED}"
+
+
+@pytest.mark.parametrize(
+    ("record", "said"),
+    [
+        ("AgentSession#9,AgentSession#10", "Not shown: Chat shows one agent's"),
+        ("AgentSession#x", "Not shown: "),
+    ],
+    ids=["two", "malformed"],
+)
+def test_chat_shows_one_agent_named_as_a_row_is(record: str, said: str) -> None:
+    client = _Client()
+
+    answer = asyncio.run(
+        _tools(client).act(action="show", visual="chat", record=record, context=_AGENT),
+    )
+
+    assert isinstance(answer, str)
+    assert answer.startswith(said)
+    assert client.calls == []
+
+
 def test_a_terminal_opens_only_on_a_ready_confirmed_host_of_the_account() -> None:
     client = _Client(hosts=[_ready("lab")])
 
