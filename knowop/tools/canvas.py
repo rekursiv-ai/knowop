@@ -37,6 +37,7 @@ import uuid
 
 from trackinizer.client.errors import ClientError, server_answer
 from trackinizer.trax.canvas import (
+    agent_operation,
     canvas_lines,
     chat_lines,
     mark_operation,
@@ -365,6 +366,8 @@ class CanvasTools:
         placement: Placement | None,
     ) -> str:
         """Show ``visual`` on the one row ``refs`` names, if it names one."""
+        if visual == _CHAT and refs:
+            return await self._agent(canvas, refs=refs)
         if visual == _CHAT:
             return await self._chat(canvas, hidden=False)
         if not visual:
@@ -454,6 +457,25 @@ class CanvasTools:
         except ClientError as error:
             return f"Could not hide {visual}: {server_answer(error)}"
         return f"Hid {visual}."
+
+    async def _agent(self, canvas: uuid.UUID, *, refs: Sequence[str]) -> str:
+        """Show the agent session ``refs`` names in a tab of Chat, without opening it."""
+        if len(refs) > 1:
+            return "Not shown: Chat shows one agent's session at a time."
+        try:
+            parsed = parse_ref(refs[0])
+        except ValueError as error:
+            return f"Not shown: {error}."
+        try:
+            row = await self._row(parsed)
+            _ = await asyncio.to_thread(
+                self._client.apply_canvas_operation,
+                canvas,
+                operation=agent_operation(row),
+            )
+        except ClientError as error:
+            return f"Could not show {_label(parsed)} in Chat: {server_answer(error)}"
+        return f"Showing {_label(parsed)} in a tab of Chat."
 
     async def _chat(self, canvas: uuid.UUID, *, hidden: bool) -> str:
         """Hide or show the person's Chat on ``canvas``."""
