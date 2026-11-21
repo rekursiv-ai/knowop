@@ -53,6 +53,14 @@ class _Client:
         self.campaigns_asked: list[str] = []
         self.jobs: list[JobView] = []
         self.jobs_refusal = 0
+        self.hosts = [
+            TerminalHost(
+                name="laptop",
+                status="online",
+                terminal_ready=True,
+                confirmed=True,
+            ),
+        ]
 
     def job_list(self) -> JobList:
         if self.jobs_refusal:
@@ -115,16 +123,7 @@ class _Client:
 
     def terminal_hosts(self, *, owner: str | None = None) -> TerminalHosts:
         assert owner is None
-        return TerminalHosts(
-            hosts=[
-                TerminalHost(
-                    name="laptop",
-                    status="online",
-                    terminal_ready=True,
-                    confirmed=True,
-                ),
-            ],
-        )
+        return TerminalHosts(hosts=self.hosts)
 
     def session_start(self, body: SessionStart) -> SessionStartResponse:
         self.starts.append(body)
@@ -155,6 +154,23 @@ async def test_list_names_hosts_states_and_rental_availability() -> None:
     client.api.refuse = 404
     assert await _tools(client).act(action="host.list") == (
         "laptop: online\nThis server rents no KnowHosts."
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_without_a_host_says_gpu_jobs_need_one_and_how_to_get_one() -> None:
+    client = _Client()
+    client.hosts = []
+    client.api.knowhosts = []
+    assert await _tools(client).act(action="host.list") == (
+        "This server rents KnowHosts.\n"
+        "No host: GPU jobs and commands need one. The person connects one from Hosts, "
+        "or host.start rents one."
+    )
+    client.api.refuse = 404
+    assert await _tools(client).act(action="host.list") == (
+        "This server rents no KnowHosts.\n"
+        "No host: GPU jobs and commands need one. The person connects one from Hosts."
     )
 
 

@@ -218,6 +218,19 @@ class KnowOpTools:
                         if rented is None
                         else "This server rents KnowHosts.",
                         *(f"{host['host']}: {host['state']}" for host in rented or ()),
+                        *(
+                            ()
+                            if registered
+                            else (
+                                "No host: GPU jobs and commands need one. The person "
+                                "connects one from Hosts"
+                                + (
+                                    "."
+                                    if rented is None
+                                    else ", or host.start rents one."
+                                ),
+                            )
+                        ),
                     ],
                 )
             case "host.start":

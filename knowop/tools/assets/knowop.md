@@ -12,6 +12,11 @@ reading Trackinizer's records.
 - `host.resume`: wake KnowHost `name`; says when memory was lost. Resume
   a paused host before using it through RemoteTool.
 
+GPU jobs: no action here submits one. Run `knowop job` on a host through
+RemoteTool, in a git repository. No host: the person connects one from Hosts, or
+`host.start`. Not logged in (`knowop status`): run `knowop login` there and give
+the person its link.
+
 ## Session
 
 - `session.budget`: the person's campaign limit, in USD: their Each campaign
