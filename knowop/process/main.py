@@ -135,7 +135,7 @@ from knowop.tools.knowop import (
     KnowOpClient,
     KnowOpTools,
 )
-from knowop.tools.records import RecordReads
+from knowop.tools.records import Records
 
 
 if TYPE_CHECKING:
@@ -407,7 +407,7 @@ async def serve(
                     KnowOpTools(
                         client,
                         session_id=session_id,
-                        records=RecordReads(client.base_url, api_key=client.api_key),
+                        records=Records(client.base_url, api_key=client.api_key),
                     ),
                 ),
             ) as o:
@@ -537,7 +537,8 @@ def agent_tools(canvas: CanvasTools, knowop: KnowOpTools) -> list[Tool]:
     shape of :meth:`CanvasTools.act`, ``set``'s settings the schema ``canvas`` holds,
     which is also all it sends; its description is ``CANVAS_DESCRIPTION``, and a
     picture it answers with reaches the model as an attachment. KnowOp's
-    ``trax.read`` action reads records, under the process's key.
+    ``trax.read`` and ``trax.write`` actions read and change records, under the
+    process's key.
 
     Args:
       canvas: The session's canvas tools.
@@ -767,7 +768,7 @@ async def _built(args: Sequence[str], *, client: Client) -> None:
             KnowOpTools(
                 client,
                 session_id=None,
-                records=RecordReads(client.base_url, api_key=client.api_key),
+                records=Records(client.base_url, api_key=client.api_key),
             ),
         ),
     ):

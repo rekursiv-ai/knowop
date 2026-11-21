@@ -141,6 +141,17 @@ cloud started, the server keeps its key to the same reads, and of transcripts
 (`agentsession N records`) to its own session's and those of the sessions its agents
 spawned; at a terminal it holds your own key, and the action alone keeps it to reads.
 
+Its `trax.write` action changes records, as the agent: it files, edits, labels,
+charges, links, unlinks, claims and deletes rows
+(`KnowOp(action="trax.write", command="issue 7 status to complete")`,
+`issue title to x narrows issue 5`, `issue 7 requires issue 5`). Each change is
+recorded as `LABEL#SESSION`, the agent `session.self` names. A delete reaches your
+account's unclaimed rows, as the server allows yours. It runs no bulk edit's
+`--makeitso` and takes no `--as`: each answers that it is refused, and nothing is
+written. Under any key the action calls only the routes those writes need;
+for an agent a daemon or Our cloud started, the server keeps its key to the same
+routes, each to what you may write.
+
 ## Continue a stored session
 
 `--session` and `--stop` take a session's UUID or its number (`AgentSession#412`,
