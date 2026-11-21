@@ -21,17 +21,15 @@ required-markers = [
 conflicts = [[
     { package = "knowop", extra = "cpu" },
     { package = "knowop", extra = "cu126" },
-    { package = "knowop", extra = "cu128" },
     { package = "knowop", extra = "cu130" },
     { package = "knowop", extra = "cu132" },
     { package = "knowop", extra = "cu134" },
 ], [
     { package = "knowop", extra = "cpu" },
     { package = "knowop", extra = "cu126" },
-    { package = "knowop", extra = "cu128" },
     { package = "knowop", extra = "cu130" },
     { package = "knowop", extra = "cu134" },
-    { package = "knowop", group = "cuda" },
+    { package = "knowop", group = "default-cuda" },
 ]]
 
 [[package]]
@@ -433,8 +431,8 @@ wheels = [
 
 [[package]]
 name = "codedoctor"
-version = "0.1.14"
-source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#590ed7bab3573e176f06bc5a17bf7adc4832e820" }
+version = "0.1.15.dev1+g689b2e03a"
+source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#689b2e03a94d866f5a7d5a6a34078e0f27b53f24" }
 dependencies = [
     { name = "pyyaml" },
     { name = "rignore" },
@@ -1171,7 +1169,7 @@ wheels = [
 [[package]]
 name = "knowop"
 source = { editable = "." }
-default-groups = ["cuda", "dev"]
+default-groups = ["default-cuda", "dev"]
 dependencies = [
     { name = "aiortc" },
     { name = "pydantic" },
@@ -1216,14 +1214,14 @@ cu134 = [
 ]
 
 [package.dev-dependencies]
-cuda = [
-    { name = "torch" },
-    { name = "torchao" },
-    { name = "torchvision" },
-]
 debug = [
     { name = "ipython" },
     { name = "tqdm" },
+]
+default-cuda = [
+    { name = "torch" },
+    { name = "torchao" },
+    { name = "torchvision" },
 ]
 dev = [
     { name = "basedpyright" },
@@ -1315,14 +1313,14 @@ requires-dist = [
 provides-extras = ["cpu", "cu126", "cu128", "cu130", "cu132", "cu134"]
 
 [package.metadata.requires-dev]
-cuda = [
-    { name = "torch" },
-    { name = "torchao" },
-    { name = "torchvision" },
-]
 debug = [
     { name = "ipython", specifier = ">=9.18.0" },
     { name = "tqdm", specifier = ">=4.70.1" },
+]
+default-cuda = [
+    { name = "torch" },
+    { name = "torchao" },
+    { name = "torchvision" },
 ]
 dev = [
     { name = "basedpyright", specifier = ">=1.40.2" },
@@ -2780,8 +2778,8 @@ wheels = [
 
 [[package]]
 name = "rekursiv-ai-typings"
-version = "0.1.27"
-source = { git = "https://github.com/rekursiv-ai/typings?branch=main#2c5d51c68e3b072c6ac3d7f84cb35508078fd953" }
+version = "0.1.28.dev1+g26747f4b0"
+source = { git = "https://github.com/rekursiv-ai/typings?branch=main#26747f4b0fcf57ea2d76e492fd0305be27a3b7c4" }
 
 [[package]]
 name = "requests"
@@ -3022,8 +3020,8 @@ wheels = [
 
 [[package]]
 name = "sagent"
-version = "0.2.6.dev1+g17e374aef"
-source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#17e374aef8da83bbacd2da6b6bc4c07442ed3072" }
+version = "0.2.6.dev2+gf7bdf0a5f"
+source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#f7bdf0a5f44cc04a9a59ec17a1da971f38c95f02" }
 dependencies = [
     { name = "bashlex" },
     { name = "cachetools" },
@@ -3353,8 +3351,8 @@ wheels = [
 
 [[package]]
 name = "trackinizer"
-version = "0.1.16.dev2+gd35784685"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#d357846856a1b8c6d6a107ba7d639d141c4fb713" }
+version = "0.1.16.dev3+g48aa02a16"
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#48aa02a16925fb1de7684e11d670e26927ac4710" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
@@ -3702,8 +3700,8 @@ wheels = [
 
 [[package]]
 name = "wesearch"
-version = "0.1.21.dev1+g6199b1309"
-source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#6199b130951b32dfa01c93cc078696e8262e9ac4" }
+version = "0.1.21.dev2+g5cd0d291a"
+source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#5cd0d291a519444a72618f4d6a83213c54dcb893" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "brotli" },
