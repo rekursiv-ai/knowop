@@ -1078,6 +1078,7 @@ def test_a_start_the_server_placed_for_remote_agents_is_refused_on_a_persons_hos
         host="remote-agents",
         token=_TOKEN,
         remote=True,
+        watcher=False,
     )
     client = _Relayed(relay)
     serving = _serving(client)
