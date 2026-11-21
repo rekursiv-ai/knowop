@@ -294,7 +294,7 @@ def _zst(path: Path) -> Path:
 def _sagent(
     folder: Path,
     *,
-    said: str = "hi",
+    content: str = "hi",
     stood: dict[str, str] | None = None,
 ) -> Path:
     """Write a sagent journal in ``folder``; ``stood`` stands a child per label."""
@@ -311,9 +311,15 @@ def _sagent(
         b"".join(
             record_line(record)
             for record in (
-                UserMessage(content=said, timestamp="2026-11-01T10:00:00+00:00"),
+                UserMessage(
+                    content=content,
+                    timestamp=datetime(2026, 11, 1, 10, tzinfo=UTC),
+                ),
                 *standing,
-                AssistantMessage(content="yo", timestamp="2026-11-01T10:02:00+00:00"),
+                AssistantMessage(
+                    content="yo",
+                    timestamp=datetime(2026, 11, 1, 10, 2, tzinfo=UTC),
+                ),
             )
         ),
     )
@@ -402,7 +408,7 @@ def test_a_session_whose_records_state_no_time_leaves_its_times_to_the_server(
 
 
 def test_each_record_is_masked_before_it_goes(tmp_path: Path) -> None:
-    path = _sagent(tmp_path / "a4458be87354", said=f"the key is {_MASKED}")
+    path = _sagent(tmp_path / "a4458be87354", content=f"the key is {_MASKED}")
     server = _Server()
 
     _ = _sent(server, plan([path]), redactor=Redactor({"KEY": _MASKED}))
@@ -678,7 +684,7 @@ def test_a_sagent_agent_goes_up_linked_with_the_label_its_spawner_stood(
     root = _sagent(
         tmp_path / "a4458be87354",
         # A line that names a standing record's kind and is none stands no child.
-        said="persistent_agent",
+        content="persistent_agent",
         stood={"scout": _SAGENT_CHILD, "critic": "critic"},
     )
     child = _sagent(tmp_path / "a4458be87354" / _SAGENT_CHILD)

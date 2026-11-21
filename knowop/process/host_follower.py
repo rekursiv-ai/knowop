@@ -35,7 +35,7 @@ import logging
 import threading
 
 from sagent.host.wire import MAX_LINE_BYTES
-from sagent.session.types import RemoteToolResult, ToolResult
+from sagent.session.types import RemoteToolResult, ToolMessage
 from sagent.tools.remote import Link, RemoteTool
 from sagent.tools.types import parse
 from sagent.types import AsyncResource
@@ -302,7 +302,7 @@ class _HostedTool(RemoteTool):
         context: ToolContext,
         arguments: Mapping[str, PlainTree],
         streams: Mapping[str, Stream[object]],
-    ) -> ToolResult:
+    ) -> ToolMessage:
         asked = parse(arguments, RemoteTool.Arguments)
         if asked.endpoint:
             if asked.tool != "AgentSend":
@@ -315,7 +315,7 @@ class _HostedTool(RemoteTool):
             f"{name}  {status}: opens on first use" for name, status in listed.items()
         )
         if not self.remote.endpoints():
-            return ToolResult(
+            return ToolMessage(
                 call_id="",
                 state="done",
                 stdout=(available,),

@@ -42,10 +42,10 @@ command does.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial, wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol, TypedDict
 from uuid import UUID, uuid4
 
 import asyncio
@@ -58,11 +58,12 @@ import sys
 from sagent.runtime import types
 from sagent.session.jsonl import JournalInUseError
 from sagent.session.types import (
-    AgentToAgentMessage,
+    AgentMessage,
     Attachment,
     UncategorizedToolResult,
 )
 from sagent.tools.function import tool
+from sagent.tools.recall import Recall
 from sagent.tools.remote import RemoteTool
 from sagent.tools.types import ToolOutput
 from sagent.tui.main import StartError, opened, parse_flags, run, signals
@@ -97,7 +98,7 @@ from trackinizer.wire.wire_terminals import (
     CLOSE_REFUSED,
     CLOSE_TAKEN_OVER,
 )
-from treekle import ReadError
+from treekle import ReadError, from_plain
 
 from knowop.agent.errors import (
     LossyConversionError,
@@ -385,6 +386,7 @@ async def serve(
         canvas_id=canvas_from_env(os.environ),
         settings=await _agent_settings(client),
     )
+    user = await asyncio.to_thread(session_user, client, session_id, tui=tui)
     try:
         async with SessionSocket(
             client,
@@ -398,6 +400,7 @@ async def serve(
                 flags,
                 given=given,
                 interactive=tui,
+                user=user,
                 use_daemon=not remote,
                 tools=agent_tools(
                     canvas,
@@ -472,7 +475,7 @@ async def delivering(
 
     """
     quit_ran = asyncio.Future[Ended](loop=asyncio.get_running_loop())
-    lines: asyncio.Queue[AgentToAgentMessage | Command] = asyncio.Queue()
+    lines: asyncio.Queue[AgentMessage | Command] = asyncio.Queue()
     tasks = [
         asyncio.create_task(
             _delivered(
@@ -553,6 +556,66 @@ def agent_tools(canvas: CanvasTools, knowop: KnowOpTools) -> list[Tool]:
     return [made, tool(knowop.act, name=KNOWOP_TOOL, description=KNOWOP_DESCRIPTION)]
 
 
+# Handed to the tool, where trax reads the same key from the profile: in the
+# environment, every command the agent runs would inherit it. A server a person
+# named (``--tool.Recall.url``) stands, and is sent no key of this process's.
+def recall_here(team: Team, *, url: str, key: str, session_id: UUID) -> None:
+    """Set each agent's ``Recall`` to search this process's server near its session.
+
+    Args:
+      team: The session's agents; one spawned later copies its spawner's tools.
+      url: The server this process reports to.
+      key: The key it serves the session with, which ``Recall`` sends to ``url`` alone.
+      session_id: The session, as the server stores it.
+
+    """
+    for member in team.values():
+        tools = member.runtime.tools
+        recall = tools.get(Recall.name)
+        if isinstance(recall, Recall) and not recall.url:
+            tools[Recall.name] = replace(
+                recall,
+                url=url,
+                key=key,
+                session=str(session_id),
+            )
+
+
+class _SessionRow(TypedDict):
+    """A session's row, as ``/api/web/get`` answers it: whom it is held for."""
+
+    account: str
+
+
+# The server says who, for the key it is asked with: no one types a name, and none
+# is read from this computer. At a screen the lines typed are the key's person's;
+# with none, every line comes from Chat, and the session is whoever it is held for.
+def session_user(client: ServeClient, session_id: UUID, *, tui: bool) -> str | None:
+    """Return whose session the agent is told it is.
+
+    Args:
+      client: Talks to the server, with the key this process serves the session with.
+      session_id: The session.
+      tui: Whether a person types at this process's screen.
+
+    Returns:
+      user: The email of the key's person at a screen, else of the account the
+        session is held for; ``None`` when the server does not say.
+
+    """
+    try:
+        if tui:
+            return from_plain(client.get("/api/me/profile"), _Person)["email"]
+        row = from_plain(client.get(f"/api/web/get/{session_id}"), _Fetched)
+        return row["self"]["account"]
+    except (ClientError, ReadError) as error:
+        logger.warning(
+            "could not read whose session this is: %s",  # pragma: no mutate[diagnostic-text]
+            error,
+        )
+        return None
+
+
 def effort_default(agent: Agent, effort: ThinkingEffort = KNOWOP_EFFORT) -> None:
     """Set a new session's agent to ``effort`` where its model offers it.
 
@@ -573,7 +636,7 @@ def effort_default(agent: Agent, effort: ThinkingEffort = KNOWOP_EFFORT) -> None
         )
         # The open stood the model as it was; left to the first turn's save, a
         # process killed before that turn leaves its next process the catalog's.
-        agent.runtime.publish(types.SaveSession())
+        agent.runtime.publish(types.SessionSaveDue())
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -639,7 +702,7 @@ def _last_told(records: Iterable[SessionRecord]) -> UUID | None:
     told = [
         canvas
         for record in records
-        if isinstance(record, AgentToAgentMessage)
+        if isinstance(record, AgentMessage)
         and (canvas := told_canvas(record)) is not None
     ]
     return told[-1] if told else None
@@ -697,6 +760,7 @@ async def _built(args: Sequence[str], *, client: Client) -> None:
         flags,
         given=given,
         interactive=False,
+        user=None,
         use_daemon=False,
         tools=agent_tools(
             canvas,
@@ -794,6 +858,12 @@ async def _live(
     # Chat is the user an agent's send to ``user`` reaches. At a terminal the screen
     # takes it over as it builds (``Views``), and prints it there.
     o.team.to_user = publisher.to_user
+    recall_here(
+        o.team,
+        url=client.base_url,
+        key=client.api_key,
+        session_id=session_id,
+    )
     commands = asyncio.Future[Commands]()
     build = _telling(
         partial(Commands, allowed=allowed),
@@ -807,7 +877,7 @@ async def _live(
             o.agent,
             catalog=o.catalog,
             team=o.team,
-            say=_unsaid,
+            print_output=_dropped_output,
             screen=o.screen,
             panes=Panes(),
             theme=o.theme,
@@ -899,13 +969,13 @@ def _telling[**P](
     def telling(*args: P.args, **kwargs: P.kwargs) -> Commands:
         commands = build(*args, **kwargs)
         if commands.agent is root:
-            say = commands.say
+            print_output = commands.print_output
 
             def both(output: CommandOutput) -> None:
-                say(output)
-                publisher.say(output)
+                print_output(output)
+                publisher.print_output(output)
 
-            commands.say = both
+            commands.print_output = both
             publisher.commands = commands
             built.set_result(commands)
         return commands
@@ -913,7 +983,7 @@ def _telling[**P](
     return telling
 
 
-def _unsaid(output: CommandOutput) -> None:
+def _dropped_output(output: CommandOutput) -> None:
     """Print nowhere what a command said: headless, Chat alone is told."""
     del output
 
@@ -960,7 +1030,7 @@ async def _halted(agent: Agent) -> None:
     taken = asyncio.Event()
 
     def observe(event: types.RuntimeEvent) -> None:
-        if isinstance(event, types.Halt):
+        if isinstance(event, types.ModelHalt):
             taken.set()
 
     agent.runtime.observers.append(observe)
@@ -981,7 +1051,7 @@ async def _delivered(
     team: Team,
     relay: ServerRelay,
     publisher: Publisher,
-    lines: asyncio.Queue[AgentToAgentMessage | Command],
+    lines: asyncio.Queue[AgentMessage | Command],
     canvas: CanvasTools,
 ) -> None:
     """Halt at each halt and hand each agent's message on as it comes; queue the rest."""
@@ -989,24 +1059,24 @@ async def _delivered(
         try:
             message = input_message(sent)
         except ValueError as error:
-            publisher.say(CommandOutput(text=error_text(error), tone="error"))
+            publisher.print_output(CommandOutput(text=error_text(error), tone="error"))
             continue
         # A root's halt leaves its sub-agents' calls running, each on a runtime of
         # its own; one for ``all``, the server's when the owner can no longer pay,
         # halts every agent here.
-        if isinstance(message, types.Halt):
+        if isinstance(message, types.ModelHalt):
             for halted in team.values() if sent.recipient == "all" else (agent,):
-                halted.runtime.halt()
-        elif isinstance(message, AgentToAgentMessage) and sent.booked is not None:
+                halted.runtime.halt(sender=message.sender)
+        elif isinstance(message, AgentMessage) and sent.booked is not None:
             relay.deliver(message, booked=sent.booked)
         else:
-            if isinstance(message, AgentToAgentMessage):
+            if isinstance(message, AgentMessage):
                 canvas.canvas_id = told_canvas(message) or canvas.canvas_id
             lines.put_nowait(message)
 
 
 async def _ran(
-    lines: asyncio.Queue[AgentToAgentMessage | Command],
+    lines: asyncio.Queue[AgentMessage | Command],
     *,
     agent: Agent,
     team: Team,
@@ -1020,7 +1090,7 @@ async def _ran(
         if not isinstance(message, Command):
             named = agent if message.recipient is None else team.get(message.recipient)
             if named is None:
-                publisher.say(
+                publisher.print_output(
                     CommandOutput(
                         text=f"No agent {message.recipient!r} here took this line.",
                         tone="error",
@@ -1035,7 +1105,7 @@ async def _ran(
             done = await ran(message.line)
         except Exception as error:
             logger.warning("command %r failed", message.line, exc_info=True)
-            ran.say(CommandOutput(text=error_text(error), tone="error"))
+            ran.print_output(CommandOutput(text=error_text(error), tone="error"))
             continue
         publisher.check_settings()
         if done:
@@ -1140,3 +1210,13 @@ def _started_on(
         return 1
     sys.stdout.write(f"{session_id}\n")
     return 0
+
+
+class _Person(TypedDict):
+    """Who a key is, as ``/api/me/profile`` answers."""
+
+    email: str
+
+
+class _Fetched(TypedDict):
+    self: _SessionRow

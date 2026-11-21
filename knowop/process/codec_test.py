@@ -16,16 +16,17 @@ from uuid import UUID
 
 from sagent.providers.openai.wire import user_content
 from sagent.runtime.types import (
-    AgentIdle,
     ChildEvent,
-    Halt,
-    ModelResponseError,
-    ModelResponsePartial,
+    ModelHalt,
+    ModelResponseCompleted,
+    ModelResponseTextStreamed,
     RuntimeEvent,
 )
 from sagent.session.types import (
-    AgentToAgentMessage,
+    AgentIdle,
+    AgentMessage,
     Attachment,
+    Failed,
     UserMessage,
     stored_record,
 )
@@ -51,10 +52,12 @@ if TYPE_CHECKING:
 
 
 def test_what_an_event_is_written_as_is_unchanged() -> None:
-    assert event_payload(ModelResponsePartial(text="hi", record=2)) == {
-        "py/object": "ModelResponsePartial",
+    assert event_payload(
+        ModelResponseTextStreamed(text="hi", response_record_index=2),
+    ) == {
+        "py/object": "ModelResponseTextStreamed",
         "text": "hi",
-        "record": 2,
+        "response_record_index": 2,
     }
 
 
@@ -63,10 +66,10 @@ def test_what_an_event_is_written_as_is_unchanged() -> None:
     [
         pytest.param(event, id=type(event).__name__)
         for event in (
-            ModelResponsePartial(text="hi"),
+            ModelResponseTextStreamed(text="hi"),
             AgentIdle(),
-            AgentToAgentMessage(sender="dan@example.com", content="hi"),
-            ChildEvent(label="Agent_0", inner=AgentIdle()),
+            AgentMessage(sender="dan@example.com", content="hi"),
+            ChildEvent(label="Agent_0", event=AgentIdle()),
             CommandOutput(text="Model: opus", tone="note", command="/model"),
         )
     ],
@@ -76,25 +79,30 @@ def test_an_event_reads_back_as_it_was_written(event: object) -> None:
 
 
 def test_an_exception_is_written_as_the_text_a_person_reads() -> None:
-    payload = event_payload(ModelResponseError(exception=RuntimeError("boom")))
+    payload = event_payload(
+        ModelResponseCompleted(outcome=Failed(exception=RuntimeError("boom"))),
+    )
 
     assert payload == {
-        "py/object": "ModelResponseError",
-        "exception": "RuntimeError: boom",
+        "py/object": "ModelResponseCompleted",
+        "outcome": {"py/object": "Failed", "exception": "RuntimeError: boom"},
     }
-    assert payload["exception"] == error_text(RuntimeError("boom"))
+    assert error_text(RuntimeError("boom")) == "RuntimeError: boom"
 
 
 def test_an_exception_inside_a_child_s_event_is_written_as_its_text_too() -> None:
     held = ChildEvent(
         label="Agent_0",
-        inner=ModelResponseError(exception=RuntimeError("boom")),
+        event=ModelResponseCompleted(outcome=Failed(exception=RuntimeError("boom"))),
     )
 
     assert event_payload(held) == {
         "py/object": "ChildEvent",
         "label": "Agent_0",
-        "inner": {"py/object": "ModelResponseError", "exception": "RuntimeError: boom"},
+        "event": {
+            "py/object": "ModelResponseCompleted",
+            "outcome": {"py/object": "Failed", "exception": "RuntimeError: boom"},
+        },
     }
 
 
@@ -129,7 +137,7 @@ def test_a_person_s_line_becomes_a_message_named_by_its_author() -> None:
 
     assert input_message(
         _input("UserMessage", event_payload(said)),
-    ) == AgentToAgentMessage(
+    ) == AgentMessage(
         content="hi",
         attachments=said.attachments,
         sender="dan@example.com",
@@ -150,7 +158,7 @@ def test_a_line_keeps_the_files_it_names_for_whoever_draws_it() -> None:
 
     message = input_message(_input("UserMessage", event_payload(said)))
 
-    assert isinstance(message, AgentToAgentMessage)
+    assert isinstance(message, AgentMessage)
     assert message.attachments == said.attachments
     assert message.extra == {
         "author": "dan@example.com",
@@ -164,7 +172,7 @@ def test_a_line_names_the_agent_it_is_for() -> None:
 
     message = input_message(sent.model_copy(update={"recipient": "lead"}))
 
-    assert isinstance(message, AgentToAgentMessage)
+    assert isinstance(message, AgentMessage)
     assert message.recipient == "lead"
 
 
@@ -177,7 +185,7 @@ def test_a_line_of_files_and_no_words_gives_the_model_their_list_and_the_picture
 
     message = input_message(_input("UserMessage", event_payload(said)))
 
-    assert isinstance(message, AgentToAgentMessage)
+    assert isinstance(message, AgentMessage)
     assert user_content(message) == (f"[from dan@example.com]: {listed}", (picture,))
 
 
@@ -187,7 +195,7 @@ def test_a_line_that_names_its_canvas_tells_the_agent_after_its_words() -> None:
 
     message = input_message(_input("UserMessage", event_payload(said)))
 
-    assert message == AgentToAgentMessage(
+    assert message == AgentMessage(
         content=(
             f'what is this?{CONTEXT_TRAILER}{{"canvas_id": "{canvas}"}}\n'
             "Your Canvas tool (show, capture, mark and the rest) acts on it; "
@@ -203,7 +211,7 @@ def test_a_line_that_names_its_canvas_tells_the_agent_after_its_words() -> None:
             "canvas_id": canvas,
         },
     )
-    assert isinstance(message, AgentToAgentMessage)
+    assert isinstance(message, AgentMessage)
     assert told_canvas(message) == UUID(canvas)
 
 
@@ -216,7 +224,7 @@ def test_a_line_of_no_words_that_names_its_canvas_tells_only_the_canvas() -> Non
 
     message = input_message(_input("UserMessage", event_payload(said)))
 
-    assert isinstance(message, AgentToAgentMessage)
+    assert isinstance(message, AgentMessage)
     assert (message.content or "").startswith(
         f'{CONTEXT_TRAILER}{{"canvas_id": "{canvas}"}}\n',
     )
@@ -231,13 +239,17 @@ def test_a_line_naming_no_canvas_reads_as_it_was_typed(extra: dict[str, JSON]) -
 
     message = input_message(_input("UserMessage", event_payload(said)))
 
-    assert isinstance(message, AgentToAgentMessage)
+    assert isinstance(message, AgentMessage)
     assert message.content == "hi"
     assert told_canvas(message) is None
 
 
-def test_a_halt_reads_as_a_halt() -> None:
-    assert input_message(_input("Halt", event_payload(Halt()))) == Halt()
+def test_a_halt_reads_as_a_halt_of_the_author_the_server_set() -> None:
+    """Whatever the payload says of who asked."""
+    for claimed in (ModelHalt(), ModelHalt(sender="eve@example.com")):
+        assert input_message(
+            _input("ModelHalt", event_payload(claimed)),
+        ) == ModelHalt(sender="dan@example.com")
 
 
 def test_a_slash_line_reads_as_a_command() -> None:
@@ -249,11 +261,11 @@ def test_a_slash_line_reads_as_a_command() -> None:
 @pytest.mark.parametrize(
     ("kind", "payload"),
     [
-        ("UserMessage", {"py/object": "Halt"}),
+        ("UserMessage", {"py/object": "ModelHalt"}),
         ("UserMessage", {"py/object": "UserMessage", "sender": "eve@example.com"}),
         # Another record with words would pass for a line, under a sender of its own.
-        ("UserMessage", {"py/object": "AgentToAgentMessage", "content": "hi"}),
-        ("Halt", {"py/object": "UserMessage", "content": "hi"}),
+        ("UserMessage", {"py/object": "AgentMessage", "content": "hi"}),
+        ("ModelHalt", {"py/object": "UserMessage", "content": "hi"}),
         ("Command", {"line": ""}),
         # A line with no slash would be pushed as a user's message with no sender.
         ("Command", {"line": "model opus"}),
@@ -265,6 +277,15 @@ def test_a_payload_that_is_not_its_kind_does_not_read(
 ) -> None:
     with pytest.raises(ValueError, match=r".+"):
         _ = input_message(_input(kind, payload))
+
+
+def test_a_line_that_names_its_own_sender_is_told_the_server_names_it() -> None:
+    claimed = {"py/object": "UserMessage", "sender": "eve@example.com"}
+    with pytest.raises(
+        ValueError,
+        match=r"^A line names no sender: the server says who sent it\.$",
+    ):
+        _ = input_message(_input("UserMessage", claimed))
 
 
 def _input(kind: InputKind, payload: JSON) -> Input:

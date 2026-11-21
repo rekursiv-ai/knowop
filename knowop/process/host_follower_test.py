@@ -27,7 +27,7 @@ from sagent.host.wire import (
     encoded,
     received,
 )
-from sagent.session.types import BashResult, ToolResult
+from sagent.session.types import BashResult, ToolMessage
 from sagent.tools.bash import Bash
 from sagent.tools.remote import Link, RemoteSession, RemoteTool
 from sagent.tools.types import ToolContext
@@ -258,7 +258,7 @@ class _Daemons:
                 self.calls.setdefault(host, []).append(message)
                 self.held.set()
                 if self.answer:
-                    record = ToolResult(
+                    record = ToolMessage(
                         call_id="",
                         state="done",
                         stdout=(f"{host}\n",),

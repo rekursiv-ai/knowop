@@ -243,6 +243,15 @@ computer. Terminals use the server relay when a direct link is unavailable.
 knowop calls the server through trackinizer's `Client`, as trax does, and never
 starts a `trax` process. KnowOp's `trax.read` action runs an agent's trax read commands
 inside the agent's own process (`trax.invoke`), reads only, under the agent's key.
+sagent's `Recall` tool searches the same server near the run's own session, under
+the same key: the process hands the tool both, so the key is in no environment a
+command of the agent inherits. A server a person names (`--tool.Recall.url`) is
+sent no key.
+The agent is told whose session it is, as the server names them for the run's key:
+at a terminal, the key's person (`/api/me/profile`); with no screen, the account the
+session is held for. A line from Chat that person wrote reads as theirs, with no
+label; anyone else's names its author. A server that does not say leaves the agent
+told no name.
 `trax host` and `trax job` say they moved out of trax.
 
 ## Development

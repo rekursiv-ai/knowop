@@ -12,7 +12,7 @@ posted and becomes what sagent's runtime takes, named by the author the server s
 Typical usage example:
 
   line = EventLine(kind=type(event).__name__, payload=event_payload(event))
-  message = input_message(sent)        # An ``AgentToAgentMessage`` from ``sent.author``.
+  message = input_message(sent)        # An ``AgentMessage`` from ``sent.author``.
 """
 
 from __future__ import annotations
@@ -26,11 +26,11 @@ import json
 
 from sagent.model import types as model_types
 from sagent.runtime import types as runtime_types
-from sagent.runtime.types import Halt
+from sagent.runtime.types import ModelHalt
+from sagent.session import types as session_types
 from sagent.session.types import (
-    AgentToAgentMessage,
+    AgentMessage,
     UserMessage,
-    record_classes,
     stored_plain,
     stored_record,
 )
@@ -55,17 +55,16 @@ CLASSES: Final[Mapping[str, type]] = MappingProxyType(
     {
         **{
             kind.__name__: kind
-            for module in (model_types, runtime_types)
+            for module in (model_types, session_types, runtime_types)
             for kind in cast("dict[str, object]", vars(module)).values()
             if isinstance(kind, type) and is_dataclass(kind)
         },
-        **record_classes(),
         CommandOutput.__name__: CommandOutput,
     },
 )
 """Every class an event or an input may name, by the name it is written under: the
-session's records, each dataclass of sagent's runtime and model types, and what a
-slash line says."""
+session's records and outcomes, each dataclass of sagent's runtime and model types,
+and what a slash line says."""
 
 
 def event_payload(event: object) -> JSON:
@@ -73,7 +72,7 @@ def event_payload(event: object) -> JSON:
     return stored_plain(_worded(event), classes=CLASSES)
 
 
-def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
+def input_message(sent: Input) -> AgentMessage | ModelHalt | Command:
     """Return what the agent takes for ``sent``: a line as a message from its author.
 
     A line reaches the agent as sagent's own message between agents, so the model
@@ -92,20 +91,23 @@ def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
       sent: An input, as the server handed it down.
 
     Returns:
-      message: A line, named by ``sent.author``; a halt; or a slash line.
+      message: A line or a halt, named by ``sent.author``; or a slash line.
 
     Raises:
-      ValueError: The payload does not read as ``sent.kind``.
+      ValueError: The payload does not read as ``sent.kind``, or a line names a
+        sender of its own.
 
     """
     match sent.kind:
         case "UserMessage":
-            said = stored_record(sent.payload, UserMessage)
-            canvas = _canvas(said)
-            files = said.extra.get("files")
-            return AgentToAgentMessage(
-                content=_told(said, canvas=canvas),
-                attachments=said.attachments,
+            line = stored_record(sent.payload, UserMessage)
+            if line.sender is not None:
+                raise ValueError("A line names no sender: the server says who sent it.")
+            canvas = _canvas(line)
+            files = line.extra.get("files")
+            return AgentMessage(
+                content=_told(line, canvas=canvas),
+                attachments=line.attachments,
                 sender=sent.author,
                 recipient=sent.recipient or None,
                 extra={
@@ -115,13 +117,16 @@ def input_message(sent: Input) -> AgentToAgentMessage | Halt | Command:
                     **({} if files is None else {"files": files}),
                 },
             )
-        case "Halt":
-            return stored_record(sent.payload, Halt, classes=CLASSES)
+        case "ModelHalt":
+            return replace(
+                stored_record(sent.payload, ModelHalt, classes=CLASSES),
+                sender=sent.author,
+            )
         case "Command":
             return Command.model_validate(sent.payload)
 
 
-def told_canvas(message: AgentToAgentMessage) -> UUID | None:
+def told_canvas(message: AgentMessage) -> UUID | None:
     """Return the canvas a line from Chat named, as :func:`input_message` keeps it.
 
     Args:
@@ -137,18 +142,18 @@ def told_canvas(message: AgentToAgentMessage) -> UUID | None:
 
 # The canvas is a hint from the sender's page: one that is no UUID is left out, and
 # the line goes as typed.
-def _canvas(said: UserMessage) -> UUID | None:
-    """Return the canvas ``said`` names, if it names one."""
+def _canvas(line: UserMessage) -> UUID | None:
+    """Return the canvas ``line`` names, if it names one."""
     try:
-        return UUID(from_plain(said.extra.get(LINE_CANVAS), str))
+        return UUID(from_plain(line.extra.get(LINE_CANVAS), str))
     except ValueError:
         return None
 
 
-def _told(said: UserMessage, *, canvas: UUID | None) -> str | None:
-    """Return ``said``'s words, then ``canvas`` and what acts on it, if it names one."""
+def _told(line: UserMessage, *, canvas: UUID | None) -> str | None:
+    """Return ``line``'s words, then ``canvas`` and what acts on it, if it names one."""
     if canvas is None:
-        return said.content
+        return line.content
     context = json.dumps({"canvas_id": str(canvas)})
     # ``knowop``, not ``trax``: a host's ``trax`` may be a wrapper that wants a profile.
     how = (
@@ -158,7 +163,7 @@ def _told(said: UserMessage, *, canvas: UUID | None) -> str | None:
         "chat is about, this one or a later one, `read` the canvas, and `rename` it "
         "while its name is `unnamed-canvas#N`."
     )
-    return f"{said.content or ''}{CONTEXT_TRAILER}{context}\n{how}"
+    return f"{line.content or ''}{CONTEXT_TRAILER}{context}\n{how}"
 
 
 # Treekle writes plain data, which an exception is not. An event holds the one that

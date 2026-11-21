@@ -43,20 +43,23 @@ from sagent.model.scripted import Reply, ScriptedProvider, call, reply
 from sagent.providers import anthropic, openai
 from sagent.providers.catalog import ModelCatalog, ModelMemory
 from sagent.providers.table import ModelTags, models
+from sagent.runtime import types
 from sagent.session.jsonl import JournalInUseError, JsonlJournal
 from sagent.session.types import (
-    AgentToAgentMessage,
+    AgentIdle,
+    AgentMessage,
     AssistantMessage,
     Attachment,
     ReadResult,
     SessionRecord,
-    ToolResult,
+    ToolMessage,
     UncategorizedRecord,
     UncategorizedToolResult,
     UserMessage,
 )
 from sagent.tools import mcp
 from sagent.tools.read import Read
+from sagent.tools.recall import Recall
 from sagent.tools.remote import RemoteSession, RemoteTool
 from sagent.tools.types import Tool, ToolContext, settled
 from sagent.tui.main import Flags, OpenAgent, StartError
@@ -103,7 +106,7 @@ from trackinizer.wire.wire_terminals import (
     CLOSE_TAKEN_OVER,
 )
 from trackinizer.wire.wire_tools import TOOLS_WS_PATH
-from treekle import PlainTree, from_plain
+from treekle import PlainTree, ReadError, from_plain
 from websockets.asyncio.server import (
     ServerConnection,
     serve as serve_websockets,
@@ -136,7 +139,9 @@ from knowop.process.main import (
     ServeClient,
     first_done,
     main,
+    recall_here,
     serve,
+    session_user,
 )
 from knowop.process.publisher import Publisher
 from knowop.process.remote_commands import REMOTE_AGENT
@@ -344,6 +349,19 @@ class _Server(_Client):
     )
     """What the server answers for the settings an agent may change, or why not."""
 
+    profile: PlainTree | ClientError = field(
+        default_factory=lambda: {"email": "ada@example.com", "role": "writer"},
+    )
+    """What the server answers for who the process's key is, or why not."""
+
+    session_row: PlainTree | ClientError = field(
+        default_factory=lambda: {
+            "self": {"kind": "AgentSession", "account": "bea@example.com"},
+            "edges": dict[str, PlainTree](),
+        },
+    )
+    """What the server answers for the session's own row, or why not."""
+
     resolved: list[Ref] = field(default_factory=list[Ref])
     """Each reference resolved: a session's number, which only the server knows."""
 
@@ -402,10 +420,16 @@ class _Server(_Client):
         return {"preferences": {"theme": "light"}}
 
     def get(self, path: str, *, timeout: float | None = None) -> PlainTree:
-        assert (path, timeout) == ("/api/me/preferences/agent", 3.0)
-        if isinstance(self.settings, ClientError):
-            raise self.settings
-        return self.settings
+        answers = {
+            "/api/me/preferences/agent": (self.settings, 3.0),
+            "/api/me/profile": (self.profile, None),
+            f"/api/web/get/{_SESSION}": (self.session_row, None),
+        }
+        answer, within = answers[path]
+        assert timeout == within
+        if isinstance(answer, ClientError):
+            raise answer
+        return answer
 
     def list_canvases(self) -> list[dict[str, PlainTree]]:
         if isinstance(self.canvases, ClientError):
@@ -570,6 +594,9 @@ class _Opened:
     given_tools: list[Sequence[Tool]] = field(default_factory=list[Sequence[Tool]])
     """The tools each open was handed, which the agent it builds is given too."""
 
+    users: list[str | None] = field(default_factory=list["str | None"])
+    """Whose session each open was told it is."""
+
     history: list[SessionRecord] = field(default_factory=list["SessionRecord"])
     """What the journal holds already, as a continued session's restored one does."""
 
@@ -587,6 +614,7 @@ class _Opened:
         *,
         given: Sequence[tuple[str, str]],
         interactive: bool,
+        user: str | None,
         use_daemon: bool = True,
         tools: Sequence[Tool] = (),
     ) -> AsyncGenerator[OpenAgent]:
@@ -595,6 +623,7 @@ class _Opened:
         self.interactive.append(interactive)
         self.use_daemon.append(use_daemon)
         self.given_tools.append(tools)
+        self.users.append(user)
         if self.raises is not None:
             raise self.raises
         assert flags.session is not None
@@ -635,13 +664,13 @@ class _Opened:
                     theme=self.theme,
                 )
 
-    def _halted(self, agent: Agent) -> Callable[[], None]:
+    def _halted(self, agent: Agent) -> Callable[..., None]:
         halt = agent.runtime.halt
 
-        def counted() -> None:
+        def counted(*, sender: str | None = None) -> None:
             self.halts += 1
             self.steps.append("halt")
-            halt()
+            halt(sender=sender)
 
         return counted
 
@@ -745,6 +774,54 @@ async def test_its_knowop_tool_acts_for_its_session_and_reads_under_its_key(
         (server.base_url, server.api_key),
     ]
     assert knowops == [(server, _SESSION, reads[0][2])]
+
+
+# The server says who: the key of the person at the screen names them; with no
+# screen the process acts for whoever its session is held for. No one types it.
+@pytest.mark.parametrize(
+    ("tui", "user"),
+    [(True, "ada@example.com"), (False, "bea@example.com")],
+    ids=["at-a-screen-its-key-s-person", "with-none-its-session-s-account"],
+)
+def test_the_agent_is_told_whose_session_it_is_as_the_server_says(
+    *,
+    tui: bool,
+    user: str,
+) -> None:
+    assert session_user(_Server(version=1), _SESSION, tui=tui) == user
+
+
+@pytest.mark.parametrize("tui", [True, False])
+@pytest.mark.parametrize(
+    "answer",
+    [ClientError("no route"), {"email": 3, "self": {"account": None}}, {}],
+    ids=["refused", "not-a-name", "says-nothing"],
+)
+def test_a_server_that_does_not_say_whose_session_it_is_leaves_the_agent_untold(
+    caplog: pytest.LogCaptureFixture,
+    *,
+    tui: bool,
+    answer: PlainTree | ClientError,
+) -> None:
+    server = _Server(version=1, profile=answer, session_row=answer)
+    with caplog.at_level(logging.WARNING, logger=main_module.__name__):
+        assert session_user(server, _SESSION, tui=tui) is None
+    # The warning carries why: what the server refused, or what it sent instead.
+    (warned,) = caplog.records
+    assert warned.levelno == logging.WARNING
+    assert isinstance(warned.args, tuple)
+    (why,) = warned.args
+    assert isinstance(why, ClientError | ReadError)
+    assert isinstance(answer, ClientError) is (why is answer)
+
+
+@pytest.mark.asyncio
+async def test_a_run_tells_its_agent_whose_session_it_is(opened: _Opened) -> None:
+    async with _relayed() as relay, _serving(relay) as (task, _):
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert opened.users == ["bea@example.com"]
 
 
 @pytest.mark.asyncio
@@ -882,12 +959,10 @@ async def test_a_line_from_chat_is_the_authors_and_the_agent_answers_it(
             "UserMessage",
             {"py/object": "UserMessage", "content": "hi", "extra": {}},
         )
-        _ = await relay.seen(_is("event", event="ModelResponseComplete"))
+        _ = await relay.seen(_is("event", event="ModelResponseCompleted"))
         assert opened.agent is not None
         said = [
-            r
-            for r in opened.agent.session.history()
-            if isinstance(r, AgentToAgentMessage)
+            r for r in opened.agent.session.history() if isinstance(r, AgentMessage)
         ]
         await relay.close(CLOSE_ENDED)
         _ = await _exited(task)
@@ -895,12 +970,12 @@ async def test_a_line_from_chat_is_the_authors_and_the_agent_answers_it(
     assert [(m.sender, m.content, dict(m.extra)) for m in said] == [
         ("ada@x.y", "hi", {"author": "ada@x.y", "input": str(sent)}),
     ]
-    assert "AgentToAgentMessage" in [r.kind for r in server.stored]
+    assert "AgentMessage" in [r.kind for r in server.stored]
 
 
 async def _completed(relay: _Relay, responses: int) -> None:
     """Return once the model has completed ``responses`` responses in all."""
-    wanted = _is("event", event="ModelResponseComplete")
+    wanted = _is("event", event="ModelResponseCompleted")
     async with asyncio.timeout(5), relay.arrived:
         await relay.arrived.wait_for(lambda: len(relay.every(wanted)) >= responses)
 
@@ -926,7 +1001,7 @@ async def test_every_agent_acts_on_the_canvas_the_newest_line_from_chat_named(
     """The Canvas tool is handed in by name; it acts on no canvas until a line names one."""
     opened.replies = [reply("none yet"), reply("shown"), reply("still")]
     context = ToolContext(cwd=tmp_path)
-    results: list[ToolResult] = []
+    results: list[ToolMessage] = []
     async with _relayed() as relay, _serving(relay, remote=remote) as (task, server):
         _ = await relay.seen(_is("settings"))
         canvas, _ = opened.given_tools[0]
@@ -1034,7 +1109,7 @@ async def test_a_viewer_of_a_starting_process_sees_the_agents_first_idle(
     if continued:
         # Answered, as a stopped session's journal ends: the agent waits for a line.
         opened.history = [
-            AgentToAgentMessage(content="a", extra={"canvas_id": str(_CANVAS_ON)}),
+            AgentMessage(content="a", extra={"canvas_id": str(_CANVAS_ON)}),
             AssistantMessage(content="b"),
         ]
     async with _relayed() as relay, _serving(relay) as (task, _):
@@ -1053,7 +1128,7 @@ async def test_a_continued_session_acts_on_the_canvas_its_stored_lines_named_las
     """A tab tells a canvas once, so the one a restored line named stands; not the run's."""
     read_on_the_loop: dict[str | None, bool] = {}
 
-    def told(message: AgentToAgentMessage) -> UUID | None:
+    def told(message: AgentMessage) -> UUID | None:
         on_the_loop = threading.current_thread() is threading.main_thread()
         read_on_the_loop[message.content] = on_the_loop
         return told_canvas(message)
@@ -1065,10 +1140,10 @@ async def test_a_continued_session_acts_on_the_canvas_its_stored_lines_named_las
         reply("ok"),
     ]
     opened.history = [
-        AgentToAgentMessage(content="a", extra={"canvas_id": str(UUID(int=96))}),
-        AgentToAgentMessage(content="a", extra={"canvas_id": str(UUID(int=98))}),
-        AgentToAgentMessage(content="b", extra={"canvas_id": str(_CANVAS_ON)}),
-        AgentToAgentMessage(content="c", extra={"author": "ada@x.y"}),
+        AgentMessage(content="a", extra={"canvas_id": str(UUID(int=96))}),
+        AgentMessage(content="a", extra={"canvas_id": str(UUID(int=98))}),
+        AgentMessage(content="b", extra={"canvas_id": str(_CANVAS_ON)}),
+        AgentMessage(content="c", extra={"author": "ada@x.y"}),
         UserMessage(content="d", extra={"canvas_id": str(UUID(int=97))}),
     ]
     async with _relayed() as relay, _serving(relay) as (task, server):
@@ -1134,7 +1209,7 @@ async def test_set_offers_the_settings_the_server_gives_and_sets_only_those(
         await _completed(relay, 2)
         assert opened.agent is not None
         (result,) = [
-            r for r in opened.agent.session.history() if isinstance(r, ToolResult)
+            r for r in opened.agent.session.history() if isinstance(r, ToolMessage)
         ]
         await relay.close(CLOSE_ENDED)
         _ = await _exited(task)
@@ -1195,11 +1270,11 @@ async def test_another_session_s_agent_is_asked_and_answered_through_the_server(
         assert opened.agent is not None
         team = opened.team
         # Held at the inbox, as the scripted model answers nothing; a halt goes on.
-        arrived = asyncio.Queue[AgentToAgentMessage]()
+        arrived = asyncio.Queue[AgentMessage]()
         push = opened.agent.runtime.push
 
         def held(message: RuntimeEvent) -> None:
-            if isinstance(message, AgentToAgentMessage):
+            if isinstance(message, AgentMessage):
                 arrived.put_nowait(message)
             else:
                 push(message)
@@ -1247,7 +1322,7 @@ async def test_a_person_s_line_reaches_the_agent_it_names_or_says_none_took_it(
     assert [
         (m.sender, m.recipient, m.content)
         for m in pushed
-        if isinstance(m, AgentToAgentMessage)
+        if isinstance(m, AgentMessage)
     ] == [("ada@x.y", "helper", "status?")]
     payload = cast("dict[str, object]", said["payload"])
     assert payload["text"] == "No agent 'ghost' here took this line."
@@ -1260,12 +1335,12 @@ async def test_what_an_agent_sends_the_user_goes_to_chat(opened: _Opened) -> Non
         assert opened.team is not None
         # As a child answers a /send from Chat: to ``user``, whom no screen shows here.
         opened.team.send("Agent", "user", "in the repository")
-        said = await relay.seen(_is("event", event="AgentToAgentMessage"))
+        message_event = await relay.seen(_is("event", event="AgentMessage"))
         await relay.close(CLOSE_ENDED)
         _ = await _exited(task)
 
-    assert said["payload"] == event_payload(
-        AgentToAgentMessage(
+    assert message_event["payload"] == event_payload(
+        AgentMessage(
             sender="Agent",
             recipient="user",
             content="in the repository",
@@ -1277,12 +1352,14 @@ async def test_what_an_agent_sends_the_user_goes_to_chat(opened: _Opened) -> Non
 async def test_a_halt_from_chat_halts_the_turn(opened: _Opened) -> None:
     async with _relayed() as relay, _serving(relay) as (task, _):
         _ = await relay.seen(_is("settings"))
-        _ = await relay.send("Halt", {"py/object": "Halt"})
-        _ = await relay.seen(_is("event", event="Halt"))
+        _ = await relay.send("ModelHalt", {"py/object": "ModelHalt"}, author="bo@x.y")
+        halted = await relay.seen(_is("event", event="ModelHalt"))
         await relay.close(CLOSE_TAKEN_OVER)
         _ = await _exited(task)
 
     assert opened.halts == 1
+    # The halt says who asked for it: the author the server set.
+    assert halted["payload"] == event_payload(types.ModelHalt(sender="bo@x.y"))
 
 
 @pytest.mark.asyncio
@@ -1291,7 +1368,11 @@ async def test_a_halt_for_all_halts_every_agent_and_chats_halt_the_root_alone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    critic_halts: list[str] = []
+    critic_halts: list[str | None] = []
+
+    def halted(*, sender: str | None = None) -> None:
+        critic_halts.append(sender)
+
     async with _relayed() as relay, _serving(relay) as (task, _):
         _ = await relay.seen(_is("settings"))
         assert opened.team is not None
@@ -1303,20 +1384,21 @@ async def test_a_halt_for_all_halts_every_agent_and_chats_halt_the_root_alone(
             system_prompt="S",
         )
         _ = opened.team.join(critic, label="critic")
-        monkeypatch.setattr(critic.runtime, "halt", lambda: critic_halts.append("x"))
-        _ = await relay.send("Halt", {"py/object": "Halt"})
-        _ = await relay.seen(_is("event", event="Halt"))
+        monkeypatch.setattr(critic.runtime, "halt", halted)
+        _ = await relay.send("ModelHalt", {"py/object": "ModelHalt"})
+        _ = await relay.seen(_is("event", event="ModelHalt"))
         chats = (opened.halts, list(critic_halts))
-        _ = await relay.send("Halt", {"py/object": "Halt"}, recipient="all")
+        _ = await relay.send("ModelHalt", {"py/object": "ModelHalt"}, recipient="all")
         async with asyncio.timeout(5), relay.arrived:
             _ = await relay.arrived.wait_for(
-                lambda: len(relay.every(_is("event", event="Halt"))) == 2,
+                lambda: len(relay.every(_is("event", event="ModelHalt"))) == 2,
             )
         await relay.close(CLOSE_TAKEN_OVER)
         _ = await _exited(task)
 
     assert chats == (1, [])
-    assert (opened.halts, critic_halts) == (2, ["x"])
+    # Each agent is told who asked: the author the server set.
+    assert (opened.halts, critic_halts) == (2, ["ada@x.y"])
 
 
 @pytest.mark.asyncio
@@ -1479,7 +1561,7 @@ async def test_quit_from_chat_ends_the_process_as_quit_at_its_screen(
     ("kind", "payload"),
     [
         ("UserMessage", {"py/object": "UserMessage", "sender": "eve", "content": "x"}),
-        ("Halt", {"py/object": "Nope"}),
+        ("ModelHalt", {"py/object": "Nope"}),
     ],
     ids=["names-its-own-sender", "not-its-kind"],
 )
@@ -1494,8 +1576,8 @@ async def test_an_input_that_does_not_read_is_answered_as_an_error(
         sent = await relay.send(kind, payload)
         said = await relay.seen(_is("event", event="CommandOutput"))
         # The next input is still delivered.
-        _ = await relay.send("Halt", {"py/object": "Halt"})
-        _ = await relay.seen(_is("event", event="Halt"))
+        _ = await relay.send("ModelHalt", {"py/object": "ModelHalt"})
+        _ = await relay.seen(_is("event", event="ModelHalt"))
         await relay.close(CLOSE_ENDED)
         _ = await _exited(task)
 
@@ -1526,8 +1608,8 @@ async def test_a_slash_line_that_raises_is_answered_as_an_error_and_logged(
         _ = await relay.send("Command", {"line": "/model"})
         said = await relay.seen(_is("event", event="CommandOutput"))
         # The next input is still delivered.
-        _ = await relay.send("Halt", {"py/object": "Halt"})
-        _ = await relay.seen(_is("event", event="Halt"))
+        _ = await relay.send("ModelHalt", {"py/object": "ModelHalt"})
+        _ = await relay.seen(_is("event", event="ModelHalt"))
         await relay.close(CLOSE_ENDED)
         _ = await _exited(task)
 
@@ -1581,7 +1663,7 @@ async def test_a_stop_halts_the_turn_and_uploads_what_the_journal_holds(
     async with _relayed() as relay, _serving(relay) as (task, server):
         _ = await relay.seen(_is("settings"))
         assert opened.agent is not None
-        # Journaled with no ``SaveSession``, so only the stop's own upload sends it.
+        # Journaled with no ``SessionSaveDue``, so only the stop's own upload sends it.
         opened.agent.session.stand(
             "note",
             UncategorizedRecord(kind="note", payload={"kept": True}),
@@ -1661,9 +1743,9 @@ async def test_an_ordinary_stop_and_resume_answers_on_another_host(
             )
             == 1
         )
-        assert target.found(_is("event", event="ModelCallStarted")) is None
+        assert target.found(_is("event", event="ModelResponseStarted")) is None
         _ = await target.send("UserMessage", _line("Continue on this host."))
-        _ = await target.seen(_is("event", event="ModelResponseComplete"))
+        _ = await target.seen(_is("event", event="ModelResponseCompleted"))
         assert (
             sum(
                 isinstance(record, AssistantMessage)
@@ -1687,7 +1769,7 @@ async def test_a_quit_from_chat_uploads_what_the_journal_holds_before_it_ends(
     async with _relayed() as relay, _serving(relay, remote=remote) as (task, server):
         _ = await relay.seen(_is("settings"))
         assert opened.agent is not None
-        # Journaled with no ``SaveSession``: an upload still owed as ``/quit`` comes.
+        # Journaled with no ``SessionSaveDue``: an upload still owed as ``/quit`` comes.
         opened.agent.session.stand(
             "note",
             UncategorizedRecord(kind="note", payload={"kept": True}),
@@ -1762,6 +1844,26 @@ async def test_a_stop_ends_the_process_when_its_turn_will_not_halt_in_time(
 
 
 @pytest.mark.asyncio
+async def test_a_halt_is_waited_for_until_the_runtime_takes_it(tmp_path: Path) -> None:
+    agent = Agent(
+        model=ScriptedProvider()["scripted"],
+        tool_context=ToolContext(cwd=tmp_path),
+    )
+    before = list(agent.runtime.observers)
+    halting = asyncio.create_task(main_module._halted(agent))
+    await asyncio.sleep(0)
+    assert agent.runtime.inbox.drain_nowait() == [types.ModelHalt()]
+
+    agent.runtime.publish(AgentIdle())
+    await asyncio.sleep(0)
+    assert not halting.done()
+    agent.runtime.publish(types.ModelHalt())
+    await halting
+
+    assert agent.runtime.observers == before
+
+
+@pytest.mark.asyncio
 async def test_hosts_are_followed_on_the_processs_own_server_and_key_beside_its_links(
     opened: _Opened,
     monkeypatch: pytest.MonkeyPatch,
@@ -1790,6 +1892,67 @@ async def test_hosts_are_followed_on_the_processs_own_server_and_key_beside_its_
     assert (given["url"], given["api_key"]) == (server.base_url, server.api_key)
     assert (given["keep"], given["own_host"]) == ((), _HOST)
     assert given["remote"] is opened.remote
+
+
+def _member(team: Team, folder: Path, *, label: str, tools: Sequence[Tool]) -> Agent:
+    """Join an agent with ``tools`` to ``team``, as the session's root or one it spawned."""
+    agent = Agent(
+        model=ScriptedProvider(replies=[])["scripted"],
+        tools=tools,
+        tool_context=ToolContext(cwd=folder),
+        environment=False,
+    )
+    _ = team.join(agent, label=label)
+    return agent
+
+
+def _searches(agent: Agent) -> tuple[str, str, str]:
+    """Return the server, key and session ``agent``'s ``Recall`` searches with."""
+    recall = agent.runtime.tools["Recall"]
+    assert isinstance(recall, Recall)
+    return recall.url, recall.key, recall.session
+
+
+def test_each_agents_recall_is_set_to_the_server_its_key_and_the_session(
+    tmp_path: Path,
+) -> None:
+    team = Team(catalog=ModelCatalog(factories={}))
+    root = _member(team, tmp_path, label="Agent", tools=[Recall(team=team)])
+    spawned = _member(team, tmp_path, label="Agent_1", tools=[Recall(team=team)])
+    # A server a person named stands, and is sent no key of this process's.
+    own = _member(
+        team,
+        tmp_path,
+        label="Agent_2",
+        tools=[Recall(team=team, url="https://own.example")],
+    )
+    without = _member(team, tmp_path, label="Agent_3", tools=[Read()])
+
+    recall_here(team, url="https://trax.example", key="held", session_id=_SESSION)
+
+    assert [_searches(root), _searches(spawned)] == [
+        ("https://trax.example", "held", str(_SESSION)),
+    ] * 2
+    assert _searches(own) == ("https://own.example", "", "")
+    assert "Recall" not in without.runtime.tools
+
+
+@pytest.mark.asyncio
+async def test_a_run_sets_recall_to_its_own_server_key_and_session(
+    opened: _Opened,
+) -> None:
+    """Handed to the tool, so no command the agent runs inherits the key."""
+    opened.tools = [Recall(team=Team(catalog=ModelCatalog(factories={})))]
+    async with _relayed() as relay, _serving(relay) as (task, server):
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert opened.agent is not None
+    assert _searches(opened.agent) == (
+        server.base_url,
+        server.api_key,
+        str(_SESSION),
+    )
 
 
 @pytest.mark.asyncio
@@ -1970,6 +2133,8 @@ async def test_at_a_terminal_the_screen_runs_and_its_quit_ends_the_process(
     assert opened.steps == ["halt"]
     assert "UncategorizedRecord" in [r.kind for r in server.stored]
     assert opened.interactive == [True]
+    # Who types at the screen is the key's person, as the server names them.
+    assert opened.users == ["ada@example.com"]
     # A person at the screen ends it; a headless one gives up (exits 4).
     assert gives_up == [None]
     [(agent, given)] = shown
@@ -2005,7 +2170,7 @@ async def test_at_a_terminal_chat_and_the_screen_run_slash_lines_on_the_same_com
             commands(
                 each,
                 catalog=catalog,
-                say=printed.append,
+                print_output=printed.append,
                 screen=drawn,
                 panes=Panes(),
             )
@@ -2068,17 +2233,17 @@ async def test_a_halt_from_chat_halts_while_a_slash_line_runs_and_a_line_waits_i
             "UserMessage",
             {"py/object": "UserMessage", "content": "hi", "extra": {}},
         )
-        _ = await relay.send("Halt", {"py/object": "Halt"})
-        _ = await relay.seen(_is("event", event="Halt"))
+        _ = await relay.send("ModelHalt", {"py/object": "ModelHalt"})
+        _ = await relay.seen(_is("event", event="ModelHalt"))
         halts_meanwhile = opened.halts
         # The halt was read after the line, which has not reached the agent.
-        said_meanwhile = relay.found(_is("event", event="AgentToAgentMessage"))
+        messages_meanwhile = relay.found(_is("event", event="AgentMessage"))
         release.set()
-        _ = await relay.seen(_is("event", event="AgentToAgentMessage"))
+        _ = await relay.seen(_is("event", event="AgentMessage"))
         await relay.close(CLOSE_TAKEN_OVER)
         _ = await _exited(task)
 
-    assert (halts_meanwhile, said_meanwhile) == (1, None)
+    assert (halts_meanwhile, messages_meanwhile) == (1, None)
 
 
 @pytest.mark.asyncio
@@ -2140,8 +2305,8 @@ async def test_a_stop_ends_the_screen_too(
         _ = await relay.seen(_is("hello"))
         # A slash line that waits on commands this screen never builds ends with it.
         _ = await relay.send("Command", {"line": "/effort"})
-        _ = await relay.send("Halt", {"py/object": "Halt"})
-        _ = await relay.seen(_is("event", event="Halt"))
+        _ = await relay.send("ModelHalt", {"py/object": "ModelHalt"})
+        _ = await relay.seen(_is("event", event="ModelHalt"))
         await relay.close(CLOSE_TAKEN_OVER)
         code = await _exited(task)
 
@@ -2165,7 +2330,7 @@ async def test_a_local_model_runs_a_local_tool_here(
         assert opened.agent is not None
         assert await opened.agent.send("run it") == "ran it"
         results = [
-            r for r in opened.agent.session.history() if isinstance(r, ToolResult)
+            r for r in opened.agent.session.history() if isinstance(r, ToolMessage)
         ]
         await relay.close(CLOSE_ENDED)
         _ = await _exited(task)
@@ -2205,7 +2370,7 @@ async def test_a_local_model_runs_a_tool_on_another_host_with_remote_tools_only(
         assert await opened.agent.send("which host?") == "it is lab-box"
         assert list(opened.remote.endpoints()) == ["lab-box"]
         results = [
-            r for r in opened.agent.session.history() if isinstance(r, ToolResult)
+            r for r in opened.agent.session.history() if isinstance(r, ToolMessage)
         ]
         await relay.close(CLOSE_ENDED)
         _ = await _exited(task)
@@ -2682,8 +2847,8 @@ def _canvas_tools(
     canvas_id: UUID | None,
     settings: Mapping[str, PlainTree],
 ) -> CanvasTools:
-    """Make the canvas tools as the process does, keeping the client they talk over."""
-    made_over.append(client)
+    """Make the canvas tools as the process does, keeping what they are made with."""
+    made_over.append((client, settings))
     return CanvasTools(client, canvas_id=canvas_id, settings=settings)
 
 
@@ -2715,6 +2880,7 @@ def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     built: list[tuple[Flags, Sequence[tuple[str, str]], bool, bool, list[str]]] = []
+    users: list[str | None] = []
     raised: list[BaseException] = []
 
     @contextlib.asynccontextmanager
@@ -2723,10 +2889,12 @@ def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
         *,
         given: Sequence[tuple[str, str]],
         interactive: bool,
+        user: str | None,
         use_daemon: bool = True,
         tools: Sequence[Tool] = (),
     ) -> AsyncGenerator[None]:
         built.append((flags, given, interactive, use_daemon, [t.name for t in tools]))
+        users.append(user)
         if raised:
             raise raised[0]
         yield
@@ -2748,7 +2916,8 @@ def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
     assert (fine, refused) == ("", "--effortt names no setting; see /help")
     # The tools a run would give the agent, over this process's own client and key,
     # for no session.
-    assert canvases == [client, client]
+    # No server is asked what an agent may set: the canvas tool is built to be named.
+    assert canvases == [(client, {"type": "object"})] * 2
     assert [(base_url, key) for base_url, key, _ in reads] == [
         (server.base_url, server.api_key),
     ] * 2
@@ -2760,6 +2929,8 @@ def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
         [("effort", "high")],
     )
     assert (interactive, use_daemon, tools) == (False, False, [CANVAS_TOOL, "KnowOp"])
+    # It is closed at once and is no one's session.
+    assert users == [None, None]
 
 
 @pytest.mark.parametrize(
