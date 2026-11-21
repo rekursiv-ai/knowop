@@ -17,7 +17,9 @@ Every watching session's agent is told each piece. One of them, the row's ``fixe
 fixes: its line asks it to, and every other line names it, so two agents never push
 the same fix. Each line starts with a ``<knowop-KIND pr=... head=...>`` tag, its first
 sentence what happened, and quotes check names as data; Chat folds it to that sentence
-(``ui/src/visuals/pullRequests.ts``, ``autofixReport``).
+(``ui/src/visuals/pullRequests.ts``, ``autofixReport``). A line goes under the person's
+key, so it comes attested as theirs: the tag is what tells Chat it is the watch's, and
+keeps it out of the lines they typed, their history among them (``chat/kinds.ts``).
 """
 
 from __future__ import annotations
