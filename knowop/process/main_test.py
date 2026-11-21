@@ -675,6 +675,12 @@ class _Opened:
         return counted
 
 
+def _this_host(server: str) -> str:
+    """Return the one host a run here is on, whichever server it names."""
+    del server
+    return _HOST
+
+
 @pytest.fixture(autouse=True)
 def this_host(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run on a host of a known name, placed on no canvas; try a failed upload again at once."""
@@ -682,7 +688,7 @@ def this_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LC_TRAX_CANVAS", raising=False)
     # Unset, so what a serve writes of it is undone with the test.
     monkeypatch.delenv("TRAX_SESSION", raising=False)
-    monkeypatch.setattr(main_module, "host_name", lambda: _HOST)
+    monkeypatch.setattr(main_module, "host_name", _this_host)
     monkeypatch.setattr(publisher, "retry_delays", lambda: itertools.repeat(0.0))
 
 

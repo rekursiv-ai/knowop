@@ -116,9 +116,9 @@ def main(
 
     """
     flags = cast(_Flags, _parser().parse_args(args))
-    host = host_name()
     try:
         name, profile = login()
+        host = host_name(profile.url)
         files = serve_files(profile.url)
         match flags.command:
             case "serve" if flags.detach:

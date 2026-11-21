@@ -186,12 +186,30 @@ journalctl -u knowop-connect -f
 host, not the unit, and `knowop logs` reads only a user service's log: use
 `journalctl`. `sudo systemctl disable --now knowop-connect` stops it.
 
+## On a shared computer
+
+Each person on a shared computer, such as a lab server, connects it as their own
+Unix user, and gets a host and a daemon of their own. A host name is unique on a
+server, so the computer's short host name goes to the first person who connects it;
+everyone after names theirs once:
+
+```bash
+knowop connect --name lab-$USER
+```
+
+A name another person holds is refused, on the approval page or at the terminal,
+with this command filled in for that server. knowop keeps the name a connect joined
+under, for that server and this computer, so every later command means that host:
+`knowop run`, `status`, `logs`, `disconnect` and `watch-pr`. A connect with another
+`--name` replaces it. The name is kept per computer too, so computers that share a
+home folder each keep their own.
+
 ## Commands
 
 | Command | Does |
 |---|---|
 | `knowop login [ORG\|URL]` | Logs in with a code approved in a browser and saves the key. |
-| `knowop connect [ORG\|URL] [--name N] [--no-exec] [--sandbox] [--jobs [--job-results-max SIZE]] [--foreground] [--follow]` | Logs in first unless knowop is logged in to that server or a token is piped in, enrolling and confirming this computer in the same approval; then serves its terminal, and the assistant's commands unless `--no-exec`. At a terminal it serves from a user service that starts again at login, and `--follow` then follows its log; elsewhere, and with `--foreground`, until Ctrl-C. No server means knowop's own, else `https://alpha.knowop.ai`. `--sandbox` records that the computer is disposable. `--jobs` also runs your account's `knowop job submit --host` jobs, each under a memory cap; it needs systemd's user manager. |
+| `knowop connect [ORG\|URL] [--name N] [--no-exec] [--sandbox] [--jobs [--job-results-max SIZE]] [--foreground] [--follow]` | Logs in first unless knowop is logged in to that server or a token is piped in, enrolling and confirming this computer in the same approval; then serves its terminal, and the assistant's commands unless `--no-exec`. At a terminal it serves from a user service that starts again at login, and `--follow` then follows its log; elsewhere, and with `--foreground`, until Ctrl-C. No server means knowop's own, else `https://alpha.knowop.ai`. `--name` names the host, and is kept for that server so later commands mean it; default the name kept, else this computer's short host name ([On a shared computer](#on-a-shared-computer)). `--sandbox` records that the computer is disposable. `--jobs` also runs your account's `knowop job submit --host` jobs, each under a memory cap; it needs systemd's user manager. |
 | `knowop menubar` | Shows the knowop mark in the macOS menu bar until Quit, which stops this computer's connect services too; `knowop connect` starts it at login. |
 | `knowop logs [NAME] [-f] [-n N]` | Prints the log of NAME's connect service on this computer (default this computer's name), its last N lines, or follows it until Ctrl-C. A host connected from another computer keeps its log there. |
 | `knowop status [--json]` | Prints, for each server knowop is logged in to (the one its commands use first), the profile, the server, your account and role, your computers with whether each is online, the knowop version and process serving each one online, and the agent processes live on each; and this computer's connect services with their flags, and whether each is turned off (macOS Login Items). On macOS, the menu bar: running, stopped, or failing with its exit code and its last log line. `--json` prints the same as one JSON object, one entry per login. Exits 1 when not logged in, or when a server refuses its login's key. |

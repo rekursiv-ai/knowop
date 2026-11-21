@@ -291,7 +291,7 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
                 flags,
                 args,
                 session_id=session_id,
-                host=host_name(),
+                host=host_name(profile.url),
                 cwd=str(cwd),
                 checkout=cwd,
             )
@@ -313,7 +313,7 @@ def main(argv: Sequence[str], *, profile: Profile | None) -> int:
             process_id=uuid4(),
             client=client,
             tui=True,
-            host=host_name(),
+            host=host_name(profile.url),
             time_limit=flags.time_limit,
             remote=False,
         )

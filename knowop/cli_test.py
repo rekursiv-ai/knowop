@@ -47,7 +47,7 @@ from treekle import json_loads
 import httpx2
 import pytest
 
-from knowop import cli, menubar, service, upload
+from knowop import cli, hosts, menubar, service, upload
 from knowop.connect import serve
 from knowop.jobs import cli as jobs_cli
 from knowop.process import main
@@ -295,6 +295,9 @@ class _Host:
         self.connects: list[_Served] = []
         self.joined: Callable[[str], None] | None = None
         """Called with the name on a join here, as the server then shows it online."""
+        self.saved: set[tuple[str, str]] = set()
+        """Each host and server a join here saved a credential for, which a later
+        connect of it serves from, reading no token."""
 
     def __call__(
         self,
@@ -318,7 +321,8 @@ class _Host:
             os.kill(os.getpid(), self.ending)
             # The signal's handler raises into this wait at once; 5 s only bounds a broken one.
             time.sleep(5)  # house-ignore[sleep] -- See above.
-        if self.reads_token and not token and signed_in is not None:
+        reads_token = self.reads_token and (name, server) not in self.saved
+        if reads_token and not token and signed_in is not None:
             token = signed_in().enroll_host(name).token
         signed_in_to = ""
         if signed_in is not None:
@@ -328,7 +332,7 @@ class _Host:
             _Served(
                 name=name,
                 server=server,
-                token=token if self.reads_token else "",
+                token=token if reads_token else "",
                 serve_tools=serve_tools,
                 sandbox=sandbox,
                 jobs=jobs,
@@ -337,6 +341,8 @@ class _Host:
                 signed_in_to=signed_in_to,
             ),
         )
+        if join_only:
+            self.saved.add((name, server))
         if join_only and self.joined is not None:
             self.joined(name)
 
@@ -610,6 +616,26 @@ def test_a_denied_login_leaves_knowop_logged_out(server: _Server) -> None:
 
     assert list_profiles() == []
     assert _knowop("status") == 1
+
+
+def test_a_denied_connect_says_how_to_connect_under_a_name_of_ones_own(
+    server: _Server,
+    host: _Host,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The approval page refuses another person's host, and its person then denies."""
+    monkeypatch.setattr(getpass, "getuser", lambda: "ada")
+    server.decision = "denied"
+
+    assert _knowop("connect", "acme") == 1
+
+    assert host.connects == []
+    assert capsys.readouterr().err == (
+        "knowop: the login was denied in the browser. If its page said host ada-mac "
+        "belongs to another person, connect under a name of your own: knowop connect "
+        f"{_ACME} --name ada-mac-ada\n"
+    )
 
 
 def test_login_leaves_traxs_current_profile_alone(
@@ -980,6 +1006,105 @@ def test_disconnect_of_another_host_disconnects_that_host(server: _Server) -> No
     assert server.disconnected == ["gpu1"]
 
 
+@pytest.mark.parametrize("here", ["lab", "nobox"], ids=["another-accounts", "none"])
+def test_disconnect_refuses_this_computers_name_unless_it_is_a_host_of_yours(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    here: str,
+) -> None:
+    """An admin may disconnect any host, and a shared computer's name may be another's."""
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: here)
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("disconnect") == 1
+
+    assert server.disconnected == []
+    assert capsys.readouterr().err == (
+        f"knowop: this computer is not a host of yours on {_ACME}: {_EMAIL} holds no "
+        f"host {here}; knowop status lists your hosts, and knowop disconnect NAME "
+        "disconnects one\n"
+    )
+
+
+def test_connect_with_a_name_keeps_it_so_later_commands_mean_that_host(
+    server: _Server,
+    host: _Host,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A second person on a shared computer names their host once."""
+    assert _knowop("login", "acme") == 0
+    assert _knowop("connect", "--name", "gpu1") == 0
+    capsys.readouterr()
+
+    assert _knowop("status") == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "host: gpu1 offline (this computer)" in lines
+    assert "host: ada-mac online" in lines
+    assert _knowop("disconnect") == 0
+    assert server.disconnected == ["gpu1"]
+    # Joined first, so only a name the server took as the account's is kept.
+    assert [(s.name, s.token, s.join_only) for s in host.connects] == [
+        ("gpu1", _ENROLL_TOKEN, True),
+        ("gpu1", "", False),
+    ]
+
+
+def test_connect_under_a_name_another_account_holds_keeps_nothing(
+    server: _Server,
+    host: _Host,
+) -> None:
+    server.refuse[ENROLL_PATH] = 403
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("connect", "--name", "lab") == 1
+
+    assert host.connects == []
+    assert hosts.host_name(_ACME) == "ada-mac"
+
+
+def test_connect_at_a_terminal_refuses_another_accounts_host_by_that_name(
+    host: _Host,
+    launchd: _Launchd,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A host an admin enrolled is listed to all: its daemon is not this computer's."""
+    _at_terminal(monkeypatch)
+    monkeypatch.setattr(getpass, "getuser", lambda: "ada")
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("connect", "--name", "lab") == 1
+
+    assert (host.connects, launchd.calls) == ([], [])
+    assert capsys.readouterr().err == (
+        f"knowop: host lab on {_ACME} belongs to another account, not to {_EMAIL}, "
+        "who is signed in. Connect this computer under a name of your own, which "
+        f"knowop then keeps for that server: knowop connect {_ACME} --name lab-ada. "
+        "An admin frees the name of a host no longer used: knowop host lab del\n"
+    )
+    assert hosts.host_name(_ACME) == "ada-mac"
+
+
+def test_a_run_here_takes_no_host_of_another_account_for_this_computer(
+    runners: _Runners,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Another person's online host by this computer's name is not this one connected."""
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "lab")
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("run", "--headless") == 1
+
+    assert runners.calls() == []
+    assert f"knowop: host lab on {_ACME} belongs to another account" in (
+        capsys.readouterr().err
+    )
+
+
 def test_connect_without_a_login_enrolls_this_computer_in_the_same_approval(
     server: _Server,
     host: _Host,
@@ -1015,11 +1140,20 @@ def test_connect_after_a_login_enrolls_the_named_host_with_knowops_key(
 
     assert _knowop("connect", "--name", "gpu1", "--sandbox") == 0
 
+    # Joined first, so the name is kept once the server takes it; then served.
     assert host.connects == [
         _Served(
             name="gpu1",
             server="https://acme.knowop.ai",
             token=_ENROLL_TOKEN,
+            serve_tools=True,
+            sandbox=True,
+            join_only=True,
+        ),
+        _Served(
+            name="gpu1",
+            server="https://acme.knowop.ai",
+            token="",
             serve_tools=True,
             sandbox=True,
         ),
@@ -1044,6 +1178,7 @@ def test_connect_logs_in_again_when_the_server_refuses_the_saved_login(
     assert server.paths().count(DEVICE_CODE_PATH) == 2
     assert [(served.name, served.token) for served in host.connects] == [
         ("gpu1", _LOGIN_TOKEN),
+        ("gpu1", ""),
     ]
 
 
@@ -1596,6 +1731,18 @@ def test_watch_pr_asks_knowops_server_with_knowops_key(
     assert server.netlocs() == {"acme.knowop.ai"}
     assert server.paths()[requests:] == ["/api/me/profile"]
     assert capsys.readouterr().err.startswith("knowop watch-pr: ")
+
+
+def test_watch_pr_with_a_profile_named_before_it_asks_that_profiles_server(
+    server: _Server,
+) -> None:
+    save_profile("staging", Profile(url="https://staging.example", api_key=_KEY))
+    assert _knowop("login", "acme") == 0
+    requests = len(server.requests)
+
+    assert _knowop("--profile", "staging", "watch-pr", "status") == 1
+
+    assert {r.url.host for r in server.requests[requests:]} == {"staging.example"}
 
 
 @dataclass(slots=True, kw_only=True)
@@ -2275,7 +2422,7 @@ def test_connect_with_a_named_profile_serves_its_server_with_its_login(
     assert server.paths().count(DEVICE_CODE_PATH) == 1
     assert [(s.server, s.signed_in_to) for s in host.connects] == [
         ("https://staging.example", "https://staging.example"),
-    ]
+    ] * 2
 
 
 def test_a_connect_nobody_approves_ends_when_its_code_expires(
@@ -3308,7 +3455,7 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --name NAME           the host's name; default this computer's short host name
+  --name NAME           the host's name, kept for that server so later commands use it; default the name kept, else this computer's short host name
   --no-exec             serve terminals only: run no tool and start no agent here for the server
   --sandbox             record that this computer is disposable
   --jobs                also run the jobs your account sends here with knowop job submit --host NAME, each in a fresh worktree of its pushed commit under a memory cap; needs systemd's user manager

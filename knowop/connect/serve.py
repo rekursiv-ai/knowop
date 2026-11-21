@@ -42,6 +42,7 @@ from trackinizer.trax.render import echo
 from treekle import from_plain
 
 from knowop.connect.wake import Wake
+from knowop.hosts import taken_name_error
 
 
 if TYPE_CHECKING:
@@ -426,14 +427,12 @@ def _enroll(client: Client, name: str, *, account: str) -> str:
     try:
         return client.enroll_host(name).token
     except ClientError as err:
-        if err.status_code != 403:
+        # A writer's refusal is 403 and an admin's 409, each ``host_owned``.
+        if err.code != "host_owned":
             raise
-        # The server names no owner: a personal host is seen by its owner alone.
-        # The status stays, so a service exits for good rather than restart into it.
-        raise ClientError(
-            f"host {name} on {client.base_url} belongs to another account, not to "
-            f"{account}, who is signed in; connect under another name with "
-            f"`knowop connect --name NAME`, or ask an admin to free it with "
-            f"`knowop host {name} del`",
-            status_code=403,
+        raise taken_name_error(
+            name,
+            server=client.base_url,
+            account=account,
+            status_code=err.status_code or 403,
         ) from err

@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
+import getpass
 import io
 
 from trackinizer.client.client import Client
@@ -31,6 +32,9 @@ from knowop.hosts import HOST_WORD, Hosts
 if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
+
+
+_SERVER = "https://acme.knowop.ai"
 
 
 def _host(
@@ -553,7 +557,7 @@ def test_host_name_is_the_short_hostname_as_a_host_name(
     """The rule a run reuses to say which host it is on, as connect names it."""
     monkeypatch.setattr(hostname, "stable_hostname", lambda: full)
 
-    assert hosts.host_name() == name
+    assert hosts.host_name(_SERVER) == name
 
 
 def test_host_name_ignores_the_name_a_network_gives_this_computer(
@@ -566,7 +570,7 @@ def test_host_name_ignores_the_name_a_network_gives_this_computer(
     )
     monkeypatch.setattr(hostname, "stable_hostname", lambda: "Ada-MacBook")
 
-    assert hosts.host_name() == "ada-macbook"
+    assert hosts.host_name(_SERVER) == "ada-macbook"
 
 
 def test_a_hostname_that_is_not_a_host_name_is_refused(
@@ -575,7 +579,7 @@ def test_a_hostname_that_is_not_a_host_name_is_refused(
     monkeypatch.setattr(hostname, "stable_hostname", lambda: "init")
 
     with pytest.raises(ClientError, match="reserved"):
-        _ = hosts.host_name()
+        _ = hosts.host_name(_SERVER)
 
 
 def test_a_hostname_of_only_punctuation_is_refused(
@@ -584,7 +588,102 @@ def test_a_hostname_of_only_punctuation_is_refused(
     monkeypatch.setattr(hostname, "stable_hostname", lambda: "___")
 
     with pytest.raises(ClientError, match="invalid host name ''"):
-        _ = hosts.host_name()
+        _ = hosts.host_name(_SERVER)
+
+
+def test_host_name_is_the_name_kept_for_that_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second person on a shared computer names it once, for each server."""
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "lab")
+
+    hosts.keep_host_name(_SERVER, "lab-ada")
+
+    assert hosts.host_name(_SERVER) == "lab-ada"
+    assert hosts.host_name(f"{_SERVER}/") == "lab-ada"
+    assert hosts.host_name("https://other.knowop.ai") == "lab"
+
+
+def test_a_name_kept_again_replaces_the_one_kept_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "lab")
+    hosts.keep_host_name(_SERVER, "lab-a")
+
+    hosts.keep_host_name(_SERVER, "lab-ada")
+
+    assert hosts.host_name(_SERVER) == "lab-ada"
+
+
+def test_a_name_kept_on_one_computer_is_not_another_computers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two computers sharing a home folder would otherwise take one host from each other."""
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "node1.cluster")
+    hosts.keep_host_name(_SERVER, "node1-ada")
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "node2.cluster")
+
+    assert hosts.host_name(_SERVER) == "node2"
+
+
+def test_a_kept_name_stands_where_the_hostname_is_no_host_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "init")
+
+    hosts.keep_host_name(_SERVER, "lab-box")
+
+    assert hosts.host_name(_SERVER) == "lab-box"
+
+
+def test_a_kept_name_that_is_no_host_name_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hostname, "stable_hostname", lambda: "lab")
+    hosts.keep_host_name(_SERVER, "Not A Name")
+
+    with pytest.raises(ClientError, match="invalid host name 'Not A Name'"):
+        _ = hosts.host_name(_SERVER)
+
+
+@pytest.mark.parametrize(
+    ("user", "suggested"),
+    [
+        ("ada", "lab-ada"),
+        ("Ada_Lovelace", "lab-ada-lovelace"),
+        ("x" * 70, f"lab-{'x' * 59}"),
+    ],
+)
+def test_the_suggested_name_is_the_taken_one_and_the_login_name(
+    monkeypatch: pytest.MonkeyPatch,
+    user: str,
+    suggested: str,
+) -> None:
+    monkeypatch.setattr(getpass, "getuser", lambda: user)
+
+    assert hosts.suggested_host_name("lab") == suggested
+
+
+def test_a_taken_name_says_whose_it_is_not_and_what_to_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(getpass, "getuser", lambda: "ada")
+
+    error = hosts.taken_name_error(
+        "lab",
+        server=_SERVER,
+        account="ada@example.com",
+        status_code=409,
+    )
+
+    assert str(error) == (
+        f"host lab on {_SERVER} belongs to another account, not to "
+        "ada@example.com, who is signed in. Connect this computer under a name of "
+        f"your own, which knowop then keeps for that server: knowop connect {_SERVER} "
+        "--name lab-ada. An admin frees the name of a host no longer used: "
+        "knowop host lab del"
+    )
+    assert error.status_code == 409
 
 
 _KNOWHOSTS = "/api/addons/knowhost/hosts"

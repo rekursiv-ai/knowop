@@ -72,6 +72,9 @@ from knowop.hosts import (
     Hosts,
     check_name,
     host_name,
+    keep_host_name,
+    suggested_host_name,
+    taken_name_error,
 )
 
 
@@ -320,7 +323,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "name",
         nargs="?",
         default="",
-        help="the host; default this computer's short host name",
+        help="the host; default this computer's, as knowop connect names it",
     )
     logs.add_argument(
         "-f",
@@ -349,7 +352,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "name",
         nargs="?",
         default="",
-        help="the host; default this computer's short host name",
+        help="the host; default this computer's, as knowop connect names it",
     )
     _add_connect_arguments(
         verbs.add_parser(
@@ -456,7 +459,10 @@ def _add_connect_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--name",
         default="",
-        help="the host's name; default this computer's short host name",
+        help=(
+            "the host's name, kept for that server so later commands use it; "
+            "default the name kept, else this computer's short host name"
+        ),
     )
     parser.add_argument(
         "--no-exec",
@@ -783,7 +789,7 @@ def _log_out(name: str, *, every: bool, named: str) -> None:
         if (caller := _caller(http)) is not None:
             key = from_plain(caller.get("api_key_id"), uuid.UUID)
             email = from_plain(caller.get("email"), str)
-            hosts = [host_name()]
+            hosts = [host_name(profile.url)]
             if every:
                 # The host a login made this key for goes last: its logout revokes
                 # the key the others' sign with.
@@ -934,23 +940,26 @@ def _login(name: str, profile: Profile) -> _Login:
             if error.status_code != 403:
                 raise
             own = None
+        here = host_name(profile.url)
         return _Login(
             profile=name,
             server=profile.url,
             account=email,
             role=from_plain(caller.get("role"), str),
-            hosts=None if own is None else [_host(http, each) for each in own],
+            hosts=None
+            if own is None
+            else [_host(http, each, here=here) for each in own],
         )
 
 
-def _host(http: Client, name: str) -> _Host:
+def _host(http: Client, name: str, *, here: str) -> _Host:
     """Return one of the account's hosts, its facts while online, and its runs."""
     detail = http.get_host(name)
     online = detail.status == "online"
     return _Host(
         name=name,
         status=detail.status,
-        this_computer=name == host_name(),
+        this_computer=name == here,
         knowop_version=(
             from_plain(detail.facts.get("knowop_version"), str, default=None)
             if online
@@ -1024,7 +1033,7 @@ def _next_step(named: str) -> None:
     _, profile = saved
     with Client(profile.url, api_key=profile.api_key) as http:
         email = from_plain(_signed_in(http).get("email"), str)
-        here = host_name()
+        here = host_name(profile.url)
         connected = any(
             m.name == here and m.owner == email and m.status == "online"
             for m in http.list_hosts()
@@ -1039,10 +1048,22 @@ def _next_step(named: str) -> None:
 # starts.
 def _disconnect(name: str, *, named: str, sleep: Callable[[float], None]) -> None:
     """Disconnect the host on the server, which stops its runs, and its service here."""
-    host = name or host_name()
-    check_name(host)
     _, profile = _profile(named)
+    host = name or host_name(profile.url)
+    check_name(host)
     with Client(profile.url, api_key=profile.api_key) as http:
+        # An admin may disconnect any host by name, even one it cannot read; on a
+        # shared computer the name this one defaults to may be another person's host,
+        # which only naming it reaches.
+        if not name:
+            email = from_plain(_signed_in(http).get("email"), str)
+            detail = _detail(http, host)
+            if detail is None or detail.owner != email:
+                raise ClientError(
+                    f"this computer is not a host of yours on {profile.url}: {email} "
+                    f"holds no host {host}; knowop status lists your hosts, and "
+                    "knowop disconnect NAME disconnects one",
+                )
         for run in http.disconnect_host(host):
             echo(f"stopped: run {run.run or run.session_id} ({run.cli})")
         _remove_service(service.here(), host, profile.url)
@@ -1065,8 +1086,6 @@ def _connect(
     for_run: bool = False,
 ) -> None:
     """Log in unless knowop already is, to that server; then serve this computer."""
-    name = flags.name or host_name()
-    check_name(name)
     background = for_run or (
         sys.stdout.isatty() and not (flags.foreground or flags.log_file)
     )
@@ -1084,6 +1103,8 @@ def _connect(
         else _server(flags.target),
         "server",
     )
+    name = flags.name or host_name(server)
+    check_name(name)
     # A saved login the server now refuses (its host was logged out elsewhere) is
     # no login: at a terminal connect logs in again, and a service's run says so.
     found = next(
@@ -1114,14 +1135,7 @@ def _connect(
     else:
         # The approval that logs in also enrolls and confirms this computer, and returns
         # its one-use token: one step for the person, and no second login.
-        result = login.login(
-            server,
-            profile=named,
-            host=name,
-            client="knowop",
-            sleep=sleep,
-            clock=clock,
-        )
+        result = _host_login(server, name=name, named=named, sleep=sleep, clock=clock)
         _remember(result.profile)
         echo(f"logged in: profile {result.profile} ({result.role})")
         profile, url = result.profile, read_profile(result.profile).url
@@ -1136,6 +1150,8 @@ def _connect(
             services=services,
             sleep=sleep,
         )
+        if flags.name:
+            keep_host_name(server, name)
         return
     if background:
         echo(
@@ -1143,7 +1159,52 @@ def _connect(
             "this terminal serves the host until Ctrl-C",
             err=True,
         )
+    # Joined first, so a name another account holds is refused before it is kept.
+    # A service's own run serves the name its definition holds, kept already.
+    if flags.name and not flags.log_file:
+        _serve(
+            name,
+            url,
+            profile=profile,
+            token=token,
+            flags=flags,
+            sleep=sleep,
+            join_only=True,
+        )
+        keep_host_name(server, name)
+        token = ""
     _serve(name, url, profile=profile, token=token, flags=flags, sleep=sleep)
+
+
+# The approval page says when the name is another person's host, and the person then
+# denies the login: the command that connects under a name of their own is said here,
+# where the server cannot know this computer's login name.
+def _host_login(
+    server: str,
+    *,
+    name: str,
+    named: str,
+    sleep: Callable[[float], None],
+    clock: Callable[[], float],
+) -> login.LoginResult:
+    """Log in to ``server`` by an approval that enrolls this computer as ``name``."""
+    try:
+        return login.login(
+            server,
+            profile=named,
+            host=name,
+            client="knowop",
+            sleep=sleep,
+            clock=clock,
+        )
+    except ClientError as error:
+        if error.code != "denied":
+            raise
+        raise ClientError(
+            f"{error}. If its page said host {name} belongs to another person, "
+            f"connect under a name of your own: knowop connect {server} --name "
+            f"{suggested_host_name(name)}",
+        ) from error
 
 
 # Joined here first, so what a service could only log (another account's host,
@@ -1174,6 +1235,11 @@ def _connect_service(
     )
     with Client(url, api_key=read_profile(profile).api_key) as http:
         before = _detail(http, name)
+        # A host an admin enrolled is anyone's to read, and its owner's daemon would
+        # read here as a connect of this computer already running.
+        email = from_plain(_signed_in(http).get("email"), str)
+        if before is not None and before.owner not in {None, email}:
+            raise taken_name_error(name, server=url, account=email, status_code=403)
         pid = None if before is None or before.status != "online" else _pid(before)
         ours = any((c.name, c.server) == (name, url) for c in services.every())
         if pid is not None and not ours:
@@ -1210,15 +1276,15 @@ def _connect_service(
             if started is None:
                 raise ClientError(
                     f"host {name} did not come online in 30 s; see knowop logs"
-                    f"{_named(name)}",
+                    f"{_named(name, url)}",
                 )
             pid = _pid(started)
     echo(
         f"connected{' already' if current else ''}: host {name} at {url} in the "
         f"background (pid {pid}); it starts again at login",
     )
-    echo(f"log:  knowop logs -f{_named(name)}")
-    echo(f"stop: knowop disconnect{_named(name)}")
+    echo(f"log:  knowop logs -f{_named(name, url)}")
+    echo(f"stop: knowop disconnect{_named(name, url)}")
     if (problem := services.show_menu_bar()) is not None:
         echo(
             f"knowop: no menu bar: {problem} in {sys.executable}; install PyObjC there "
@@ -1318,9 +1384,9 @@ def _logs(
     sleep: Callable[[float], None],
 ) -> None:
     """Print the log of ``name``'s connect service here; with ``follow``, follow it."""
-    host = name or host_name()
-    check_name(host)
     _, profile = _profile(named)
+    host = name or host_name(profile.url)
+    check_name(host)
     log = (
         state_dir()
         / "rekursiv-ai"
@@ -1422,7 +1488,7 @@ def _hand_off(
         _log_in(named=named, sleep=sleep, clock=clock)
     _, profile = _profile(named)
     flags, _ = process_command.parse_run(process_command.run_parser(), args)
-    if flags.stop is None and flags.on in {None, host_name()}:
+    if flags.stop is None and flags.on in {None, host_name(profile.url)}:
         _connected_here(profile, named=named, sleep=sleep)
     # Sagent's own agent, live in Trackinizer: knowop's flags, then sagent's after
     # ``--``.
@@ -1439,13 +1505,16 @@ def _connected_here(
     sleep: Callable[[float], None],
 ) -> None:
     """Connect this computer as ``knowop connect`` does, unless it is an online host."""
-    here = host_name()
+    here = host_name(profile.url)
     try:
         with Client(profile.url, api_key=profile.api_key) as http:
             listed = http.list_hosts()
+            email = from_plain(_signed_in(http).get("email"), str)
     except ClientError:
         return
-    if any(m.name == here and m.status == "online" for m in listed):
+    # A host an admin enrolled is listed to everyone: another person's online host
+    # by this computer's name is not this computer connected.
+    if any((m.name, m.owner, m.status) == (here, email, "online") for m in listed):
         return
     services = service.here()
     if services is None:
@@ -1512,9 +1581,9 @@ def _pid(detail: HostDetail) -> int | None:
     return from_plain(detail.facts.get("pid"), int, default=None)
 
 
-def _named(name: str) -> str:
+def _named(name: str, server: str) -> str:
     """Return a space and ``name``, or nothing for the host verbs default to."""
-    return "" if name == host_name() else f" {name}"
+    return "" if name == host_name(server) else f" {name}"
 
 
 def _signed_in(http: Client) -> dict[str, object]:
