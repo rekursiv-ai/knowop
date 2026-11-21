@@ -70,6 +70,8 @@ _CANVAS: Final = "11111111-1111-4111-8111-1111111111c1"
 _RECORD: Final = "22222222-2222-4222-8222-2222222222c2"
 _VISUAL: Final = "33333333-3333-4333-8333-3333333333c3"
 _SESSION: Final = "44444444-4444-4444-8444-4444444444c4"
+_DOWNLOAD: Final = b'{"seq": 412}\n{"part": 0, "idx": 0}\n'
+"""What the session's download route answers: a header, then one record."""
 
 
 class _Server:
@@ -179,6 +181,10 @@ class _Server:
             return httpx2.Response(200, json={"hosts": self.hosts})
         if route == ("GET", f"/api/inquiries/{_SESSION}"):
             return httpx2.Response(200, json={"id": str(_SESSION), "seq": 412})
+        if route == ("GET", "/api/inquiries/AgentSession/412"):
+            return httpx2.Response(200, json={"id": str(_SESSION), "seq": 412})
+        if route == ("GET", f"/api/sessions/{_SESSION}/download"):
+            return httpx2.Response(200, content=_DOWNLOAD)
         if route == ("GET", f"/api/canvases/{_CANVAS}"):
             return httpx2.Response(200, json={"id": _CANVAS, "revision": 3})
         if route == ("POST", f"/api/canvases/{_CANVAS}/operations"):
@@ -1430,6 +1436,118 @@ def test_session_outside_an_agents_tools_says_to_ask_the_tool(
 
     assert len(server.requests) == requests
     assert "KnowOp tool's session.self" in capsys.readouterr().err
+
+
+def test_session_download_writes_the_running_sessions_file_to_stdout(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("TRAX_SESSION", _SESSION)
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+
+    assert _knowop("session", "download") == 0
+
+    assert server.paths()[-1] == f"/api/sessions/{_SESSION}/download"
+    assert capsys.readouterr().out == _DOWNLOAD.decode()
+
+
+def test_session_download_writes_a_named_session_to_the_file_given(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("TRAX_SESSION", raising=False)
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+    out = tmp_path / "chat.jsonl"
+
+    assert _knowop("session", "download", "AgentSession#412", "-o", str(out)) == 0
+
+    assert server.paths()[-2:] == [
+        "/api/inquiries/AgentSession/412",
+        f"/api/sessions/{_SESSION}/download",
+    ]
+    assert out.read_bytes() == _DOWNLOAD
+    assert capsys.readouterr().out == f"wrote {out}\n"
+
+
+def test_session_download_with_a_profile_named_goes_to_that_login(
+    server: _Server,
+    tmp_path: Path,
+) -> None:
+    save_profile("staging", Profile(url="https://staging.example", api_key=_KEY))
+    assert _knowop("login", "acme") == 0
+    out = tmp_path / "chat.jsonl"
+
+    assert (
+        _knowop(
+            "--profile",
+            "staging",
+            "session",
+            "download",
+            "AgentSession#412",
+            "-o",
+            str(out),
+        )
+        == 0
+    )
+
+    assert server.requests[-1].url.host == "staging.example"
+    assert out.read_bytes() == _DOWNLOAD
+
+
+def test_session_download_help_says_what_it_writes_and_where(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        _ = _knowop("session", "--help")
+    listed = " ".join(capsys.readouterr().out.split())
+    with pytest.raises(SystemExit):
+        _ = _knowop("session", "download", "--help")
+    said = " ".join(capsys.readouterr().out.split())
+
+    assert "knowop session [-h] ACTION ..." in listed
+    assert "download write a session's every record as one JSON-lines file" in listed
+    assert (
+        "Write a session's every record as one JSON-lines file, as Chat's ⋯ "
+        "Download session does: a header naming its parts, then one record per "
+        "line. To stdout, unless --output names a file."
+    ) in said
+    assert "AgentSession#N or a UUID (default: the session $TRAX_SESSION names)" in said
+    assert "-o, --output OUTPUT the file to write" in said
+
+
+def test_session_download_refuses_a_ref_that_names_no_row(
+    server: _Server,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+    requests = len(server.requests)
+
+    assert _knowop("session", "download", "not a ref") == 1
+
+    assert len(server.requests) == requests
+    assert "download takes AgentSession#N or a UUID" in capsys.readouterr().err
+
+
+def test_session_download_outside_an_agents_tools_names_no_session(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("TRAX_SESSION", raising=False)
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+    requests = len(server.requests)
+
+    assert _knowop("session", "download") == 1
+
+    assert len(server.requests) == requests
+    assert "$TRAX_SESSION is unset" in capsys.readouterr().err
 
 
 def test_session_help_says_where_the_session_comes_from(
