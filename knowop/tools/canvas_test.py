@@ -11,13 +11,14 @@ from typing import TYPE_CHECKING, Final, cast
 
 import asyncio
 import base64
+import json
 import uuid
 
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.refs import SeqRef
 from trackinizer.wire.wire_capture import CaptureImage
 from trackinizer.wire.wire_terminals import TerminalHost, TerminalHosts
-from treekle import PlainTree, ReadError
+from treekle import PlainTree, ReadError, immutable
 
 import pytest
 
@@ -1085,6 +1086,21 @@ def test_a_setting_the_schema_offers_is_set_and_said_as_it_is_now() -> None:
 
     assert said == "Set theme to light, chat_side to left."
     assert client.calls == [("preferences", {"theme": "light", "chat_side": None})]
+
+
+def test_a_setting_whose_value_is_an_object_is_sent_as_plain_json() -> None:
+    """A provider hands the tool its arguments frozen, an object in them a mappingproxy."""
+    client = _Client()
+    view = {"view": "chat", "density": "compact", "output_lines": [3, 3]}
+
+    _ = _set(
+        client,
+        cast("dict[str, PlainTree]", immutable({"chat_view": view})),
+        offered={"type": "object", "properties": {"chat_view": {"type": "object"}}},
+    )
+
+    [(_, sent)] = client.calls
+    assert json.loads(json.dumps(sent)) == {"chat_view": view}
 
 
 def test_a_setting_whose_answer_names_none_says_none_is_known() -> None:

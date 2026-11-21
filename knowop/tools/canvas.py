@@ -44,7 +44,7 @@ from trackinizer.trax.canvas import (
 )
 from trackinizer.trax.grammar import parse_ref
 from trackinizer.wire.refs import SeqRef
-from treekle import PlainTree, from_plain
+from treekle import PlainTree, from_plain, mutable
 
 
 if TYPE_CHECKING:
@@ -619,7 +619,8 @@ class CanvasTools:
             state = await asyncio.to_thread(
                 self._client.set_preferences,
                 canvas,
-                change=change,
+                # The call's arguments come frozen; a mappingproxy is no JSON object.
+                change=mutable(change),
             )
         except ClientError as error:
             return f"Not changed: {server_answer(error)}"
