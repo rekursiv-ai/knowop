@@ -13,6 +13,7 @@ from unittest.mock import Mock
 from urllib.parse import urlsplit
 
 import asyncio
+import getpass
 import io
 import os
 import select
@@ -98,11 +99,14 @@ class _Server:
         *,
         poll: DeviceToken | None = None,
         enroll_status: int = 201,
+        enroll_refusal: dict[str, object] | None = None,
         revoked: str = "",
     ) -> None:
         self.poll = poll
         self.enroll_status = enroll_status
         """What an enrollment answers when ada asks: 201 enrolls, else a refusal."""
+        self.enroll_refusal = enroll_refusal or {"detail": "enrollment is busy"}
+        """The body of that refusal."""
         self.revoked = revoked
         """The host credential whose heartbeats answer 410, as after a disconnect."""
         self.requests: list[tuple[str, str, str, dict[str, object]]] = []
@@ -134,13 +138,18 @@ class _Server:
         if path == wire_daemon.ENROLL_PATH and _ACCOUNTS[auth] != "ada@example.com":
             return httpx2.Response(
                 403,
-                json={"detail": "host belongs to another user"},
+                json={
+                    "detail": {
+                        "code": "host_owned",
+                        "message": (
+                            "host 'dev-box' belongs to another person; enroll this "
+                            "computer under another name"
+                        ),
+                    },
+                },
             )
         if path == wire_daemon.ENROLL_PATH and self.enroll_status != 201:
-            return httpx2.Response(
-                self.enroll_status,
-                json={"detail": "enrollment is busy"},
-            )
+            return httpx2.Response(self.enroll_status, json=self.enroll_refusal)
         if path == DEVICE_CODE_PATH:
             code = DeviceCode(
                 device_code="d" * 43,
@@ -588,6 +597,7 @@ def test_another_account_on_this_computer_is_never_served_the_first_ones_host(
     _connect(_Waits())
     second = _Server()
     _on(second, monkeypatch)
+    monkeypatch.setattr(getpass, "getuser", lambda: "bob")
     bob = Client(_SERVER, api_key=_BOB_KEY)
 
     with pytest.raises(ClientError) as err:
@@ -602,9 +612,10 @@ def test_another_account_on_this_computer_is_never_served_the_first_ones_host(
 
     assert str(err.value) == (
         f"host dev-box on {_SERVER} belongs to another account, not to "
-        "bob@example.com, who is signed in; connect under another name with "
-        "`knowop connect --name NAME`, or ask an admin to free it with "
-        "`knowop host dev-box del`"
+        "bob@example.com, who is signed in. Connect this computer under a name of "
+        f"your own, which knowop then keeps for that server: knowop connect {_SERVER} "
+        "--name dev-box-bob. An admin frees the name of a host no longer used: "
+        "knowop host dev-box del"
     )
     # A refusal a restart cannot change: a service exits for good on it.
     assert err.value.status_code == 403
@@ -656,7 +667,7 @@ def test_a_token_the_caller_holds_joins_before_stdin_a_profile_or_a_login(
 def test_an_enrollment_refused_for_another_reason_is_said_as_the_server_said_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only a 403 names another owner; any other refusal is the server's own."""
+    """Only ``host_owned`` names another owner; any other refusal is the server's own."""
     server = _Server(enroll_status=409)
     _on(server, monkeypatch)
     _stdin(monkeypatch, "")
@@ -674,6 +685,43 @@ def test_an_enrollment_refused_for_another_reason_is_said_as_the_server_said_it(
 
     assert err.value.status_code == 409
     assert "another account" not in str(err.value)
+    assert server.calls("/api/hosts/join") == []
+
+
+def test_an_admins_refusal_of_another_persons_host_says_what_to_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An admin is told the owner, as a 409; knowop says the same as to a writer."""
+    server = _Server(
+        enroll_status=409,
+        enroll_refusal={
+            "detail": "host 'dev-box' belongs to mal@x.y; enroll this computer under "
+            "another name, or delete that host first",
+            "code": "host_owned",
+        },
+    )
+    _on(server, monkeypatch)
+    _stdin(monkeypatch, "")
+    monkeypatch.setattr(getpass, "getuser", lambda: "ada")
+    keyed = Client(_SERVER, api_key=_PROFILE_KEY)
+
+    with pytest.raises(ClientError) as err:
+        serve.connect_host(
+            "dev-box",
+            server=_SERVER,
+            signed_in=lambda: keyed,
+            sandbox=False,
+            serve_tools=True,
+            sleep=_Waits(_never),
+        )
+
+    assert err.value.status_code == 409
+    assert str(err.value).startswith(
+        f"host dev-box on {_SERVER} belongs to another account, not to "
+        "ada@example.com, who is signed in. Connect this computer under a name of "
+        f"your own, which knowop then keeps for that server: knowop connect {_SERVER} "
+        "--name dev-box-ada.",
+    )
     assert server.calls("/api/hosts/join") == []
 
 

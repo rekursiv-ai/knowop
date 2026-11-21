@@ -30,7 +30,8 @@ if TYPE_CHECKING:
 PROFILE: Final = Profile(url="https://lab.test", api_key="k")
 
 
-def laptop() -> str:
+def laptop(server: str) -> str:
+    assert server == PROFILE.url
     return "laptop"
 
 

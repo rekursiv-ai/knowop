@@ -5,8 +5,9 @@ writer role, and changing the registry needs the admin role. A KnowHost, a host 
 server rents you, is one more host here: ``host start`` rents one, ``host NAME pause``
 and ``resume`` stop and wake it, and ``host NAME del`` ends it, through the server's
 KnowHost API (``/api/addons/knowhost``). ``knowop connect`` names this computer by
-:func:`host_name` and checks a name it is given with :func:`check_name`; a hostname
-recorded elsewhere reads as a host name through :func:`short_name`.
+:func:`host_name`: the name :func:`keep_host_name` kept for the server, else
+:func:`default_host_name`. It checks a name it is given with :func:`check_name`; a
+hostname recorded elsewhere reads as a host name through :func:`short_name`.
 """
 
 from __future__ import annotations
@@ -23,12 +24,15 @@ from typing import (
 )
 
 import argparse
+import getpass
 import re
 import sys
 
 from trackinizer.client.errors import ClientError
 from trackinizer.lib.posix import hostname
+from trackinizer.lib.userdirs import config_dir
 from trackinizer.trax.commands import Command, HelpPage, TraxArgumentParser
+from trackinizer.trax.connection import server_dir
 from trackinizer.trax.context import cwd
 from trackinizer.trax.render import echo
 from treekle import from_plain
@@ -52,7 +56,9 @@ __all__ = [
     "Hosts",
     "KnowHost",
     "check_name",
+    "default_host_name",
     "host_name",
+    "keep_host_name",
     "listed_knowhosts",
     "named_knowhost",
     "pause_knowhost",
@@ -62,6 +68,8 @@ __all__ = [
     "short_name",
     "start_knowhost",
     "started_lines",
+    "suggested_host_name",
+    "taken_name_error",
 ]
 
 HOST_WORD: Final = "host"
@@ -330,13 +338,71 @@ def run_del(client_factory: Callable[[], Client], name: str) -> None:
     echo(f"deleted: {HOST_WORD} {name}")
 
 
-def host_name() -> str:
+def host_name(server: str) -> str:
+    """Return the name this computer is a host of ``server`` by, for this user.
+
+    It is the name ``knowop connect --name`` last joined ``server`` under here
+    (:func:`keep_host_name`), else :func:`default_host_name`. The command that
+    connects this computer enrolls it under this name, an agent run says it runs on
+    the host of that name, and every verb that means this computer defaults to it. A
+    second person on a shared computer, whose hostname another person's host already
+    holds, connects once under a name of their own and keeps it.
+
+    Args:
+      server: The server's URL.
+
+    Returns:
+      name: The host's name.
+
+    Raises:
+      ClientError: No name is kept and the hostname is reserved or still not a host
+        name, or the kept one is not a host name.
+
+    """
+    kept = (
+        config_dir()
+        / "rekursiv-ai"
+        / "knowop"
+        / "hosts"
+        / short_name(hostname.stable_hostname())
+        / server_dir(server)
+    )
+    try:
+        name = kept.read_text().strip()
+    except FileNotFoundError:
+        return default_host_name()
+    check_name(name)
+    return name
+
+
+def keep_host_name(server: str, name: str) -> None:
+    """Keep ``name`` as the name this computer is a host of ``server`` by, for this user.
+
+    Args:
+      server: The server's URL.
+      name: A host name the user's account holds on ``server``.
+
+    """
+    # Per computer as well as per user: a home folder may be shared between computers
+    # (a cluster's), each a host of its own, and two that read one name would each
+    # take the host from the other.
+    kept = (
+        config_dir()
+        / "rekursiv-ai"
+        / "knowop"
+        / "hosts"
+        / short_name(hostname.stable_hostname())
+        / server_dir(server)
+    )
+    kept.parent.mkdir(parents=True, exist_ok=True)
+    kept.write_text(f"{name}\n")
+
+
+def default_host_name() -> str:
     """Return this computer's short hostname as a host name.
 
-    The command that connects this computer enrolls it under this name, an agent
-    run says it runs on the host of that name, and a detached run records it. It is
-    the :func:`~trackinizer.lib.posix.hostname.stable_hostname`, which a Mac keeps on every
-    network: one named by the network would enroll as a new host on each.
+    It is the :func:`~trackinizer.lib.posix.hostname.stable_hostname`, which a Mac keeps on
+    every network: one named by the network would enroll as a new host on each.
 
     Returns:
       name: The hostname's :func:`short_name`.
@@ -348,6 +414,53 @@ def host_name() -> str:
     name = short_name(hostname.stable_hostname())
     check_name(name)
     return name
+
+
+def suggested_host_name(taken: str) -> str:
+    """Return a name of this user's own on this computer, for ``taken`` held by another.
+
+    Args:
+      taken: A host name another person's host holds, such as ``lab``.
+
+    Returns:
+      name: ``taken`` and this user's login name, such as ``lab-ada``, cut to
+        63 characters.
+
+    """
+    return f"{taken}-{short_name(getpass.getuser())}"[:63].rstrip("-")
+
+
+def taken_name_error(
+    name: str,
+    *,
+    server: str,
+    account: str,
+    status_code: int,
+) -> ClientError:
+    """Return the refusal of connecting this computer as ``name``, another's host.
+
+    Args:
+      name: The host name another account holds on ``server``.
+      server: The server's URL.
+      account: The account signed in, which the host is not.
+      status_code: The server's refusal, kept so a connect service exits for good
+        rather than restart into it.
+
+    Returns:
+      error: Says whose it is not, the command that connects under a name of the
+        user's own, and how a name no longer used is freed.
+
+    """
+    # No owner is named: a writer's refusal names none, since a personal host is seen
+    # by its owner alone.
+    return ClientError(
+        f"host {name} on {server} belongs to another account, not to {account}, who "
+        "is signed in. Connect this computer under a name of your own, which knowop "
+        f"then keeps for that server: knowop connect {server} --name "
+        f"{suggested_host_name(name)}. An admin frees the name of a host no longer "
+        f"used: knowop host {name} del",
+        status_code=status_code,
+    )
 
 
 def short_name(full: str) -> str:
