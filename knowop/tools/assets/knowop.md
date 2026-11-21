@@ -36,6 +36,11 @@ reading Trackinizer's records.
   once attached. Messaging remains AgentSend to that name.
 - `session.self`: your own `LABEL#UUID`, as `--session` takes it.
 
+To download a session for the person, run
+`knowop session download AgentSession#N -o PATH` on their host through
+`RemoteTool`: every record, one JSON line each. With no host online, point
+them to Chat's ⋯ menu, Download session.
+
 ## Pull requests
 
 After you open or push a GitHub pull request, watch it:

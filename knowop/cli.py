@@ -60,6 +60,7 @@ from trackinizer.lib.userdirs import config_dir, state_dir
 from trackinizer.trax.client_cache import close_clients
 from trackinizer.trax.connection import connect, connect_flags
 from trackinizer.trax.context import OUT_STREAM
+from trackinizer.trax.grammar import parse_ref
 from trackinizer.trax.profile import Profile, del_profile, read_profile
 from trackinizer.trax.render import echo
 from treekle import from_plain, json_dumps
@@ -202,6 +203,14 @@ class _UploadFlags(Protocol):
     no_subagents: bool
     jobs: int
     dry_run: bool
+
+
+class _DownloadFlags(Protocol):
+    """The flags of ``session``, and of ``session download`` when it is named."""
+
+    session_verb: str | None
+    ref: str | None
+    output: Path | None
 
 
 class _TopFlags(Protocol):
@@ -391,7 +400,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         _WATCH_PR_WORD,
         help="watch GitHub pull requests for agent sessions, and tell their agents",
     )
-    verbs.add_parser(
+    session = verbs.add_parser(
         "session",
         help="show the session whose agent runs this command",
         description=(
@@ -401,6 +410,21 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             "session.self instead."
         ),
     )
+    download = session.add_subparsers(dest="session_verb", metavar="ACTION").add_parser(
+        "download",
+        help="write a session's every record as one JSON-lines file",
+        description=(
+            "Write a session's every record as one JSON-lines file, as Chat's ⋯ "
+            "Download session does: a header naming its parts, then one record per "
+            "line. To stdout, unless --output names a file."
+        ),
+    )
+    download.add_argument(
+        "ref",
+        nargs="?",
+        help="AgentSession#N or a UUID (default: the session $TRAX_SESSION names)",
+    )
+    download.add_argument("-o", "--output", type=Path, help="the file to write")
     _add_upload_arguments(
         verbs.add_parser(
             "upload",
@@ -568,6 +592,8 @@ def _run(
             menubar.run(stop=services.stop)
         case "upload":
             _upload(cast(_UploadFlags, flags), named=named)
+        case "session" if cast(_DownloadFlags, flags).session_verb == "download":
+            _download(cast(_DownloadFlags, flags), named=named)
         case "session":
             _session(named=named)
         case _:
@@ -578,17 +604,49 @@ def _run(
 
 def _session(*, named: str) -> None:
     """Print the session ``$TRAX_SESSION`` names: its number and its UUID."""
-    text = os.environ.get("TRAX_SESSION", "")
-    if not text:
-        raise ClientError(
-            "no agent's session runs this command ($TRAX_SESSION is unset); an agent "
-            "whose tools run on another host asks its KnowOp tool's session.self",
-        )
-    session = uuid.UUID(text)
+    session = _running_session()
     _, profile = _profile(named)
     with Client(profile.url, api_key=profile.api_key) as http:
         number = from_plain(http.get(f"/api/inquiries/{session}"), _Numbered)["seq"]
     echo(f"AgentSession#{number} {session}")
+
+
+def _download(flags: _DownloadFlags, *, named: str) -> None:
+    """Write a session's every record, as one file, to ``--output`` or stdout."""
+    _, profile = _profile(named)
+    with _client(profile) as http:
+        if flags.ref is None:
+            session = _running_session()
+        else:
+            try:
+                ref = parse_ref(flags.ref)
+            except ValueError as error:
+                raise ClientError(
+                    f"download takes AgentSession#N or a UUID: {error}",
+                ) from error
+            _, session = http.resolve_id(ref)
+        lines = http.download_session(session)
+        if flags.output is None:
+            for line in lines:
+                echo(line)
+            return
+        with flags.output.open("wb") as out:
+            for line in lines:
+                out.write(f"{line}\n".encode())
+    echo(f"wrote {flags.output}")
+
+
+def _running_session() -> uuid.UUID:
+    """Return the session ``$TRAX_SESSION`` names, the one whose agent runs this."""
+    text = os.environ.get("TRAX_SESSION") or ""
+    if not text:
+        # pragma: no mutate[diagnostic-text] start
+        raise ClientError(
+            "no agent's session runs this command ($TRAX_SESSION is unset); an agent "
+            "whose tools run on another host asks its KnowOp tool's session.self",
+        )
+        # pragma: no mutate end
+    return uuid.UUID(text)
 
 
 class _Numbered(TypedDict):
