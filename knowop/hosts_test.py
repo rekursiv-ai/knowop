@@ -658,6 +658,7 @@ def test_start_waits_past_the_servers_deadline_and_sends_once(
     assert api.calls == [("POST", _KNOWHOSTS, {"timeout": 150.0, "retry_attempts": 1})]
     assert capsys.readouterr().out == (
         "knowhost-0b5e9a101c2d is running: open its terminal from Hosts.\n"
+        "Its knowop and trax are signed in as you.\n"
     )
 
 

@@ -164,6 +164,7 @@ async def test_start_sends_once_waits_150_seconds_and_names_online_host() -> Non
     client.api.answer["tools"] = False
     assert await _tools(client).act(action="host.start") == (
         "knowhost-0b5e9a101c2d is running: open its terminal from Hosts.\n"
+        "Its knowop and trax are signed in as you.\n"
         "Its knowop serves terminals but no tools."
     )
     assert client.api.calls == [
