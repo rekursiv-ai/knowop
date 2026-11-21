@@ -499,6 +499,7 @@ def started_lines(knowhost: KnowHost) -> list[str]:
     """Describe a KnowHost just rented, as the CLI and tool say it."""
     return [
         f"{knowhost['host']} is running: open its terminal from Hosts.",
+        "Its knowop and trax are signed in as you.",
         *_tools_lines(knowhost),
     ]
 
