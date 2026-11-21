@@ -112,10 +112,12 @@ def test_a_passing_draft_is_news_auto_fix_on_or_off() -> None:
 
 def test_a_failure_waits_for_its_workflows_running_checks_until_the_hold_ends() -> None:
     held = replace(FAILING, pending=("CI / types",), waiting=("CI / unit",))
-    assert due_failures(held, told=[], first_seen=0.0, now=HOLD_SEC - 1) == (
+    # Monotonic seconds start anywhere: the hold counts from the first sighting.
+    seen = 1_000.0
+    assert due_failures(held, told=[], first_seen=seen, now=seen + HOLD_SEC - 1) == (
         "CI / lint",
     )
-    assert due_failures(held, told=[], first_seen=0.0, now=HOLD_SEC) == (
+    assert due_failures(held, told=[], first_seen=seen, now=seen + HOLD_SEC) == (
         "CI / unit",
         "CI / lint",
     )
