@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from sagent.host.server import Host, Server, _Session
     from sagent.host.strings import ServeDirs
     from trackinizer.client import tool_bridge
-    from trackinizer.sagent.session.types import ToolResult
+    from trackinizer.sagent.session.types import ToolMessage
     from trackinizer.wire import wire_tools
     from websockets.asyncio.client import ClientConnection
 else:
@@ -59,7 +59,7 @@ else:
     sagent_server = lazy_import("sagent.host.server")
     strings = lazy_import("sagent.host.strings")
     wire = lazy_import("sagent.host.wire")
-    ToolResult = lazy_import("trackinizer.sagent.session.types", "ToolResult")
+    ToolMessage = lazy_import("trackinizer.sagent.session.types", "ToolMessage")
     tool_bridge = lazy_import("trackinizer.client.tool_bridge")
     wire_tools = lazy_import("trackinizer.wire.wire_tools")
 
@@ -681,7 +681,7 @@ class _PermittedHost:
             wire.encoded(
                 wire.Result(
                     id=call_id,
-                    record=ToolResult(call_id="", state=outcome, stderr=(reason,)),
+                    record=ToolMessage(call_id="", state=outcome, stderr=(reason,)),
                 ),
             ),
         )

@@ -62,7 +62,7 @@ class _Screen:
     show_thinking: bool = False
 
 
-def _said(output: CommandOutput) -> None:
+def _dropped(output: CommandOutput) -> None:
     del output
 
 
@@ -75,7 +75,7 @@ async def _registry() -> list[str]:
         commands = Commands(
             agent,
             catalog=catalog,
-            say=_said,
+            print_output=_dropped,
             screen=_Screen(),
             panes=Panes(),
             team=team,

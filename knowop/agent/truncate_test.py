@@ -20,13 +20,13 @@ from trackinizer.runs.refusal import stand_in
 from trackinizer.sagent.scripts.convert_session import claude
 from trackinizer.sagent.session.types import (
     CONCRETE_TYPES,
-    AgentToAgentMessage,
+    AgentMessage,
     Attachment,
     BashResult,
     ContextClear,
     IncompleteRecord,
     Thinking,
-    ToolResult,
+    ToolMessage,
     UncategorizedRecord,
     UncategorizedToolResult,
     UserMessage,
@@ -78,12 +78,12 @@ _LOG: Final = (
 the wire, which is how ~1 MB of output became 11.39 MB."""
 
 
-def _shell(output: str, *, image: PlainTree = None) -> ToolResult[BashResult]:
+def _shell(output: str, *, image: PlainTree = None) -> ToolMessage[BashResult]:
     """Return a shell result holding ``output`` twice, as codex stores one."""
     extra: dict[str, PlainTree] = {"aggregated_output": output}
     if image is not None:
         extra["image"] = image
-    return ToolResult(
+    return ToolMessage(
         call_id="c",
         state="done",
         stdout=(output,),
@@ -163,7 +163,7 @@ class TestAnEventPayload:
     """An event's plain data is cut as a record's strings are, to the bound given."""
 
     def test_one_that_fits_is_returned_as_it_is(self) -> None:
-        payload = {"py/object": "ModelResponsePartial", "text": "hi"}
+        payload = {"py/object": "ModelResponseTextStreamed", "text": "hi"}
 
         assert bounded_payload(payload, max_bytes=1 << 10) is payload
         # As the client sends it: compact, non-ASCII kept raw.
@@ -172,12 +172,12 @@ class TestAnEventPayload:
 
     def test_a_long_string_keeps_its_beginning_and_end_within_the_bound(self) -> None:
         text = _LOG * 2_000
-        payload = {"py/object": "ModelResponsePartial", "text": text}
+        payload = {"py/object": "ModelResponseTextStreamed", "text": text}
 
         cut = bounded_payload(payload, max_bytes=64 << 10)
 
         assert len(json_dumps(cut).encode()) <= 64 << 10
-        assert cut["py/object"] == "ModelResponsePartial"
+        assert cut["py/object"] == "ModelResponseTextStreamed"
         kept = cut["text"]
         assert isinstance(kept, str)
         _assert_cut_from(text, kept)
@@ -228,7 +228,7 @@ class TestARecordThatFitsIsUntouched:
 
     def test_a_tool_result_under_its_budget_sends_the_same_bytes(self) -> None:
         body = _body(
-            ToolResult(
+            ToolMessage(
                 call_id="c",
                 state="done",
                 stdout=("é\x1b[0m" * 5_000,),
@@ -283,7 +283,7 @@ class TestAnOversizedToolResult:
         output = _LOG * 4_000
         record = _read(bounded(_body(_shell(output))))
 
-        assert isinstance(record, ToolResult)
+        assert isinstance(record, ToolMessage)
         assert isinstance(record.result, BashResult)
         copy = record.extra["aggregated_output"]
         assert isinstance(copy, str)
@@ -294,7 +294,7 @@ class TestAnOversizedToolResult:
         output = _LOG * 4_000
         record = _read(bounded(_body(_shell(output))))
 
-        assert isinstance(record, ToolResult)
+        assert isinstance(record, ToolMessage)
         assert isinstance(record.result, BashResult)
         copy = record.extra["aggregated_output"]
         assert isinstance(copy, str)
@@ -336,7 +336,7 @@ class TestTheCutKeepsTextValid:
         reread = RecordBody.model_validate_json(_wire(cut))
         record = _read(reread)
 
-        assert isinstance(record, ToolResult)
+        assert isinstance(record, ToolMessage)
         assert isinstance(record.result, BashResult)
         _assert_cut_from(output, _stdout_text(record))
 
@@ -347,7 +347,7 @@ class TestTheCutKeepsTextValid:
 
         record = _read(bounded(_body(_shell(output))))
 
-        assert isinstance(record, ToolResult)
+        assert isinstance(record, ToolMessage)
         assert isinstance(record.result, BashResult)
         _assert_cut_from(output, _stdout_text(record))
 
@@ -356,7 +356,7 @@ class TestWhatIsNeverCut:
     def test_bytes_survive_whole(self) -> None:
         """An attachment is base64 of bytes: a cut would corrupt both."""
         data = bytes(range(256)) * 1_000
-        record = ToolResult(
+        record = ToolMessage(
             call_id="c",
             state="done",
             stdout=(
@@ -368,7 +368,7 @@ class TestWhatIsNeverCut:
 
         cut = _read(bounded(_body(record)))
 
-        assert isinstance(cut, ToolResult)
+        assert isinstance(cut, ToolMessage)
         assert cut.attachments[0].data == data
         assert was_truncated(cut)
 
@@ -380,7 +380,7 @@ class TestBytesTakeNoShareOfTheBudget:
         picture = Attachment(mime_descriptor="image/png", data=_bytes(1_400_000))
         words = "w" * (4 << 10)
         body = _body(
-            AgentToAgentMessage(content=words, attachments=(picture,), sender="a@x.y"),
+            AgentMessage(content=words, attachments=(picture,), sender="a@x.y"),
         )
         assert encoded_size(body) > MAX_RECORD_BYTES
 
@@ -388,7 +388,7 @@ class TestBytesTakeNoShareOfTheBudget:
 
     def test_a_tool_result_s_text_beside_its_picture_is_stored_whole(self) -> None:
         picture = Attachment(mime_descriptor="image/png", data=_bytes(300_000))
-        result = ToolResult(
+        result = ToolMessage(
             call_id="c",
             state="done",
             stdout=("x" * (10 << 10), picture),
@@ -464,7 +464,7 @@ class TestAnImageIsKeptWholeOrNamed:
 
         assert encoded_size(cut) <= MAX_TOOL_RESULT_BYTES
         record = _read(cut)
-        assert isinstance(record, ToolResult)
+        assert isinstance(record, ToolMessage)
         assert isinstance(record.result, BashResult)
         assert record.extra["image"] == immutable(image)
 
@@ -473,7 +473,7 @@ class TestAnImageIsKeptWholeOrNamed:
 
         record = _read(bounded(_body(_shell("short", image=image))))
 
-        assert isinstance(record, ToolResult)
+        assert isinstance(record, ToolMessage)
         assert isinstance(record.result, BashResult)
         assert record.extra["image"] == immutable(
             {
@@ -620,7 +620,7 @@ class TestTheSharedLengthShrinks:
 def test_the_size_is_what_the_http_client_sends() -> None:
     """Measured as ``httpx2`` encodes ``json=``: compact, non-ASCII kept raw."""
     body = _body(
-        ToolResult(
+        ToolMessage(
             call_id="c",
             state="done",
             stdout=('é€😀\x00\x1b[31m"\\\n',),
@@ -686,7 +686,7 @@ def _assert_cut_from(original: str, kept: str) -> None:
     assert kept.encode().decode() == kept
 
 
-def _stdout_text(record: ToolResult[object, object, object]) -> str:
+def _stdout_text(record: ToolMessage[object, object, object]) -> str:
     """Return the single text item of ``record.stdout``."""
     [text] = [item for item in record.stdout if isinstance(item, str)]
     return text

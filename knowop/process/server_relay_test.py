@@ -17,7 +17,7 @@ from sagent.agent.agent import Agent
 from sagent.agent.team import MessageKind, Team
 from sagent.model.scripted import ScriptedProvider
 from sagent.providers.catalog import ModelCatalog
-from sagent.session.types import AgentToAgentMessage, SystemMessage
+from sagent.session.types import AgentMessage, SystemMessage
 from sagent.tools.types import ToolContext
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.wire_sessions import SessionAgent
@@ -110,11 +110,9 @@ def _team(tmp_path: Path, *labels: str) -> Team:
 def _told(team: Team, label: str) -> list[tuple[str | None, str | None]]:
     """Return who sent ``label`` what, each note of the team's as from no one."""
     return [
-        (m.sender, m.content)
-        if isinstance(m, AgentToAgentMessage)
-        else (None, m.content)
+        (m.sender, m.content) if isinstance(m, AgentMessage) else (None, m.content)
         for m in team[label].runtime.inbox.drain_nowait()
-        if isinstance(m, (AgentToAgentMessage, SystemMessage))
+        if isinstance(m, (AgentMessage, SystemMessage))
     ]
 
 
@@ -328,8 +326,8 @@ def _from(
     sender: str,
     content: str | None,
     recipient: str | None = None,
-) -> AgentToAgentMessage:
-    return AgentToAgentMessage(sender=sender, recipient=recipient, content=content)
+) -> AgentMessage:
+    return AgentMessage(sender=sender, recipient=recipient, content=content)
 
 
 @pytest.mark.asyncio

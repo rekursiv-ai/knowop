@@ -64,7 +64,7 @@ from trackinizer.sagent.scripts.convert_session.convert import (
 )
 from trackinizer.sagent.session.jsonl import read_record
 from trackinizer.sagent.session.projects import session_id, spawner_journal
-from trackinizer.sagent.session.types import TurnContext, UncategorizedRecord
+from trackinizer.sagent.session.types import SessionContext, UncategorizedRecord
 from trackinizer.types.session_records import record_time
 from trackinizer.wire.audience import PRIVATE
 from trackinizer.wire.wire_session_ir import MAX_RECORD_BATCH
@@ -556,10 +556,10 @@ class _Read:
             start += len(batch)
 
     def _seen(self, record: SessionRecord) -> SessionRecord:
-        """Note the time ``record`` states, and the encoding a ``TurnContext`` restates."""
+        """Note the time ``record`` states, and the encoding a ``SessionContext`` restates."""
         if (time := record_time(record)) is not None:
             self._last = time
-        if isinstance(record, TurnContext) and record.encoding:
+        if isinstance(record, SessionContext) and record.encoding:
             self.encoding = dict(record.encoding)
         return record
 

@@ -42,7 +42,7 @@ import re
 from trackinizer.runs.refusal import REFUSED_KIND
 from trackinizer.sagent.session.types import (
     IncompleteRecord,
-    ToolResult,
+    ToolMessage,
     UncategorizedRecord,
 )
 from trackinizer.types.session_records import (
@@ -129,7 +129,7 @@ def bounded(body: RecordBody) -> RecordBody:
         return body
     record = payload_record(body.payload, record_class(body.kind))
     max_bytes = (
-        MAX_TOOL_RESULT_BYTES if isinstance(record, ToolResult) else MAX_RECORD_BYTES
+        MAX_TOOL_RESULT_BYTES if isinstance(record, ToolMessage) else MAX_RECORD_BYTES
     ) + _uncut_size(body)
     # A body within its budget is returned by the first try, which cuts nothing.
     return _shrunk(

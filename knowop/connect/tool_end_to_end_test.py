@@ -49,7 +49,7 @@ from sagent.session.types import (
     BashResult,
     ReadResult,
     RemoteToolResult,
-    ToolResult,
+    ToolMessage,
     UncategorizedToolResult,
 )
 from sagent.tools.bash import Bash
@@ -502,14 +502,14 @@ async def _said(endpoint: Endpoint, text: str) -> None:
         await endpoint.until(lambda each: text in each.error)
 
 
-def _failed(result: ToolResult) -> str:
+def _failed(result: ToolMessage) -> str:
     """Return the error text of a failed ``RemoteTool`` call."""
     assert isinstance(result.result, RemoteToolResult), result
     assert result.is_error
     return result.text()
 
 
-def _text(result: ToolResult) -> str:
+def _text(result: ToolMessage) -> str:
     """Return the text of a ``Read`` call's result."""
     assert isinstance(result.result, ReadResult), result
     return result.text()
@@ -521,7 +521,7 @@ async def _call(
     *,
     agent: str = "Agent",
     **arguments: PlainTree,
-) -> ToolResult:
+) -> ToolMessage:
     async with asyncio.timeout(_LIMIT_SEC):
         return await endpoint.call(
             agent=agent,
@@ -535,7 +535,7 @@ def _running(
     endpoint: Endpoint,
     tool: str,
     **arguments: PlainTree,
-) -> asyncio.Task[ToolResult]:
+) -> asyncio.Task[ToolMessage]:
     return asyncio.create_task(
         endpoint.call(agent="Agent", window="w1", tool=tool, arguments=arguments),
     )
@@ -610,7 +610,7 @@ async def test_a_calls_session_record_names_it_by_the_id_the_relay_read(
     (record,) = [
         r
         for r in map(read_record, path.read_bytes().splitlines())
-        if isinstance(r, ToolResult) and isinstance(r.result, ReadResult)
+        if isinstance(r, ToolMessage) and isinstance(r.result, ReadResult)
     ]
     (call,) = relay.calls
     assert "from this host" in _text(record)
@@ -834,7 +834,7 @@ async def test_detached_commands_release_permits_before_any_client_reconnects(
         ]
         assert len(endpoints) == MUX_CALLS
         mux = relay.mux[host.id]
-        calls: list[asyncio.Task[ToolResult]] = []
+        calls: list[asyncio.Task[ToolMessage]] = []
         writes: list[Path] = []
         releases: list[int] = []
         for index, endpoint in enumerate(endpoints):
@@ -942,7 +942,7 @@ async def test_a_refused_line_decodes_as_a_result() -> None:
     message = await received(reader)
     assert isinstance(message, Result)
     assert message.id == "c1"
-    assert isinstance(message.record, ToolResult)
+    assert isinstance(message.record, ToolMessage)
     assert message.record.state == "failed"
     assert (message.record.text(), message.record.is_error) == ("no Bash", True)
 
@@ -1160,7 +1160,7 @@ class _Stuck:
             whole = encoded(
                 Result(
                     id=message.id,
-                    record=ToolResult(
+                    record=ToolMessage(
                         call_id="",
                         state="done",
                         stdout=("corrupt",),

@@ -6,8 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Final, cast
-from unittest.mock import Mock
+from typing import TYPE_CHECKING, Final, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import asyncio
@@ -20,12 +19,21 @@ import time
 from sagent.agent.agent import Agent
 from sagent.agent.agents_md import AgentsMdConfig
 from sagent.agent.team import Team
+from sagent.model.exceptions import RetryableError
 from sagent.model.scripted import ScriptedProvider, call, reply
 from sagent.providers.catalog import ModelCatalog
-from sagent.runtime import types
+from sagent.runtime import (
+    runtime as runtime_module,
+    types,
+)
 from sagent.session.jsonl import JsonlJournal
 from sagent.session.types import (
-    AgentToAgentMessage,
+    AgentIdle,
+    AgentMessage,
+    Cancelled,
+    Failed,
+    ModelIdle,
+    Succeeded,
     ToolCall,
     UncategorizedToolResult,
     UserMessage,
@@ -290,10 +298,10 @@ async def test_save_session_is_not_sent_and_each_other_event_is_by_its_name(
         await p.publisher.caught_up()
 
     kinds = [line.kind for line in p.events()]
-    assert "SaveSession" not in kinds
-    assert {"ModelCallStarted", "ModelResponseComplete", "AgentIdle"} <= set(kinds)
+    assert "SessionSaveDue" not in kinds
+    assert {"ModelResponseStarted", "ModelResponseCompleted", "AgentIdle"} <= set(kinds)
     idle = next(line for line in p.events() if line.kind == "AgentIdle")
-    assert idle.payload == event_payload(types.AgentIdle())
+    assert idle.payload == event_payload(AgentIdle())
 
 
 @pytest.mark.asyncio
@@ -302,12 +310,12 @@ async def test_a_child_s_save_session_is_not_sent_at_any_depth(tmp_path: Path) -
         p.publisher(
             types.ChildEvent(
                 label="a",
-                inner=types.ChildEvent(label="b", inner=types.SaveSession()),
+                event=types.ChildEvent(label="b", event=types.SessionSaveDue()),
             ),
         )
-        p.publisher(types.ChildEvent(label="a", inner=types.AgentIdle()))
+        p.publisher(types.ChildEvent(label="a", event=AgentIdle()))
 
-    assert [line.kind for line in p.events()] == ["ChildEvent"]
+    assert [line.kind for line in p.events()] == ["ChildEvent", "SessionQuitCompleted"]
     assert p.store.appended == []
 
 
@@ -454,7 +462,7 @@ async def test_an_agent_whose_spawner_this_session_does_not_hold_is_let_go(
         )
         _ = p.team.join(stray, label="stray")
         async with journal, stray:
-            stray.runtime.publish(types.SaveSession())
+            stray.runtime.publish(types.SessionSaveDue())
             await p.publisher.caught_up()
 
     assert p.store.starts == []
@@ -471,23 +479,27 @@ async def test_what_an_agent_tells_the_user_goes_up_as_its_message(
     async with _published(tmp_path) as p:
         p.publisher.to_user("pyq2", "in the repository")
 
-    said = AgentToAgentMessage(
+    message = AgentMessage(
         sender="pyq2",
         recipient="user",
         content="in the repository",
     )
-    assert p.events() == [
-        EventLine(kind="AgentToAgentMessage", payload=event_payload(said)),
+    assert p.events()[:-1] == [
+        EventLine(kind="AgentMessage", payload=event_payload(message)),
     ]
+    assert p.events()[-1].kind == "SessionQuitCompleted"
 
 
 @pytest.mark.asyncio
 async def test_a_command_s_output_goes_up_as_an_event(tmp_path: Path) -> None:
-    said = CommandOutput(text="[/effort] high", tone="note", command="/effort")
+    output = CommandOutput(text="[/effort] high", tone="note", command="/effort")
     async with _published(tmp_path) as p:
-        p.publisher.say(said)
+        p.publisher.print_output(output)
 
-    assert p.events() == [EventLine(kind="CommandOutput", payload=event_payload(said))]
+    assert p.events()[:-1] == [
+        EventLine(kind="CommandOutput", payload=event_payload(output)),
+    ]
+    assert p.events()[-1].kind == "SessionQuitCompleted"
 
 
 @pytest.mark.asyncio
@@ -498,16 +510,25 @@ async def test_a_long_event_is_cut_to_fit_and_one_that_cannot_be_is_not_sent(
     bound = 64 << 10
     monkeypatch.setattr(publisher_module, "MAX_EVENT_BYTES", bound)
     async with _published(tmp_path) as p:
-        p.publisher(types.ModelResponsePartial(text="x" * 3 * bound))
+        p.publisher(types.ModelResponseTextStreamed(text="x" * 3 * bound))
         # Each string is cut to no less than a kibibyte, so these stay over.
         p.publisher(
-            types.LoginsSpent(
+            types.ModelResponseSuspended(
+                exception=RetryableError("busy", retry_after_sec=1.0),
+                retry_at=datetime.fromtimestamp(0.0, UTC),
+                failures_in_a_row=1,
                 provider="p",
-                resets=tuple((f"{n:04}" + "y" * 1_100, 0.0) for n in range(80)),
+                reset_at_by_login={
+                    f"{n:04}" + "y" * 1_100: datetime.fromtimestamp(0.0, UTC)
+                    for n in range(80)
+                },
             ),
         )
 
-    assert [line.kind for line in p.events()] == ["ModelResponsePartial"]
+    assert [line.kind for line in p.events()] == [
+        "ModelResponseTextStreamed",
+        "SessionQuitCompleted",
+    ]
     assert len(p.events()[0].model_dump_json().encode()) <= bound
     assert MAX_EVENT_BYTES == 1 << 20
 
@@ -518,9 +539,9 @@ async def test_a_state_is_sent_when_built_and_at_once_when_busy_changes(
 ) -> None:
     async with _published(tmp_path) as p:
         built = list(p.states())
-        p.publisher(types.ModelCallStarted())
+        p.publisher(types.ModelResponseStarted())
         started = p.states()[-1]
-        p.publisher(types.ModelResponseCancelled())
+        p.publisher(types.ModelResponseCompleted(outcome=Cancelled()))
 
     assert [s.state.busy for s in built] == [False]
     assert started.state.busy
@@ -576,12 +597,12 @@ async def test_a_change_of_text_alone_goes_at_most_once_a_second(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with _published(tmp_path) as p:
-        p.publisher(types.ModelCallStarted())
+        p.publisher(types.ModelResponseStarted())
         before = len(p.states())
-        p.publisher(types.ModelResponsePartial(text="x" * 4_000))
+        p.publisher(types.ModelResponseTextStreamed(text="x" * 4_000))
         withheld = len(p.states()) - before
         monkeypatch.setattr(publisher_module, "_LINE_SEC", 0.0)
-        p.publisher(types.ModelResponsePartial(text="x" * 4_000))
+        p.publisher(types.ModelResponseTextStreamed(text="x" * 4_000))
 
     assert withheld == 0
     assert len(p.states()) == before + 1
@@ -642,22 +663,22 @@ async def test_a_call_that_streams_nothing_still_moves_the_line_until_idle_or_cl
     reads = _held_reads(monkeypatch)
     async with _published(tmp_path) as p:
         idle = len(reads)
-        p.publisher(types.ModelCallStarted())
+        p.publisher(types.ModelResponseStarted())
         started = p.states()[-1].state.line
         [first] = reads
         clock.now += 20
         monkeypatch.setattr(publisher_module, "_LINE_SEC", 0.0)
         first.fire()
         moved = p.states()[-1].state
-        p.publisher(types.ModelResponseCancelled())
+        p.publisher(types.ModelResponseCompleted(outcome=Cancelled()))
         reads[-1].fire()
         after_idle = len(reads)
-        p.publisher(types.ModelCallStarted())
+        p.publisher(types.ModelResponseStarted())
         last = reads[-1]
-    p.publisher(types.ModelResponseCancelled())
+    p.publisher(types.ModelResponseCompleted(outcome=Cancelled()))
     # A read already under way as it closed arms no other, nor does a call after it.
     last.fire()
-    p.publisher(types.ModelCallStarted())
+    p.publisher(types.ModelResponseStarted())
 
     assert (idle, first.delay_sec) == (0, 1.0)
     assert "waiting on model." not in started
@@ -679,6 +700,8 @@ class _Waiting:
     schema: Mapping[str, PlainTree] = field(default_factory=dict[str, "PlainTree"])
     display: ToolDisplay = field(default_factory=ToolDisplay)
     release: asyncio.Event = field(default_factory=asyncio.Event)
+    runs_until_stopped: bool = False
+    """Whether it says its calls end only when stopped, as a tool that watches does."""
 
     def summary(self, arguments: Mapping[str, PlainTree]) -> str:
         return f"wait for {arguments}"
@@ -697,7 +720,10 @@ class _Waiting:
         arguments: Mapping[str, PlainTree],
     ) -> ToolStreamingResult[UncategorizedToolResult, object, object]:
         del context, arguments
-        return whole_output(self._run())
+        return whole_output(
+            self._run(),
+            runs_until_stopped=self.runs_until_stopped,
+        )
 
     async def _run(self) -> ToolOutput[UncategorizedToolResult, object, object]:
         _ = await self.release.wait()
@@ -735,7 +761,7 @@ async def test_a_background_job_goes_up_at_once_and_its_turn_ends_with_its_resul
         reply("it is built"),
         tools=[waiting],
     ) as p:
-        answered = _when(p.agent, types.ModelIdle)
+        answered = _when(p.agent, ModelIdle)
         turn = asyncio.create_task(p.agent.send("go"))
         _ = await answered.wait()
         running = p.states()[-1].state
@@ -757,6 +783,30 @@ async def test_a_background_job_goes_up_at_once_and_its_turn_ends_with_its_resul
     assert (ended.jobs, ended.working) == ((), False)
     assert ended.turn_ended is not None
     assert ended.turn_ended > job.started
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_runs_until_stopped_keeps_nothing_working_and_no_turn_open(
+    tmp_path: Path,
+) -> None:
+    watching = _Waiting(runs_until_stopped=True)
+    async with _published(
+        tmp_path,
+        reply(calls=[call("wait", "w1", what="news", background=True)]),
+        reply("watching"),
+        tools=[watching],
+    ) as p:
+        # The turn ends with the call still running: it has no result to wait for.
+        assert await p.agent.send("go") == "watching"
+        idle = p.states()[-1].state
+        watching.release.set()
+
+    assert idle.jobs is not None
+    assert [(job.call_id, job.runs_until_stopped) for job in idle.jobs] == [
+        ("w1", True),
+    ]
+    assert (idle.busy, idle.working) == (False, False)
+    assert idle.turn_ended is not None
 
 
 @pytest.mark.asyncio
@@ -823,21 +873,25 @@ class _Held:
     """A job as a runtime lists it."""
 
     call: ToolCall
-    started: float
-    state: str
+    status: str
+    runs_until_stopped: bool = False
 
 
 def _job(
     call_id: str,
-    state: str,
+    status: str,
     name: str = "Bash",
     **arguments: PlainTree,
 ) -> _Held:
     """Return a job of ``name``'s, asked for at 10 s past the epoch."""
     return _Held(
-        call=ToolCall(call_id=call_id, name=name, arguments=arguments),
-        started=10.0,
-        state=state,
+        call=ToolCall(
+            call_id=call_id,
+            name=name,
+            arguments=arguments,
+            timestamp=datetime.fromtimestamp(10.0, UTC),
+        ),
+        status=status,
     )
 
 
@@ -849,7 +903,7 @@ def _member(
     """Return an agent running ``held``, those ``running`` in its turn, holding ``tools``."""
     runtime = SimpleNamespace(
         jobs={job.call.call_id: job for job in held},
-        at_work=any(job.state == "running" for job in held),
+        at_work=any(job.status == "running" for job in held),
         tools=dict(tools or {}),
     )
     return cast("Agent", SimpleNamespace(runtime=runtime, spend_usd=spend_usd))
@@ -858,7 +912,12 @@ def _member(
 def test_spawns_and_job_management_are_no_jobs_and_a_wait_marks_the_job_it_waits_for() -> (
     None
 ):
-    summary = Mock(return_value="Bash make")
+    summarized: list[Mapping[str, PlainTree]] = []
+
+    def summary(arguments: Mapping[str, PlainTree]) -> str:
+        summarized.append(arguments)
+        return "Bash make"
+
     root = _member(
         _job("w1", "detached", command="make", background=True),
         _job("w2", "sleeping", "gone"),
@@ -881,7 +940,7 @@ def test_spawns_and_job_management_are_no_jobs_and_a_wait_marks_the_job_it_waits
         # A call detached with its group may name a tool the agent does not hold.
         ("w2", "gone", "sleeping", False),
     ]
-    summary.assert_called_once_with({"command": "make"})
+    assert summarized == [{"command": "make"}]
 
 
 # Away from UTC, so a job's start read as local time would show another instant.
@@ -928,6 +987,48 @@ def test_each_agent_s_jobs_go_up_by_its_label_masked_those_its_turn_waits_on_lef
 
 
 @pytest.mark.asyncio
+async def test_only_calls_run_apart_are_jobs_each_under_its_agent_s_label(
+    tmp_path: Path,
+) -> None:
+    """A call the model waits on is no background job."""
+    agent = Agent(
+        model=ScriptedProvider()["scripted"],
+        tool_context=ToolContext(cwd=tmp_path),
+    )
+    at_zero = datetime.fromtimestamp(0.0, UTC)
+    calls: tuple[tuple[str, datetime | None, Literal["waited", "apart"], bool], ...] = (
+        ("running", at_zero, "waited", True),
+        ("detached", at_zero, "apart", True),
+        ("sleeping", at_zero, "apart", False),
+        # A call no runtime stamped, as a test's own may be, starts now, in UTC.
+        ("unstamped", None, "apart", True),
+    )
+    for call_id, stamp, status, started in calls:
+        agent.runtime._calls[call_id] = runtime_module._Call(
+            call=ToolCall(call_id=call_id, name="gone", timestamp=stamp),
+            key=None,
+            task=asyncio.create_task(asyncio.wait_for(asyncio.Future[None](), None)),
+            background=status == "apart",
+            status=status,
+            refusal=None,
+            sleeping=not started,
+        )
+    before = datetime.now(UTC)
+
+    jobs = publisher_module._jobs(agent, label="kid", mask=str)
+    for each in agent.runtime._calls.values():
+        _ = each.task.cancel()
+
+    assert [(job.call_id, job.agent, job.state) for job in jobs] == [
+        ("detached", "kid", "running"),
+        ("sleeping", "kid", "sleeping"),
+        ("unstamped", "kid", "running"),
+    ]
+    assert jobs[0].started == datetime.fromtimestamp(0.0, UTC)
+    assert jobs[-1].started >= before
+
+
+@pytest.mark.asyncio
 async def test_a_delayed_job_goes_up_sleeping(tmp_path: Path) -> None:
     async with _published(
         tmp_path,
@@ -935,7 +1036,7 @@ async def test_a_delayed_job_goes_up_sleeping(tmp_path: Path) -> None:
         reply("later"),
         tools=[_Waiting()],
     ) as p:
-        answered = _when(p.agent, types.ModelIdle)
+        answered = _when(p.agent, ModelIdle)
         turn = asyncio.create_task(p.agent.send("go"))
         _ = await answered.wait()
         sleeping = p.states()[-1].state
@@ -956,14 +1057,15 @@ async def test_the_team_goes_up_as_sagent_s_tree_each_agent_with_its_session(
         _ = await p.agent.send("go")
         await p.publisher.caught_up()
         # The kid's session opened at its first save; the next event takes it up.
-        p.publisher(types.AgentIdle())
+        p.publisher(AgentIdle())
         kid = p.team["kid"].session.journal.path
+        # Read before the agents close: the quit is told, of a team gone.
+        teams = [
+            [(m.label, m.parent, m.busy, m.session) for m in line.state.team or ()]
+            for line in p.states()
+        ]
 
     assert kid is not None
-    teams = [
-        [(m.label, m.parent, m.busy, m.session) for m in line.state.team or ()]
-        for line in p.states()
-    ]
     assert [("Agent", "", True, _SESSION), ("kid", "Agent", True, None)] in teams
     assert teams[-1] == [
         ("Agent", "", False, _SESSION),
@@ -975,32 +1077,84 @@ async def test_the_team_goes_up_as_sagent_s_tree_each_agent_with_its_session(
 @pytest.mark.parametrize(
     "ending",
     [
-        types.AgentIdle(),
-        types.ModelResponseError(exception=RuntimeError("down")),
-        types.ModelResponseCancelled(),
+        AgentIdle(),
+        ModelIdle(outcome=Failed(exception=RuntimeError("down"))),
+        ModelIdle(outcome=Cancelled()),
     ],
     ids=["idle", "failed", "halted"],
 )
-async def test_a_turn_ends_when_the_root_idles_after_a_call_fails_or_halts(
+async def test_a_turn_ends_when_the_root_idles_after_a_call_or_stops_short(
     tmp_path: Path,
     ending: types.RuntimeEvent,
 ) -> None:
     async with _published(tmp_path) as p:
-        p.publisher(types.AgentIdle())
-        p.publisher(types.ChildEvent(label="kid", inner=types.ModelCallStarted()))
-        p.publisher(types.ChildEvent(label="kid", inner=ending))
+        p.publisher(AgentIdle())
+        p.publisher(types.ChildEvent(label="kid", event=types.ModelResponseStarted()))
+        p.publisher(types.ChildEvent(label="kid", event=ending))
         unended = p.states()[-1].state.turn_ended
-        p.publisher(types.ModelCallStarted())
+        p.publisher(types.ModelResponseStarted())
         before = datetime.now(UTC)
         p.publisher(ending)
         ended = p.states()[-1].state.turn_ended
-        p.publisher(types.AgentIdle())
+        p.publisher(AgentIdle())
         again = p.states()[-1].state.turn_ended
 
     assert unended is None
     assert ended is not None
     assert ended >= before
     assert again == ended
+
+
+# Only the runtime knows whether a turn stopped: a compaction cancels a call, a
+# failure may be got past, and a halt or a clear of an agent at rest stops nothing.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [
+        types.ModelResponseCompleted(outcome=Cancelled()),
+        types.ModelResponseCompleted(
+            outcome=Failed(exception=RuntimeError("down")),
+        ),
+        types.ModelHalt(),
+        types.SessionClearCompleted(outcome=Succeeded(value=None)),
+        ModelIdle(outcome=Succeeded(value=None)),
+    ],
+    ids=["a-call-cancelled", "a-call-failed", "a-halt-asked", "a-clear", "finished"],
+)
+async def test_nothing_but_an_idle_or_a_turn_that_stopped_short_ends_a_turn(
+    tmp_path: Path,
+    event: types.RuntimeEvent,
+) -> None:
+    async with _published(tmp_path) as p:
+        p.publisher(types.ModelResponseStarted())
+        p.publisher(event)
+        unended = p.states()[-1].state.turn_ended
+        p.publisher(AgentIdle())
+        idled = p.states()[-1].state.turn_ended
+
+    assert unended is None
+    assert idled is not None
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_failed_and_is_then_finished_ends_again_at_its_idle(
+    tmp_path: Path,
+) -> None:
+    """A retry may get past the failure: the same turn then ends a second time."""
+    async with _published(tmp_path) as p:
+        p.publisher(types.ModelResponseStarted())
+        p.publisher(ModelIdle(outcome=Failed(exception=RuntimeError("x"))))
+        failed = p.states()[-1].state.turn_ended
+        p.publisher(types.ModelResponseStarted())
+        p.publisher(ModelIdle(outcome=Succeeded(value=None)))
+        retried = p.states()[-1].state.turn_ended
+        p.publisher(AgentIdle())
+        finished = p.states()[-1].state.turn_ended
+
+    assert failed is not None
+    assert retried == failed
+    assert finished is not None
+    assert finished > failed
 
 
 @pytest.mark.asyncio
@@ -1011,7 +1165,7 @@ async def test_a_message_waiting_mid_stream_goes_at_once(
     waiting = UserMessage(content="also this")
     async with _published(tmp_path) as p:
         monkeypatch.setattr(p.agent.runtime, "pending_mid_stream", lambda: (waiting,))
-        p.publisher(types.AgentIdle())
+        p.publisher(AgentIdle())
 
     assert p.states()[-1].state.pending == (event_payload(waiting),)
 
@@ -1024,13 +1178,13 @@ async def test_the_settings_go_when_assigned_and_again_only_when_they_change(
         commands = Commands(
             p.agent,
             catalog=ModelCatalog(factories={"scripted": ScriptedProvider}),
-            say=p.publisher.say,
+            print_output=p.publisher.print_output,
             screen=_Screen(),
             panes=Panes(),
         )
         p.publisher.commands = commands
         assert p.publisher.commands is commands
-        p.publisher.say(CommandOutput(text="nothing changed", tone="note"))
+        p.publisher.print_output(CommandOutput(text="nothing changed", tone="note"))
         _ = await commands("/screen.thinking show")
         p.publisher.check_settings()
         # A setting with words of every kind, so a field left out shows.
@@ -1066,20 +1220,20 @@ async def test_a_setting_changed_with_nothing_said_here_goes_when_busy_next_chan
         elsewhere = Commands(
             p.agent,
             catalog=catalog,
-            say=shown.append,
+            print_output=shown.append,
             screen=screen,
             panes=Panes(),
         )
         p.publisher.commands = Commands(
             p.agent,
             catalog=catalog,
-            say=p.publisher.say,
+            print_output=p.publisher.print_output,
             screen=screen,
             panes=Panes(),
         )
         _ = await elsewhere("/screen.thinking show")
         unsent = len(p.settings())
-        p.publisher(types.ModelCallStarted())
+        p.publisher(types.ModelResponseStarted())
 
     assert (unsent, len(p.settings())) == (1, 2)
     settings = {s.name: s for s in p.settings()[-1].settings}
@@ -1275,7 +1429,7 @@ async def test_records_saved_while_a_pass_finds_nothing_new_still_go_up(
             return waiting()
 
         monkeypatch.setattr(journal, "history", first_read_waits)
-        p.publisher(types.SaveSession())
+        p.publisher(types.SessionSaveDue())
         assert await asyncio.to_thread(reading.wait, 5)
         _ = await p.agent.send("b")
         read.set()
@@ -1296,9 +1450,11 @@ async def test_a_secret_named_for_masking_never_goes_up(
     async with _published(tmp_path, reply("hello")) as p:
         _ = await p.agent.send("the key is hunter2-hunter2")
         await p.publisher.caught_up()
-        p.publisher.say(CommandOutput(text="[/login] hunter2-hunter2", tone="note"))
+        p.publisher.print_output(
+            CommandOutput(text="[/login] hunter2-hunter2", tone="note"),
+        )
         monkeypatch.setattr(p.agent.runtime, "pending_mid_stream", lambda: (waiting,))
-        p.publisher(types.ModelCallStarted())
+        p.publisher(types.ModelResponseStarted())
 
     sent = [r.model_dump_json() for _, _, batch in p.store.appended for r in batch]
     assert any("[redacted:KEY]" in body for body in sent)
@@ -1313,10 +1469,10 @@ async def test_a_secret_named_for_masking_never_goes_up(
 @pytest.mark.asyncio
 async def test_with_no_secret_named_an_event_goes_up_as_it_is(tmp_path: Path) -> None:
     async with _published(tmp_path) as p:
-        p.publisher(types.ModelResponsePartial(text="hunter2-hunter2"))
+        p.publisher(types.ModelResponseTextStreamed(text="hunter2-hunter2"))
 
     assert p.events()[0].payload == event_payload(
-        types.ModelResponsePartial(text="hunter2-hunter2"),
+        types.ModelResponseTextStreamed(text="hunter2-hunter2"),
     )
 
 

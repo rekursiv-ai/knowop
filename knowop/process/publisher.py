@@ -1,8 +1,8 @@
 """What an agent process tells Trackinizer: each agent's records, and the root's lines.
 
 One observer on the root agent's runtime. Each event goes up the session's socket as
-it is published, and the root's journal goes up as records from each ``SaveSession``.
-What an agent sends ``user`` goes up as its ``AgentToAgentMessage``, Chat being the
+it is published, and the root's journal goes up as records from each ``SessionSaveDue``.
+What an agent sends ``user`` goes up as its ``AgentMessage``, Chat being the
 user. The agent's state is sagent's own status line, and what a slash line can name is
 sagent's own settings registry, each sent when it changes; while the agent works, the
 line is read again each second, as sagent's screen polls it. A secret named in
@@ -11,7 +11,7 @@ masked piece by piece as it streams, so a value the model writes across two piec
 is masked only in its record.
 
 Each child an agent spawns, a watcher among them, journals in a folder of its
-spawner's (``child_journal``). Its journal goes up from its own ``SaveSession`` to a
+spawner's (``child_journal``). Its journal goes up from its own ``SessionSaveDue`` to a
 session of its own, started at its first save ``spawned_by`` its spawner's session,
 its label the link's note, named by its folders from the root's down
 (``projects.session_id``), as ``knowop upload`` names it. A refused child is let go;
@@ -20,7 +20,7 @@ the root's session goes on.
 ::
 
     runtime event ──Publisher──▶ EventLine, StateLine, SettingsLine ──▶ the socket
-    SaveSession   ──_Journal───▶ journal lines ──▶ POST .../records (a worker thread)
+    SessionSaveDue   ──_Journal───▶ journal lines ──▶ POST .../records (a worker thread)
       (each agent's own: the root's to the session, a child's to the session its
        first save starts, spawned_by its spawner's)
 
@@ -29,7 +29,7 @@ Typical usage example:
   publisher = Publisher(agent, team=team, client=client, session_id=session_id,
                         part=part, start=start, send=socket.send)
   agent.runtime.observers.append(publisher)
-  commands = Commands(agent, ..., say=publisher.say)
+  commands = Commands(agent, ..., print_output=publisher.print_output)
   publisher.commands = commands           # The settings' source from now on.
 """
 
@@ -50,7 +50,12 @@ import time
 from sagent.runtime import types
 from sagent.session import projects
 from sagent.session.jsonl import record_line
-from sagent.session.types import AgentToAgentMessage
+from sagent.session.types import (
+    AgentIdle,
+    AgentMessage,
+    ModelIdle,
+    Succeeded,
+)
 from sagent.tools.background_task import without_controls
 from sagent.tui.status import Status
 from trackinizer.client.errors import ClientError
@@ -192,26 +197,26 @@ class Publisher:
         self._send(SettingsLine(settings=self._settings))
 
     def __call__(self, event: types.RuntimeEvent) -> None:
-        """Send ``event`` up, or upload the journal at a ``SaveSession``; then the state."""
+        """Send ``event`` up, or upload the journal at a ``SessionSaveDue``; then the state."""
         self._status(event)
         self._turn(event)
         inner = event
         while isinstance(inner, types.ChildEvent):
-            inner = inner.inner
-        if not isinstance(inner, types.SaveSession):
+            inner = inner.event
+        if not isinstance(inner, types.SessionSaveDue):
             self._event(event)
         elif inner is event:
             self._root.upload()
         self._check_state()
 
-    def say(self, output: CommandOutput) -> None:
+    def print_output(self, output: CommandOutput) -> None:
         """Send what a slash command said up, then the settings if they changed."""
         self._event(output)
         self.check_settings()
 
     def to_user(self, sender: str, text: str) -> None:
         """Send up what ``sender`` told the user, as its message to ``user``."""
-        self._event(AgentToAgentMessage(sender=sender, recipient="user", content=text))
+        self._event(AgentMessage(sender=sender, recipient="user", content=text))
 
     def check_settings(self) -> None:
         """Send the settings a slash line can name, if they differ from the last sent."""
@@ -253,16 +258,16 @@ class Publisher:
         self._send(line)
 
     # An idle with no model call since is no turn's end: a runtime idles as it starts.
-    # A failure or a halt ends the turn it stops, whatever came before it.
+    # A turn that stops short says so itself; one that finishes ends once the agent
+    # has nothing more to do, the results its jobs owe it among that.
     def _turn(self, event: types.RuntimeEvent) -> None:
         """Note when the root agent's turn ends."""
-        if isinstance(event, types.ModelCallStarted):
+        if isinstance(event, types.ModelResponseStarted):
             self._worked = True
-        elif isinstance(
-            event,
-            (types.ModelResponseError, types.ModelResponseCancelled),
-        ) or (isinstance(event, types.AgentIdle) and self._worked):
-            self._worked = False
+        elif (
+            isinstance(event, ModelIdle) and not isinstance(event.outcome, Succeeded)
+        ) or (isinstance(event, AgentIdle) and self._worked):
+            self._worked = False  # pragma: no mutate[truthiness]
             self._turn_ended = datetime.now(UTC)
 
     # Its text, once a second.
@@ -533,12 +538,13 @@ def _jobs(
             tool=job.call.name,
             title=mask(_title(runtime.tools.get(job.call.name), job.call)),
             agent=label,
-            started=datetime.fromtimestamp(job.started, UTC),
-            state="sleeping" if job.state == "sleeping" else "running",
+            started=job.call.timestamp or datetime.now(UTC),
+            state="sleeping" if job.status == "sleeping" else "running",
             awaited=job.call.call_id in awaited,
+            runs_until_stopped=job.runs_until_stopped,
         )
         for job in held
-        if job.state != "running"
+        if job.status != "running"
         and job.call.name not in {"AgentSpawn", "BackgroundTask"}
     ]
 
@@ -638,8 +644,8 @@ class _Journal:
         return None if self._part is None else self._part.session_id
 
     def saved(self, event: types.RuntimeEvent) -> None:
-        """Upload at the agent's own ``SaveSession``."""
-        if isinstance(event, types.SaveSession):
+        """Upload at the agent's own ``SessionSaveDue``."""
+        if isinstance(event, types.SessionSaveDue):
             self.upload()
 
     def upload(self) -> None:
@@ -663,7 +669,7 @@ class _Journal:
     # Read on the runtime's loop, which writes the journal first; turned into lines and
     # sent on a worker thread. A pass reads the journal as it stood when the pass began,
     # so a save during it asks for one more: a record written meanwhile goes with this
-    # upload, not with the next ``SaveSession``, which may be the person's next line.
+    # upload, not with the next ``SessionSaveDue``, which may be the person's next line.
     async def _uploaded(self) -> None:
         """Open the session once, then upload until caught up, retrying an outage."""
         delays = retry_delays()

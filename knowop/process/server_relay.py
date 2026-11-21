@@ -49,7 +49,7 @@ from trackinizer.wire.wire_sessions import SessionAgent
 
 if TYPE_CHECKING:
     from sagent.agent.team import Team
-    from sagent.session.types import AgentToAgentMessage
+    from sagent.session.types import AgentMessage
 
 
 __all__ = ["AgentMessenger", "ServerRelay"]
@@ -158,7 +158,7 @@ class ServerRelay(AsyncResource):
             ),
         )
 
-    def deliver(self, message: AgentToAgentMessage, *, booked: MessageKind) -> None:
+    def deliver(self, message: AgentMessage, *, booked: MessageKind) -> None:
         """Hand an agent's message from another session to the agent here it names.
 
         It is booked as its sender booked it: an ask is owed a reply, and a reply

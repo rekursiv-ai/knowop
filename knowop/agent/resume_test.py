@@ -16,13 +16,13 @@ from trackinizer.sagent.session.types import (
     AssistantMessage,
     BashResult,
     ContextState,
+    SessionContext,
     SessionRecord,
     SystemMessage,
     Thinking,
     TokenUsage,
     ToolCall,
-    ToolResult,
-    TurnContext,
+    ToolMessage,
     UncategorizedRecord,
     UserMessage,
 )
@@ -116,7 +116,9 @@ def _journal_here(folder: str, *records: SessionRecord) -> Path:
 
 def _journal_lines(path: Path) -> list[SessionRecord]:
     with path.open(encoding="utf-8") as handle:
-        return [r for r in sagent.normalize(handle) if not isinstance(r, TurnContext)]
+        return [
+            r for r in sagent.normalize(handle) if not isinstance(r, SessionContext)
+        ]
 
 
 _SAID: Final = (UserMessage(content="hi"), AssistantMessage(content="hello"))
@@ -325,7 +327,7 @@ class TestTheJournalAProcessWrites:
             )
 
     def test_a_cut_record_restores_only_when_a_loss_is_accepted(self) -> None:
-        cut = ToolResult(
+        cut = ToolMessage(
             call_id="c",
             state="done",
             result=BashResult(command=("ls",)),
@@ -354,7 +356,7 @@ class TestTheJournalAProcessWrites:
         )
 
         [restored] = _journal_lines(choice.path)
-        assert restored == ToolResult(
+        assert restored == ToolMessage(
             call_id="c",
             state="done",
             result=BashResult(command=("ls",)),
@@ -380,8 +382,12 @@ def _call(call_id: str, request: str) -> ToolCall:
     )
 
 
-def _result(call_id: str) -> ToolResult:
-    return ToolResult(call_id=call_id, state="done", result=BashResult(command=("ls",)))
+def _result(call_id: str) -> ToolMessage:
+    return ToolMessage(
+        call_id=call_id,
+        state="done",
+        result=BashResult(command=("ls",)),
+    )
 
 
 def _whole(message: str) -> str:
