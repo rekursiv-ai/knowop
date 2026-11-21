@@ -20,7 +20,7 @@ import pytest
 from knowop.hosts_test import _KNOWHOST, _KnowHostApi
 from knowop.process.main_test import _attached
 from knowop.tools import knowop
-from knowop.tools.records import RecordReads
+from knowop.tools.records import Records
 from knowop.tools.records_test import _Server
 
 
@@ -140,9 +140,9 @@ def _tools(client: _Client, server: _Server | None = None) -> knowop.KnowOpTools
     )
 
 
-def _reads(server: _Server) -> RecordReads:
-    """Return record reads over ``server``, under the agent's key."""
-    return RecordReads("https://records.test", api_key="agent-key", transport=server)
+def _reads(server: _Server) -> Records:
+    """Return the records tool over ``server``, under the agent's key."""
+    return Records("https://records.test", api_key="agent-key", transport=server)
 
 
 @pytest.mark.asyncio
@@ -790,6 +790,69 @@ async def test_trax_sends_no_write_and_says_so() -> None:
 
     assert "is not available to this client" in said
     assert [method for method, _, _ in server.sent] == ["GET"]
+
+
+@pytest.mark.asyncio
+async def test_trax_writes_records_as_the_calling_agent_of_its_session() -> None:
+    """Each change names the agent as ``session.self`` does; the reads' key sends it."""
+    client = _Client()
+    server = _Server()
+    tools = _tools(client, server)
+
+    said = [
+        await tools.act(
+            action="trax.write",
+            command="issue 7 status to complete",
+            context=_Agent(label="lead"),
+        ),
+        await tools.act(action="trax.write", command="trax issue 7 owner to lead"),
+    ]
+
+    assert said == [
+        "set: Issue#7 status = complete\n",
+        "set: Issue#7 owner = lead\n",
+    ]
+    assert server.written == [
+        (
+            ("PUT", "/api/inquiries/{target_id}/status"),
+            {"value": "complete", "actor": f"lead#{UUID(int=90)}"},
+        ),
+        (
+            ("PUT", "/api/inquiries/{target_id}/owner"),
+            {"value": "lead", "actor": f"Agent#{UUID(int=90)}"},
+        ),
+    ]
+    assert {key for _, _, key in server.sent} == {"Bearer agent-key"}
+    assert client.starts == client.started == client.puts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [None, "", "  "])
+async def test_trax_write_requires_a_command_and_sends_nothing(
+    command: str | None,
+) -> None:
+    server = _Server()
+    tools = _tools(_Client(), server)
+
+    said = await (
+        tools.act(action="trax.write")
+        if command is None
+        else tools.act(action="trax.write", command=command)
+    )
+
+    assert said == "trax.write requires a command"
+    assert (server.sent, server.closed) == ([], 0)
+
+
+@pytest.mark.asyncio
+async def test_trax_write_without_a_session_names_no_agent_and_sends_nothing() -> None:
+    server = _Server()
+    tools = knowop.KnowOpTools(_Client(), session_id=None, records=_reads(server))
+
+    said = await tools.act(action="trax.write", command="issue 7 status to complete")
+
+    assert said == "trax.write requires a caller session"
+    assert (server.sent, server.closed) == ([], 0)
 
 
 if __name__ == "__main__":

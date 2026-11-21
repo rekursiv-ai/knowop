@@ -1,4 +1,4 @@
-"""The KnowOp tool for hosts, agent sessions and reading Trackinizer's records."""
+"""The KnowOp tool for hosts, agent sessions and Trackinizer's records."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
     from trackinizer.wire.wire_terminals import TerminalHosts
     from treekle import PlainTree
 
-    from knowop.tools.records import RecordReads
+    from knowop.tools.records import Records
 
 KNOWOP_TOOL: Final = "KnowOp"
 KNOWOP_DESCRIPTION: Final = (files(__package__) / "assets" / "knowop.md").read_text(
@@ -68,6 +68,7 @@ type Action = Literal[
     "session.continue",
     "session.self",
     "trax.read",
+    "trax.write",
 ]
 
 
@@ -123,14 +124,14 @@ class KnowOpClient(KnowHostClient, ProcessClient, Protocol):
 
 
 class KnowOpTools:
-    """Operate on the caller's hosts and agent sessions, and read its records."""
+    """Operate on the caller's hosts and agent sessions, and read and write records."""
 
     def __init__(
         self,
         client: KnowOpClient,
         *,
         session_id: UUID | None,
-        records: RecordReads,
+        records: Records,
     ) -> None:
         self._client = client
         self._session_id = session_id
@@ -148,20 +149,22 @@ class KnowOpTools:
         command: str = "",
         context: Caller = _UNNAMED,
     ) -> str:
-        """Operate on a host or an agent session, or read Trackinizer's records.
+        """Operate on a host or agent session, or read or write Trackinizer's records.
 
         Args:
           action: Operate hosts; launch, stop, inspect or continue a session; or
-            read records (trax.read).
+            read records (trax.read) or change them (trax.write).
           name: The host name, launch label, required LABEL#N for session actions, or
             for ``session.budget`` a campaign's brief, Issue#N, to read its spend.
           time: Required launch/continue Slurm time limit (20 means 20 minutes).
           model: Launch model; empty keeps the server's default.
           effort: Launch thinking effort; empty keeps the default.
           budget: Launch budget in USD; omitted takes the person's campaign limit.
-          command: Required for trax.read: a trax read command, as typed after `trax`.
-          context: The calling agent, whose label ``session.self`` answers with; the
-            agent framework passes it, and it is no argument of the model's.
+          command: Required for trax.read and trax.write: a trax command, as typed
+            after `trax`.
+          context: The calling agent, whose label ``session.self`` answers with and
+            trax.write records each change as; the agent framework passes it, and it
+            is no argument of the model's.
 
         Returns:
           answer: The result or the server's refusal.
@@ -301,6 +304,15 @@ class KnowOpTools:
                 if not command.strip():
                     return "trax.read requires a command"
                 return self._records.read(command)
+            case "trax.write":
+                if not command.strip():
+                    return "trax.write requires a command"
+                if self._session_id is None:
+                    return "trax.write requires a caller session"
+                return self._records.write(
+                    command,
+                    actor=f"{label}#{self._session_id}",
+                )
 
     def _started_session(
         self,

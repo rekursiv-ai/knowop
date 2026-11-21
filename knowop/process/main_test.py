@@ -156,7 +156,7 @@ from knowop.tools.knowop import (
     KNOWOP_TOOL,
     KnowOpTools,
 )
-from knowop.tools.records import RecordReads
+from knowop.tools.records import Records
 
 
 _THIS: Final[Path] = Path(__file__).resolve()
@@ -762,14 +762,14 @@ async def test_a_headless_run_says_hello_and_prints_its_session_first(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("opened")
-async def test_its_knowop_tool_acts_for_its_session_and_reads_under_its_key(
+async def test_its_knowop_tool_acts_for_its_session_and_runs_trax_under_its_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """KnowOp acts over the process's client for its session; trax reads with its key."""
-    knowops: list[tuple[object, UUID | None, RecordReads]] = []
-    reads: list[tuple[str, str, RecordReads]] = []
+    """KnowOp acts over the process's client for its session; trax runs with its key."""
+    knowops: list[tuple[object, UUID | None, Records]] = []
+    reads: list[tuple[str, str, Records]] = []
     monkeypatch.setattr(main_module, "KnowOpTools", partial(_knowop_tools, knowops))
-    monkeypatch.setattr(main_module, "RecordReads", partial(_record_reads, reads))
+    monkeypatch.setattr(main_module, "Records", partial(_made_records, reads))
 
     async with _relayed() as relay, _serving(relay) as (task, server):
         _ = await relay.seen(_is("hello"))
@@ -1040,7 +1040,9 @@ async def test_every_agent_acts_on_the_canvas_the_newest_line_from_chat_named(
         host_tool.schema["properties"],
         dict[str, dict[str, object]],
     )
-    assert "trax.read" in from_plain(knowop_args["action"]["enum"], list[str])
+    assert {"trax.read", "trax.write"} <= set(
+        from_plain(knowop_args["action"]["enum"], list[str]),
+    )
     assert "command" in knowop_args
     actions = from_plain(canvas.schema["properties"], dict[str, dict[str, object]])
     assert actions["action"]["enum"] == [
@@ -2859,27 +2861,27 @@ def _canvas_tools(
 
 
 def _knowop_tools(
-    made: list[tuple[object, UUID | None, RecordReads]],
+    made: list[tuple[object, UUID | None, Records]],
     client: KnowOpClient,
     *,
     session_id: UUID | None,
-    records: RecordReads,
+    records: Records,
 ) -> KnowOpTools:
     """Make the KnowOp tools as the process does, keeping what they are made with."""
     made.append((client, session_id, records))
     return KnowOpTools(client, session_id=session_id, records=records)
 
 
-def _record_reads(
-    made: list[tuple[str, str, RecordReads]],
+def _made_records(
+    made: list[tuple[str, str, Records]],
     base_url: str,
     *,
     api_key: str,
-) -> RecordReads:
-    """Make the record reads as the process does, keeping their server and key."""
-    reads = RecordReads(base_url, api_key=api_key)
-    made.append((base_url, api_key, reads))
-    return reads
+) -> Records:
+    """Make the records tool as the process does, keeping its server and key."""
+    records = Records(base_url, api_key=api_key)
+    made.append((base_url, api_key, records))
+    return records
 
 
 def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
@@ -2908,10 +2910,10 @@ def test_unbuilt_builds_the_agent_as_a_run_would_without_its_journal_or_daemon(
     monkeypatch.setattr(main_module, "opened", opened)
     canvases: list[object] = []
     monkeypatch.setattr(main_module, "CanvasTools", partial(_canvas_tools, canvases))
-    knowops: list[tuple[object, UUID | None, RecordReads]] = []
-    reads: list[tuple[str, str, RecordReads]] = []
+    knowops: list[tuple[object, UUID | None, Records]] = []
+    reads: list[tuple[str, str, Records]] = []
     monkeypatch.setattr(main_module, "KnowOpTools", partial(_knowop_tools, knowops))
-    monkeypatch.setattr(main_module, "RecordReads", partial(_record_reads, reads))
+    monkeypatch.setattr(main_module, "Records", partial(_made_records, reads))
     server = _Server(version=1)
     client = cast("Client", server)
 

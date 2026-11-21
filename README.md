@@ -254,13 +254,14 @@ computer. Terminals use the server relay when a direct link is unavailable.
 | `watch_pr/` | `knowop watch-pr`: pull request rows, their news, and the serve that reads them through `gh`. |
 | `hosts.py` | `knowop host`: the host registry, and KnowHosts through the server's KnowHost API. |
 | `canvas.py` | `knowop canvas`: trax's canvas command, named as knowop's. |
-| `tools/` | The tools every agent of `knowop run` is given, plain functions over the client: the canvas's (`tools/canvas.py`), hosts, sessions and record reads (`tools/knowop.py`, whose `trax.read` action runs `tools/records.py`). |
+| `tools/` | The tools every agent of `knowop run` is given, plain functions over the client: the canvas's (`tools/canvas.py`), hosts, sessions and records (`tools/knowop.py`, whose `trax.read` and `trax.write` actions run `tools/records.py`). |
 | `upload.py` | `knowop upload`: finds session files and sends each as an AgentSession. |
 | `skills/` | Each package's instructions for agents. |
 
 knowop calls the server through trackinizer's `Client`, as trax does, and never
-starts a `trax` process. KnowOp's `trax.read` action runs an agent's trax read commands
-inside the agent's own process (`trax.invoke`), reads only, under the agent's key.
+starts a `trax` process. KnowOp's `trax.read` and `trax.write` actions run an agent's
+trax commands inside the agent's own process (`trax.invoke`), under the agent's key:
+`trax.read` reads only, and `trax.write` records each change as the agent.
 sagent's `Recall` tool searches the same server near the run's own session, under
 the same key: the process hands the tool both, so the key is in no environment a
 command of the agent inherits. A server a person names (`--tool.Recall.url`) is

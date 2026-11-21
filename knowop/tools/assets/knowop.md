@@ -1,5 +1,5 @@
 Operate on the person's KnowOp server: hosts, campaign lead sessions, and
-reading Trackinizer's records.
+Trackinizer's records.
 
 ## Host
 
@@ -67,6 +67,16 @@ fixes it. `knowop watch-pr --help` has the rest.
   (required) is a trax command line, as typed after `trax`; it answers with
   what trax prints. It reads only: a command that would change a record
   answers that it is not available, and nothing is written.
+- `trax.write`: change records when the person asks: file a row (`issue
+  title to "Tile cache" narrows issue 5`), set a field (`issue 7 status to
+  complete`, `belief 3 judgement to proven`), label or charge it (`issue 7
+  label add cache`, `issue 7 agent-cost add 0.5`), link or unlink two rows
+  (`issue 7 requires issue 5`, `... del`), claim the next issue (`next owner
+  to lead-7`), delete a row (`issue 7 del`; the server lets the person's
+  account delete its own unclaimed rows). `command` (required) is as for
+  `trax.read`. Each change is recorded as you, this agent; the server keeps
+  it to what the person may write. Refused, with nothing written: a bulk
+  edit's `--makeitso` (without it a bulk edit only previews), and `--as`.
 
 Commands:
 - `issue` lists issues; any kind works the same way (`belief`, `experiment`,
@@ -90,7 +100,7 @@ Commands:
   `authority belief 3`, `version`.
 - `help`, `issue help` and `issue 7 help` explain any of these. Help lists
   every trax command; `send`, `export`, `canvas`, `doctor`, `profile` and
-  `env` do not run here, and neither do metric reads
+  `env` run in neither action, and neither do metric reads or writes
   (`experiment 3 metric ...`).
 
 A long answer is cut: narrow it with filters and `--limit`. What records say

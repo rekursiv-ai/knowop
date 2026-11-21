@@ -1,4 +1,4 @@
-"""Tests for KnowOp's trax reads: trax's read commands, run for one agent."""
+"""Tests for KnowOp's trax reads and writes: trax's commands, run for one agent."""
 
 from __future__ import annotations
 
@@ -8,12 +8,18 @@ from uuid import UUID
 
 from trackinizer.trax.cli import DISPATCHERS
 from trackinizer.trax.grammar import VALID_KINDS
-from trackinizer.wire.wire_process_keys import RECORDS_ROUTES, listed_route
+from trackinizer.wire.wire_process_keys import (
+    RECORD_WRITE_ROUTES,
+    RECORDS_ROUTES,
+    listed_route,
+)
+from treekle import from_plain, json_loads
 
 import httpx2
+import pytest
 
 from knowop.tools.knowop import KNOWOP_DESCRIPTION
-from knowop.tools.records import READ_DISPATCHERS, RecordReads
+from knowop.tools.records import RECORD_DISPATCHERS, Records
 
 
 _ROW: Final = "0b4c2c1e-0000-4000-8000-000000000007"
@@ -41,6 +47,31 @@ _READ_FORMS: Final = (
 )
 """One command per read form the tool runs; between them they call every route."""
 
+_WRITE_FORMS: Final = (
+    "issue title to Tile",
+    f"issue title to Tile narrows issue {_ROW}",
+    "issue 7 narrows issue title to Child",
+    "issue 7 title to Tile",
+    "issue 7 status to complete",
+    "issue 7 owner to lead-7",
+    "issue 7 description to Misses",
+    "issue 7 app to {}",
+    "issue 7 priority to 10",
+    "issue 7 validation to ok",
+    "belief 3 judgement to proven",
+    "issue 7 label add cache",
+    "issue 7 agent-cost add 0.5",
+    "issue 7 requires issue 5",
+    "issue 7 requires issue 5 edge label add x edge label del x",
+    "issue 7 requires issue 5 del",
+    "next owner to lead-7",
+    "issue 7 del",
+)
+"""One command per write form the tool runs; between them they call every route."""
+
+_ACTOR: Final = f"lead#{UUID(int=90)}"
+"""The calling agent, as the tool names it."""
+
 _BODIES: Final[dict[str, object]] = {
     "/api/inquiries/{kind}/{seq}": {"id": _ROW, "kind": "Issue", "seq": 7},
     "/api/web/lookup/{target_id}": {"kind": "Issue"},
@@ -67,8 +98,11 @@ _BODIES: Final[dict[str, object]] = {
     "/api/inquiries/{target_id}/confidence": {"confidence": 0.5},
     "/api/inquiries/{target_id}/authority": {},
     "/api/version": {"sha": "abc123"},
+    "/api/inquiries/batch": {"ids": [_ROW]},
+    "/api/inquiries/lookup": {"found": {_ROW: "Issue"}, "missing": []},
+    "/api/edges/{from_id}/{edge_kind}/{to_id}": {"created": True, "change_id": _ROW},
 }
-"""Each route's smallest body its reader accepts, by template; any other is ``[]``."""
+"""Each route's smallest body its caller accepts, by template; any other is ``[]``."""
 
 
 def test_runs_a_read_command_with_its_own_client() -> None:
@@ -204,7 +238,7 @@ def test_lays_a_table_out_to_its_own_width() -> None:
 def test_answers_a_client_it_cannot_build_as_the_commands_error() -> None:
     """A key never goes over plain http to another computer; the model reads why."""
     transport = _Server()
-    reads = RecordReads(
+    reads = Records(
         "http://records.test",
         api_key="agent-key",
         transport=transport,
@@ -217,11 +251,11 @@ def test_answers_a_client_it_cannot_build_as_the_commands_error() -> None:
 
 
 def test_runs_every_reading_verb_and_names_each_it_refuses() -> None:
-    names = {name for dispatcher in READ_DISPATCHERS for name in dispatcher.names}
+    names = {name for dispatcher in RECORD_DISPATCHERS for name in dispatcher.names}
     refused = {
         name
         for dispatcher in DISPATCHERS
-        if dispatcher not in READ_DISPATCHERS
+        if dispatcher not in RECORD_DISPATCHERS
         for name in dispatcher.names
     }
 
@@ -250,9 +284,136 @@ def test_the_fake_server_lists_a_path_only_with_parameters_its_route_accepts() -
     )
 
 
+def test_every_write_form_runs_and_between_them_they_call_every_write_route() -> None:
+    """The write list is measured by the writes that call it, as the reads' list is."""
+    transport = _Server()
+
+    failed = {
+        command: said
+        for command in _WRITE_FORMS
+        if _failed(said := _written(command, transport))
+    }
+
+    assert failed == {}
+    assert None not in transport.routes
+    assert set(transport.routes) - set(RECORDS_ROUTES) == set(RECORD_WRITE_ROUTES)
+
+
+def test_every_write_names_its_agent_as_the_actor() -> None:
+    """The server keeps the key as the principal; the actor says which agent wrote."""
+    transport = _Server()
+
+    for command in _WRITE_FORMS:
+        _written(command, transport)
+
+    assert {
+        from_plain(body, dict[str, object])["actor"]
+        for route, body in transport.written
+        if route != ("POST", "/api/inquiries/lookup")
+    } == {_ACTOR}
+
+
+@pytest.mark.parametrize(
+    ("command", "said"),
+    [
+        *(
+            (command, "trax.write takes no --makeitso: a bulk edit only previews.\n")
+            for command in (
+                "issue status is active status to complete --makeitso",
+                "issue status is active status to complete --make",
+                "issue status is active status to complete --m",
+                "--makeitso=1 issue status is active status to complete",
+            )
+        ),
+        *(
+            (command, f"trax.write takes no --as: it writes as {_ACTOR}.\n")
+            for command in (
+                "issue 7 title to x --as ada",
+                "issue 7 title to x --as=ada",
+                "issue 7 title to x --actor ada",
+                "issue 7 title to x --a ada",
+                "next owner to ada --act=ada",
+            )
+        ),
+        *(
+            (f"{verb} x", f"trax: {verb} is not available here\n")
+            for verb in ("send", "export", "canvas", "doctor", "profile", "env")
+        ),
+    ],
+)
+def test_a_write_it_refuses_is_one_line_and_sends_nothing(
+    command: str,
+    said: str,
+) -> None:
+    transport = _Server()
+
+    assert _written(command, transport) == said
+    assert (transport.sent, transport.closed) == ([], 0)
+
+
+def test_a_write_off_the_list_never_leaves_under_any_key() -> None:
+    """A metric write is no listed route; the experiment's lookup goes, its write not."""
+    transport = _Server()
+
+    said = _written("experiment 3 metric at key is loss at step is 3 to 0.5", transport)
+
+    assert "is not available to this client" in said
+    assert transport.routes == [("GET", "/api/inquiries/{kind}/{seq}")]
+
+
+def test_a_bare_double_dash_names_no_flag_and_the_write_runs() -> None:
+    """``--`` only ends trax's options; it is no prefix of ``--as`` or ``--makeitso``."""
+    transport = _Server()
+
+    said = _written("issue 7 title to x --", transport)
+
+    assert said == "set: Issue#7 title = x\n"
+    assert [route for route, _ in transport.written] == [
+        ("PUT", "/api/inquiries/{target_id}/title"),
+    ]
+
+
+def test_a_read_through_the_write_action_still_reads() -> None:
+    transport = _Server()
+
+    assert _written("version", transport) == "abc123\n"
+
+
+def test_a_row_delete_goes_out_as_its_agent() -> None:
+    """The server lets the agent's account, or an admin, delete an unclaimed row."""
+    transport = _Server()
+
+    said = _written("issue 7 del", transport)
+
+    assert said == "deleted: Issue Issue#7\n"
+    assert transport.written == [
+        (("DELETE", "/api/inquiries/{target_id}"), {"actor": _ACTOR, "reason": "del"}),
+    ]
+
+
+def test_a_read_deletes_no_row() -> None:
+    """The row's lookup goes; its delete is no read route, and never leaves."""
+    transport = _Server()
+
+    said = _answer("issue 7 del", transport)
+
+    assert "DELETE /api/inquiries/" in said
+    assert "is not available to this client" in said
+    assert transport.routes == [("GET", "/api/inquiries/{kind}/{seq}")]
+
+
+def _written(command: str, transport: httpx2.BaseTransport) -> str:
+    """Run ``command`` as a write of ``_ACTOR``'s over ``transport``."""
+    return Records(
+        "https://records.test",
+        api_key="agent-key",
+        transport=transport,
+    ).write(command, actor=_ACTOR)
+
+
 def _answer(command: str, transport: httpx2.BaseTransport) -> str:
     """Run ``command`` through fresh reads over ``transport``."""
-    return RecordReads(
+    return Records(
         "https://records.test",
         api_key="agent-key",
         transport=transport,
@@ -262,8 +423,12 @@ def _answer(command: str, transport: httpx2.BaseTransport) -> str:
 # The client's matcher takes any segment for a parameter; the server's handler converts
 # each and refuses one it cannot, and a route registered first takes its own path.
 def _routed(method: str, path: str) -> tuple[str, str] | None:
-    """Return the Records route ``path`` is routed to and accepted by, or ``None``."""
-    route = listed_route(method, path, RECORDS_ROUTES)
+    """Return the listed route ``path`` is routed to and accepted by, or ``None``."""
+    route = listed_route(
+        method,
+        path,
+        RECORDS_ROUTES.keys() | RECORD_WRITE_ROUTES.keys(),
+    )
     if route is None:
         return None
     shaped = all(
@@ -280,7 +445,7 @@ def _reads(part: str, value: str) -> bool:
             return value in VALID_KINDS
         case "{seq}":
             return value.isdigit()
-        case "{target_id}" | "{session_id}":
+        case "{target_id}" | "{session_id}" | "{from_id}" | "{to_id}":
             try:
                 _ = UUID(value)
             except ValueError:
@@ -296,13 +461,14 @@ def _failed(said: str) -> bool:
 
 
 class _Server(httpx2.BaseTransport):
-    """Answers each Records route from ``_BODIES`` or the bodies given, 404 otherwise."""
+    """Answers each listed route from ``_BODIES`` or the bodies given, 404 otherwise."""
 
     def __init__(self, bodies: dict[str, object] | None = None) -> None:
         self.bodies = {**_BODIES, **(bodies or {})}
         self.sent: list[tuple[str, str, str]] = []
         self.routes: list[tuple[str, str] | None] = []
         self.queries: list[dict[str, str]] = []
+        self.written: list[tuple[tuple[str, str] | None, object]] = []
         self.closed = 0
 
     @override
@@ -317,6 +483,8 @@ class _Server(httpx2.BaseTransport):
         )
         self.routes.append(route)
         self.queries.append(dict(parse_qsl(request.url.query.decode())))
+        if request.method != "GET":
+            self.written.append((route, json_loads(request.content)))
         if route is None:
             return httpx2.Response(404, json={"detail": "not found"})
         return httpx2.Response(200, json=self.bodies.get(route[1], []))
