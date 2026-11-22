@@ -70,6 +70,7 @@ from sagent.tui.theme import ThemeState
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.client.session_socket import SessionSocket, SocketClient
+from trackinizer.lib.userdirs import data_dir
 from trackinizer.trax.profile import Profile
 from trackinizer.wire.refs import Ref, SeqRef
 from trackinizer.wire.wire_capture import CaptureImage
@@ -145,6 +146,7 @@ from knowop.process.main import (
 )
 from knowop.process.publisher import Publisher
 from knowop.process.remote_commands import REMOTE_AGENT
+from knowop.skill_merge import SKILL_DIRS
 from knowop.tools.canvas import (
     CANVAS_DESCRIPTION,
     CANVAS_TOOL,
@@ -837,6 +839,32 @@ async def test_a_remote_agent_opens_without_sagents_daemon(opened: _Opened) -> N
         _ = await _exited(task)
 
     assert opened.use_daemon == [False]
+    assert not (data_dir() / "rekursiv-ai" / "sagent" / "skills").exists()
+
+
+@pytest.mark.asyncio
+async def test_an_agent_merges_the_skill_folders_its_service_names(
+    opened: _Opened,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Into its user's skills, which sagent loads; the first folder's wins a name."""
+    for folder, name in (("cloud", "pr"), ("repo", "pr"), ("repo", "tdd")):
+        (tmp_path / folder / name).mkdir(parents=True)
+        (tmp_path / folder / name / "SKILL.md").write_text(f"---\nname: {name}\n---\n")
+    named = os.pathsep.join(str(tmp_path / each) for each in ("cloud", "repo"))
+    monkeypatch.setenv(SKILL_DIRS, named)
+
+    async with _relayed() as relay, _serving(relay, remote=True) as (task, _):
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    user = data_dir() / "rekursiv-ai" / "sagent" / "skills"
+    assert {each.name: each.readlink() for each in user.iterdir()} == {
+        "pr": (tmp_path / "cloud" / "pr").resolve(),
+        "tdd": (tmp_path / "repo" / "tdd").resolve(),
+    }
+    del opened
 
 
 @pytest.mark.asyncio

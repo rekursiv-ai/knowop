@@ -1,6 +1,6 @@
 ---
-name: knowop-watch-pr
-description: ALWAYS invoke this skill after you open or push a GitHub pull request in a knowop session, or when a <knowop-autofix>, <knowop-conflict>, <knowop-merged>, <knowop-ready> or <knowop-unreadable> line arrives -- knowop watch-pr add, remove, fix, status, serve, stop. Do not poll CI or gh pr checks yourself -- invoke this skill first.
+name: pr
+description: ALWAYS invoke this skill before you open a GitHub pull request in a knowop session, after you push to one, or when a <knowop-autofix>, <knowop-conflict>, <knowop-merged>, <knowop-ready> or <knowop-unreadable> line arrives -- knowop watch-pr add, remove, fix, status, serve, stop. Do not poll CI or gh pr checks yourself -- invoke this skill first.
 argument-hint: "[add|remove|fix|status|serve|stop] ..."
 user-invocable: true
 tools: Bash
@@ -16,6 +16,22 @@ pill, with its Auto-fix switch and Auto-merge box.
 
 Core rule: `knowop watch-pr --help` is the source of truth. If this skill
 disagrees with it, trust the help.
+
+## Your pull request
+
+- One request, one pull request: roll related changes into it until it merges,
+  and put later ones in a new pull request.
+- Work in a worktree of your own, branched from the base fetched fresh.
+- Commit and push after each verified step, and print the pull request's link.
+- Watch it (`knowop watch-pr add`) as soon as it exists.
+- Name the issues it serves in its body, as `Issue#7`, and link it in each
+  (`agent-tasks`).
+- Mark it ready, not draft, once its last change is in; do not wait for CI.
+- A failing check this pull request caused: fix it here.
+- A failing check it did not cause (a flaky test, a broken base): change nothing
+  here. Unless `gh pr list` shows an open fix, send an agent to fix it in a pull
+  request of its own. Say which.
+- Merge only when the person asks, or its Auto-merge is on.
 
 ## Your session
 

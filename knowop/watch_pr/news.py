@@ -293,10 +293,11 @@ def _failed(
             f"`gh pr checks {pull_request.number} --repo {pull_request.repo}`, then "
             f"`gh run view RUN_ID --repo {pull_request.repo} --log-failed` for each "
             "failed run. Make the smallest change that clears each failure, run the "
-            "narrowest check that proves it, then commit and push. Leave a failure "
+            "narrowest check that proves it, then commit and push. For a failure "
             "this pull request did not cause, such as a flaky test or a broken base "
-            "branch, and say so. Do not poll CI: the watch writes again when the "
-            "checks change."
+            "branch, change nothing here: unless `gh pr list` shows an open fix, "
+            "send an agent to fix it in a pull request of its own, and say which. "
+            "Do not poll CI: the watch writes again when the checks change."
         )
     else:
         task = _watching(pull_request, audience=audience)
