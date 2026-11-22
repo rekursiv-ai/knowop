@@ -16,6 +16,7 @@ import itertools
 import threading
 import time
 
+from sagent.agent import team as team_module
 from sagent.agent.agent import Agent
 from sagent.agent.agents_md import AgentsMdConfig
 from sagent.agent.team import Team
@@ -39,7 +40,7 @@ from sagent.session.types import (
     UserMessage,
 )
 from sagent.settings.harvest import harvest
-from sagent.tools.agent_spawn import AgentSpawn
+from sagent.tools.agent_spawn import AgentSpawn, _Forward
 from sagent.tools.background_task import BackgroundTask
 from sagent.tools.display import ToolDisplay
 from sagent.tools.types import ToolContext, ToolOutput, whole_output
@@ -73,9 +74,11 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Iterator, Sequence
     from pathlib import Path
 
+    from sagent.agent.team import MessageKind
     from sagent.model.scripted import Reply
     from sagent.session.types import SessionRecord
     from sagent.tools.types import Tool, ToolStreamingResult
+    from trackinizer.wire.json_types import JSON
 
 
 _SESSION: Final = UUID(int=9)
@@ -120,6 +123,9 @@ class _Store:
     )
     """Each child's session: its part's name, and the records appended to it."""
 
+    child_appended: threading.Event = field(default_factory=threading.Event)
+    """Set once any child's records are appended."""
+
     def session_start(self, body: SessionStart) -> SessionStartResponse:
         if self.start_failing and (error := self.start_failing.pop(0)) is not None:
             raise error
@@ -147,6 +153,7 @@ class _Store:
         if session_id != _SESSION:
             assert (name, manifest.name) == (self.children[session_id][0],) * 2
             self.children[session_id][1].extend(records)
+            self.child_appended.set()
             return None
         if self.held is not None:
             assert self.held.wait(5)
@@ -243,6 +250,12 @@ async def _published(
             )
         finally:
             await publisher.aclose()
+
+
+async def _told(p: _Published, event: types.RuntimeEvent) -> None:
+    """Tell the publisher ``event``, then let it read the state once the loop turns."""
+    p.publisher(event)
+    await asyncio.sleep(0)
 
 
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -473,6 +486,135 @@ async def test_an_agent_whose_spawner_this_session_does_not_hold_is_let_go(
 
 
 @pytest.mark.asyncio
+async def test_an_agent_with_no_spawner_is_let_go_though_the_root_keeps_no_journal(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A root held in memory has no journal: no child's spawner is that missing one."""
+    team = Team(catalog=ModelCatalog(factories={}))
+    journal = JsonlJournal(tmp_path / "elsewhere" / str(uuid4()) / "session.jsonl")
+    agent, stray = _scripted(tmp_path), _scripted(tmp_path, journal=journal)
+    store = _Store()
+    async with agent, team, journal, stray:
+        _ = team.join(agent)
+        publisher = Publisher(
+            agent,
+            team=team,
+            client=store,
+            session_id=_SESSION,
+            part=_PART,
+            start=0,
+            send=lambda _: None,
+        )
+        try:
+            _ = team.join(stray, label="stray")
+            stray.runtime.publish(types.SessionSaveDue())
+            await publisher.caught_up()
+        finally:
+            await publisher.aclose()
+
+    assert store.starts == []
+    assert any(
+        "stray" in warned and "no journal of this session" in warned
+        for warned in _warnings(caplog)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_child_in_the_team_before_the_publisher_goes_up_too(
+    tmp_path: Path,
+) -> None:
+    """A restarted process resumes its persistent children before it publishes."""
+    team = Team(catalog=ModelCatalog(factories={}))
+    journal = JsonlJournal(tmp_path / _FOLDER / "session.jsonl")
+    folder = uuid4().hex
+    kid_journal = JsonlJournal(tmp_path / _FOLDER / folder / "session.jsonl")
+    agent = Agent(
+        # What it answers its child's idle.
+        model=ScriptedProvider(replies=[reply("noted")])["scripted"],
+        journal=journal,
+        tool_context=ToolContext(cwd=tmp_path),
+    )
+    kid = Agent(
+        model=ScriptedProvider(replies=[reply("pong")])["scripted"],
+        journal=kid_journal,
+        tool_context=ToolContext(cwd=tmp_path),
+    )
+    store = _Store()
+    async with journal, agent, team, kid_journal, kid:
+        _ = team.join(agent)
+        _ = team.join(kid, label="reviewer", parent="Agent")
+        publisher = Publisher(
+            agent,
+            team=team,
+            client=store,
+            session_id=_SESSION,
+            part=_PART,
+            start=0,
+            send=lambda _: None,
+        )
+        try:
+            _ = await kid.send("ping")
+            await publisher.caught_up()
+            history = list(kid.session.history())
+        finally:
+            await publisher.aclose()
+
+    kid_id = f"{_FOLDER}/{folder}"
+    assert [(s.cli_session_id, s.spawned_by, s.note) for s in store.starts] == [
+        (kid_id, _SESSION, "reviewer"),
+    ]
+    _, stored = store.children[uuid5(NAMESPACE_URL, kid_id)]
+    assert [r.idx for r in stored] == list(range(len(history)))
+
+
+@pytest.mark.asyncio
+async def test_what_a_resumed_child_wrote_before_the_publisher_goes_up_with_no_new_turn(
+    tmp_path: Path,
+) -> None:
+    """Its records go up as the publisher is built, not at its next save or the stop."""
+    team = Team(catalog=ModelCatalog(factories={}))
+    journal = JsonlJournal(tmp_path / _FOLDER / "session.jsonl")
+    folder = uuid4().hex
+    kid_journal = JsonlJournal(tmp_path / _FOLDER / folder / "session.jsonl")
+    agent = Agent(
+        # What it answers its child's idle.
+        model=ScriptedProvider(replies=[reply("noted")])["scripted"],
+        journal=journal,
+        tool_context=ToolContext(cwd=tmp_path),
+    )
+    kid = Agent(
+        model=ScriptedProvider(replies=[reply("pong")])["scripted"],
+        journal=kid_journal,
+        tool_context=ToolContext(cwd=tmp_path),
+    )
+    store = _Store()
+    kid_session = uuid5(NAMESPACE_URL, f"{_FOLDER}/{folder}")
+    async with journal, agent, team, kid_journal, kid:
+        _ = team.join(agent)
+        _ = team.join(kid, label="reviewer", parent="Agent")
+        _ = await kid.send("ping")
+        written = len(list(kid.session.history()))
+        publisher = Publisher(
+            agent,
+            team=team,
+            client=store,
+            session_id=_SESSION,
+            part=_PART,
+            start=0,
+            send=lambda _: None,
+        )
+        try:
+            appended = await asyncio.to_thread(store.child_appended.wait, 1)
+        finally:
+            await publisher.aclose()
+
+    assert appended
+    _, stored = store.children[kid_session]
+    assert [r.idx for r in stored] == list(range(written))
+
+
+@pytest.mark.asyncio
 async def test_what_an_agent_tells_the_user_goes_up_as_its_message(
     tmp_path: Path,
 ) -> None:
@@ -539,14 +681,135 @@ async def test_a_state_is_sent_when_built_and_at_once_when_busy_changes(
 ) -> None:
     async with _published(tmp_path) as p:
         built = list(p.states())
-        p.publisher(types.ModelResponseStarted())
+        await _told(p, types.ModelResponseStarted())
         started = p.states()[-1]
-        p.publisher(types.ModelResponseCompleted(outcome=Cancelled()))
+        await _told(p, types.ModelResponseCompleted(outcome=Cancelled()))
+        # A halted call ends its turn too, as the runtime tells it.
+        await _told(p, ModelIdle(outcome=Cancelled()))
 
     assert [s.state.busy for s in built] == [False]
     assert started.state.busy
     assert started.state.since > built[0].state.since
     assert [s.state.busy for s in p.states()] == [False, True, False]
+
+
+# The runtime tells of a reply's end before the same step starts its calls, and of the
+# calls' end before it calls the model again: read there, the agent seemed idle.
+@pytest.mark.asyncio
+async def test_a_turn_with_a_call_is_busy_throughout_from_its_reply_to_its_calls_and_back(
+    tmp_path: Path,
+) -> None:
+    waiting = _Waiting()
+    waiting.release.set()
+    async with _published(
+        tmp_path,
+        reply(calls=[call("wait", "w1")]),
+        reply("done"),
+        tools=[waiting],
+    ) as p:
+        _ = p.team.join(p.agent)
+        _ = await p.agent.send("go")
+        await asyncio.sleep(0)
+
+    states = [line.state for line in p.states()]
+    members = [all(m.busy for m in s.team or ()) for s in states if s.busy]
+    assert [busy for busy, _ in itertools.groupby(s.busy for s in states)] == [
+        False,
+        True,
+        False,
+    ]
+    assert members == [True] * len(members)
+    assert len({s.since for s in states if s.busy}) == 1
+
+
+async def _ranks_logins_on_a_thread(turn_start: bool) -> None:
+    """Wait on a worker thread before a model call, as a team's ``before_call`` does."""
+    del turn_start
+    await asyncio.to_thread(time.sleep, 0.005)
+
+
+# A team agent's runtime awaits ``before_call`` before each model call, and the team's
+# hook ranks its provider's logins on a worker thread (``team._Precedence``): the loop
+# turns there with no call running, after a reply's calls start or end.
+@pytest.mark.parametrize(
+    "arguments",
+    [{}, {"background": True}],
+    ids=["waited", "background"],
+)
+@pytest.mark.asyncio
+async def test_a_turn_is_busy_until_it_ends_though_each_model_call_waits_on_a_thread(
+    tmp_path: Path,
+    arguments: dict[str, PlainTree],
+) -> None:
+    waiting = _Waiting()
+    waiting.release.set()
+    async with _published(
+        tmp_path,
+        reply(calls=[call("wait", "w1", **arguments)]),
+        reply(calls=[call("wait", "w2", **arguments)]),
+        reply("done"),
+        # What a background call's result wakes the model to say, once the turn ended.
+        reply("noted"),
+        reply("noted"),
+        tools=[waiting],
+    ) as p:
+        _ = p.team.join(p.agent)
+        p.agent.runtime.before_call = _ranks_logins_on_a_thread
+        _ = await p.agent.send("go")
+        await asyncio.sleep(0)
+
+    ended = next(
+        n
+        for n, line in enumerate(p.sent)
+        if isinstance(line, EventLine) and line.kind == "ModelIdle"
+    )
+    told = next(
+        n for n, line in enumerate(p.sent) if n > ended and isinstance(line, StateLine)
+    )
+    turn = [
+        line.state.busy for line in p.sent[: told + 1] if isinstance(line, StateLine)
+    ]
+    assert [busy for busy, _ in itertools.groupby(turn)] == [False, True, False]
+
+
+# A child's runtime waits on its own ``before_call`` before each of its calls, as its
+# parent's does; neither member is told idle between the steps of its turn.
+@pytest.mark.asyncio
+async def test_each_member_is_busy_until_its_turn_ends_though_each_call_waits_on_a_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        team_module._Precedence,
+        "before_call",
+        staticmethod(_ranks_logins_on_a_thread),
+    )
+    waiting = _Waiting()
+    waiting.release.set()
+    async with _published(
+        tmp_path,
+        reply(calls=[call("AgentSpawn", "s1", prompt="dig", label="kid")]),
+        reply(calls=[call("wait", "w1")]),
+        reply("root done"),
+        children=(
+            reply(calls=[call("wait", "w2")]),
+            reply(calls=[call("wait", "w3")]),
+            reply("kid done"),
+        ),
+        tools=[waiting],
+    ) as p:
+        _ = await p.agent.send("go")
+        await asyncio.sleep(0)
+
+    states = [line.state for line in p.states()]
+    for label in ("Agent", "kid"):
+        seen = (m.busy for s in states for m in s.team or () if m.label == label)
+        runs = [busy for busy, _ in itertools.groupby(seen)]
+        assert (label, [busy for busy in runs if busy], runs[-1]) == (
+            label,
+            [True],
+            False,
+        )
 
 
 @pytest.fixture
@@ -568,6 +831,24 @@ async def test_the_first_state_is_dated_now_on_a_host_away_from_utc(
         built = p.states()[0].state.since
 
     assert abs(built - datetime.now(UTC)) < timedelta(minutes=1)
+
+
+# A naive local time reads as UTC on the wire, so on a host at UTC it passes unseen.
+@pytest.mark.usefixtures("five_hours_east_of_utc")
+@pytest.mark.asyncio
+async def test_each_time_a_turn_tells_is_now_on_a_host_away_from_utc(
+    tmp_path: Path,
+) -> None:
+    async with _published(tmp_path, reply("hello")) as p:
+        _ = await p.agent.send("hi")
+        await asyncio.sleep(0)
+
+    states = [line.state for line in p.states()]
+    ended = [s.turn_ended for s in states if s.turn_ended is not None]
+    assert [s.busy for s in states] == [False, True, False]
+    assert ended
+    for each in [*(s.since for s in states), *ended]:
+        assert abs(each - datetime.now(UTC)) < timedelta(minutes=1)
 
 
 @pytest.mark.asyncio
@@ -597,12 +878,12 @@ async def test_a_change_of_text_alone_goes_at_most_once_a_second(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async with _published(tmp_path) as p:
-        p.publisher(types.ModelResponseStarted())
+        await _told(p, types.ModelResponseStarted())
         before = len(p.states())
-        p.publisher(types.ModelResponseTextStreamed(text="x" * 4_000))
+        await _told(p, types.ModelResponseTextStreamed(text="x" * 4_000))
         withheld = len(p.states()) - before
         monkeypatch.setattr(publisher_module, "_LINE_SEC", 0.0)
-        p.publisher(types.ModelResponseTextStreamed(text="x" * 4_000))
+        await _told(p, types.ModelResponseTextStreamed(text="x" * 4_000))
 
     assert withheld == 0
     assert len(p.states()) == before + 1
@@ -663,17 +944,19 @@ async def test_a_call_that_streams_nothing_still_moves_the_line_until_idle_or_cl
     reads = _held_reads(monkeypatch)
     async with _published(tmp_path) as p:
         idle = len(reads)
-        p.publisher(types.ModelResponseStarted())
+        await _told(p, types.ModelResponseStarted())
         started = p.states()[-1].state.line
         [first] = reads
         clock.now += 20
         monkeypatch.setattr(publisher_module, "_LINE_SEC", 0.0)
         first.fire()
         moved = p.states()[-1].state
-        p.publisher(types.ModelResponseCompleted(outcome=Cancelled()))
+        await _told(p, types.ModelResponseCompleted(outcome=Cancelled()))
+        # A halted call ends its turn too, as the runtime tells it.
+        await _told(p, ModelIdle(outcome=Cancelled()))
         reads[-1].fire()
         after_idle = len(reads)
-        p.publisher(types.ModelResponseStarted())
+        await _told(p, types.ModelResponseStarted())
         last = reads[-1]
     p.publisher(types.ModelResponseCompleted(outcome=Cancelled()))
     # A read already under way as it closed arms no other, nor does a call after it.
@@ -786,6 +1069,278 @@ async def test_a_background_job_goes_up_at_once_and_its_turn_ends_with_its_resul
 
 
 @pytest.mark.asyncio
+async def test_a_member_whose_turn_ended_is_not_busy_while_only_a_background_job_runs(
+    tmp_path: Path,
+) -> None:
+    waiting = _Waiting()
+    async with _published(
+        tmp_path,
+        reply(calls=[call("wait", "w1", background=True)]),
+        reply("started it"),
+        reply("it is built"),
+        tools=[waiting],
+    ) as p:
+        _ = p.team.join(p.agent)
+        answered = _when(p.agent, ModelIdle)
+        turn = asyncio.create_task(p.agent.send("go"))
+        _ = await answered.wait()
+        await asyncio.sleep(0)
+        running = p.states()[-1].state
+        waiting.release.set()
+        _ = await turn
+
+    assert [(m.label, m.busy) for m in running.team or ()] == [("Agent", False)]
+    assert (running.busy, running.working) == (False, True)
+
+
+def _scripted(
+    tmp_path: Path,
+    *replies: Reply,
+    journal: JsonlJournal | None = None,
+) -> Agent:
+    """Return an agent that answers ``replies`` in turn, writing ``journal`` if one."""
+    return Agent(
+        model=ScriptedProvider(replies=replies)["scripted"],
+        journal=journal,
+        tool_context=ToolContext(cwd=tmp_path),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_closed_publisher_tells_nothing_of_a_child_heard_as_the_team_changed(
+    tmp_path: Path,
+) -> None:
+    """Each change of the team looks again at who joined; a child is heard once."""
+    team = Team(catalog=ModelCatalog(factories={}))
+    # The root answers its child's idle.
+    agent, kid = _scripted(tmp_path, reply("noted")), _scripted(tmp_path, reply("pong"))
+    sent: list[EventLine | StateLine | SettingsLine] = []
+    async with agent, team, kid:
+        _ = team.join(agent)
+        _ = team.join(kid, label="kid", parent="Agent")
+        publisher = Publisher(
+            agent,
+            team=team,
+            client=_Store(),
+            session_id=_SESSION,
+            part=_PART,
+            start=0,
+            send=sent.append,
+        )
+        team.set_peer_messaging("Agent", False)
+        await publisher.aclose()
+        told = len(sent)
+        _ = await kid.send("ping")
+        await asyncio.sleep(0)
+
+    assert len(sent) == told
+
+
+@pytest.mark.parametrize("before", [True, False], ids=["just before", "after"])
+@pytest.mark.asyncio
+async def test_a_read_an_event_asks_for_around_the_close_tells_nothing_after_it(
+    tmp_path: Path,
+    before: bool,
+) -> None:
+    """An event reads the state once the loop next turns, which may be after the close."""
+    async with _published(tmp_path) as p:
+        if before:
+            p.publisher(types.ModelResponseStarted())
+        await p.publisher.aclose()
+        told = p.states()
+        # The runtime goes on telling of events, as the agent closes after its publisher.
+        if not before:
+            p.publisher(types.ModelResponseStarted())
+        await asyncio.sleep(0)
+        after = p.states()
+
+    assert after == told
+
+
+# Each child tells its spawner's runtime what sagent shows of it (``agent_spawn._Forward``),
+# but tells no child's on: a grandchild's stops at its parent, below the root's runtime.
+@pytest.mark.asyncio
+async def test_what_sagent_shows_of_an_agent_below_a_child_goes_up_once_under_its_labels(
+    tmp_path: Path,
+) -> None:
+    team = Team(catalog=ModelCatalog(factories={}))
+    # Each spawner answers what its child's failure tells it.
+    agent = _scripted(tmp_path, reply("noted"), reply("noted"))
+    kid, grandkid = _scripted(tmp_path, reply("noted")), _scripted(tmp_path)
+    shown = (
+        ModelIdle(outcome=Failed(exception=RuntimeError("down"))),
+        types.ModelResponseSuspended(
+            exception=RetryableError("busy", retry_after_sec=1.0),
+            retry_at=datetime.fromtimestamp(0.0, UTC),
+            failures_in_a_row=1,
+        ),
+        types.LoginSwitched(provider="p", from_login="a", to_login="b"),
+    )
+    sent: list[EventLine | StateLine | SettingsLine] = []
+    async with agent, team, kid, grandkid:
+        _ = team.join(agent)
+        _ = team.join(kid, label="kid", parent="Agent")
+        _ = team.join(grandkid, label="grandkid", parent="kid")
+        # As a spawn wires them.
+        kid.runtime.observers.append(_Forward(label="kid", parent=agent))
+        grandkid.runtime.observers.append(_Forward(label="grandkid", parent=kid))
+        publisher = Publisher(
+            agent,
+            team=team,
+            client=_Store(),
+            session_id=_SESSION,
+            part=_PART,
+            start=0,
+            send=sent.append,
+        )
+        agent.runtime.observers.append(publisher)
+        try:
+            # The team changes again after each joined: each is heard once all the same.
+            team.set_peer_messaging("Agent", False)
+            for each in (kid, grandkid):
+                for event in (*shown, ModelIdle(outcome=Succeeded(value=None))):
+                    each.runtime.publish(event)
+        finally:
+            await publisher.aclose()
+
+    told = [line.payload for line in sent if isinstance(line, EventLine)]
+
+    def below(*labels: str, event: types.RuntimeEvent) -> JSON:
+        for label in reversed(labels):
+            event = types.ChildEvent(label=label, event=event)
+        return event_payload(event)
+
+    succeeded = ModelIdle(outcome=Succeeded(value=None))
+    assert [told.count(below("kid", event=e)) for e in shown] == [1, 1, 1]
+    assert [told.count(below("kid", "grandkid", event=e)) for e in shown] == [1, 1, 1]
+    assert [below("grandkid", event=e) in told for e in shown] == [False] * 3
+    assert below("kid", "grandkid", event=succeeded) not in told
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Far:
+    """An agent on another machine, which takes what it is sent and says nothing."""
+
+    def send(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        content: str,
+        kind: MessageKind,
+    ) -> None:
+        del sender, recipient, content, kind
+
+
+@pytest.mark.asyncio
+async def test_a_child_an_agent_of_another_machine_spawned_is_told_of_by_no_one_here(
+    tmp_path: Path,
+) -> None:
+    """Its spawner is no member: what sagent shows of it goes to that spawner alone."""
+    team = Team(catalog=ModelCatalog(factories={}))
+    agent, kid = _scripted(tmp_path), _scripted(tmp_path)
+    sent: list[EventLine | StateLine | SettingsLine] = []
+    async with agent, team, kid:
+        _ = team.join(agent)
+        team.reach("far@box", relay=_Far())
+        _ = team.join(kid, label="kid", parent="far@box")
+        publisher = Publisher(
+            agent,
+            team=team,
+            client=_Store(),
+            session_id=_SESSION,
+            part=_PART,
+            start=0,
+            send=sent.append,
+        )
+        try:
+            kid.runtime.publish(
+                ModelIdle(outcome=Failed(exception=RuntimeError("down"))),
+            )
+        finally:
+            await publisher.aclose()
+
+    assert [line for line in sent if isinstance(line, EventLine)] == []
+
+
+@pytest.mark.asyncio
+async def test_an_agent_that_takes_the_label_another_left_is_heard_as_its_own(
+    tmp_path: Path,
+) -> None:
+    team = Team(catalog=ModelCatalog(factories={}))
+    agent = _scripted(tmp_path, reply("noted"))
+    gone, kid = _scripted(tmp_path), _scripted(tmp_path, reply("pong"))
+    sent: list[EventLine | StateLine | SettingsLine] = []
+    async with agent, team, gone, kid:
+        _ = team.join(agent)
+        _ = team.join(gone, label="kid", parent="Agent")
+        publisher = Publisher(
+            agent,
+            team=team,
+            client=_Store(),
+            session_id=_SESSION,
+            part=_PART,
+            start=0,
+            send=sent.append,
+        )
+        try:
+            _ = team.leave("kid")
+            _ = team.join(kid, label="kid", parent="Agent")
+            # Only the child works: what is read of it, its own events ask for.
+            _ = await kid.send("ping")
+            await asyncio.sleep(0)
+        finally:
+            await publisher.aclose()
+
+    assert True in [
+        m.busy
+        for line in sent
+        if isinstance(line, StateLine)
+        for m in line.state.team or ()
+        if m.label == "kid"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_child_that_joins_at_work_goes_up_at_its_own_save_its_secrets_masked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No catch-up asks for it, nor does it resume before the publisher is built."""
+    monkeypatch.setenv("TRAX_REDACT_NAMES", "KEY")
+    monkeypatch.setenv("KEY", "hunter2-hunter2")
+    team = Team(catalog=ModelCatalog(factories={}))
+    journal = JsonlJournal(tmp_path / _FOLDER / "session.jsonl")
+    kid_journal = JsonlJournal(tmp_path / _FOLDER / uuid4().hex / "session.jsonl")
+    agent = _scripted(tmp_path, reply("noted"), journal=journal)
+    kid = _scripted(tmp_path, reply("pong"), journal=kid_journal)
+    store = _Store()
+    async with journal, agent, team, kid_journal, kid:
+        _ = team.join(agent)
+        publisher = Publisher(
+            agent,
+            team=team,
+            client=store,
+            session_id=_SESSION,
+            part=_PART,
+            start=0,
+            send=lambda _: None,
+        )
+        try:
+            _ = team.join(kid, label="kid", parent="Agent")
+            _ = await kid.send("the key is hunter2-hunter2")
+            appended = await asyncio.to_thread(store.child_appended.wait, 1)
+        finally:
+            await publisher.aclose()
+
+    assert appended
+    [(_, stored)] = store.children.values()
+    bodies = [r.model_dump_json() for r in stored]
+    assert any("[redacted:KEY]" in body for body in bodies)
+    assert not any("hunter2-hunter2" in body for body in bodies)
+
+
+@pytest.mark.asyncio
 async def test_a_job_that_runs_until_stopped_keeps_nothing_working_and_no_turn_open(
     tmp_path: Path,
 ) -> None:
@@ -845,8 +1400,12 @@ class _StateSays:
     published: _Published
     seen: asyncio.Event = field(default_factory=asyncio.Event)
 
+    # The publisher reads the state an event asks for once the loop turns: look after.
     def __call__(self, event: types.RuntimeEvent) -> None:
         del event
+        _ = asyncio.get_running_loop().call_soon(self._look)
+
+    def _look(self) -> None:
         if any(_awaits(line.state) for line in self.published.states()):
             self.seen.set()
 
@@ -933,6 +1492,7 @@ def test_spawns_and_job_management_are_no_jobs_and_a_wait_marks_the_job_it_waits
         root,
         mask=str,
         sessions=lambda _: None,
+        calling=lambda _: False,
     )
 
     assert [(job.call_id, job.title, job.state, job.awaited) for job in jobs] == [
@@ -960,6 +1520,8 @@ def test_each_agent_s_jobs_go_up_by_its_label_masked_those_its_turn_waits_on_lef
         root,
         mask=str.lower,
         sessions=lambda agent: _SESSION if agent is root else None,
+        # The root's model works on its turn, between two of its steps.
+        calling=lambda agent: agent is root,
     )
 
     started = datetime.fromtimestamp(10.0, UTC)
@@ -981,11 +1543,13 @@ def test_each_agent_s_jobs_go_up_by_its_label_masked_those_its_turn_waits_on_lef
         ),
     )
     assert members == (
-        TeamMember(label="Agent", busy=False, spend_usd=1.5, session=_SESSION),
+        TeamMember(label="Agent", busy=True, spend_usd=1.5, session=_SESSION),
         TeamMember(label="kid", parent="Agent", busy=True),
     )
 
 
+# Away from UTC, so an unstamped call's start read as local time would show another instant.
+@pytest.mark.usefixtures("five_hours_east_of_utc")
 @pytest.mark.asyncio
 async def test_only_calls_run_apart_are_jobs_each_under_its_agent_s_label(
     tmp_path: Path,
@@ -1025,7 +1589,7 @@ async def test_only_calls_run_apart_are_jobs_each_under_its_agent_s_label(
         ("unstamped", "kid", "running"),
     ]
     assert jobs[0].started == datetime.fromtimestamp(0.0, UTC)
-    assert jobs[-1].started >= before
+    assert timedelta(0) <= jobs[-1].started - before < timedelta(minutes=1)
 
 
 @pytest.mark.asyncio
@@ -1057,7 +1621,7 @@ async def test_the_team_goes_up_as_sagent_s_tree_each_agent_with_its_session(
         _ = await p.agent.send("go")
         await p.publisher.caught_up()
         # The kid's session opened at its first save; the next event takes it up.
-        p.publisher(AgentIdle())
+        await _told(p, AgentIdle())
         kid = p.team["kid"].session.journal.path
         # Read before the agents close: the quit is told, of a team gone.
         teams = [
@@ -1088,15 +1652,18 @@ async def test_a_turn_ends_when_the_root_idles_after_a_call_or_stops_short(
     ending: types.RuntimeEvent,
 ) -> None:
     async with _published(tmp_path) as p:
-        p.publisher(AgentIdle())
-        p.publisher(types.ChildEvent(label="kid", event=types.ModelResponseStarted()))
-        p.publisher(types.ChildEvent(label="kid", event=ending))
+        await _told(p, AgentIdle())
+        await _told(
+            p,
+            types.ChildEvent(label="kid", event=types.ModelResponseStarted()),
+        )
+        await _told(p, types.ChildEvent(label="kid", event=ending))
         unended = p.states()[-1].state.turn_ended
-        p.publisher(types.ModelResponseStarted())
+        await _told(p, types.ModelResponseStarted())
         before = datetime.now(UTC)
-        p.publisher(ending)
+        await _told(p, ending)
         ended = p.states()[-1].state.turn_ended
-        p.publisher(AgentIdle())
+        await _told(p, AgentIdle())
         again = p.states()[-1].state.turn_ended
 
     assert unended is None
@@ -1126,10 +1693,12 @@ async def test_nothing_but_an_idle_or_a_turn_that_stopped_short_ends_a_turn(
     event: types.RuntimeEvent,
 ) -> None:
     async with _published(tmp_path) as p:
-        p.publisher(types.ModelResponseStarted())
-        p.publisher(event)
+        # Its runtime idles as it starts, which ends no turn; let it, before the call.
+        await asyncio.sleep(0)
+        await _told(p, types.ModelResponseStarted())
+        await _told(p, event)
         unended = p.states()[-1].state.turn_ended
-        p.publisher(AgentIdle())
+        await _told(p, AgentIdle())
         idled = p.states()[-1].state.turn_ended
 
     assert unended is None
@@ -1142,13 +1711,15 @@ async def test_a_turn_that_failed_and_is_then_finished_ends_again_at_its_idle(
 ) -> None:
     """A retry may get past the failure: the same turn then ends a second time."""
     async with _published(tmp_path) as p:
-        p.publisher(types.ModelResponseStarted())
-        p.publisher(ModelIdle(outcome=Failed(exception=RuntimeError("x"))))
+        # Its runtime idles as it starts, which ends no turn; let it, before the call.
+        await asyncio.sleep(0)
+        await _told(p, types.ModelResponseStarted())
+        await _told(p, ModelIdle(outcome=Failed(exception=RuntimeError("x"))))
         failed = p.states()[-1].state.turn_ended
-        p.publisher(types.ModelResponseStarted())
-        p.publisher(ModelIdle(outcome=Succeeded(value=None)))
+        await _told(p, types.ModelResponseStarted())
+        await _told(p, ModelIdle(outcome=Succeeded(value=None)))
         retried = p.states()[-1].state.turn_ended
-        p.publisher(AgentIdle())
+        await _told(p, AgentIdle())
         finished = p.states()[-1].state.turn_ended
 
     assert failed is not None
@@ -1165,7 +1736,7 @@ async def test_a_message_waiting_mid_stream_goes_at_once(
     waiting = UserMessage(content="also this")
     async with _published(tmp_path) as p:
         monkeypatch.setattr(p.agent.runtime, "pending_mid_stream", lambda: (waiting,))
-        p.publisher(AgentIdle())
+        await _told(p, AgentIdle())
 
     assert p.states()[-1].state.pending == (event_payload(waiting),)
 
@@ -1233,7 +1804,7 @@ async def test_a_setting_changed_with_nothing_said_here_goes_when_busy_next_chan
         )
         _ = await elsewhere("/screen.thinking show")
         unsent = len(p.settings())
-        p.publisher(types.ModelResponseStarted())
+        await _told(p, types.ModelResponseStarted())
 
     assert (unsent, len(p.settings())) == (1, 2)
     settings = {s.name: s for s in p.settings()[-1].settings}
@@ -1454,7 +2025,7 @@ async def test_a_secret_named_for_masking_never_goes_up(
             CommandOutput(text="[/login] hunter2-hunter2", tone="note"),
         )
         monkeypatch.setattr(p.agent.runtime, "pending_mid_stream", lambda: (waiting,))
-        p.publisher(types.ModelResponseStarted())
+        await _told(p, types.ModelResponseStarted())
 
     sent = [r.model_dump_json() for _, _, batch in p.store.appended for r in batch]
     assert any("[redacted:KEY]" in body for body in sent)

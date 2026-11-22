@@ -8,14 +8,20 @@ description: "ALWAYS invoke this skill when you start, plan, hand off or finish 
 KnowOp keeps each task's state in its Trackinizer issue, not in Chat: whoever
 resumes the task, you after a restart or another agent, starts from the issue.
 
-Every unit of work you start is tied to an issue: a task, a sub-agent's job, a pull
-request, an experiment. Name the issue in each agent's brief and each pull request.
+Every unit of work is tied to an issue: a task, a sub-agent's job, a pull request,
+an experiment. The agent that plans a task files its issue; an agent spawned to
+help works under it, adding what it does there, or files a sub-issue that
+`narrows` it for a part of its own. Name the issue in each pull request, and in an
+agent's brief when you have one.
 
-1. Start: before anything else, search Trackinizer for issues related to the
-   task, for context: `search "..." --kind issue`, and titles. Read each related
-   issue's description, its edges, and the sessions that produced it. Work under
-   the task's issue when one fits; file a new one only when none does, linked under
-   the issue it serves (`narrows`).
+1. Start: before anything else, find the task's issue: the one your brief names,
+   else your spawner's. Your session's row (`id UUID`, from `session.self`) is
+   `produced_by` your spawner's session, and that session is `produced_by` its
+   issue. With neither, search Trackinizer for issues related to the task:
+   `search "..." --kind issue`, and titles. Read each related issue's description,
+   its edges, and the sessions that produced it. Work under the task's issue when
+   one fits, or file a sub-issue that `narrows` it for a part of your own; file a
+   new one only when none fits, linked under the issue it serves (`narrows`).
 2. Plan: once the person agrees a plan, write it into the issue's description:
    the goal, the steps, and how each is checked.
 3. Work: link each result's evidence to the issue as it lands, and each pull
