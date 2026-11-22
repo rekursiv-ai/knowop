@@ -35,6 +35,7 @@ Typical usage example:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -47,12 +48,14 @@ import logging
 import os
 import time
 
+from sagent.agent.agent import Agent
 from sagent.runtime import types
 from sagent.session import projects
 from sagent.session.jsonl import record_line
 from sagent.session.types import (
     AgentIdle,
     AgentMessage,
+    Failed,
     ModelIdle,
     Succeeded,
 )
@@ -89,10 +92,9 @@ from knowop.process.codec import event_payload
 
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable
+    from collections.abc import Awaitable, Iterable
     from pathlib import Path
 
-    from sagent.agent.agent import Agent
     from sagent.agent.team import Team
     from sagent.session.types import SessionRecord, ToolCall
     from sagent.tools.types import Tool
@@ -125,7 +127,8 @@ class Publisher:
 
     Args:
       agent: The root agent, whose journal is the session's part.
-      team: The session's agents; each child that joins with a journal goes up too.
+      team: The session's agents; each child in it or that joins it, with a journal,
+        goes up too.
       client: Where the records are stored.
       session_id: The session.
       part: The part's name, ``<folder>.jsonl``, the folder a uuid's hex.
@@ -175,14 +178,23 @@ class Publisher:
             agent.session.journal.path: self._root,
         }
         # The children whose events this publisher hears, by label.
-        self._heard: dict[str, Agent] = {}
+        self._heard: dict[str, _Child] = {}
         # Whether the root called its model since its turn last ended.
         self._worked = False  # pragma: no mutate[truthiness]
+        # Whether the root's model works on its turn: from a call's start to its ModelIdle.
+        self._calling = False  # pragma: no mutate[truthiness]
         self._turn_ended: datetime | None = None
         # The next read of the state while busy; none once closed.
         self._tick: asyncio.TimerHandle | None = None
+        # The read of the state an event asked for, once the loop next turns.
+        self._soon: asyncio.Handle | None = None
         self._open = True
         team.changes.add(self._joined)
+        self._joined()
+        # What a resumed child wrote before goes up now: it may run no turn until the stop.
+        for each in self._journals.values():
+            if each is not self._root:
+                each.upload()
         self._sent(self._now(since=datetime.now(UTC)))
 
     @property
@@ -207,7 +219,7 @@ class Publisher:
             self._event(event)
         elif inner is event:
             self._root.upload()
-        self._check_state()
+        self._read_soon()
 
     def print_output(self, output: CommandOutput) -> None:
         """Send what a slash command said up, then the settings if they changed."""
@@ -238,11 +250,12 @@ class Publisher:
     async def aclose(self) -> None:
         """Stop each upload running and the state's reads, and hear of no more agents."""
         self._open = False  # pragma: no mutate[truthiness]
-        if self._tick is not None:
-            self._tick.cancel()
+        for read in (self._tick, self._soon):
+            if read is not None:
+                read.cancel()
         self._team.changes.discard(self._joined)
         for child in self._heard.values():
-            child.runtime.observers.remove(self._child_heard)
+            child.agent.runtime.observers.remove(child)
         for each in self._journals.values():
             await each.aclose()
 
@@ -261,14 +274,31 @@ class Publisher:
     # A turn that stops short says so itself; one that finishes ends once the agent
     # has nothing more to do, the results its jobs owe it among that.
     def _turn(self, event: types.RuntimeEvent) -> None:
-        """Note when the root agent's turn ends."""
+        """Note when the root agent's model works on its turn, and when the turn ends."""
         if isinstance(event, types.ModelResponseStarted):
-            self._worked = True
-        elif (
+            self._worked = self._calling = True
+            return
+        if isinstance(event, ModelIdle):
+            self._calling = False  # pragma: no mutate[truthiness]
+        if (
             isinstance(event, ModelIdle) and not isinstance(event.outcome, Succeeded)
         ) or (isinstance(event, AgentIdle) and self._worked):
             self._worked = False  # pragma: no mutate[truthiness]
             self._turn_ended = datetime.now(UTC)
+
+    # A runtime tells of each event inside the step that takes it: of a reply's end
+    # before it starts the reply's calls, of the calls' end before it calls the model
+    # again. Read there, an agent at work seemed idle for that instant, and every
+    # viewer saw its turn end and start again; sagent's toolbar reads it a turn later.
+    def _read_soon(self) -> None:
+        """Read the state once the loop next turns, unless a read is due then or closed."""
+        if self._open and self._soon is None:
+            self._soon = asyncio.get_running_loop().call_soon(self._read)
+
+    def _read(self) -> None:
+        """Read the state an event asked for."""
+        self._soon = None
+        self._check_state()
 
     # Its text, once a second.
     def _check_state(self) -> None:
@@ -284,7 +314,12 @@ class Publisher:
         ):
             self._sent(state)
 
-    # ``busy`` is whether sagent turns its spinner: a call, tool calls or a compaction.
+    # ``busy`` is whether sagent turns its spinner (a call, tool calls or a compaction), or
+    # the root's model works on its turn: a team's runtime awaits its ``before_call``
+    # before each call, on a worker thread, with nothing running, and read there the
+    # agent seemed idle between its steps. So a quota wait that holds a call back
+    # (``ModelResponseSuspended``) is busy too, until the turn's ``ModelIdle``. After it, a
+    # background job alone is no work of the turn's. Each member is busy by the same rule.
     def _now(self, *, since: datetime) -> AgentState:
         """Return the agents' state now, ``busy`` last changed at ``since``."""
         line = self._status.line()
@@ -293,10 +328,11 @@ class Publisher:
             self._agent,
             mask=self._masked,
             sessions=self._session,
+            calling=self._mid_turn,
         )
         return AgentState(
             line=line,
-            busy=self._status.frame() != line,
+            busy=self._calling or self._status.frame() != line,
             since=since,
             pending=tuple(
                 self._plain(m) for m in self._agent.runtime.pending_mid_stream()
@@ -305,6 +341,12 @@ class Publisher:
             team=team,
             turn_ended=self._turn_ended,
         )
+
+    def _mid_turn(self, agent: Agent) -> bool:
+        """Return whether ``agent``'s model works on its turn, as heard of its events."""
+        if agent is self._agent:
+            return self._calling
+        return any(c.calling for c in self._heard.values() if c.agent is agent)
 
     def _session(self, agent: Agent) -> UUID | None:
         """Return the session ``agent``'s records go to: the root's, or a child's once opened."""
@@ -346,14 +388,25 @@ class Publisher:
         self._arm()
 
     # A child joins before its journal opens (``AgentSpawn._start``), so its first save
-    # is heard; one with no journal, a far caller's, has nothing to send.
+    # is heard; one with no journal, a far caller's, has nothing to send. A process
+    # resumes its persistent children before it builds its publisher, which so takes
+    # them up as it is built: no change of the team tells of them.
     def _joined(self) -> None:
         """Hear each child that joined the team at work, and one with a journal save it."""
         for label in self._team:
             agent = self._team[label]
-            if agent is not self._agent and self._heard.get(label) is not agent:
-                self._heard[label] = agent
-                agent.runtime.observers.append(self._child_heard)
+            if agent is self._agent:
+                continue
+            heard = self._heard.get(label)
+            if heard is None or heard.agent is not agent:
+                child = _Child(
+                    agent=agent,
+                    path=self._path(label),
+                    read=self._read_soon,
+                    tell=self._event,
+                )
+                self._heard[label] = child
+                agent.runtime.observers.append(child)
             path = agent.session.journal.path
             if path is None or path in self._journals:
                 continue
@@ -367,12 +420,13 @@ class Publisher:
             self._journals[path] = journal
             agent.runtime.observers.append(journal.saved)
 
-    # A child's own runtime tells when it starts and stops work; its spawner hears only
-    # some of its events (``agent_spawn._Forward``), and none as its model is called.
-    def _child_heard(self, event: types.RuntimeEvent) -> None:
-        """Send the state if a child's event changed it."""
-        del event
-        self._check_state()
+    # A watcher has no parent, and an outside member's child a parent of no member here.
+    def _path(self, label: str) -> tuple[str, ...]:
+        """Return the labels from the root's child down to ``label``'s agent."""
+        above = self._team.parent(label)
+        if above is None or self._team.get(above) in (None, self._agent):
+            return (label,)
+        return (*self._path(above), label)
 
     # Its spawner's session is opened first: a spawner saves before its model is called,
     # so before it spawns, but its start may still be on its way.
@@ -382,7 +436,10 @@ class Publisher:
         spawner = None if above is None else self._journals.get(above)
         if spawner is None:
             raise _NoSpawnerError(f"no journal of this session spawned {label!r}")
-        spawned_by = await spawner.session()
+        # The root's session is known before its first save, which may not come.
+        spawned_by = (
+            self._session_id if spawner is self._root else await spawner.session()
+        )
         return await asyncio.to_thread(
             self._started,
             journal,
@@ -461,6 +518,7 @@ def team_work(
     *,
     mask: Callable[[str], str],
     sessions: Callable[[Agent], UUID | None],
+    calling: Callable[[Agent], bool],
 ) -> tuple[tuple[BackgroundJob, ...], tuple[TeamMember, ...]]:
     """Return what ``team``'s agents have going, as sagent's tree screen shows it.
 
@@ -469,6 +527,8 @@ def team_work(
       root: Its root agent, whose jobs come first.
       mask: What each job's title is shown through, its secrets masked.
       sessions: The session each agent's records are stored in, if one is yet.
+      calling: Whether each agent's model works on its turn, between its steps
+        too; an agent is busy then, or while at work.
 
     Returns:
       jobs: Each background job of every agent, the root's first.
@@ -493,7 +553,7 @@ def team_work(
         TeamMember(
             label=label,
             parent=parent or "",
-            busy=team[label].runtime.at_work,
+            busy=team[label].runtime.at_work or calling(team[label]),
             spend_usd=team[label].spend_usd,
             session=sessions(team[label]),
         )
@@ -747,3 +807,41 @@ class _Journal:
             batch=batch,
             format="sagent",
         )
+
+
+# A child's own runtime tells when it starts and stops work; its spawner hears only
+# some of its events (``agent_spawn._Forward``), and none as its model is called. A
+# child passes none of its own children's on, so what sagent shows of an agent below a
+# child stops at that child's runtime: it is told from here, nested as sagent nests a
+# child's event, and its parent's runtime alone hears the rest.
+@dataclass(slots=True, kw_only=True)
+class _Child:
+    """An observer of a child's runtime: reads the state at each of its events.
+
+    Args:
+      agent: The child.
+      path: The labels from the root's child down to it, the child's own last.
+      read: Reads the state once the loop next turns.
+      tell: Sends an event up.
+
+    """
+
+    agent: Agent
+    path: tuple[str, ...]
+    read: Callable[[], None]
+    tell: Callable[[object], None]
+    calling: bool = False
+    """Whether its model works on its turn: from a call's start to its ``ModelIdle``."""
+
+    def __call__(self, event: types.RuntimeEvent) -> None:
+        """Note when its model starts and stops working, tell what shows of it; then read."""
+        if isinstance(event, types.ModelResponseStarted | ModelIdle):
+            self.calling = isinstance(event, types.ModelResponseStarted)
+        if len(self.path) > 1 and (
+            isinstance(event, types.ModelResponseSuspended | types.LoginSwitched)
+            or (isinstance(event, ModelIdle) and isinstance(event.outcome, Failed))
+        ):
+            for label in reversed(self.path):
+                event = types.ChildEvent(label=label, event=event)
+            self.tell(event)
+        self.read()
