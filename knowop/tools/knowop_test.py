@@ -51,6 +51,8 @@ class _Client:
         self.campaigns: list[PlainTree] = []
         self.campaigns_refusal = 0
         self.campaigns_asked: list[str] = []
+        self.today: PlainTree = _TODAY
+        self.today_refusal = 0
         self.jobs: list[JobView] = []
         self.jobs_refusal = 0
         self.hosts = [
@@ -106,6 +108,11 @@ class _Client:
                 status = self.campaigns_refusal
                 raise ClientError(f"GET {path} -> {status}", status_code=status)
             return self.campaigns
+        if path == "/api/addons/knowspend/today":
+            if self.today_refusal:
+                status = self.today_refusal
+                raise ClientError(f"GET {path} -> {status}", status_code=status)
+            return self.today
         if path.startswith("/api/addons/"):
             return self.api.get(path)
         assert path in (
@@ -623,6 +630,67 @@ async def test_budget_of_anything_but_one_brief_reads_nothing(name: str) -> None
         "or nothing, for the campaign limit."
     )
     assert client.campaigns_asked == []
+
+
+# Each figure sits a micro-dollar past a half cent, so a wrong scale rounds apart.
+_TODAY: Final[dict[str, PlainTree]] = {
+    "account": "ada@x.test",
+    "today_spent": 12_345_001,
+    "today_allowance": 20_005_001,
+    "today_allowance_used": 7_665_001,
+    "credit_left": 40_005_001,
+    "today_limit": None,
+    "today_remaining": 30_005_001,
+    "reserve": 2_005_001,
+    "resets_at": "2026-11-23T00:00:00Z",
+    "allowed": True,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "said"),
+    [
+        pytest.param(
+            {},
+            "Today you spent $12.35, $7.67 of it from today's $20.01 allowance; "
+            "$40.01 of credit is left. Campaigns and other agent work may spend "
+            "$30.01 more today; $2.01 is held back for Chat and KnowHosts. No daily "
+            "limit is set. The allowance starts again at midnight UTC.",
+            id="no-limit",
+        ),
+        pytest.param(
+            {"today_limit": 50_005_001},
+            "Today you spent $12.35, $7.67 of it from today's $20.01 allowance; "
+            "$40.01 of credit is left. Campaigns and other agent work may spend "
+            "$30.01 more today; $2.01 is held back for Chat and KnowHosts. The daily "
+            "limit is $50.01. The allowance starts again at midnight UTC.",
+            id="limit",
+        ),
+    ],
+)
+async def test_usage_today_says_what_was_spent_and_what_is_left(
+    change: dict[str, PlainTree],
+    said: str,
+) -> None:
+    client = _Client()
+    client.today = {**_TODAY, **change}
+    assert await _tools(client).act(action="usage.today") == said
+    assert client.puts == client.starts == client.started == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "said"),
+    [(404, "This server keeps no usage."), (403, "the server answered 403.")],
+)
+async def test_usage_today_says_what_a_server_without_it_or_a_refusal_says(
+    status: int,
+    said: str,
+) -> None:
+    client = _Client()
+    client.today_refusal = status
+    assert await _tools(client).act(action="usage.today") == said
 
 
 @pytest.mark.asyncio
