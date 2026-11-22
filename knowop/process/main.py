@@ -81,6 +81,7 @@ from trackinizer.client.session_socket import (
     SocketClosedError,
 )
 from trackinizer.client.session_upload import PartUploader
+from trackinizer.lib.userdirs import data_dir
 from trackinizer.trax.canvas import canvas_from_env
 from trackinizer.wire.refs import UuidRef
 from trackinizer.wire.wire_science_chat import chat_session_id
@@ -120,6 +121,7 @@ from knowop.process.remote_commands import REMOTE_AGENT
 from knowop.process.server_relay import AgentMessenger, ServerRelay
 from knowop.process.start import slurm_time, start_args, started_process
 from knowop.service import knowop_version
+from knowop.skill_merge import SKILL_DIRS, merged
 from knowop.tools.canvas import (
     CANVAS_DESCRIPTION,
     CANVAS_TOOL,
@@ -368,6 +370,14 @@ async def serve(
     except (ClientError, NotResumableError, LossyConversionError) as error:
         sys.stderr.write(f"Error: {error}\n")
         return 1
+    # The skill folders a remote agent's service names, merged into its user's, which
+    # sagent loads.
+    named = os.environ.get(SKILL_DIRS)
+    if named is not None:
+        _ = merged(
+            (Path(each) for each in named.split(os.pathsep) if each),
+            into=data_dir() / "rekursiv-ai" / "sagent" / "skills",
+        )
     flags, given = parse_flags([*args, "--session", str(choice.path)])
     # A setting sagent is given applies over the one a session stood on, so the
     # default is set for a session with no records yet alone: given at each start,
