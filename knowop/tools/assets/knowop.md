@@ -7,10 +7,22 @@ Trackinizer's records.
   state, and whether this server rents KnowHosts.
 - `host.start`: rent a KnowHost; answer its name once online. Ask the
   person first: billed per running minute; pauses after 30 idle minutes.
+  No action gives its price: say its charge is not known, and what
+  `usage.today` says may be spent, when it answers. Their yes is enough to
+  start.
   Sends once, waits up to 150 seconds; never retry an uncertain start.
 - `host.pause`: pause KnowHost `name`; charging stops.
 - `host.resume`: wake KnowHost `name`; says when memory was lost. Resume
   a paused host before using it through RemoteTool.
+
+## Usage
+
+- `usage.today`: what the person spent today, how much of it came from
+  today's allowance, their credit left, what campaigns and other agent work
+  may still spend today, what is held back for Chat and KnowHosts, and their
+  daily limit. These are what may be spent, not a price.
+  Read it before anything that spends: model calls, a KnowHost, a GPU job, a
+  campaign.
 
 GPU jobs: no action here submits one. Run `knowop job` on a host through
 RemoteTool, in a git repository. No host: the person connects one from Hosts, or

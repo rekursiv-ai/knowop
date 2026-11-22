@@ -67,6 +67,7 @@ type Action = Literal[
     "session.status",
     "session.continue",
     "session.self",
+    "usage.today",
     "trax.read",
     "trax.write",
 ]
@@ -300,6 +301,8 @@ class KnowOpTools:
                     effort=effort,
                     budget=budget,
                 )
+            case "usage.today":
+                return self._today()
             case "trax.read":
                 if not command.strip():
                     return "trax.read requires a command"
@@ -442,6 +445,31 @@ class KnowOpTools:
             "the figure is not final."
         )
 
+    def _today(self) -> str:
+        """Say what the person spent today, of their allowance, and the credit left."""
+        try:
+            today = from_plain(self._client.get("/api/addons/knowspend/today"), _Today)
+        except ClientError as error:
+            if error.status_code != 404:
+                raise
+            return "This server keeps no usage."
+        limit = today["today_limit"]
+        return (
+            f"Today you spent ${today['today_spent'] / 1_000_000:.2f}, "
+            f"${today['today_allowance_used'] / 1_000_000:.2f} of it from today's "
+            f"${today['today_allowance'] / 1_000_000:.2f} allowance; "
+            f"${today['credit_left'] / 1_000_000:.2f} of credit is left. "
+            "Campaigns and other agent work may spend "
+            f"${today['today_remaining'] / 1_000_000:.2f} more today; "
+            f"${today['reserve'] / 1_000_000:.2f} is held back for Chat and KnowHosts. "
+            + (
+                "No daily limit is set."
+                if limit is None
+                else f"The daily limit is ${limit / 1_000_000:.2f}."
+            )
+            + " The allowance starts again at midnight UTC."
+        )
+
     def _limits(self) -> _Limits | None:
         """Return the person's limits; ``None`` from a server without usage."""
         try:
@@ -472,6 +500,19 @@ class _CampaignSpend(TypedDict):
     spent: int
     budget: int | None
     last_hour: int
+
+
+# The fields of knowspend's ``Today`` this tool reads. Its own type is not imported:
+# the client ships alone as ``knowop``, which carries no knowspend
+# (``import_boundary_test``).
+class _Today(TypedDict):
+    today_spent: int
+    today_allowance: int
+    today_allowance_used: int
+    credit_left: int
+    today_limit: int | None
+    today_remaining: int
+    reserve: int
 
 
 class _Limit(TypedDict):

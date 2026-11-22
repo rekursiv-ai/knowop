@@ -3411,6 +3411,7 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
         lambda c: c.get(f"/api/inquiries/{session_id}"),
         lambda c: c.get("/api/addons/knowspend/limits"),
         lambda c: c.get("/api/addons/knowspend/campaigns?ref=campaign%2FIssue%237"),
+        lambda c: c.get("/api/addons/knowspend/today"),
         lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/pause"),
         lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/resume"),
     ]
