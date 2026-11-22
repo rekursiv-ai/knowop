@@ -1,6 +1,6 @@
 ---
 name: agent-tasks
-description: "ALWAYS invoke this skill when you start, plan, hand off or finish a task in KnowOp: search Trackinizer for related issues, file the agreed plan, say which agent and session wrote it, link pull requests and evidence, mark what is done. Do not leave a task's state only in Chat."
+description: "ALWAYS invoke this skill when you start, plan, hand off or finish a task in KnowOp, a task an agent spawned you for included: work under the issue your brief names or your spawner's, or search Trackinizer for related issues, file the agreed plan, say which agent and session wrote it, link pull requests and evidence, mark what is done. Do not leave a task's state only in Chat."
 ---
 
 # A task's issue in KnowOp
@@ -9,15 +9,15 @@ KnowOp keeps each task's state in its Trackinizer issue, not in Chat: whoever
 resumes the task, you after a restart or another agent, starts from the issue.
 
 Every unit of work is tied to an issue: a task, a sub-agent's job, a pull request,
-an experiment. The agent that plans a task files its issue; an agent spawned to
-help works under it, adding what it does there, or files a sub-issue that
-`narrows` it for a part of its own. Name the issue in each pull request, and in an
-agent's brief when you have one.
+an experiment. The agent that plans a task files its issue and names it in each
+agent's brief and each pull request. An agent spawned to help works under the
+issue its brief names, or its spawner's, and writes what it did there, or in a
+sub-issue that `narrows` it, before it reports.
 
-1. Start: before anything else, find the task's issue: the one your brief names,
-   else your spawner's. Your session's row (`id UUID`, from `session.self`) is
-   `produced_by` your spawner's session, and that session is `produced_by` its
-   issue. With neither, search Trackinizer for issues related to the task:
+1. Start: before anything else, find the task's issue: the one your brief names.
+   Spawned with none, take your spawner's: `id` of the session `session.self`
+   names shows the issue it is `produced_by`. With neither, search Trackinizer
+   for issues related to the task:
    `search "..." --kind issue`, and titles. Read each related issue's description,
    its edges, and the sessions that produced it. Work under the task's issue when
    one fits, or file a sub-issue that `narrows` it for a part of your own; file a
