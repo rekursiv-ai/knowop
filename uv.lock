@@ -431,8 +431,8 @@ wheels = [
 
 [[package]]
 name = "codedoctor"
-version = "0.1.15.dev3+gfafdd93aa"
-source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#fafdd93aa39dd5e2f44ce166b4bec4758f5a7658" }
+version = "0.1.15.dev5+g50401e527"
+source = { git = "https://github.com/rekursiv-ai/codedoctor?branch=main#50401e5271340d77ab60f8babb1a4c5d7050587f" }
 dependencies = [
     { name = "pyyaml" },
     { name = "rignore" },
@@ -3020,8 +3020,8 @@ wheels = [
 
 [[package]]
 name = "sagent"
-version = "0.2.6.dev6+g37955f7e3"
-source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#37955f7e3b9b65971fb048f3136005c8b4fdcfd2" }
+version = "0.2.6.dev9+g8efdd5072"
+source = { git = "https://github.com/rekursiv-ai/sagent?branch=main#8efdd507280ad9a9088b22f24cd3281a02b3818b" }
 dependencies = [
     { name = "bashlex" },
     { name = "cachetools" },
@@ -3351,8 +3351,8 @@ wheels = [
 
 [[package]]
 name = "trackinizer"
-version = "0.1.16.dev14+g325b80604"
-source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#325b806047d9e94a28510a5473435684f8730e89" }
+version = "0.1.16.dev17+g863303465"
+source = { git = "https://github.com/rekursiv-ai/trackinizer?branch=main#86330346568899e2d11d7dd494cc59da8f3123e1" }
 dependencies = [
     { name = "bashlex" },
     { name = "httpx2" },
@@ -3700,8 +3700,8 @@ wheels = [
 
 [[package]]
 name = "wesearch"
-version = "0.1.21.dev4+ged2bbef76"
-source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#ed2bbef764503481f0627fca7358be151552692e" }
+version = "0.1.21.dev5+g39bcb3bdb"
+source = { git = "https://github.com/rekursiv-ai/wesearch?branch=main#39bcb3bdbdcd3a13a0d0fb8911613e242116d730" }
 dependencies = [
     { name = "beautifulsoup4" },
     { name = "brotli" },
