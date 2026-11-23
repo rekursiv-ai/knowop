@@ -35,7 +35,7 @@ _ALLOWED: Final = (
     # The modules trackinizer's export carries: the session records a stored
     # session restores from, their readers, the pty plumbing the hosts use, and the
     # per-user folders.
-    "trackinizer.sagent.session",
+    "trackinizer.sagent.journal",
     "trackinizer.sagent.scripts.convert_session",
     # Sagent's tool server, from the sagent package knowop depends on: the tool host
     # serves sagent's remote tools through it (connect/tool_serving.py).
@@ -67,7 +67,7 @@ _PROCESS_ALLOWED: Final = ("sagent",)
 
 # ToolServing builds the records sagent's tool wire carries, so the export names its
 # session types as sagent's own: the wire refuses trackinizer's copy of a record.
-_TOOL_SERVING_ALLOWED: Final = ("sagent.session.types",)
+_TOOL_SERVING_ALLOWED: Final = ("sagent.journal.types",)
 
 
 def _shipped() -> list[Path]:

@@ -49,16 +49,16 @@ import os
 import time
 
 from sagent.agent.agent import Agent
-from sagent.runtime import types
-from sagent.session import projects
-from sagent.session.jsonl import record_line
-from sagent.session.types import (
+from sagent.journal import projects
+from sagent.journal.jsonl import record_line
+from sagent.journal.types import (
     AgentIdle,
     AgentMessage,
     Failed,
     ModelIdle,
     Succeeded,
 )
+from sagent.runtime import types
 from sagent.tools.background_task import without_controls
 from sagent.tui.status import Status
 from trackinizer.client.errors import ClientError
@@ -96,7 +96,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from sagent.agent.team import Team
-    from sagent.session.types import SessionRecord, ToolCall
+    from sagent.journal.types import SessionRecord, ToolCall
     from sagent.tools.types import Tool
     from sagent.tui.slash import Commands
     from sagent.tui.types import CommandOutput

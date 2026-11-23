@@ -54,6 +54,9 @@ from trackinizer.client.session_upload import (
 )
 from trackinizer.runs.adapters.claude import ClaudeAdapter
 from trackinizer.runs.adapters.codex import CodexAdapter
+from trackinizer.sagent.journal.jsonl import read_record
+from trackinizer.sagent.journal.projects import session_id, spawner_journal
+from trackinizer.sagent.journal.types import SessionContext, UncategorizedRecord
 from trackinizer.sagent.scripts.convert_session import claude, codex, sagent
 from trackinizer.sagent.scripts.convert_session.convert import (
     die_with_parent,
@@ -62,9 +65,6 @@ from trackinizer.sagent.scripts.convert_session.convert import (
     transcript_name,
     transcripts,
 )
-from trackinizer.sagent.session.jsonl import read_record
-from trackinizer.sagent.session.projects import session_id, spawner_journal
-from trackinizer.sagent.session.types import SessionContext, UncategorizedRecord
 from trackinizer.types.session_records import record_time
 from trackinizer.wire.audience import PRIVATE
 from trackinizer.wire.wire_session_ir import MAX_RECORD_BATCH
@@ -81,7 +81,7 @@ if TYPE_CHECKING:
 
     from trackinizer.runs.adapters.custom_types import Subagent
     from trackinizer.runs.redact import Redactor
-    from trackinizer.sagent.session.types import SessionRecord
+    from trackinizer.sagent.journal.types import SessionRecord
     from trackinizer.wire.wire_sessions import SessionStartResponse
 
 

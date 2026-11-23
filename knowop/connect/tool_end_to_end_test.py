@@ -39,18 +39,18 @@ from sagent.host.wire import (
     encoded,
     received,
 )
-from sagent.model.scripted import (
-    ScriptedProvider,
-    call as scripted_call,
-    reply,
-)
-from sagent.session.jsonl import JsonlJournal, read_record
-from sagent.session.types import (
+from sagent.journal.jsonl import JsonlJournal, read_record
+from sagent.journal.types import (
     BashResult,
     ReadResult,
     RemoteToolResult,
     ToolMessage,
     UncategorizedToolResult,
+)
+from sagent.model.scripted import (
+    ScriptedProvider,
+    call as scripted_call,
+    reply,
 )
 from sagent.tools.bash import Bash
 from sagent.tools.display import ToolDisplay

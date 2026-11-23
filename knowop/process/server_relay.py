@@ -49,7 +49,7 @@ from trackinizer.wire.wire_sessions import SessionAgent
 
 if TYPE_CHECKING:
     from sagent.agent.team import Team
-    from sagent.session.types import AgentMessage
+    from sagent.journal.types import AgentMessage
 
 
 __all__ = ["AgentMessenger", "ServerRelay"]

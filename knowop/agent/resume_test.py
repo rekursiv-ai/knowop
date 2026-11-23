@@ -10,9 +10,8 @@ import re
 
 from trackinizer.client.conversation import read_part
 from trackinizer.lib.userdirs import state_dir
-from trackinizer.sagent.scripts.convert_session import sagent
-from trackinizer.sagent.session.jsonl import record_line
-from trackinizer.sagent.session.types import (
+from trackinizer.sagent.journal.jsonl import record_line
+from trackinizer.sagent.journal.types import (
     AssistantMessage,
     BashResult,
     ContextState,
@@ -26,6 +25,7 @@ from trackinizer.sagent.session.types import (
     UncategorizedRecord,
     UserMessage,
 )
+from trackinizer.sagent.scripts.convert_session import sagent
 from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.wire_session_ir import PartBody, RecordBody
 from treekle import immutable

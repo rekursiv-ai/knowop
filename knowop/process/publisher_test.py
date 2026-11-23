@@ -20,15 +20,8 @@ from sagent.agent import team as team_module
 from sagent.agent.agent import Agent
 from sagent.agent.agents_md import AgentsMdConfig
 from sagent.agent.team import Team
-from sagent.model.exceptions import RetryableError
-from sagent.model.scripted import ScriptedProvider, call, reply
-from sagent.providers.catalog import ModelCatalog
-from sagent.runtime import (
-    runtime as runtime_module,
-    types,
-)
-from sagent.session.jsonl import JsonlJournal
-from sagent.session.types import (
+from sagent.journal.jsonl import JsonlJournal
+from sagent.journal.types import (
     AgentIdle,
     AgentMessage,
     Cancelled,
@@ -38,6 +31,13 @@ from sagent.session.types import (
     ToolCall,
     UncategorizedToolResult,
     UserMessage,
+)
+from sagent.model.exceptions import RetryableError
+from sagent.model.scripted import ScriptedProvider, call, reply
+from sagent.providers.catalog import ModelCatalog
+from sagent.runtime import (
+    runtime as runtime_module,
+    types,
 )
 from sagent.settings.harvest import harvest
 from sagent.tools.agent_spawn import AgentSpawn, _Forward
@@ -75,8 +75,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from sagent.agent.team import MessageKind
+    from sagent.journal.types import SessionRecord
     from sagent.model.scripted import Reply
-    from sagent.session.types import SessionRecord
     from sagent.tools.types import Tool, ToolStreamingResult
     from trackinizer.wire.json_types import JSON
 

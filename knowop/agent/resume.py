@@ -18,7 +18,7 @@ import re
 
 from trackinizer.client.conversation import read_part
 from trackinizer.lib.userdirs import state_dir
-from trackinizer.sagent.session.types import SessionRecord, UncategorizedRecord
+from trackinizer.sagent.journal.types import SessionRecord, UncategorizedRecord
 
 from knowop.agent.errors import (
     LossyConversionError,

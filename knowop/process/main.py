@@ -55,13 +55,13 @@ import os
 import subprocess
 import sys
 
-from sagent.runtime import types
-from sagent.session.jsonl import JournalInUseError
-from sagent.session.types import (
+from sagent.journal.jsonl import JournalInUseError
+from sagent.journal.types import (
     AgentMessage,
     Attachment,
     UncategorizedToolResult,
 )
+from sagent.runtime import types
 from sagent.tools.function import tool
 from sagent.tools.recall import Recall
 from sagent.tools.remote import RemoteTool
@@ -153,8 +153,8 @@ if TYPE_CHECKING:
 
     from sagent.agent.agent import Agent
     from sagent.agent.team import Team
+    from sagent.journal.types import SessionRecord
     from sagent.model.capability import ThinkingEffort
-    from sagent.session.types import SessionRecord
     from sagent.tools.types import Tool
     from sagent.tui.main import OpenAgent
     from sagent.tui.slash import Allowed

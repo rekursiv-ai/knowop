@@ -17,8 +17,7 @@ import json
 import re
 
 from trackinizer.runs.refusal import stand_in
-from trackinizer.sagent.scripts.convert_session import claude
-from trackinizer.sagent.session.types import (
+from trackinizer.sagent.journal.types import (
     CONCRETE_TYPES,
     AgentMessage,
     Attachment,
@@ -31,6 +30,7 @@ from trackinizer.sagent.session.types import (
     UncategorizedToolResult,
     UserMessage,
 )
+from trackinizer.sagent.scripts.convert_session import claude
 from trackinizer.types.session_records import SessionRecordRow, search_text
 from trackinizer.types.streams import Stderr, Stdin, Stdout
 from trackinizer.wire.wire_session_ir import RecordBody
@@ -57,7 +57,7 @@ from knowop.agent.truncate import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from trackinizer.sagent.session.types import SessionRecord
+    from trackinizer.sagent.journal.types import SessionRecord
     from trackinizer.types.streams import TraxRecord
     from treekle import MutablePlainTree, PlainTree
 

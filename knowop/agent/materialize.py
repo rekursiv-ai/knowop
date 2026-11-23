@@ -20,8 +20,8 @@ from uuid import uuid4
 
 import json
 
+from trackinizer.sagent.journal.types import IncompleteRecord, Thinking
 from trackinizer.sagent.scripts.convert_session import sagent
-from trackinizer.sagent.session.types import IncompleteRecord, Thinking
 
 from knowop.agent.errors import CiphertextDroppedError
 
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
-    from trackinizer.sagent.session.types import SessionRecord
+    from trackinizer.sagent.journal.types import SessionRecord
 
 
 __all__ = ["materialize"]
