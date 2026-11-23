@@ -51,6 +51,7 @@ from knowop.connect.job_serving import JobServing, SystemdLauncher
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
+    from threading import BoundedSemaphore
 
 
 _JAN = "jan@example.com"
@@ -58,6 +59,8 @@ _URL = "https://alpha.knowop.ai"
 _TAG = hashlib.sha256(_URL.encode()).hexdigest()[:8]
 _HOST = uuid.UUID(int=1)
 _INSTANCE = uuid.UUID(int=2)
+_REMOTE = "https://github.com/o/r.git"
+_REF = "refs/heads/main"
 
 
 def _spec(job_id: int = 7, /, **fields: object) -> HostJobSpec:
@@ -66,8 +69,8 @@ def _spec(job_id: int = 7, /, **fields: object) -> HostJobSpec:
             "id": job_id,
             "owner": _JAN,
             "argv": ["python", "train.py"],
-            "remote": "https://github.com/o/r.git",
-            "ref": "refs/heads/main",
+            "remote": _REMOTE,
+            "ref": _REF,
             "commit": "a" * 40,
             "gpus": 0,
             "memory_mb": 1_024,
@@ -201,7 +204,7 @@ class _Repos:
         dest: Path,
         cancel: threading.Event | None = None,
     ) -> None:
-        del remote, ref
+        assert (remote, ref) == (_REMOTE, _REF)
         self.fetching.append(dest)
         if self.gate is not None:
             deadline = time.monotonic() + 5
@@ -214,7 +217,7 @@ class _Repos:
         _ = (dest / "COMMIT").write_text(commit)
 
     def remove(self, *, remote: str, dest: Path) -> None:
-        del remote
+        assert remote == _REMOTE
         self.removed.append(dest)
         if self.removals_failing:
             self.removals_failing -= 1
@@ -306,8 +309,10 @@ def test_cancellation_interrupts_preparation(tmp_path: Path) -> None:
         _start(rig)
         rig.daemon.step()
         _until(lambda: bool(repos.fetching))
+        job = rig.daemon._jobs[7]
         rig.daemon.handle(CancelWork(job_id=7))
         _until(lambda: _phase(rig, 7) != "fetching")
+        assert job.failure == JobReport(state="failed", reason="preparation cancelled")
         rig.daemon.step()
         _cleaned(rig)
         assert (7, "cancelled") in rig.server.states()
@@ -438,12 +443,20 @@ def _fetched(rig: _Rig, job_id: int = 7) -> JobFolder:
     rig.daemon.step()
     folder = JobFolder(rig.root / str(job_id))
     _until(lambda: _phase(rig, job_id) == "ready")
+    _freed(rig.daemon._fetch_slots)
     return folder
 
 
 def _cleaned(rig: _Rig, job_id: int = 7) -> None:
     """Wait for the cleanup worker without retrying the end report."""
     _until(lambda: _phase(rig, job_id) in {"ended", "gone"})
+    _freed(rig.daemon._cleanup_slots)
+
+
+def _freed(slots: BoundedSemaphore) -> None:
+    """Wait for a worker's slot: it sets its job's phase before it frees the slot."""
+    assert slots.acquire(timeout=5)
+    slots.release()
 
 
 def _phase(rig: _Rig, job_id: int) -> str:
@@ -605,7 +618,8 @@ def test_a_job_waits_until_the_running_jobs_leave_room_in_the_memory_budget(
 
 
 def test_a_commit_that_cannot_be_fetched_fails_the_job_with_why(tmp_path: Path) -> None:
-    rig = _daemon(tmp_path, repos=_Repos(failure="git fetch failed: fatal: no access"))
+    why = "git fetch failed: fatal: " + "no access; " * 100
+    rig = _daemon(tmp_path, repos=_Repos(failure=why))
     rig.daemon.start(_HOST, _INSTANCE)
     try:
         _ = _start(rig)
@@ -615,10 +629,7 @@ def test_a_commit_that_cannot_be_fetched_fails_the_job_with_why(tmp_path: Path) 
     finally:
         rig.daemon.stop()
 
-    assert rig.server.reports[-1] == (
-        7,
-        JobReport(state="failed", reason="git fetch failed: fatal: no access"),
-    )
+    assert rig.server.reports[-1] == (7, JobReport(state="failed", reason=why[:1_000]))
     assert rig.launcher.started == []
 
 
@@ -1122,11 +1133,14 @@ def test_only_one_worktree_cleanup_runs_at_a_time(
 def test_unexpected_preparation_failure_can_finish_and_be_cancelled(
     rig: _Rig,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     cancel: bool,
 ) -> None:
+    why = "unexpected preparation failure; " * 40
+
     def broken(self: _Repos, **kwargs: object) -> None:
         del self, kwargs
-        raise RuntimeError("unexpected preparation failure")
+        raise RuntimeError(why)
 
     monkeypatch.setattr(_Repos, "checkout", broken)
     _start(rig)
@@ -1138,7 +1152,37 @@ def test_unexpected_preparation_failure_can_finish_and_be_cancelled(
         rig.daemon.handle(CancelWork(job_id=7))
     rig.daemon.step()
     _cleaned(rig)
-    assert (7, "cancelled" if cancel else "failed") in rig.server.states()
+    assert rig.server.reports[-1] == (
+        7,
+        JobReport(state="cancelled", reason="Cancelled.")
+        if cancel
+        else JobReport(state="failed", reason=why[:1_000]),
+    )
+    assert "Job 7 preparation failed" in caplog.messages
+    assert not rig.launcher.started
+
+
+def test_a_preparation_cut_short_by_a_base_exception_fails_the_job(
+    rig: _Rig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def exited(self: _Repos, **kwargs: object) -> None:
+        del self, kwargs
+        raise SystemExit(1)
+
+    monkeypatch.setattr(_Repos, "checkout", exited)
+    _start(rig)
+    assert rig.daemon._fetch_slots.acquire(blocking=False)
+
+    with pytest.raises(SystemExit):
+        rig.daemon._fetch(rig.daemon._jobs[7])
+    rig.daemon.step()
+    _cleaned(rig)
+
+    assert rig.server.reports[-1] == (
+        7,
+        JobReport(state="failed", reason="Preparation did not complete."),
+    )
     assert not rig.launcher.started
 
 
@@ -1600,7 +1644,12 @@ def test_a_cleanup_that_fails_is_logged_and_tried_again_at_the_next_step(
     folder.write_ended(Ended(state="completed", exit_code=0, reason=""))
 
     rig.daemon.step()
-    _until(lambda: "Job 7 cleanup failed; will retry" in caplog.text)
+    worker = rig.daemon._jobs[7].cleanup_thread
+    assert worker is not None
+    # A step retries only once the failed worker has exited, which follows its log.
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert "Job 7 cleanup failed; will retry" in caplog.messages
     assert _phase(rig, 7) == "cleaning"
     rig.daemon.step()
     _cleaned(rig)
