@@ -15,9 +15,9 @@ import threading
 
 from sagent.agent.agent import Agent
 from sagent.agent.team import MessageKind, Team
+from sagent.journal.types import AgentMessage, SystemMessage
 from sagent.model.scripted import ScriptedProvider
 from sagent.providers.catalog import ModelCatalog
-from sagent.session.types import AgentMessage, SystemMessage
 from sagent.tools.types import ToolContext
 from trackinizer.client.errors import ClientError
 from trackinizer.wire.wire_sessions import SessionAgent

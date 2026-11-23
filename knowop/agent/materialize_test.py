@@ -8,15 +8,15 @@ from uuid import UUID
 import re
 import stat
 
-from trackinizer.sagent.scripts.convert_session import sagent
-from trackinizer.sagent.session.jsonl import record_line
-from trackinizer.sagent.session.types import (
+from trackinizer.sagent.journal.jsonl import record_line
+from trackinizer.sagent.journal.types import (
     AssistantMessage,
     IncompleteRecord,
     SessionRecord,
     Thinking,
     UserMessage,
 )
+from trackinizer.sagent.scripts.convert_session import sagent
 
 import pytest
 

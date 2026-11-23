@@ -24,16 +24,16 @@ from uuid import UUID
 
 import json
 
-from sagent.model import types as model_types
-from sagent.runtime import types as runtime_types
-from sagent.runtime.types import ModelHalt
-from sagent.session import types as session_types
-from sagent.session.types import (
+from sagent.journal import types as session_types
+from sagent.journal.types import (
     AgentMessage,
     UserMessage,
     stored_plain,
     stored_record,
 )
+from sagent.model import types as model_types
+from sagent.runtime import types as runtime_types
+from sagent.runtime.types import ModelHalt
 from sagent.tui.render import error_text
 from sagent.tui.types import CommandOutput
 from trackinizer.wire.wire_session_relay import Command

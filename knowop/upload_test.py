@@ -15,15 +15,15 @@ import os
 from trackinizer.client.errors import ClientError
 from trackinizer.lib import zstd_compat
 from trackinizer.runs.redact import Redactor
-from trackinizer.sagent.scripts.convert_session import claude
-from trackinizer.sagent.scripts.convert_session.convert import die_with_parent
-from trackinizer.sagent.scripts.convert_session.tail import Tail
-from trackinizer.sagent.session.jsonl import read_record, record_line
-from trackinizer.sagent.session.types import (
+from trackinizer.sagent.journal.jsonl import read_record, record_line
+from trackinizer.sagent.journal.types import (
     AssistantMessage,
     UncategorizedRecord,
     UserMessage,
 )
+from trackinizer.sagent.scripts.convert_session import claude
+from trackinizer.sagent.scripts.convert_session.convert import die_with_parent
+from trackinizer.sagent.scripts.convert_session.tail import Tail
 from trackinizer.wire.wire_session_ir import ManifestBody, PartBody, RecordBody
 from trackinizer.wire.wire_sessions import (
     SessionEnd,

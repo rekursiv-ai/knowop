@@ -48,7 +48,7 @@ if TYPE_CHECKING:
     )
     from sagent.host.server import Host, Server, _Session
     from sagent.host.strings import ServeDirs
-    from sagent.session.types import ToolMessage
+    from sagent.journal.types import ToolMessage
     from trackinizer.client import tool_bridge
     from trackinizer.wire import wire_tools
     from websockets.asyncio.client import ClientConnection
@@ -59,7 +59,7 @@ else:
     sagent_server = lazy_import("sagent.host.server")
     strings = lazy_import("sagent.host.strings")
     wire = lazy_import("sagent.host.wire")
-    ToolMessage = lazy_import("sagent.session.types", "ToolMessage")
+    ToolMessage = lazy_import("sagent.journal.types", "ToolMessage")
     tool_bridge = lazy_import("trackinizer.client.tool_bridge")
     wire_tools = lazy_import("trackinizer.wire.wire_tools")
 

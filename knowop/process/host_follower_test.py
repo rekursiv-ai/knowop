@@ -27,7 +27,7 @@ from sagent.host.wire import (
     encoded,
     received,
 )
-from sagent.session.types import BashResult, ToolMessage
+from sagent.journal.types import BashResult, ToolMessage
 from sagent.tools.bash import Bash
 from sagent.tools.remote import Link, RemoteSession, RemoteTool
 from sagent.tools.types import ToolContext

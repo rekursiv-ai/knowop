@@ -40,7 +40,7 @@ import json
 import re
 
 from trackinizer.runs.refusal import REFUSED_KIND
-from trackinizer.sagent.session.types import (
+from trackinizer.sagent.journal.types import (
     IncompleteRecord,
     ToolMessage,
     UncategorizedRecord,

@@ -35,7 +35,7 @@ import logging
 import threading
 
 from sagent.host.wire import MAX_LINE_BYTES
-from sagent.session.types import RemoteToolResult, ToolMessage
+from sagent.journal.types import RemoteToolResult, ToolMessage
 from sagent.tools.remote import Link, RemoteTool
 from sagent.tools.types import parse
 from sagent.types import AsyncResource

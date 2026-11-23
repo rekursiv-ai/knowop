@@ -14,6 +14,14 @@ from typing import (
 )
 from uuid import UUID
 
+from sagent.journal.types import (
+    AgentIdle,
+    AgentMessage,
+    Attachment,
+    Failed,
+    UserMessage,
+    stored_record,
+)
 from sagent.providers.openai.wire import user_content
 from sagent.runtime.types import (
     ChildEvent,
@@ -21,14 +29,6 @@ from sagent.runtime.types import (
     ModelResponseCompleted,
     ModelResponseTextStreamed,
     RuntimeEvent,
-)
-from sagent.session.types import (
-    AgentIdle,
-    AgentMessage,
-    Attachment,
-    Failed,
-    UserMessage,
-    stored_record,
 )
 from sagent.tui.render import error_text
 from sagent.tui.types import CommandOutput

@@ -44,7 +44,7 @@ from sagent.host.wire import (
     encoded,
     received,
 )
-from sagent.session.types import (
+from sagent.journal.types import (
     ReadResult,
     UncategorizedToolResult,
 )
