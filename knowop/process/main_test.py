@@ -3414,6 +3414,7 @@ def test_each_call_a_process_makes_is_a_route_its_key_reaches() -> None:
         lambda c: c.get("/api/addons/knowspend/today"),
         lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/pause"),
         lambda c: c.post(f"/api/addons/knowhost/hosts/{session_id}/resume"),
+        lambda c: c.post("/api/addons/campaignscores/iterations/12", body={}),
     ]
     with Client(
         "https://trax.test",

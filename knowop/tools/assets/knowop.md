@@ -1,5 +1,5 @@
-Operate on the person's KnowOp server: hosts, campaign lead sessions, and
-Trackinizer's records.
+Operate on the person's KnowOp server: hosts, campaign lead sessions, campaign
+scoring, and Trackinizer's records.
 
 ## Host
 
@@ -57,6 +57,21 @@ To download a session for the person, run
 `knowop session download AgentSession#N -o PATH` on their host through
 `RemoteTool`: every record, one JSON line each. With no host online, point
 them to Chat's ⋯ menu, Download session.
+
+## Campaign
+
+- `campaign.score`: score one iteration of the campaign you lead, filed as an
+  Experiment. `experiment` (`Experiment#N` or `N`), `metric` and `value` are
+  required. `metric` is the brief's metric, one lowercase name
+  (`[a-z][a-z0-9_./-]`, at most 64 characters), the same on every iteration.
+  The baseline sends no `verdict` and no `reason`; each later iteration sends
+  both: `verdict` is `works`, `doesnt` or `inconclusive`, and `reason` is one
+  sentence of at most 200 characters. Answers what was stamped. The server
+  refuses, saying why, a misspelt metric, one other than the brief's
+  `SLUG:metric:` label, a brief without exactly one `SLUG:metric:` label and
+  one `SLUG:direction:minimize` or `maximize` label, a value that is not
+  finite, a verdict or reason on the baseline, and a later iteration without
+  both.
 
 ## Pull requests
 

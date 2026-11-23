@@ -63,6 +63,7 @@ class _Client:
                 confirmed=True,
             ),
         ]
+        self.post_refusal: ClientError | None = None
 
     def job_list(self) -> JobList:
         if self.jobs_refusal:
@@ -122,7 +123,10 @@ class _Client:
         return {"seq": 412}
 
     def post(self, path: str, **options: object) -> PlainTree:
-        return self.api.post(path, **options)
+        answer = self.api.post(path, **options)
+        if self.post_refusal is not None:
+            raise self.post_refusal
+        return answer
 
     def put(self, path: str, *, body: object = None) -> PlainTree:
         self.puts.append((path, body))
@@ -894,6 +898,66 @@ async def test_trax_writes_records_as_the_calling_agent_of_its_session() -> None
     assert client.starts == client.started == client.puts == []
 
 
+_SCORES: Final = "/api/addons/campaignscores/iterations/12"
+_NOT_AN_EXPERIMENT: Final = (
+    "campaign.score takes its experiment as Experiment#N or N, N from 1."
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("experiment", "value", "verdict", "reason"),
+    [
+        pytest.param("Experiment#12", 3.41, None, "", id="baseline"),
+        # A score of zero is a score given, not one left out.
+        pytest.param("12", 0.0, "works", "Scaling helped.", id="iteration"),
+    ],
+)
+async def test_score_posts_what_it_was_given_and_answers_the_servers_line(
+    experiment: str,
+    value: float,
+    verdict: knowop.Verdict | None,
+    reason: str,
+) -> None:
+    client = _Client()
+    client.api.answer = {"line": "Experiment#12: val_loss 3.41 stamped."}
+    tools = _tools(client)
+    # A model scoring the baseline leaves the verdict and reason out.
+    said = await (
+        tools.act(
+            action="campaign.score",
+            experiment=experiment,
+            metric="val_loss",
+            value=value,
+        )
+        if verdict is None
+        else tools.act(
+            action="campaign.score",
+            experiment=experiment,
+            metric="val_loss",
+            value=value,
+            verdict=verdict,
+            reason=reason,
+        )
+    )
+    assert said == "Experiment#12: val_loss 3.41 stamped."
+    assert client.api.calls == [
+        (
+            "POST",
+            _SCORES,
+            {
+                "body": {
+                    "metric": "val_loss",
+                    "value": value,
+                    "verdict": verdict,
+                    "reason": reason,
+                },
+            },
+        ),
+    ]
+    assert client.starts == client.started == client.puts == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", [None, "", "  "])
 async def test_trax_write_requires_a_command_and_sends_nothing(
@@ -921,6 +985,125 @@ async def test_trax_write_without_a_session_names_no_agent_and_sends_nothing() -
 
     assert said == "trax.write requires a caller session"
     assert (server.sent, server.closed) == ([], 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("experiment", "metric", "value", "said"),
+    [
+        ("", "val_loss", 3.41, "campaign.score requires an experiment"),
+        ("Experiment#12", "", 3.41, "campaign.score requires a metric"),
+        ("Experiment#12", "val_loss", None, "campaign.score requires a value"),
+        *(
+            (named, "val_loss", 3.41, _NOT_AN_EXPERIMENT)
+            for named in ("Issue#12", "Experiment#", "twelve", "-3", "Experiment#0")
+        ),
+    ],
+)
+async def test_score_without_its_experiment_metric_or_value_sends_nothing(
+    experiment: str,
+    metric: str,
+    value: float | None,
+    said: str,
+) -> None:
+    client = _Client()
+    assert (
+        await _tools(client).act(
+            action="campaign.score",
+            experiment=experiment,
+            metric=metric,
+            value=value,
+        )
+        == said
+    )
+    assert client.api.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("left_out", "said"),
+    [
+        ("experiment", "campaign.score requires an experiment"),
+        ("metric", "campaign.score requires a metric"),
+        ("value", "campaign.score requires a value"),
+    ],
+)
+async def test_score_with_a_parameter_left_out_sends_nothing(
+    left_out: str,
+    said: str,
+) -> None:
+    """A model that names no ``experiment``, ``metric`` or ``value`` leaves it out."""
+    client = _Client()
+    tools = _tools(client)
+
+    answer = await (
+        tools.act(action="campaign.score", metric="val_loss", value=3.41)
+        if left_out == "experiment"
+        else tools.act(action="campaign.score", experiment="Experiment#12", value=3.41)
+        if left_out == "metric"
+        else tools.act(
+            action="campaign.score",
+            experiment="Experiment#12",
+            metric="val_loss",
+        )
+    )
+
+    assert answer == said
+    assert client.api.calls == []
+
+
+# FastAPI answers a route it does not serve with 404, so the 404 says only that the
+# server runs no campaign scoring, whatever its detail.
+@pytest.mark.asyncio
+async def test_score_on_a_server_without_campaign_scoring_says_so() -> None:
+    client = _Client()
+    client.post_refusal = ClientError(
+        f'POST {_SCORES} -> 404: {{"detail": "Not Found"}}',
+        status_code=404,
+    )
+    assert (
+        await _tools(client).act(
+            action="campaign.score",
+            experiment="Experiment#12",
+            metric="val_loss",
+            value=3.41,
+        )
+        == "This server has no campaign scoring."
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [
+        (422, "not_an_iteration: Experiment#12 is labelled no iter-NN"),
+        (422, "bad_metric: val loss is not one lowercase name"),
+        (
+            409,
+            "no_metric: Issue#7 names no label tile:metric:NAME; the launcher adds it",
+        ),
+    ],
+)
+async def test_score_refused_by_the_server_answers_the_servers_message(
+    status: int,
+    detail: str,
+) -> None:
+    client = _Client()
+    client.post_refusal = ClientError(
+        f'POST {_SCORES} -> {status}: {{"detail": "{detail}."}}',
+        status_code=status,
+    )
+    assert (
+        await _tools(client).act(
+            action="campaign.score",
+            experiment="Experiment#12",
+            metric="val_loss",
+            value=3.41,
+            verdict="works",
+            reason="Scaling helped.",
+        )
+        == f"the server answered {status}: {detail}."
+    )
 
 
 if __name__ == "__main__":
