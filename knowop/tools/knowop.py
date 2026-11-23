@@ -1,4 +1,4 @@
-"""The KnowOp tool for hosts, agent sessions and Trackinizer's records."""
+"""The KnowOp tool: hosts, agent sessions, campaign scores and Trackinizer's records."""
 
 from __future__ import annotations
 
@@ -70,7 +70,11 @@ type Action = Literal[
     "usage.today",
     "trax.read",
     "trax.write",
+    "campaign.score",
 ]
+
+type Verdict = Literal["works", "doesnt", "inconclusive"]  # codespell:ignore doesnt
+"""A campaign iteration's keep-or-revert call, as the campaign view reads it."""
 
 
 class Caller(Protocol):
@@ -125,7 +129,7 @@ class KnowOpClient(KnowHostClient, ProcessClient, Protocol):
 
 
 class KnowOpTools:
-    """Operate on the caller's hosts and agent sessions, and read and write records."""
+    """Run the caller's hosts and sessions, score its campaigns, read and write records."""
 
     def __init__(
         self,
@@ -148,13 +152,19 @@ class KnowOpTools:
         effort: str = "",
         budget: float | None = None,
         command: str = "",
+        experiment: str = "",
+        metric: str = "",
+        value: float | None = None,
+        verdict: Verdict | None = None,
+        reason: str = "",
         context: Caller = _UNNAMED,
     ) -> str:
-        """Operate on a host or agent session, or read or write Trackinizer's records.
+        """Operate on a host or agent session, read or write records, or score.
 
         Args:
-          action: Operate hosts; launch, stop, inspect or continue a session; or
-            read records (trax.read) or change them (trax.write).
+          action: Operate hosts; launch, stop, inspect or continue a session; read
+            records (trax.read) or change them (trax.write); or score a campaign
+            iteration (campaign.score).
           name: The host name, launch label, required LABEL#N for session actions, or
             for ``session.budget`` a campaign's brief, Issue#N, to read its spend.
           time: Required launch/continue Slurm time limit (20 means 20 minutes).
@@ -163,6 +173,15 @@ class KnowOpTools:
           budget: Launch budget in USD; omitted takes the person's campaign limit.
           command: Required for trax.read and trax.write: a trax command, as typed
             after `trax`.
+          experiment: Required for campaign.score: the iteration's Experiment,
+            Experiment#N or N.
+          metric: Required for campaign.score: the brief's metric, one lowercase
+            name such as val_loss, the same on every iteration.
+          value: Required for campaign.score: the iteration's score on ``metric``.
+          verdict: For campaign.score after the baseline, required: ``works``,
+            ``doesnt`` or ``inconclusive``; the baseline sends none.
+          reason: For campaign.score after the baseline, required: one sentence of
+            at most 200 characters saying why; the baseline sends none.
           context: The calling agent, whose label ``session.self`` answers with and
             trax.write records each change as; the agent framework passes it, and it
             is no argument of the model's.
@@ -181,6 +200,13 @@ class KnowOpTools:
                 effort=effort,
                 budget=budget,
                 command=command,
+                score=_Score(
+                    experiment=experiment,
+                    metric=metric,
+                    value=value,
+                    verdict=verdict,
+                    reason=reason,
+                ),
                 label=context.label or "Agent",
             )
         except ClientError as error:
@@ -198,6 +224,7 @@ class KnowOpTools:
         effort: str,
         budget: float | None,
         command: str,
+        score: _Score,
         label: str,
     ) -> str:
         client = self._client
@@ -316,6 +343,37 @@ class KnowOpTools:
                     command,
                     actor=f"{label}#{self._session_id}",
                 )
+            case "campaign.score":
+                return self._scored(score)
+
+    # The server decides whether an Experiment is a baseline or a later iteration,
+    # and refuses a stamp that does not fit; the tool sends what it was given.
+    def _scored(self, score: _Score) -> str:
+        """Stamp an iteration with ``score``; answer the server's line."""
+        if not score.experiment:
+            return "campaign.score requires an experiment"
+        if not score.metric:
+            return "campaign.score requires a metric"
+        if score.value is None:
+            return "campaign.score requires a value"
+        named = re.fullmatch(r"(?:Experiment#)?([1-9][0-9]*)", score.experiment)
+        if named is None:
+            return "campaign.score takes its experiment as Experiment#N or N, N from 1."
+        try:
+            answer = self._client.post(
+                f"/api/addons/campaignscores/iterations/{named[1]}",
+                body={
+                    "metric": score.metric,
+                    "value": score.value,
+                    "verdict": score.verdict,
+                    "reason": score.reason,
+                },
+            )
+        except ClientError as error:
+            if error.status_code != 404:
+                raise
+            return "This server has no campaign scoring."
+        return from_plain(answer, _Line)["line"]
 
     def _started_session(
         self,
@@ -490,6 +548,21 @@ def _is_each_campaign(limit: _Limit) -> bool:
         and limit["lane"] is None
         and limit["stops"]
     )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Score:
+    """What ``campaign.score`` was given; an empty or ``None`` field was not."""
+
+    experiment: str
+    metric: str
+    value: float | None
+    verdict: Verdict | None
+    reason: str
+
+
+class _Line(TypedDict):
+    line: str
 
 
 class _Numbered(TypedDict):
