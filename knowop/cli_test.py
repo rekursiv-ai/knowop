@@ -1652,7 +1652,8 @@ def test_session_download_help_says_what_it_writes_and_where(
         "line. To stdout, unless --output names a file."
     ) in said
     assert "AgentSession#N or a UUID (default: the session $TRAX_SESSION names)" in said
-    assert "-o, --output OUTPUT the file to write" in said
+    # Python 3.12's argparse repeats the metavar after the short alias.
+    assert re.search(r" -o(?: OUTPUT)?, --output OUTPUT the file to write", said)
 
 
 def test_session_download_refuses_a_ref_that_names_no_row(

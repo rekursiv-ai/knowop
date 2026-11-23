@@ -55,6 +55,7 @@ REMOTE_AGENT: Final = Allowed(
             "model.service_tier",
             "model.cache_ttl_sec",
             "model.manage_context_server_side",
+            "model.compaction",
             # How its own calls wait, and how they show.
             "runtime.detach",
             "runtime.detach.*",
