@@ -45,6 +45,9 @@ REMOTE_AGENT: Final = Allowed(
             "defer",
             "tasks",
             "watcher",
+            # Chat's +, the process's own line (``main.SPAWN``): an agent of the team,
+            # with its spawner's tools, as the model's AgentSpawn starts one.
+            "spawn",
             # The model, among the providers the agent was started with
             # (``--allow-providers``), and its choices.
             "model",

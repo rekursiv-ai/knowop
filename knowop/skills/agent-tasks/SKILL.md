@@ -12,7 +12,8 @@ Every unit of work is tied to an issue: a task, a sub-agent's job, a pull reques
 an experiment. The agent that plans a task files its issue and names it in each
 agent's brief and each pull request. An agent spawned to help works under the
 issue its brief names, or its spawner's, and writes what it did there, or in a
-sub-issue that `narrows` it, before it reports.
+sub-issue that `narrows` it, before it answers or reports, whether to its spawner
+or to the person.
 
 1. Start: before anything else, find the task's issue: the one your brief names.
    Spawned with none, take your spawner's: `id` of the session `session.self`

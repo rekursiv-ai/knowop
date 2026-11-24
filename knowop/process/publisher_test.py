@@ -1340,6 +1340,56 @@ async def test_a_child_that_joins_at_work_goes_up_at_its_own_save_its_secrets_ma
     assert not any("hunter2-hunter2" in body for body in bodies)
 
 
+def _team_told(
+    sent: Sequence[EventLine | StateLine | SettingsLine],
+) -> list[tuple[str, UUID | None]]:
+    """Return each member of the team the last state sent names, with its session."""
+    [*_, state] = (line.state for line in sent if isinstance(line, StateLine))
+    return [(m.label, m.session) for m in state.team or ()]
+
+
+# Chat draws an agent's tab by its member: a child's own first event may come a model
+# call after it joined and its session opened.
+@pytest.mark.asyncio
+async def test_a_child_is_told_as_it_joins_and_again_once_its_session_opens(
+    tmp_path: Path,
+) -> None:
+    team = Team(catalog=ModelCatalog(factories={}))
+    journal = JsonlJournal(tmp_path / _FOLDER / "session.jsonl")
+    kid_journal = JsonlJournal(tmp_path / _FOLDER / uuid4().hex / "session.jsonl")
+    agent, kid = (
+        _scripted(tmp_path, journal=journal),
+        _scripted(tmp_path, journal=kid_journal),
+    )
+    store = _Store()
+    sent: list[EventLine | StateLine | SettingsLine] = []
+    async with journal, agent, team, kid_journal, kid:
+        _ = team.join(agent)
+        publisher = Publisher(
+            agent,
+            team=team,
+            client=store,
+            session_id=_SESSION,
+            part=_PART,
+            start=0,
+            send=sent.append,
+        )
+        try:
+            _ = team.join(kid, label="kid", parent="Agent")
+            await asyncio.sleep(0)
+            joined = _team_told(sent)
+            # Its first upload opens its session; the kid itself does nothing.
+            await publisher.caught_up()
+            await asyncio.sleep(0)
+            opened = _team_told(sent)
+        finally:
+            await publisher.aclose()
+
+    [kids] = store.children
+    assert joined == [("Agent", _SESSION), ("kid", None)]
+    assert opened == [("Agent", _SESSION), ("kid", kids)]
+
+
 @pytest.mark.asyncio
 async def test_a_job_that_runs_until_stopped_keeps_nothing_working_and_no_turn_open(
     tmp_path: Path,
