@@ -320,6 +320,9 @@ class _Server(_Client):
     author: str = ""
     parts: list[PartBody] = field(default_factory=list[PartBody])
     stored: list[RecordBody] = field(default_factory=list[RecordBody])
+    appended: threading.Event = field(default_factory=threading.Event)
+    """Set at each append, on the worker thread an upload sends from."""
+
     failing: list[ClientError] = field(default_factory=list[ClientError])
     started: list[ProcessSpec] = field(default_factory=list[ProcessSpec])
     answer: AgentProcess | None = None
@@ -538,6 +541,7 @@ class _Server(_Client):
         if self.failing:
             raise self.failing.pop(0)
         self.stored.extend(records)
+        self.appended.set()
         return None
 
     def session_start(self, body: SessionStart) -> SessionStartResponse:
@@ -2206,22 +2210,28 @@ async def test_a_call_cut_off_by_a_move_is_answered_interrupted_on_the_new_host(
         stored=list(server.stored),
     )
     monkeypatch.setattr(resume, "state_dir", lambda: tmp_path / "destination-state")
+    held = len(destination.stored)
     async with (
         _relayed() as target,
         _serving(target, server=destination, host="destination") as (target_task, _),
     ):
         _ = await target.seen(_is("settings"))
-        assert opened.agent is not None
-        (answered,) = [
-            r for r in opened.agent.session.history() if isinstance(r, ToolMessage)
-        ]
+        # Stored before any line comes: Chat reads the server, not the journal.
+        assert await asyncio.to_thread(destination.appended.wait, 5)
+        before_any_line = destination.stored[held:]
         assert target.found(_is("event", event="ModelResponseStarted")) is None
         await target.close(CLOSE_ENDED)
         assert await _exited(target_task) == 0
-    assert (answered.call_id, answered.state, answered.text()) == (
+    (answered,) = [
+        each.payload
+        for each in before_any_line
+        if isinstance(each.payload, dict)
+        and each.payload.get("py/object") == "ToolMessage"
+    ]
+    assert (answered["call_id"], answered["state"], answered["stderr"]) == (
         "moving",
         "failed",
-        "[interrupted]",
+        ("[interrupted]",),
     )
 
 
