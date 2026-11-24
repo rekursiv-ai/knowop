@@ -440,8 +440,6 @@ async def serve(
             ) as o:
                 if fresh:
                     effort_default(o.agent)
-                for member in o.team.values():
-                    answer_interrupted(member)
                 ended = await _live(
                     o,
                     socket=socket,
@@ -918,6 +916,10 @@ async def _live(
         send=socket.send,
     )
     o.agent.runtime.observers.append(publisher)
+    # After the publisher listens: the save each answer asks for uploads it at once,
+    # where before it would wait for the person's next turn.
+    for member in o.team.values():
+        answer_interrupted(member)
     # The agent runs from ``opened`` on, so nothing is awaited before the publisher
     # listens: what the agent says meanwhile, its first idle among it, would reach no
     # viewer. The journal is read then, off the loop, and before any line is delivered.
