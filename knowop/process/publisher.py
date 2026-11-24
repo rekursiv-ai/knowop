@@ -180,9 +180,9 @@ class Publisher:
         # The children whose events this publisher hears, by label.
         self._heard: dict[str, _Child] = {}
         # Whether the root called its model since its turn last ended.
-        self._worked = False  # pragma: no mutate[truthiness]
+        self._worked = False  # pragma: no mutate[truthiness] -- Only truth is read.
         # Whether the root's model works on its turn: from a call's start to its ModelIdle.
-        self._calling = False  # pragma: no mutate[truthiness]
+        self._calling = False  # pragma: no mutate[truthiness] -- Only truth is read.
         self._turn_ended: datetime | None = None
         # The next read of the state while busy; none once closed.
         self._tick: asyncio.TimerHandle | None = None
@@ -249,7 +249,7 @@ class Publisher:
 
     async def aclose(self) -> None:
         """Stop each upload running and the state's reads, and hear of no more agents."""
-        self._open = False  # pragma: no mutate[truthiness]
+        self._open = False  # pragma: no mutate[truthiness] -- Only truth is read.
         for read in (self._tick, self._soon):
             if read is not None:
                 read.cancel()
@@ -279,11 +279,13 @@ class Publisher:
             self._worked = self._calling = True
             return
         if isinstance(event, ModelIdle):
-            self._calling = False  # pragma: no mutate[truthiness]
+            # pragma: no mutate[truthiness] start -- Only truth is read.
+            self._calling = False
+            # pragma: no mutate end
         if (
             isinstance(event, ModelIdle) and not isinstance(event.outcome, Succeeded)
         ) or (isinstance(event, AgentIdle) and self._worked):
-            self._worked = False  # pragma: no mutate[truthiness]
+            self._worked = False  # pragma: no mutate[truthiness] -- Only truth is read.
             self._turn_ended = datetime.now(UTC)
 
     # A runtime tells of each event inside the step that takes it: of a reply's end

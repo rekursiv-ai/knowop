@@ -292,7 +292,7 @@ class ToolServing:
         instance: uuid.UUID,
     ) -> None:
         path = wire_tools.HOST_TOOLS_MUX_PATH.format(host_id=host_id)
-        last = None  # pragma: no mutate[truthiness]
+        last = None  # pragma: no mutate[truthiness] -- Only truth is read.
         while not self._stop.is_set():
             try:
                 async with connect(

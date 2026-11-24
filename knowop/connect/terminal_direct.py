@@ -139,7 +139,7 @@ class DirectRouter:
         self._send_lock = asyncio.Lock()
         self._peer: DirectPeer | None = None
         self._gen = 0
-        self._fenced = False  # pragma: no mutate[truthiness]
+        self._fenced = False  # pragma: no mutate[truthiness] -- Only `if self._fenced:` reads it, so falsy values act alike.
         """The browser's relay fence came before it switched the route."""
 
         self._last_input = clock()
@@ -343,7 +343,7 @@ class DirectRouter:
         peer.send(encode_frame(Frame.ACK, resume.to_bytes(8)))
         self._send_output(peer, data)
         if self._fenced:
-            self._fenced = False  # pragma: no mutate[truthiness]
+            self._fenced = False  # pragma: no mutate[truthiness] -- Only `if self._fenced:` reads it, so falsy values act alike.
             peer.send(self._fence())
         if self._keepalive is None or self._keepalive.done():
             self._keepalive = asyncio.create_task(self._report_idle())

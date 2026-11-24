@@ -809,7 +809,7 @@ def _standing_labels(journal: Path) -> dict[str, str]:
                 child = from_plain(
                     record.payload.get("journal"),
                     str,
-                    default="",  # pragma: no mutate[truthiness]
+                    default="",  # pragma: no mutate[truthiness] -- Only the truth of `child` is read, by its `if child:` test.
                 )
                 if child:
                     labels[PurePath(child).parent.name] = from_plain(

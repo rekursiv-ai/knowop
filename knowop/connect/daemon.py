@@ -407,7 +407,7 @@ def _heartbeat(
     claim: Claim = "take"
     unsent = facts
     failures = 0
-    told = False  # pragma: no mutate[truthiness]
+    told = False  # pragma: no mutate[truthiness] -- Only `not told` reads it, a truth test.
     while True:
         try:
             beat = client.heartbeat_host(

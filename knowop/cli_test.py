@@ -275,6 +275,9 @@ class _Served:
     """The server of the login the host signs in with; empty for none. Left out of
     comparisons: the tests that compare whole calls ask what was served."""
 
+    given: str = field(default="", compare=False)
+    """The token the connect was handed, whether or not a saved credential serves it."""
+
 
 class _Host:
     """Stands in for ``serve.connect_host``: records the call, takes a token."""
@@ -319,8 +322,7 @@ class _Host:
             raise self.ending
         if isinstance(self.ending, int):
             os.kill(os.getpid(), self.ending)
-            # The signal's handler raises into this wait at once; 5 s only bounds a broken one.
-            time.sleep(5)  # house-ignore[sleep] -- See above.
+            time.sleep(5)  # house-ignore[sleep] -- The handler interrupts at once.
         reads_token = self.reads_token and (name, server) not in self.saved
         if reads_token and not token and signed_in is not None:
             token = signed_in().enroll_host(name).token
@@ -339,6 +341,7 @@ class _Host:
                 results_max=results_max,
                 join_only=join_only,
                 signed_in_to=signed_in_to,
+                given=token,
             ),
         )
         if join_only:
@@ -582,21 +585,29 @@ def test_output_goes_out_line_by_line_so_a_reader_sees_the_code_at_once(
 
 
 @pytest.mark.parametrize(
-    "target",
-    ["Acme", "acme.knowop.ai", "acme corp", "acme-", "ftp://acme.example"],
+    ("target", "message"),
+    [
+        ("Acme", "'Acme' is neither an org name, such as acme, nor a URL"),
+        (
+            "acme.knowop.ai",
+            "'acme.knowop.ai' is neither an org name, such as acme, nor a URL",
+        ),
+        ("acme corp", "'acme corp' is neither an org name, such as acme, nor a URL"),
+        ("acme-", "'acme-' is neither an org name, such as acme, nor a URL"),
+        ("ftp://acme.example", "login URL has invalid URL 'ftp://acme.example'"),
+    ],
 )
 def test_login_refuses_what_is_neither_an_org_nor_a_url(
     server: _Server,
     capsys: pytest.CaptureFixture[str],
     target: str,
+    message: str,
 ) -> None:
     assert _knowop("login", target) == 1
 
     assert server.requests == []
     assert list_profiles() == []
-    err = capsys.readouterr().err
-    assert err.startswith("knowop: ")
-    assert err.count("\n") == 1
+    assert capsys.readouterr().err == f"knowop: {message}\n"
 
 
 def test_login_refuses_plain_http_beyond_this_computer(
@@ -900,7 +911,7 @@ def test_logout_logs_this_computers_host_out_and_its_key_goes_with_it(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     server.key_host = "ada-mac"
-    server.runs["ada-mac"] = [_run("chat-1a2b3c4d")]
+    server.runs["ada-mac"] = [_run("chat-1a2b3c4d"), {**_run("x"), "run": None}]
     assert _knowop("login", "acme") == 0
     capsys.readouterr()
 
@@ -911,7 +922,10 @@ def test_logout_logs_this_computers_host_out_and_its_key_goes_with_it(
     assert not any(path.endswith("/revoke") for path in server.paths())
     assert list_profiles() == []
     assert capsys.readouterr().out.splitlines() == [
-        "logged out: host ada-mac; runs stopped: chat-1a2b3c4d; keys revoked: 1",
+        (
+            "logged out: host ada-mac; runs stopped: chat-1a2b3c4d, "
+            "11111111-1111-1111-1111-111111111111; keys revoked: 1"
+        ),
         "logged out: revoked its key; deleted profile acme.knowop.ai",
     ]
 
@@ -962,13 +976,71 @@ def test_logout_keeps_the_profile_when_the_key_cannot_be_revoked(
 
 def test_logout_of_a_key_revoked_elsewhere_still_removes_its_profile(
     server: _Server,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert _knowop("login", "acme") == 0
     server.revoked = True
+    capsys.readouterr()
 
     assert _knowop("logout") == 0
 
     assert not any(path.endswith("/revoke") for path in server.paths())
+    assert list_profiles() == []
+    assert capsys.readouterr().out == (
+        "logged out: its key was revoked already; deleted profile acme.knowop.ai\n"
+    )
+
+
+@pytest.mark.usefixtures("server")
+def test_logout_keeps_a_pin_that_names_another_profile() -> None:
+    assert _knowop("login", "acme") == 0
+    pin = config_dir() / "rekursiv-ai" / "trax" / "current"
+    pin.parent.mkdir(parents=True, exist_ok=True)
+    pin.write_text("other\n")
+
+    assert _knowop("logout") == 0
+
+    assert pin.read_text() == "other\n"
+
+
+def test_keep_logins_records_names_and_removes_the_record_when_none() -> None:
+    record = config_dir() / "rekursiv-ai" / "knowop" / "profile"
+    cli._keep_logins([])
+    cli._keep_logins(["acme.knowop.ai"])
+    cli._keep_logins(["staging", "acme.knowop.ai"])
+    assert record.read_text() == "staging\nacme.knowop.ai\n"
+
+    cli._keep_logins([])
+
+    assert not record.exists()
+
+
+def test_login_gives_up_when_its_code_expires_on_the_clock_it_is_given(
+    server: _Server,
+) -> None:
+    server.decision = "pending"
+    clock = _Time()
+    polls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        polls.append(seconds)
+        clock.sleep(seconds)
+        assert len(polls) < 200
+
+    assert cli.main(["login", "acme"], sleep=sleep, clock=clock.clock) == 1
+
+    assert clock.now >= _CODE.expires_in
+
+
+@pytest.mark.usefixtures("server")
+def test_logout_without_a_service_manager_still_logs_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "here", lambda: None)
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("logout") == 0
+
     assert list_profiles() == []
 
 
@@ -1180,6 +1252,85 @@ def test_connect_logs_in_again_when_the_server_refuses_the_saved_login(
         ("gpu1", _LOGIN_TOKEN),
         ("gpu1", ""),
     ]
+    assert [served.given for served in host.connects] == [_LOGIN_TOKEN, ""]
+
+
+@pytest.mark.usefixtures("server")
+def test_connect_with_a_name_sleeps_on_the_sleep_it_is_given(host: _Host) -> None:
+    assert _knowop("login", "acme") == 0
+    host.waits = 1
+    waits: list[float] = []
+
+    assert (
+        cli.main(["connect", "--name", "gpu1"], sleep=waits.append, clock=_Time().clock)
+        == 0
+    )
+
+    assert waits == [15.0, 15.0]
+
+
+@pytest.mark.usefixtures("launchd", "host")
+def test_connect_at_a_terminal_keeps_the_name_it_was_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _at_terminal(monkeypatch)
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("connect", "--name", "gpu1") == 0
+
+    assert hosts.host_name(_ACME) == "gpu1"
+
+
+@pytest.mark.usefixtures("launchd")
+def test_connect_at_a_terminal_serves_from_its_service_and_waits_for_it(
+    server: _Server,
+    host: _Host,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _at_terminal(monkeypatch)
+    assert _knowop("login", "acme") == 0
+    host.waits = 1
+    waits: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        server.serves("ada-mac", pid=4243)
+
+    assert cli.main(["connect"], sleep=sleep, clock=_Time().clock) == 0
+
+    assert [served.server for served in host.connects] == [_ACME]
+    assert waits == [15.0]
+
+
+@pytest.mark.usefixtures("launchd", "host")
+def test_connect_at_a_terminal_refuses_a_taken_name_as_403(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _at_terminal(monkeypatch)
+    monkeypatch.setattr(getpass, "getuser", lambda: "ada")
+    refusals: list[int] = []
+
+    def record(
+        name: str,
+        *,
+        server: str,
+        account: str,
+        status_code: int,
+    ) -> ClientError:
+        refusals.append(status_code)
+        return hosts.taken_name_error(
+            name,
+            server=server,
+            account=account,
+            status_code=status_code,
+        )
+
+    monkeypatch.setattr(cli, "taken_name_error", record)
+    assert _knowop("login", "acme") == 0
+
+    assert _knowop("connect", "--name", "lab") == 1
+
+    assert refusals == [403]
 
 
 def test_connect_with_no_exec_serves_terminals_only(host: _Host) -> None:
@@ -1632,6 +1783,19 @@ def test_session_download_with_a_profile_named_goes_to_that_login(
 
     assert server.requests[-1].url.host == "staging.example"
     assert out.read_bytes() == _DOWNLOAD
+
+
+def test_session_names_the_session_under_the_profile_named(
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_profile("staging", Profile(url="https://staging.example", api_key=_KEY))
+    assert _knowop("login", "acme") == 0
+    monkeypatch.setenv("TRAX_SESSION", _SESSION)
+
+    assert _knowop("--profile", "staging", "session") == 0
+
+    assert server.requests[-1].url.host == "staging.example"
 
 
 def test_session_download_help_says_what_it_writes_and_where(
@@ -2256,6 +2420,28 @@ def test_a_run_connects_this_computer_to_the_server_its_profile_names(
 
     assert f"not connected to {_ACME}; connecting" in capsys.readouterr().err
     assert agents.every() == [Connect(name="ada-mac", server=_ACME, flags=())]
+    assert runners.calls() == [("run", ["--headless"])]
+
+
+@pytest.mark.usefixtures("launchd", "host")
+def test_a_run_whose_saved_login_the_server_refuses_logs_in_again(
+    server: _Server,
+    runners: _Runners,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _knowop("login", "acme") == 0
+    server.hosts = [_host("ada-mac", status="offline", owner=_EMAIL)]
+
+    # The saved login is refused once the run has listed the hosts.
+    def refused(profile: object) -> bool:
+        del profile
+        return False
+
+    monkeypatch.setattr(cli, "_accepted", refused)
+
+    assert _knowop("run", "--headless") == 0
+
+    assert server.paths().count(DEVICE_CODE_PATH) == 2
     assert runners.calls() == [("run", ["--headless"])]
 
 
@@ -3502,6 +3688,7 @@ def _connect_log(name: str) -> Path:
     [
         ([], "serving: one\njoined: two\nretrying: three\n"),
         (["-n", "2"], "joined: two\nretrying: three\n"),
+        (["-n", "5"], "serving: one\njoined: two\nretrying: three\n"),
         (["gpu1", "-n", "0"], ""),
     ],
 )
@@ -3518,6 +3705,24 @@ def test_logs_prints_a_hosts_log_here_or_its_last_lines(
     assert _knowop("logs", *argv) == 0
 
     assert capsys.readouterr().out == printed
+
+
+def test_logs_follow_prints_nothing_twice_when_the_log_gains_nothing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _ = _connect_log("ada-mac")
+    assert _knowop("login", "acme") == 0
+    capsys.readouterr()
+    waits: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        if len(waits) > 1:
+            raise KeyboardInterrupt
+
+    assert cli.main(["logs", "-f"], sleep=sleep, clock=_Time().clock) == 130
+
+    assert capsys.readouterr().out == "serving: one\njoined: two\nretrying: three\n"
 
 
 def test_logs_follow_reads_on_from_the_start_of_a_rotated_log(
@@ -3635,6 +3840,7 @@ def test_status_json_holds_each_login_and_the_services(
         "knowop_version": "0.1.6",
         "started_at": started,
     }
+    server.facts["gpu1"] = {"started_at": started}
     server.runs["gpu1"] = [_run("chat-1a2b3c4d")]
     assert _knowop("login", "acme") == 0
     capsys.readouterr()

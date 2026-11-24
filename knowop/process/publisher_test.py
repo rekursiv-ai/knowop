@@ -367,6 +367,7 @@ async def test_each_child_goes_up_to_a_session_of_its_own_spawned_by_its_spawner
         (kid_id, f"sagent/{kid_id}", "kid"),
         (grandkid_id, f"sagent/{grandkid_id}", "grandkid"),
     ]
+    assert {s.cli for s in p.store.starts} == {"sagent"}
     assert [s.spawned_by for s in p.store.starts] == [
         _SESSION,
         uuid5(NAMESPACE_URL, kid_id),
@@ -2095,6 +2096,152 @@ async def test_with_no_secret_named_an_event_goes_up_as_it_is(tmp_path: Path) ->
     assert p.events()[0].payload == event_payload(
         types.ModelResponseTextStreamed(text="hunter2-hunter2"),
     )
+
+
+@pytest.mark.asyncio
+async def test_a_text_change_is_sent_once_a_line_period_has_passed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(status_module, "time", clock)
+    monkeypatch.setattr(publisher_module, "time", clock)
+    async with _published(tmp_path) as p:
+        await _told(p, types.ModelResponseStarted())
+        before = len(p.states())
+        clock.now += publisher_module._LINE_SEC
+        await _told(p, types.ModelResponseTextStreamed(text="x"))
+
+    assert len(p.states()) == before + 1
+
+
+@pytest.mark.asyncio
+async def test_an_event_of_exactly_the_most_bytes_is_sent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def at_bound(line: EventLine) -> int:
+        del line
+        return MAX_EVENT_BYTES
+
+    monkeypatch.setattr(publisher_module, "encoded_size", at_bound)
+    async with _published(tmp_path) as p:
+        p.publisher(types.ModelResponseTextStreamed(text="x"))
+
+    assert "ModelResponseTextStreamed" in [line.kind for line in p.events()]
+
+
+@pytest.mark.asyncio
+async def test_an_event_too_large_to_cut_is_warned_of_with_its_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def over_bound(line: EventLine) -> int:
+        del line
+        return MAX_EVENT_BYTES + 1
+
+    monkeypatch.setattr(publisher_module, "encoded_size", over_bound)
+    async with _published(tmp_path) as p:
+        p.publisher(types.ModelResponseTextStreamed(text="x"))
+
+    warned = [r.args for r in caplog.records if r.name == publisher_module.__name__]
+    assert ("ModelResponseTextStreamed",) in warned
+    assert p.events() == []
+
+
+@pytest.mark.asyncio
+async def test_a_background_job_title_goes_up_with_its_secret_masked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRAX_REDACT_NAMES", "KEY")
+    monkeypatch.setenv("KEY", "hunter2-hunter2")
+    waiting = _Waiting()
+    async with _published(
+        tmp_path,
+        reply(
+            calls=[
+                call("wait", "w1", what="hunter2-hunter2", background=True),
+            ],
+        ),
+        reply("started it"),
+        reply("it is built"),
+        tools=[waiting],
+    ) as p:
+        answered = _when(p.agent, ModelIdle)
+        turn = asyncio.create_task(p.agent.send("go"))
+        _ = await answered.wait()
+        running = p.states()[-1].state
+        waiting.release.set()
+        _ = await turn
+
+    assert running.jobs is not None
+    [job] = running.jobs
+    assert "[redacted:KEY]" in job.title
+    assert "hunter2" not in job.title
+
+
+@pytest.mark.asyncio
+async def test_a_child_with_no_journal_is_stored_in_no_session(
+    tmp_path: Path,
+) -> None:
+    async with _published(tmp_path) as p:
+        _ = p.team.join(p.agent)
+        kid = _scripted(tmp_path)
+        async with kid:
+            _ = p.team.join(kid, label="kid", parent="Agent")
+            kid.runtime.publish(types.SessionSaveDue())
+            await asyncio.sleep(0)
+            members = p.states()[-1].state.team or ()
+
+    assert [m.session for m in members if m.label == "kid"] == [None]
+
+
+@pytest.mark.asyncio
+async def test_a_child_s_session_waits_for_its_spawner_s_to_open(
+    tmp_path: Path,
+) -> None:
+    part = publisher_module._Part(session_id=_SESSION, name=_PART, start=0)
+
+    async def opened() -> publisher_module._Part:
+        return part
+
+    journal = publisher_module._Journal(
+        _scripted(tmp_path),
+        client=_Store(),
+        redactor=None,
+        opened=opened,
+        ends=lambda _error: False,
+    )
+    waiting = asyncio.create_task(journal.session())
+    await asyncio.sleep(0)
+    assert not waiting.done()
+    _ = await journal._part_opened()
+    assert await waiting == _SESSION
+
+
+@pytest.mark.asyncio
+async def test_a_journal_s_close_waits_for_its_upload_to_stop(
+    tmp_path: Path,
+) -> None:
+    async def opened() -> publisher_module._Part:
+        _ = await asyncio.Event().wait()
+        raise AssertionError("never opened")
+
+    journal = publisher_module._Journal(
+        _scripted(tmp_path),
+        client=_Store(),
+        redactor=None,
+        opened=opened,
+        ends=lambda _error: False,
+    )
+    journal.upload()
+    await asyncio.sleep(0)
+    await journal.aclose()
+    upload = journal._uploading
+    assert upload is not None
+    assert upload.done()
 
 
 if __name__ == "__main__":

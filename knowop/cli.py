@@ -255,8 +255,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "login",
         help="log in with a code approved in a browser",
         description=(
-            "Log in with a code approved in a browser; knowop uses this login "  # pragma: no mutate[diagnostic-text]
-            "from then on."  # pragma: no mutate[diagnostic-text]
+            "Log in with a code approved in a browser; knowop uses this login "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "from then on."  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
         ),
     )
     verb.add_argument(
@@ -270,10 +270,10 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "logout",
         help="log this computer out, revoke knowop's key and delete its profile",
         description=(
-            "Log this computer's host out on the server, revoke knowop's key, "  # pragma: no mutate[diagnostic-text]
-            "delete its profile and remove this computer's connect services. NAME "  # pragma: no mutate[diagnostic-text]
-            "logs that host out alone, as the Hosts page does: its connect is "  # pragma: no mutate[diagnostic-text]
-            "revoked, its runs stop, and the keys its logins made are revoked."  # pragma: no mutate[diagnostic-text]
+            "Log this computer's host out on the server, revoke knowop's key, "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "delete its profile and remove this computer's connect services. NAME "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "logs that host out alone, as the Hosts page does: its connect is "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "revoked, its runs stop, and the keys its logins made are revoked."  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
         ),
     ).add_mutually_exclusive_group()
     logout.add_argument(
@@ -291,9 +291,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "status",
         help="show knowop's profile, server, account, role, hosts and their runs",
         description=(
-            "Show knowop's profile, server, account and role; each of your hosts, "  # pragma: no mutate[diagnostic-text]
-            "online or not, with its knowop version and process while online, and "  # pragma: no mutate[diagnostic-text]
-            "its live sessions; and this computer's connect services, with their flags."  # pragma: no mutate[diagnostic-text]
+            "Show knowop's profile, server, account and role; each of your hosts, "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "online or not, with its knowop version and process while online, and "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "its live sessions; and this computer's connect services, with their flags."  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
         ),
     ).add_argument(
         "--json",
@@ -304,19 +304,19 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "menubar",
         help="show this computer's connects in the macOS menu bar",
         description=(
-            "Show the knowop mark in the macOS menu bar, dimmed while a connect "  # pragma: no mutate[diagnostic-text]
-            "service here is not online, with a menu of each server knowop is logged "  # pragma: no mutate[diagnostic-text]
-            "in to and its hosts. knowop connect starts it at login beside its "  # pragma: no mutate[diagnostic-text]
-            "connect services; Quit stops them and it until then."  # pragma: no mutate[diagnostic-text]
+            "Show the knowop mark in the macOS menu bar, dimmed while a connect "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "service here is not online, with a menu of each server knowop is logged "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "in to and its hosts. knowop connect starts it at login beside its "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "connect services; Quit stops them and it until then."  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
         ),
     )
     logs = verbs.add_parser(
         "logs",
         help="print or follow the log of a host's connect on this computer",
         description=(
-            "Print the log the connect service of a host writes on this computer, "  # pragma: no mutate[diagnostic-text]
-            "or follow it. A connect in the foreground prints to its terminal "  # pragma: no mutate[diagnostic-text]
-            "instead, and a host connected elsewhere keeps its log there."  # pragma: no mutate[diagnostic-text]
+            "Print the log the connect service of a host writes on this computer, "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "or follow it. A connect in the foreground prints to its terminal "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "instead, and a host connected elsewhere keeps its log there."  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
         ),
     )
     logs.add_argument(
@@ -342,11 +342,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "disconnect",
         help="disconnect a host of yours on the server, stopping its runs",
         description=(
-            "Disconnect the host on the server: its connect is revoked, and every run "  # pragma: no mutate[diagnostic-text]
-            "of yours that names it is stopped, here or anywhere. Its connect service "  # pragma: no mutate[diagnostic-text]
-            "on this computer is removed, and it waits until the server shows the "  # pragma: no mutate[diagnostic-text]
-            "host offline. knowop connect joins it again, with no login; knowop "  # pragma: no mutate[diagnostic-text]
-            "logout also revokes this computer's key."  # pragma: no mutate[diagnostic-text]
+            "Disconnect the host on the server: its connect is revoked, and every run "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "of yours that names it is stopped, here or anywhere. Its connect service "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "on this computer is removed, and it waits until the server shows the "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "host offline. knowop connect joins it again, with no login; knowop "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "logout also revokes this computer's key."  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
         ),
     ).add_argument(
         "name",
@@ -382,9 +382,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "job",
         help="run, list and cancel jobs on a GPU node, and keep their secrets",
         description=(
-            "Run a job on a GPU node from this repository as knowop's account, read "  # pragma: no mutate[diagnostic-text]
-            "its log and results, list and cancel jobs, and keep their secrets; its "  # pragma: no mutate[diagnostic-text]
-            "arguments pass to the job runner unchanged."  # pragma: no mutate[diagnostic-text]
+            "Run a job on a GPU node from this repository as knowop's account, read "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "its log and results, list and cancel jobs, and keep their secrets; its "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+            "arguments pass to the job runner unchanged."  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
         ),
         usage="knowop job submit|logs|results|status|cancel|secrets|secret ...",
     )
@@ -433,12 +433,12 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
             "upload",
             help="send finished Claude Code, Codex and sagent sessions to the server",
             description=(
-                "Send finished Claude Code, Codex and sagent sessions to the server, "  # pragma: no mutate[diagnostic-text]
-                "each as an AgentSession under the CLI's own id for it, started and "  # pragma: no mutate[diagnostic-text]
-                "ended when it was. A folder is searched for session files; a "  # pragma: no mutate[diagnostic-text]
-                "session's sub-agents go too, each linked to the session that spawned "  # pragma: no mutate[diagnostic-text]
-                "it. Uploading a session again sends only what the server lacks, and "  # pragma: no mutate[diagnostic-text]
-                "leaves it to the readers it has."  # pragma: no mutate[diagnostic-text]
+                "Send finished Claude Code, Codex and sagent sessions to the server, "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+                "each as an AgentSession under the CLI's own id for it, started and "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+                "ended when it was. A folder is searched for session files; a "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+                "session's sub-agents go too, each linked to the session that spawned "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+                "it. Uploading a session again sends only what the server lacks, and "  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
+                "leaves it to the readers it has."  # pragma: no mutate[diagnostic-text] -- Argparse help a person reads; no code matches its wording.
             ),
         ),
     )
@@ -646,7 +646,7 @@ def _running_session() -> uuid.UUID:
     """Return the session ``$TRAX_SESSION`` names, the one whose agent runs this."""
     text = os.environ.get("TRAX_SESSION") or ""
     if not text:
-        # pragma: no mutate[diagnostic-text] start
+        # pragma: no mutate[diagnostic-text] start -- A test matches a substring only.
         raise ClientError(
             "no agent's session runs this command ($TRAX_SESSION is unset); an agent "
             "whose tools run on another host asks its KnowOp tool's session.self",
@@ -1126,7 +1126,7 @@ def _connect(
         _serve(
             name,
             server,
-            profile="",  # pragma: no mutate[truthiness]
+            profile="",  # pragma: no mutate[truthiness] -- _serve reads only its truth.
             token=piped,
             flags=flags,
             sleep=sleep,
@@ -1462,9 +1462,7 @@ def _hand_off(
         # The login is read only when a form asks the server: help needs none.
         command = Hosts if verb == HOST_WORD else canvas.Canvas
         command.dispatch(
-            # Neither command reads the verb it is run under (each has one name, and
-            # ``del``s it), so a mutant that hands it none is this same call.
-            verb,  # pragma: no mutate
+            verb,  # pragma: no mutate -- Neither command reads its verb.
             args,
             lambda: connect(argparse.Namespace(profile=_profile(named)[0])),
         )
@@ -1542,9 +1540,7 @@ def _connected_here(
             cast(Flags, parser.parse_args(words)),
             named=named,
             sleep=sleep,
-            # The run's login was just accepted, so this connect never logs in, and
-            # never reads a login code's clock.
-            clock=time.monotonic,  # pragma: no mutate
+            clock=time.monotonic,  # pragma: no mutate -- This connect never reads the clock.
             for_run=True,
         )
     finally:
