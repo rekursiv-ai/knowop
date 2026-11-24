@@ -60,7 +60,10 @@ from sagent.journal.jsonl import JournalInUseError
 from sagent.journal.types import (
     AgentMessage,
     Attachment,
+    ToolMessage,
     UncategorizedToolResult,
+    now_timestamp,
+    pairings,
 )
 from sagent.runtime import types
 from sagent.tools.agent_spawn import AgentSpawn
@@ -437,6 +440,8 @@ async def serve(
             ) as o:
                 if fresh:
                     effort_default(o.agent)
+                for member in o.team.values():
+                    answer_interrupted(member)
                 ended = await _live(
                     o,
                     socket=socket,
@@ -647,6 +652,38 @@ def session_user(client: ServeClient, session_id: UUID, *, tui: bool) -> str | N
             error,
         )
         return None
+
+
+def answer_interrupted(agent: Agent) -> None:
+    """Answer each call the session's last process left with no result ``[interrupted]``.
+
+    A call cut off by a stop, a crash or a move has no result, so Chat draws it
+    running. sagent answers such a call only at its next model call, after the
+    person's next line, and in a new window Chat does not read. Answered here, at
+    the end, it is a plain record Chat pairs with its call at once.
+
+    Args:
+      agent: An agent of the session, opened, before its first turn.
+
+    """
+    cut_off = pairings(list(agent.session))[1]
+    if not cut_off:
+        return
+    agent.session.append(
+        *(
+            ToolMessage(
+                call_id=cid,
+                timestamp=now_timestamp(),
+                state="failed",
+                stderr=("[interrupted]",),
+            )
+            for cid in cut_off
+        ),
+    )
+    # Its results now end the history, which the model would answer at the next
+    # wake; a resume answers nothing before the person's next line.
+    agent.runtime.hold_for_user()
+    agent.runtime.publish(types.SessionSaveDue())
 
 
 def effort_default(agent: Agent, effort: ThinkingEffort = KNOWOP_EFFORT) -> None:
