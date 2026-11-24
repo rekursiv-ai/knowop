@@ -228,7 +228,6 @@ async def test_launch_is_spawned_by_this_session_and_returns_number_not_event_se
     said = await _tools(client).act(
         action="session.launch",
         name="lead",
-        time="20",
         model="sol",
         effort="high",
         budget=0.5,
@@ -244,8 +243,6 @@ async def test_launch_is_spawned_by_this_session_and_returns_number_not_event_se
     assert client.started == [
         ProcessSpec(
             args=(
-                "--time",
-                "0-00:20:00",
                 "--name",
                 "lead",
                 "--model",
@@ -289,17 +286,6 @@ async def test_server_refusal_is_a_tool_answer(action: knowop.Action) -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_launch_opens_no_session() -> None:
-    client = _Client()
-    assert "no time limit" in await _tools(client).act(
-        action="session.launch",
-        name="lead",
-        time="bad",
-    )
-    assert client.starts == []
-
-
-@pytest.mark.asyncio
 async def test_launch_returns_the_servers_refusal_sentence() -> None:
     client = _Client()
     client.failure = ClientError(
@@ -307,7 +293,7 @@ async def test_launch_returns_the_servers_refusal_sentence() -> None:
         status_code=403,
     )
     assert (
-        await _tools(client).act(action="session.launch", time="20")
+        await _tools(client).act(action="session.launch")
         == "the server answered 403: This account cannot launch agents."
     )
     assert client.started == []
@@ -317,7 +303,7 @@ async def test_launch_returns_the_servers_refusal_sentence() -> None:
 async def test_remote_flags_are_checked_before_opening_a_session() -> None:
     client = _Client()
     assert (
-        await _tools(client).act(action="session.launch", name="--tools", time="20")
+        await _tools(client).act(action="session.launch", name="--tools")
         == "a remote agent takes --name with a value"
     )
     assert client.starts == []
@@ -337,21 +323,11 @@ async def test_stop_with_a_uuid_uses_it_without_an_inquiry_lookup() -> None:
 
 
 @pytest.mark.asyncio
-async def test_launch_requires_a_time_limit_before_opening_a_session() -> None:
-    client = _Client()
-    assert (
-        await _tools(client).act(action="session.launch")
-        == "session.launch requires a time limit"
-    )
-    assert client.starts == client.started == []
-
-
-@pytest.mark.asyncio
 async def test_preflight_tool_has_no_caller_and_opens_no_session() -> None:
     client = _Client()
     tools = knowop.KnowOpTools(client, session_id=None, records=_reads(_Server()))
     assert (
-        await tools.act(action="session.launch", time="20")
+        await tools.act(action="session.launch")
         == "session.launch requires a caller session"
     )
     assert client.starts == client.started == []
@@ -364,7 +340,6 @@ async def test_launch_refuses_a_blank_label_before_opening_a_session() -> None:
         await _tools(client).act(
             action="session.launch",
             name=" ",
-            time="20",
         )
         == "the agent label must not be blank"
     )
@@ -374,12 +349,10 @@ async def test_launch_refuses_a_blank_label_before_opening_a_session() -> None:
 @pytest.mark.asyncio
 async def test_launch_defaults_the_label_and_the_most_per_campaign() -> None:
     client = _Client()
-    assert await _tools(client).act(action="session.launch", time="3") == "Agent#412"
+    assert await _tools(client).act(action="session.launch") == "Agent#412"
     assert client.started == [
         ProcessSpec(
             args=(
-                "--time",
-                "0-00:03:00",
                 "--name",
                 "Agent",
                 "--max-budget-usd",
@@ -510,8 +483,7 @@ async def test_a_refused_limits_read_is_the_answer_and_starts_nothing() -> None:
     client = _Client()
     client.limits_refusal = 403
     assert (
-        await _tools(client).act(action="session.launch", time="3")
-        == "the server answered 403."
+        await _tools(client).act(action="session.launch") == "the server answered 403."
     )
     assert client.starts == client.started == []
 
@@ -709,9 +681,9 @@ async def test_a_confirmed_budget_over_the_limit_starts_with_that_budget(
     client = _Client()
     client.limits = [_EACH_CAMPAIGN]
     tools = _tools(client)
-    assert await tools.act(action=action, name=name, time="3") == "lead#412"
+    assert await tools.act(action=action, name=name) == "lead#412"
     assert client.started[-1].args[-2:] == ("--max-budget-usd", "20.5")
-    assert await tools.act(action=action, name=name, time="3", budget=30) == "lead#412"
+    assert await tools.act(action=action, name=name, budget=30) == "lead#412"
     assert client.started[-1].args[-2:] == ("--max-budget-usd", "30")
 
 
@@ -729,13 +701,12 @@ async def test_status_reads_one_named_sessions_process(state: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_continue_restarts_the_same_session_with_a_new_time_limit() -> None:
+async def test_continue_restarts_the_same_session() -> None:
     client = _Client()
     assert (
         await _tools(client).act(
             action="session.continue",
             name="lead#412",
-            time="3",
             model="sol",
             effort="high",
         )
@@ -746,8 +717,6 @@ async def test_continue_restarts_the_same_session_with_a_new_time_limit() -> Non
     assert client.started == [
         ProcessSpec(
             args=(
-                "--time",
-                "0-00:03:00",
                 "--name",
                 "lead",
                 "--model",
@@ -759,16 +728,6 @@ async def test_continue_restarts_the_same_session_with_a_new_time_limit() -> Non
             ),
         ),
     ]
-
-
-@pytest.mark.asyncio
-async def test_continue_requires_a_new_time_limit_before_starting() -> None:
-    client = _Client()
-    assert (
-        await _tools(client).act(action="session.continue", name="lead#412")
-        == "continue requires a new time limit"
-    )
-    assert client.starts == client.started == []
 
 
 @pytest.mark.asyncio

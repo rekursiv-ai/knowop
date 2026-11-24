@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol, TypedDict
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
-import argparse
 import asyncio
 import re
 
@@ -32,8 +31,7 @@ from knowop.hosts import (
     started_lines,
 )
 from knowop.jobs.job_records import NOT_HERE
-from knowop.process.command import time_limit
-from knowop.process.start import ProcessClient, start_args, started_process
+from knowop.process.start import ProcessClient, started_process
 
 
 if TYPE_CHECKING:
@@ -147,7 +145,6 @@ class KnowOpTools:
         *,
         action: Action,
         name: str = "",
-        time: str = "",
         model: str = "",
         effort: str = "",
         budget: float | None = None,
@@ -167,7 +164,6 @@ class KnowOpTools:
             iteration (campaign.score).
           name: The host name, launch label, required LABEL#N for session actions, or
             for ``session.budget`` a campaign's brief, Issue#N, to read its spend.
-          time: Required launch/continue Slurm time limit (20 means 20 minutes).
           model: Launch model; empty keeps the server's default.
           effort: Launch thinking effort; empty keeps the default.
           budget: Launch budget in USD; omitted takes the person's campaign limit.
@@ -195,7 +191,6 @@ class KnowOpTools:
                 self._act,
                 action=action,
                 name=name,
-                time=time,
                 model=model,
                 effort=effort,
                 budget=budget,
@@ -211,7 +206,7 @@ class KnowOpTools:
             )
         except ClientError as error:
             return server_answer(error)
-        except (ValueError, argparse.ArgumentTypeError, TimeoutError) as error:
+        except (ValueError, TimeoutError) as error:
             return str(error)
 
     def _act(
@@ -219,7 +214,6 @@ class KnowOpTools:
         *,
         action: Action,
         name: str,
-        time: str,
         model: str,
         effort: str,
         budget: float | None,
@@ -286,8 +280,6 @@ class KnowOpTools:
                 return self._set_campaign_most(budget)
             case "session.stop" | "session.status" | "session.continue":
                 target = SessionAgent.parse(name)
-                if action == "session.continue" and not time:
-                    return "continue requires a new time limit"
                 session_id = (
                     client.resolve_id(SeqRef(kind="AgentSession", seq=target.session))[
                         1
@@ -298,7 +290,6 @@ class KnowOpTools:
                 if action == "session.continue":
                     return self._started_session(
                         name=target.label,
-                        time=time,
                         model=model,
                         effort=effort,
                         budget=budget,
@@ -317,13 +308,10 @@ class KnowOpTools:
                     f"; {process.reason}" if process.reason else ""
                 )
             case "session.launch":
-                if not time:
-                    return "session.launch requires a time limit"
                 if self._session_id is None:
                     return "session.launch requires a caller session"
                 return self._started_session(
                     name=name,
-                    time=time,
                     model=model,
                     effort=effort,
                     budget=budget,
@@ -379,7 +367,6 @@ class KnowOpTools:
         self,
         *,
         name: str,
-        time: str,
         model: str,
         effort: str,
         budget: float | None,
@@ -395,7 +382,7 @@ class KnowOpTools:
         if budget is None:
             budget, _ = self._campaign_most()
         args.extend(("--max-budget-usd", f"{budget:g}"))
-        built = start_args(time_limit(time), args)
+        built = tuple(args)
         if refused := remote_flags_refused(built):
             return refused
         if session_id is None:
