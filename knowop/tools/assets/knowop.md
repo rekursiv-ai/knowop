@@ -39,18 +39,19 @@ the person its link.
 - `session.set_budget`: set the person's campaign limit to `budget` (USD),
   only when the person asks; every other limit stays.
 - `session.launch`: start a campaign lead on our cloud, spawned by this
-  session. `name` is its label; `time` is required, a Slurm time limit
-  (20 = 20 minutes). `model`, `effort`, and `budget` (USD) are optional;
-  `budget` defaults to the person's campaign limit (`session.budget`).
-  Returns `LABEL#N` once attached; use that name with AgentSend.
+  session. `name` is its label. It has no time limit: it runs until it
+  ends, is stopped, or spends its budget. `model`, `effort`, and `budget`
+  (USD) are optional; `budget` defaults to the person's campaign limit
+  (`session.budget`). Returns `LABEL#N` once attached; use that name with
+  AgentSend.
 - `session.status`: inspect session `name` (`LABEL#N`, required); answer
   its process state (starting, attached, detached) and reason. The server
   permits only sessions spawned below this session.
 - `session.stop`: stop the process of session `name` (`LABEL#N`).
 - `session.continue`: restart session `name` (`LABEL#N`, required) on the
-  SAME session and journal, with a new `time` limit (required). Optional
-  `model`, `effort`, and `budget` work as for launch. Returns `LABEL#N`
-  once attached. Messaging remains AgentSend to that name.
+  SAME session and journal. Optional `model`, `effort`, and `budget` work
+  as for launch. Returns `LABEL#N` once attached. Messaging remains
+  AgentSend to that name.
 - `session.self`: your own `LABEL#UUID`, as `--session` takes it.
 
 To download a session for the person, run
