@@ -47,8 +47,10 @@ from sagent.journal.types import (
     AgentMessage,
     AssistantMessage,
     Attachment,
+    ContextClear,
     ReadResult,
     SessionRecord,
+    ToolCall,
     ToolMessage,
     UncategorizedRecord,
     UncategorizedToolResult,
@@ -113,7 +115,7 @@ from trackinizer.wire.wire_terminals import (
     CLOSE_TAKEN_OVER,
 )
 from trackinizer.wire.wire_tools import TOOLS_WS_PATH
-from treekle import PlainTree, ReadError, from_plain
+from treekle import PlainTree, ReadError, from_plain, json_loads
 from websockets.asyncio.server import (
     ServerConnection,
     serve as serve_websockets,
@@ -879,6 +881,10 @@ async def test_an_agent_merges_the_skill_folders_its_service_names(
         _ = await _exited(task)
 
     user = data_dir() / "rekursiv-ai" / "sagent" / "skills"
+    # By the names each folder lists: a filesystem that ignores case finds any case.
+    assert "rekursiv-ai" in {each.name for each in data_dir().iterdir()}
+    assert "sagent" in {each.name for each in user.parent.parent.iterdir()}
+    assert "skills" in {each.name for each in user.parent.iterdir()}
     assert {each.name: each.readlink() for each in user.iterdir()} == {
         "pr": (tmp_path / "cloud" / "pr").resolve(),
         "tdd": (tmp_path / "repo" / "tdd").resolve(),
@@ -935,6 +941,51 @@ async def test_knowops_effort_is_high_where_the_model_offers_it_and_stands_at_on
     assert (
         ModelTags.parse(from_plain(stood["model"], ModelMemory).model).effort == effort
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answered", [False, True], ids=["cut off", "answered"])
+async def test_a_call_the_last_process_never_answered_is_journaled_interrupted(
+    tmp_path: Path,
+    *,
+    answered: bool,
+) -> None:
+    """Chat pairs a result by call id only from a plain record, never a new window."""
+    path = tmp_path / "session.jsonl"
+    async with JsonlJournal(path) as journal:
+        journal.append(
+            ContextClear(system_prompt="S"),
+            UserMessage(content="move"),
+            ToolCall(call_id="c1", name="Echo"),
+            *([ToolMessage(call_id="c1", state="done", stdout=("ok",))] * answered),
+        )
+    provider = ScriptedProvider()
+    journal = JsonlJournal(path)
+    agent = Agent(
+        model=provider["scripted"],
+        journal=journal,
+        tool_context=ToolContext(cwd=tmp_path),
+        system_prompt="S",
+    )
+    async with journal, agent:
+        main_module.answer_interrupted(agent)
+        # Written at once, so Chat has it before the agent's next turn.
+        journal.flush()
+        lines = [
+            json_loads(line, dict[str, object])
+            for line in path.read_text().splitlines()
+        ]
+
+    results = [
+        (line["state"], line.get("stderr", line.get("stdout")), "timestamp" in line)
+        for line in lines
+        if line["py/object"] == "ToolMessage"
+    ]
+    assert results == (
+        [("done", ["ok"], False)] if answered else [("failed", ["[interrupted]"], True)]
+    )
+    assert [line["py/object"] for line in lines].count("ContextClear") == 1
+    assert provider.requests == []
 
 
 def test_knowops_effort_turns_thinking_on_where_it_cannot_be_off(
@@ -2119,6 +2170,59 @@ async def test_an_ordinary_stop_and_resume_answers_on_another_host(
         )
         await target.close(CLOSE_ENDED)
         assert await _exited(target_task) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_call_cut_off_by_a_move_is_answered_interrupted_on_the_new_host(
+    opened: _Opened,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async with _relayed() as source, _serving(source) as (source_task, server):
+        _ = await source.seen(_is("settings"))
+        assert opened.agent is not None
+        opened.agent.session.append(
+            UserMessage(content="move"),
+            call("Bash", "moving", command="knowop run --on destination"),
+        )
+        journal = opened.agent.session.journal.path
+        assert journal is not None
+        _ = list(opened.agent.session.history())
+        await source.close(CLOSE_ENDED)
+        assert await _exited(source_task) == 0
+        count = len(
+            [line for line in journal.read_bytes().splitlines() if line.strip()],
+        )
+    destination = _Server(
+        version=1,
+        parts=[
+            PartBody(
+                part=0,
+                name=f"{journal.parent.name}.jsonl",
+                format="sagent",
+                records=count,
+            ),
+        ],
+        stored=list(server.stored),
+    )
+    monkeypatch.setattr(resume, "state_dir", lambda: tmp_path / "destination-state")
+    async with (
+        _relayed() as target,
+        _serving(target, server=destination, host="destination") as (target_task, _),
+    ):
+        _ = await target.seen(_is("settings"))
+        assert opened.agent is not None
+        (answered,) = [
+            r for r in opened.agent.session.history() if isinstance(r, ToolMessage)
+        ]
+        assert target.found(_is("event", event="ModelResponseStarted")) is None
+        await target.close(CLOSE_ENDED)
+        assert await _exited(target_task) == 0
+    assert (answered.call_id, answered.state, answered.text()) == (
+        "moving",
+        "failed",
+        "[interrupted]",
+    )
 
 
 @pytest.mark.asyncio
