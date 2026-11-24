@@ -368,9 +368,7 @@ def _until(condition: Callable[[], bool]) -> None:
     deadline = time.monotonic() + 5
     while not condition():
         assert time.monotonic() < deadline, "the condition never held"
-        # Its conditions read job folders on disk, the launcher's units, the fake
-        # server's replies and the daemon's job table, none of which notifies.
-        time.sleep(0.005)  # house-ignore[sleep] -- See above.
+        time.sleep(0.005)  # house-ignore[sleep] -- Disk and fakes notify nothing.
 
 
 def _daemon(

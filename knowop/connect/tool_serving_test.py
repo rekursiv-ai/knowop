@@ -686,6 +686,8 @@ async def test_stop_closes_the_server_and_joins_the_mux(
             started.set()
             await asyncio.Future[None]()
         finally:
+            # One yield lets the serving task return before the mux finishes.
+            await asyncio.sleep(0)
             stopped.set()
 
     mux_loop = AsyncMock(side_effect=run_mux)
@@ -2648,6 +2650,278 @@ def _assert_lock_free(dirs: ServeDirs) -> None:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     finally:
         os.close(fd)
+
+
+async def test_an_adopted_stream_closes_its_writer_then_its_socket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer_close, adopt = Mock(), AsyncMock()
+    monkeypatch.setattr(
+        tool_bridge,
+        "bridged",
+        AsyncMock(return_value=(Mock(), Mock(close=writer_close))),
+    )
+    server = Mock(adopt=adopt)
+    fast_close = AsyncMock()
+    fast = Mock(wait_closed=AsyncMock(return_value=None), close=fast_close)
+    await tool_serving._adopted_stream(
+        server,
+        fast,
+        peer="relay:s",
+        end_sec=5.0,
+        line_bytes=10,
+    )
+    writer_close.assert_called_once_with()
+    fast_close.assert_awaited_once_with()
+    adopt.assert_awaited_once()
+    slow_close = AsyncMock()
+    slow = Mock(wait_closed=asyncio.Future, close=slow_close)
+    async with asyncio.timeout(5):
+        await tool_serving._adopted_stream(
+            server,
+            slow,
+            peer="relay:s",
+            end_sec=0.01,
+            line_bytes=10,
+        )
+    slow_close.assert_awaited_once_with()
+
+
+async def test_a_bridge_closes_its_socket_once_it_ends_or_its_wait_runs_out() -> None:
+    fast_close = AsyncMock()
+    fast = Mock(wait_closed=AsyncMock(return_value=None), close=fast_close)
+    await tool_serving._bridge_ended(fast, end_sec=5.0)
+    fast_close.assert_awaited_once_with()
+    slow_close = AsyncMock()
+    slow = Mock(wait_closed=asyncio.Future, close=slow_close)
+    async with asyncio.timeout(5):
+        await tool_serving._bridge_ended(slow, end_sec=0.01)
+    slow_close.assert_awaited_once_with()
+
+
+async def test_a_start_that_fails_after_its_cancel_still_ends_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(tool_serving, "_RESIDENT_WORKERS", 1)
+    started, spawned = asyncio.Event(), asyncio.Event()
+
+    async def start(tools: Sequence[str], directory: Path) -> Host:
+        del tools, directory
+        started.set()
+        await spawned.wait()
+        raise OSError("Could not spawn worker.")
+
+    monkeypatch.setattr(tool_serving, "scrubbed_host", start)
+    permits = tool_serving._CallPermits()
+    opening = asyncio.create_task(permits.start_host(("Read",), tmp_path))
+    async with asyncio.timeout(2):
+        await started.wait()
+        opening.cancel()
+        spawned.set()
+        with pytest.raises(asyncio.CancelledError):
+            await opening
+    assert permits._residents == 0
+
+
+async def test_a_daemon_takes_its_defaults_and_its_relay_url_scheme() -> None:
+    daemon = ToolServing(
+        "http://http.test/",
+        credential=_CREDENTIAL,
+        name=_NAME,
+        dirs=tool_dirs(_NAME, server="http://http.test/"),
+    )
+    assert (daemon._retry_sec, daemon._dial_sec, daemon._line_bytes) == (
+        5.0,
+        10.0,
+        MAX_LINE_BYTES,
+    )
+    assert daemon._url == "ws://http.test"
+    trailing_x = ToolServing(
+        "http://relayX",
+        credential=_CREDENTIAL,
+        name=_NAME,
+        dirs=tool_dirs(_NAME, server="http://relayX"),
+    )
+    assert trailing_x._url == "ws://relayX"
+
+
+async def test_mux_socket_waits_for_a_pending_stream_when_another_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    relays: _Board,
+) -> None:
+    first, second = uuid.UUID(int=4), uuid.UUID(int=5)
+    closed = ConnectionClosedOK(None, None)
+    frames = [b"O" + first.bytes, b"O" + second.bytes]
+    first_started, second_started = asyncio.Event(), asyncio.Event()
+    release, second_go = asyncio.Event(), asyncio.Event()
+
+    async def read() -> bytes:
+        if frames:
+            return frames.pop(0)
+        await asyncio.gather(first_started.wait(), second_started.wait())
+        raise closed
+
+    async def adopt(*_args: object, peer: str, **_kwargs: object) -> None:
+        if peer == f"relay:{first}":
+            first_started.set()
+            await release.wait()
+            return
+        second_started.set()
+        await second_go.wait()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(tool_serving, "_adopted_stream", adopt)
+    socket = Mock(recv=AsyncMock(side_effect=read), send=AsyncMock())
+    server = Mock(spec=sagent_host_server.Server)
+    async with _relay(relays) as relay:
+        daemon = _daemon(relay)
+        mux = asyncio.create_task(daemon._mux_socket(server, socket))
+        await second_started.wait()
+        second_go.set()
+        done, _ = await asyncio.wait({mux}, timeout=0.01)
+        assert not done
+        release.set()
+        assert await mux is None
+
+
+def _mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+async def test_a_folder_that_exists_is_made_again_without_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    real_exists = Path.exists
+
+    def exists(self: Path) -> bool:
+        return False if self == tmp_path else real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", exists)
+    tool_serving._private(tmp_path)
+    assert _mode(tmp_path) == 0o700
+
+
+async def test_a_queued_call_due_now_expires_instead_of_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    monkeypatch.setattr(tool_serving, "_QUEUE_SEC", 0.0)
+    monkeypatch.setattr(asyncio.get_running_loop(), "time", lambda: 100.0)
+    permits = tool_serving._CallPermits()
+    active, waiting = _HeldWorker(), _HeldWorker()
+    first = tool_serving._PermittedHost(active, permits=permits)
+    second = tool_serving._PermittedHost(waiting, permits=permits)
+    first.writer.write(encoded(_call("running", "Bash")))
+    second.writer.write(encoded(_call("expired", "Bash")))
+
+    permits.completed(first, "running")
+
+    assert waiting.output.lines == []
+    expired = await received(second.reader)
+    assert isinstance(expired, Result)
+    assert (expired.id, expired.record.state) == ("expired", "failed")
+
+
+async def test_a_stopped_worker_frees_exactly_its_resident_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    child = _HeldWorker()
+    child.stopped.set()
+    monkeypatch.setattr(tool_serving, "scrubbed_host", AsyncMock(return_value=child))
+    permits = tool_serving._CallPermits()
+    worker = await permits.start_host(("Read",), tmp_path)
+    assert permits._residents == 1
+    await worker.stop()
+    assert permits._residents == 0
+
+
+async def test_a_stopped_worker_discards_its_own_queued_calls_and_no_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    permits = tool_serving._CallPermits()
+    active, waiting = _HeldWorker(), _HeldWorker()
+    first = tool_serving._PermittedHost(active, permits=permits)
+    second = tool_serving._PermittedHost(waiting, permits=permits)
+    running = encoded(_call("running", "Bash"))
+    first.writer.write(running)
+    first.writer.write(encoded(_call("own", "Bash")))
+    other = encoded(_call("other", "Bash"))
+    second.writer.write(other)
+
+    permits.exited(first)
+
+    assert active.output.lines == [running]
+    assert waiting.output.lines == [other]
+
+
+async def test_a_call_already_running_is_not_queued_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    permits = tool_serving._CallPermits()
+    active = _HeldWorker()
+    first = tool_serving._PermittedHost(active, permits=permits)
+    running = encoded(_call("running", "Bash"))
+    first.writer.write(running)
+    first.writer.write(running)
+
+    permits.completed(first, "running")
+
+    assert active.output.lines == [running]
+
+
+async def test_queued_bytes_add_up_across_queued_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "1")
+    monkeypatch.setenv("KNOWOP_TOOL_QUEUED_CALLS", "3")
+    monkeypatch.setenv("KNOWOP_TOOL_QUEUED_MIB", "1")
+    permits = tool_serving._CallPermits()
+    active, waiting = _HeldWorker(), _HeldWorker()
+    first = tool_serving._PermittedHost(active, permits=permits)
+    second = tool_serving._PermittedHost(waiting, permits=permits)
+    rejected = Mock()
+    monkeypatch.setattr(second, "reject", rejected)
+    first.writer.write(encoded(_call("active", "Bash")))
+    second.writer.write(encoded(_call("a", "Bash", payload="x" * 300_000)))
+    second.writer.write(encoded(_call("b", "Bash", payload="x" * 300_000)))
+
+    second.writer.write(encoded(_call("c", "Bash", payload="x" * 500_000)))
+
+    rejected.assert_called_once_with(
+        "c",
+        outcome="failed",
+        reason="The tool call queue is full.",
+    )
+
+
+async def test_a_rejected_call_names_its_call_only_as_the_result_id() -> None:
+    worker = tool_serving._PermittedHost(
+        _HeldWorker(),
+        permits=tool_serving._CallPermits(),
+    )
+    worker.reject("c1", outcome="failed", reason="Refused.")
+    result = await received(worker.reader)
+    assert isinstance(result, Result)
+    assert (result.id, result.record.call_id) == ("c1", "")
+
+
+async def test_a_worker_whose_output_failed_is_not_read_again() -> None:
+    broken = _HeldWorker()
+    worker = tool_serving._PermittedHost(broken, permits=tool_serving._CallPermits())
+    broken.reader.set_exception(OSError("worker output failed"))
+    with pytest.raises(OSError, match="worker output failed"):
+        await worker.reader.readline()
+    with pytest.raises(OSError, match="worker output failed"):
+        await worker.reader.readline()
+    reading = worker.reader._reading
+    assert reading is not None
+    await asyncio.wait({reading})
+    assert reading.exception() is None
 
 
 if __name__ == "__main__":

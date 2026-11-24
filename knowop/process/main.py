@@ -648,7 +648,7 @@ def session_user(client: ServeClient, session_id: UUID, *, tui: bool) -> str | N
         return row["self"]["account"]
     except (ClientError, ReadError) as error:
         logger.warning(
-            "could not read whose session this is: %s",  # pragma: no mutate[diagnostic-text]
+            "could not read whose session this is: %s",  # pragma: no mutate[diagnostic-text] -- Only an operator reads this warning.
             error,
         )
         return None
