@@ -419,6 +419,9 @@ class Publisher:
             )
             self._journals[path] = journal
             agent.runtime.observers.append(journal.saved)
+        # The team is told as it changes: a child's own first event may be a model call
+        # away, and Chat draws its tab by its member.
+        self._read_soon()
 
     # A watcher has no parent, and an outside member's child a parent of no member here.
     def _path(self, label: str) -> tuple[str, ...]:
@@ -440,12 +443,16 @@ class Publisher:
         spawned_by = (
             self._session_id if spawner is self._root else await spawner.session()
         )
-        return await asyncio.to_thread(
+        part = await asyncio.to_thread(
             self._started,
             journal,
             label=label,
             spawned_by=spawned_by,
         )
+        # Read once the loop turns, by when its journal holds the part: the team names
+        # its session then, not at its next event.
+        self._read_soon()
+        return part
 
     def _started(self, journal: Path, *, label: str, spawned_by: UUID) -> _Part:
         """Start the child's session, or re-open it; return where its upload begins."""

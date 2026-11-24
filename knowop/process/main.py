@@ -52,6 +52,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -62,6 +63,7 @@ from sagent.journal.types import (
     UncategorizedToolResult,
 )
 from sagent.runtime import types
+from sagent.tools.agent_spawn import AgentSpawn
 from sagent.tools.function import tool
 from sagent.tools.recall import Recall
 from sagent.tools.remote import RemoteTool
@@ -146,6 +148,7 @@ if TYPE_CHECKING:
         AsyncIterator,
         Awaitable,
         Callable,
+        Coroutine,
         Iterable,
         Sequence,
     )
@@ -190,6 +193,17 @@ _GIVE_UP_SEC: Final = 600.0
 
 _STOPPED_SEC: Final = 30.0
 """How long a stopped process halts its turn and uploads before it ends."""
+
+SPAWN: Final = "/spawn"
+"""The slash line Chat's + sends: ``/spawn LABEL`` on its first line, then the agent's
+prompt as the person wrote it. The root spawns ``LABEL`` on it as its AgentSpawn does,
+with no turn of its model: ``LABEL`` joins the team, or an error says why not, its
+``command`` ``/spawn LABEL`` (``/spawn`` where no label reads)."""
+
+_SPAWN_USAGE: Final = f"Usage: {SPAWN} LABEL, then its prompt on the lines below."
+
+_SPAWN_LINE: Final = re.compile(rf"{SPAWN}(?=[ \n]|\Z)")
+"""Whether a slash line is a ``/spawn``: ``/spawn``, then a space, a newline or no more."""
 
 _EXITS: Final = {
     CLOSE_ENDED: 0,
@@ -460,6 +474,7 @@ async def delivering(
     commands: Awaitable[Commands],
     publisher: Publisher,
     canvas: CanvasTools,
+    allowed: Allowed | None = None,
 ) -> AsyncGenerator[asyncio.Future[Ended]]:
     """Deliver each input to the agent, as its kind says, while the block runs.
 
@@ -467,8 +482,9 @@ async def delivering(
     agent's message from another session goes to the team at once, booked as its
     sender booked it. A person's line is pushed as a message from its author to the
     agent it names, and a slash line runs in ``commands``, each in its turn after the
-    slash line before it. A line that names the canvas it was sent from moves the
-    canvas tools to it as it arrives.
+    slash line before it; a ``/spawn`` line (:data:`SPAWN`) spawns its agent from the
+    root, with no turn of the root's model, while the lines after it run on. A line
+    that names the canvas it was sent from moves the canvas tools to it as it arrives.
 
     Args:
       inputs: The inputs, as they come down the socket.
@@ -479,6 +495,8 @@ async def delivering(
         it did; awaited at the first slash line.
       publisher: Says what does not read, and sends the settings a slash line changed.
       canvas: The session's canvas tools, which act on the canvas Chat named last.
+      allowed: The only slash lines a remote agent runs, ``/spawn`` too; ``None`` on
+        a person's own host, which runs every one.
 
     Yields:
       quit_ran: Resolves once a ``/quit`` ran.
@@ -486,6 +504,7 @@ async def delivering(
     """
     quit_ran = asyncio.Future[Ended](loop=asyncio.get_running_loop())
     lines: asyncio.Queue[AgentMessage | Command] = asyncio.Queue()
+    spawning: set[asyncio.Task[None]] = set()
     tasks = [
         asyncio.create_task(
             _delivered(
@@ -506,6 +525,8 @@ async def delivering(
                 commands=commands,
                 publisher=publisher,
                 quit_ran=quit_ran,
+                spawning=spawning,
+                allowed=allowed,
             ),
         ),
     ]
@@ -513,10 +534,11 @@ async def delivering(
         yield quit_ran
     finally:
         # Waited for: a slash line still running has ended before its caller closes
-        # what it uses.
-        for task in tasks:
+        # what it uses. A spawn's agent stops its first turn and stays.
+        ending = [*tasks, *spawning]
+        for task in ending:
             _ = task.cancel()
-        _ = await asyncio.gather(*tasks, return_exceptions=True)
+        _ = await asyncio.gather(*ending, return_exceptions=True)
 
 
 async def first_done[T](*awaited: Awaitable[T]) -> T:
@@ -921,6 +943,7 @@ async def _live(
                 commands=commands,
                 publisher=publisher,
                 canvas=canvas,
+                allowed=allowed,
             ) as quit_ran,
         ):
             for member in {o.agent, *o.team.values()}:
@@ -1094,6 +1117,8 @@ async def _ran(
     commands: Awaitable[Commands],
     publisher: Publisher,
     quit_ran: asyncio.Future[Ended],
+    spawning: set[asyncio.Task[None]],
+    allowed: Allowed | None,
 ) -> None:
     """Run each line and slash line in turn; resolve ``quit_ran`` once a ``/quit`` runs."""
     while True:
@@ -1110,6 +1135,17 @@ async def _ran(
             else:
                 named.runtime.push(message)
             continue
+        if _SPAWN_LINE.match(message.line):
+            _held(
+                spawning,
+                _spawned(
+                    message.line,
+                    agent=agent,
+                    publisher=publisher,
+                    allowed=allowed,
+                ),
+            )
+            continue
         # Shielded: cancelling this must not cancel what the screen has yet to build.
         ran = await asyncio.shield(commands)
         try:
@@ -1123,6 +1159,58 @@ async def _ran(
             # As a stop: a remote agent's folder goes as it ends, its journal too.
             quit_ran.set_result(Ended(code=0, stopped=True))
             return
+
+
+def _held(
+    running: set[asyncio.Task[None]],
+    work: Coroutine[object, object, None],
+) -> None:
+    """Run ``work`` in a task ``running`` holds while it runs, for a close to cancel."""
+    task = asyncio.create_task(work)
+    running.add(task)
+    task.add_done_callback(running.discard)
+
+
+# Chat's + sends it, so the person's words reach the new agent as they are and the
+# root's model is asked nothing. The spawn runs the agent's first turn, as the root's
+# own call would; no call of the root's waits on its reply, which its tab shows.
+async def _spawned(
+    line: str,
+    *,
+    agent: Agent,
+    publisher: Publisher,
+    allowed: Allowed | None,
+) -> None:
+    """Spawn the agent ``line`` asks for, from the root as its AgentSpawn; say why not."""
+    head, _, prompt = line.partition("\n")
+    labels = head.split(" ")[1:]
+    # The draft that sent it knows its refusal by the label.
+    named = f"{SPAWN} {labels[0]}" if labels and labels[0] else SPAWN
+    spawn = agent.tools.get(AgentSpawn.name)
+    # It runs no sagent command, but a remote agent's lines are its list's alone.
+    if allowed is not None and not allowed.allows((SPAWN.removeprefix("/"),)):
+        _spawn_refused(publisher, f"{SPAWN} {allowed.refusal}", command=named)
+        return
+    if len(labels) != 1 or not labels[0] or not prompt.strip():
+        _spawn_refused(publisher, _SPAWN_USAGE, command=named)
+        return
+    if not isinstance(spawn, AgentSpawn):
+        _spawn_refused(publisher, "This agent spawns no agents.", command=named)
+        return
+    arguments: dict[str, PlainTree] = {"label": labels[0], "prompt": prompt}
+    try:
+        _ = await spawn.call(agent.runtime.tool_context, arguments).result
+    except ValueError as error:
+        _spawn_refused(publisher, str(error), command=named)
+    # Past its checks, as its journal fails to open: else the + draft waits on it.
+    except Exception as error:
+        logger.warning("spawn of %r failed", labels[0], exc_info=True)
+        _spawn_refused(publisher, error_text(error), command=named)
+
+
+def _spawn_refused(publisher: Publisher, text: str, *, command: str) -> None:
+    """Tell why a ``/spawn`` line spawned nothing, as an error of ``command``."""
+    publisher.print_output(CommandOutput(text=text, tone="error", command=command))
 
 
 def _session_id(client: Client, ref: Ref) -> UUID:

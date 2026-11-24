@@ -22,6 +22,7 @@ from sagent.tui.slash import Commands
 
 import pytest
 
+from knowop.process.main import SPAWN
 from knowop.process.remote_commands import REMOTE_AGENT
 
 
@@ -67,7 +68,7 @@ def _dropped(output: CommandOutput) -> None:
 
 
 async def _registry() -> list[str]:
-    """Return every name a remote agent's commands harvest, and its watcher's."""
+    """Return every name a remote agent's lines run: its commands', its watcher's, ``spawn``."""
     catalog = ModelCatalog(factories={"scripted": ScriptedProvider})
     agent = Agent(model=catalog["scripted"]["scripted"], tools=[Read()])
     async with Team(catalog=catalog) as team:
@@ -88,7 +89,8 @@ async def _registry() -> list[str]:
             for s in harvest(each.owners())
         ]
         await commands.aclose()
-    return list(dict.fromkeys(names))
+    # The process runs its own ``/spawn`` before sagent's commands see the line.
+    return list(dict.fromkeys([*names, SPAWN.removeprefix("/")]))
 
 
 @pytest.mark.asyncio

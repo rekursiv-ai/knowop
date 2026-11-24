@@ -7,7 +7,7 @@ standing in for the one sagent's ``opened`` builds.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from functools import partial
@@ -26,6 +26,7 @@ from uuid import UUID, uuid4
 import asyncio
 import base64
 import contextlib
+import gc
 import io
 import itertools
 import json
@@ -35,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 
 from sagent.agent.agent import Agent
 from sagent.agent.agents_md import AgentsMdConfig
@@ -58,6 +60,8 @@ from sagent.providers.catalog import ModelCatalog, ModelMemory
 from sagent.providers.table import ModelTags, models
 from sagent.runtime import types
 from sagent.tools import mcp
+from sagent.tools.agent_spawn import AgentSpawn
+from sagent.tools.function import tool
 from sagent.tools.read import Read
 from sagent.tools.recall import Recall
 from sagent.tools.remote import RemoteSession, RemoteTool
@@ -65,8 +69,9 @@ from sagent.tools.types import Tool, ToolContext, settled
 from sagent.tui.main import Flags, OpenAgent, StartError
 from sagent.tui.prompt import Panes
 from sagent.tui.render import error_text
-from sagent.tui.slash import Commands
+from sagent.tui.slash import Allowed, Commands
 from sagent.tui.theme import ThemeState
+from sagent.tui.types import CommandOutput
 from trackinizer.client.client import Client
 from trackinizer.client.errors import ClientError
 from trackinizer.client.session_socket import SessionSocket, SocketClient
@@ -91,6 +96,7 @@ from trackinizer.wire.wire_session_relay import (
     ProcessSpec,
     ServeSession,
     SettingsLine,
+    StateLine,
     ViewerFrame,
 )
 from trackinizer.wire.wire_sessions import (
@@ -171,7 +177,6 @@ if TYPE_CHECKING:
 
     from mcp.client.stdio import StdioServerParameters
     from sagent.runtime.types import RuntimeEvent
-    from sagent.tui.types import CommandOutput
     from trackinizer.types.inquiries import Inquiry
     from trackinizer.wire.json_types import JSON
     from trackinizer.wire.wire_job import JobList
@@ -583,6 +588,12 @@ class _Opened:
     remote_tools_only: bool = False
     """Give the agent ``RemoteTool`` alone, over the hosts the main links."""
 
+    spawns: bool = False
+    """Give the agent ``AgentSpawn`` too, over its team."""
+
+    child_replies: list[Reply] = field(default_factory=list[Reply])
+    """What each agent it spawns replies, each from the start."""
+
     show_thinking: bool = False
     """Whether the screen it builds shows reasoning."""
 
@@ -630,7 +641,11 @@ class _Opened:
             raise self.raises
         assert flags.session is not None
         provider = ScriptedProvider(replies=self.replies)
-        catalog = ModelCatalog(factories={"scripted": ScriptedProvider})
+        catalog = ModelCatalog(
+            factories={
+                "scripted": partial(ScriptedProvider, replies=self.child_replies),
+            },
+        )
         journal = JsonlJournal(flags.session)
         async with (
             Team(catalog=catalog) as team,
@@ -643,7 +658,11 @@ class _Opened:
                 journal=journal,
                 tools=[RemoteTool(remote=remote)]
                 if self.remote_tools_only
-                else [*self.tools, *tools],
+                else [
+                    *self.tools,
+                    *tools,
+                    *([AgentSpawn(team=team)] if self.spawns else []),
+                ],
                 tool_context=ToolContext(cwd=self.folder),
                 system_prompt="S",
                 agents_md=AgentsMdConfig(
@@ -1360,8 +1379,9 @@ async def test_a_person_s_line_reaches_the_agent_it_names_or_says_none_took_it(
         for m in pushed
         if isinstance(m, AgentMessage)
     ] == [("ada@x.y", "helper", "status?")]
-    payload = cast("dict[str, object]", said["payload"])
-    assert payload["text"] == "No agent 'ghost' here took this line."
+    assert said["payload"] == event_payload(
+        CommandOutput(text="No agent 'ghost' here took this line.", tone="error"),
+    )
 
 
 @pytest.mark.asyncio
@@ -1454,6 +1474,308 @@ async def test_a_slash_line_runs_and_says_what_it_did_and_the_settings_follow(
     thinking = {s.name: s for s in settings}[("screen", "thinking")]
     assert (thinking.value or "").startswith("show")
     del opened
+
+
+_SPAWN_USAGE: Final = "Usage: /spawn LABEL, then its prompt on the lines below."
+
+
+def _spawn_refused(text: str, *, command: str) -> JSON:
+    """Return the payload of a ``/spawn`` line's refusal, which names the line."""
+    return event_payload(CommandOutput(text=text, tone="error", command=command))
+
+
+def _lists(frame: dict[str, object], *, label: str) -> bool:
+    """Say whether ``frame`` is a state whose team lists ``label`` under the root."""
+    if frame["type"] != "state":
+        return False
+    team = StateLine.model_validate(frame).state.team or ()
+    return any((m.label, m.parent) == (label, "Agent") for m in team)
+
+
+# Chat's + sends it: the person's words reach the new agent as they are, and the root's
+# model is asked nothing, so no turn of its can refuse or reword them.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", [True, False], ids=["remote", "own-host"])
+async def test_a_spawn_line_starts_an_agent_on_the_persons_words_with_no_turn_of_the_roots(
+    opened: _Opened,
+    *,
+    remote: bool,
+) -> None:
+    """As a new process's first input: its root has run no turn, and runs none."""
+    opened.spawns = True
+    opened.child_replies = [reply("on it")]
+    words = "look at the logs\n  and say why it failed"
+    async with _relayed() as relay, _serving(relay, remote=remote) as (task, _):
+        _ = await relay.seen(_is("settings"))
+        _ = await relay.send("Command", {"line": f"/spawn agent-1\n{words}"})
+        _ = await relay.seen(partial(_lists, label="agent-1"))
+        # Its reply, which its spawn tells the root's runtime.
+        _ = await relay.seen(_is("event", event="ChildEvent"))
+        assert opened.team is not None
+        assert opened.agent is not None
+        kid = opened.team["agent-1"]
+        asked = [r.content for r in kid.session.history() if isinstance(r, UserMessage)]
+        above = opened.team.parent("agent-1")
+        roots = {type(r).__name__ for r in opened.agent.session.history()}
+        spawn = opened.agent.tools[AgentSpawn.name]
+        assert isinstance(spawn, AgentSpawn)
+        # What the root's model is told of it, at its next call.
+        told = spawn.reminder(opened.agent.runtime.tool_context)
+        # The slash line after it runs too; the spawn itself said nothing.
+        _ = await relay.send("Command", {"line": "/spawn"})
+        _ = await relay.seen(_is("event", event="CommandOutput"))
+        said = [f["payload"] for f in relay.every(_is("event", event="CommandOutput"))]
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert said == [_spawn_refused(_SPAWN_USAGE, command="/spawn")]
+    assert (above, asked) == ("Agent", [words])
+    # No model call, and no line a session's first line is read from.
+    assert (
+        roots & {"ToolCall", "AssistantMessage", "UserMessage", "AgentMessage"} == set()
+    )
+    assert told == "Your children: agent-1."
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Hold:
+    """A call that runs until it is let go."""
+
+    held: asyncio.Event = field(default_factory=asyncio.Event)
+    release: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def wait(self) -> str:
+        """Wait to be let go."""
+        self.held.set()
+        _ = await self.release.wait()
+        return "let go"
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_line_runs_at_once_while_the_roots_turn_runs(
+    opened: _Opened,
+) -> None:
+    """As a halt does: the root's turn holds it back no more than a slash line before it."""
+    hold = _Hold()
+    opened.spawns = True
+    opened.tools = [tool(hold.wait, name="Hold")]
+    opened.replies = [reply(calls=[call("Hold", "h1")]), reply("done")]
+    opened.child_replies = [reply("on it")]
+    async with _relayed() as relay, _serving(relay) as (task, _):
+        _ = await relay.seen(_is("settings"))
+        _ = await relay.send(
+            "UserMessage",
+            {"py/object": "UserMessage", "content": "hold on", "extra": {}},
+        )
+        async with asyncio.timeout(5):
+            _ = await hold.held.wait()
+        _ = await relay.send("Command", {"line": "/spawn agent-1\nlook"})
+        _ = await relay.seen(partial(_lists, label="agent-1"))
+        _ = await relay.seen(_is("event", event="ChildEvent"))
+        assert opened.agent is not None
+        running = set(opened.agent.runtime.running_tools)
+        hold.release.set()
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert running == {"h1"}
+
+
+# Its ``command`` names the line, ``/spawn LABEL``, so the draft that sent it knows it
+# as its own; ``/spawn`` alone where no label reads.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("line", "spawns", "said", "command"),
+    [
+        ("/spawn", True, _SPAWN_USAGE, "/spawn"),
+        ("/spawn agent-1", True, _SPAWN_USAGE, "/spawn agent-1"),
+        ("/spawn agent-1 look", True, _SPAWN_USAGE, "/spawn agent-1"),
+        ("/spawn  agent-1\nlook", True, _SPAWN_USAGE, "/spawn"),
+        ("/spawn agent-1\n \n", True, _SPAWN_USAGE, "/spawn agent-1"),
+        (
+            "/spawn ag.ent\nlook",
+            True,
+            "A label is 1 to 64 letters, digits, '_' or '-'; got 'ag.ent'.",
+            "/spawn ag.ent",
+        ),
+        (
+            "/spawn Agent\nlook",
+            True,
+            "An agent is already labelled 'Agent'.",
+            "/spawn Agent",
+        ),
+        (
+            "/spawn agent-1\nlook",
+            False,
+            "This agent spawns no agents.",
+            "/spawn agent-1",
+        ),
+    ],
+    ids=[
+        "no label",
+        "no words",
+        "words on the label's line",
+        "two spaces before the label",
+        "blank words",
+        "a malformed label",
+        "a label taken",
+        "no AgentSpawn",
+    ],
+)
+async def test_a_spawn_line_the_spawn_refuses_says_why_and_starts_no_agent(
+    opened: _Opened,
+    *,
+    line: str,
+    spawns: bool,
+    said: str,
+    command: str,
+) -> None:
+    """As a slash line that fails does: in its output, as an error."""
+    opened.spawns = spawns
+    async with _relayed() as relay, _serving(relay) as (task, _):
+        _ = await relay.seen(_is("settings"))
+        _ = await relay.send("Command", {"line": line})
+        output = await relay.seen(_is("event", event="CommandOutput"))
+        members = list(opened.team or ())
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert output["payload"] == _spawn_refused(said, command=command)
+    assert members == ["Agent"]
+
+
+@pytest.mark.asyncio
+async def test_a_process_that_ends_halts_the_first_turn_of_an_agent_it_spawned(
+    opened: _Opened,
+) -> None:
+    """As a slash line still running ends before what it uses is closed."""
+    hold = _Hold()
+    opened.spawns = True
+    opened.tools = [tool(hold.wait, name="Hold")]
+    opened.child_replies = [reply(calls=[call("Hold", "k1")]), reply("done")]
+    halts: list[str | None] = []
+
+    def halted(*, sender: str | None = None) -> None:
+        halts.append(sender)
+        hold.release.set()
+
+    async with _relayed() as relay, _serving(relay) as (task, _):
+        _ = await relay.seen(_is("settings"))
+        _ = await relay.send("Command", {"line": "/spawn agent-1\nlook"})
+        async with asyncio.timeout(5):
+            _ = await hold.held.wait()
+        assert opened.team is not None
+        opened.monkeypatch.setattr(opened.team["agent-1"].runtime, "halt", halted)
+        await relay.close(CLOSE_TAKEN_OVER)
+        _ = await _exited(task)
+
+    assert halts == ["Agent"]
+
+
+async def _no_room(self: AgentSpawn, *args: object, **kwargs: object) -> NoReturn:
+    """Fail to start a child, as a full disk fails its journal."""
+    del self, args, kwargs
+    raise OSError("no room for its journal")
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_that_fails_past_its_checks_says_why_and_is_logged(
+    opened: _Opened,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Else the + draft waits on an agent that never comes."""
+    monkeypatch.setattr(AgentSpawn, "_start", _no_room)
+    opened.spawns = True
+    caplog.set_level(logging.WARNING, logger=main_module.__name__)
+    async with _relayed() as relay, _serving(relay) as (task, _):
+        _ = await relay.seen(_is("settings"))
+        _ = await relay.send("Command", {"line": "/spawn agent-1\nlook"})
+        output = await relay.seen(_is("event", event="CommandOutput"))
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert output["payload"] == _spawn_refused(
+        "OSError: no room for its journal",
+        command="/spawn agent-1",
+    )
+    assert [
+        (record.getMessage(), type(record.exc_info and record.exc_info[1]))
+        for record in caplog.records
+        if record.name == main_module.__name__
+    ] == [("spawn of 'agent-1' failed", OSError)]
+
+
+@dataclass(slots=True, kw_only=True)
+class _Spawns:
+    """Runs each ``/spawn`` as the process does, noting its task, held by no one here."""
+
+    spawned: Callable[..., Coroutine[object, object, None]]
+    tasks: list[weakref.ref[asyncio.Task[object]]] = field(
+        default_factory=list["weakref.ref[asyncio.Task[object]]"],
+    )
+    ended: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def __call__(self, *args: object, **kwargs: object) -> None:
+        """Run the spawn, noting its task, and say when it ends."""
+        running = asyncio.current_task()
+        assert running is not None
+        self.tasks.append(weakref.ref(running))
+        await self.spawned(*args, **kwargs)
+        self.ended.set()
+
+
+@pytest.mark.asyncio
+async def test_a_spawn_that_ended_is_held_no_longer(
+    opened: _Opened,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process spawns all its life: what each spawn's task holds goes as it ends."""
+    spawns = _Spawns(spawned=main_module._spawned)
+    monkeypatch.setattr(main_module, "_spawned", spawns)
+    opened.spawns = True
+    opened.child_replies = [reply("on it")]
+    async with _relayed() as relay, _serving(relay) as (task, _):
+        _ = await relay.seen(_is("settings"))
+        _ = await relay.send("Command", {"line": "/spawn agent-1\nlook"})
+        async with asyncio.timeout(5):
+            _ = await spawns.ended.wait()
+        # A done task's callbacks run as the loop next turns.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        _ = gc.collect()
+        kept = [each() is not None for each in spawns.tasks]
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert kept == [False]
+
+
+@pytest.mark.asyncio
+async def test_a_remote_agent_spawns_only_while_its_lines_list_spawn(
+    opened: _Opened,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``/spawn`` runs no sagent command, but a remote agent's list holds it all the same."""
+    monkeypatch.setattr(
+        main_module,
+        "REMOTE_AGENT",
+        Allowed(names=frozenset({"compact"}), refusal="is not available here"),
+    )
+    opened.spawns = True
+    async with _relayed() as relay, _serving(relay, remote=True) as (task, _):
+        _ = await relay.seen(_is("settings"))
+        _ = await relay.send("Command", {"line": "/spawn agent-1\nlook"})
+        output = await relay.seen(_is("event", event="CommandOutput"))
+        members = list(opened.team or ())
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    assert output["payload"] == _spawn_refused(
+        "/spawn is not available here",
+        command="/spawn agent-1",
+    )
+    assert members == ["Agent"]
 
 
 _SERVER_PROBE: Final = (
@@ -1643,9 +1965,14 @@ async def test_a_slash_line_that_raises_is_answered_as_an_error_and_logged(
         _ = await relay.seen(_is("settings"))
         _ = await relay.send("Command", {"line": "/model"})
         said = await relay.seen(_is("event", event="CommandOutput"))
-        # The next input is still delivered.
+        # The next input is still delivered, and the next slash line still runs.
         _ = await relay.send("ModelHalt", {"py/object": "ModelHalt"})
         _ = await relay.seen(_is("event", event="ModelHalt"))
+        _ = await relay.send("Command", {"line": "/model"})
+        async with asyncio.timeout(5), relay.arrived:
+            _ = await relay.arrived.wait_for(
+                lambda: len(relay.every(_is("event", event="CommandOutput"))) == 2,
+            )
         await relay.close(CLOSE_ENDED)
         _ = await _exited(task)
 
@@ -1655,7 +1982,7 @@ async def test_a_slash_line_that_raises_is_answered_as_an_error_and_logged(
         (record.getMessage(), record.exc_info and record.exc_info[1])
         for record in caplog.records
         if record.name == main_module.__name__
-    ] == [("command '/model' failed", raised)]
+    ] == [("command '/model' failed", raised)] * 2
     del opened
 
 
