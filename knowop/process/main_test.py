@@ -41,7 +41,7 @@ import weakref
 from sagent.agent.agent import Agent
 from sagent.agent.agents_md import AgentsMdConfig
 from sagent.agent.team import Team
-from sagent.journal.jsonl import JournalInUseError, JsonlJournal
+from sagent.journal.jsonl import JournalInUseError, JsonlJournal, read_record
 from sagent.journal.types import (
     AgentIdle,
     AgentMessage,
@@ -79,6 +79,7 @@ from trackinizer.client.errors import ClientError
 from trackinizer.client.session_socket import SessionSocket, SocketClient
 from trackinizer.lib.userdirs import data_dir
 from trackinizer.trax.profile import Profile
+from trackinizer.types.session_records import SessionRecordRow
 from trackinizer.wire.refs import Ref, SeqRef
 from trackinizer.wire.wire_capture import CaptureImage
 from trackinizer.wire.wire_process_keys import (
@@ -115,7 +116,7 @@ from trackinizer.wire.wire_terminals import (
     CLOSE_TAKEN_OVER,
 )
 from trackinizer.wire.wire_tools import TOOLS_WS_PATH
-from treekle import PlainTree, ReadError, from_plain, json_loads
+from treekle import PlainTree, ReadError, from_plain, immutable, json_loads
 from websockets.asyncio.server import (
     ServerConnection,
     serve as serve_websockets,
@@ -128,6 +129,7 @@ import pytest
 from knowop.agent import placement, resume
 from knowop.agent.errors import NotResumableError
 from knowop.agent.resume import JournalChoice
+from knowop.agent.truncate import NOTE
 from knowop.connect.session_serving import SERVE_COMMAND
 from knowop.lib.testing.import_graph import Counted, import_graph
 from knowop.process import (
@@ -912,8 +914,14 @@ async def test_the_journal_is_the_sessions_own_and_sagents_flags_reach_the_build
     assert flags.session.parent.parent.name == str(_SESSION)
 
 
-def _chosen(choice: JournalChoice, client: object, session_id: UUID) -> JournalChoice:
-    del client, session_id
+def _chosen(
+    choice: JournalChoice,
+    client: object,
+    session_id: UUID,
+    *,
+    offered: object,
+) -> JournalChoice:
+    del client, session_id, offered
     return choice
 
 
@@ -1436,6 +1444,140 @@ async def test_a_person_s_line_reaches_the_agent_it_names_or_says_none_took_it(
     ] == [("ada@x.y", "helper", "status?")]
     assert said["payload"] == event_payload(
         CommandOutput(text="No agent 'ghost' here took this line.", tone="error"),
+    )
+
+
+_PLAN: Final = "anthropic-sub/opus-5.5+highthink"
+"""A subscription's model line, which a remote agent's key providers do not offer."""
+
+
+@dataclass(slots=True, kw_only=True)
+class _OneSession(_Server):
+    """Stores parts for ``_SESSION`` alone, as the server lists one session's."""
+
+    @override
+    def read_session_parts(self, session_id: UUID) -> list[PartBody]:
+        return self.parts if session_id == _SESSION else []
+
+
+# A capture cut its first record, which a process restores all the same.
+def _stood_on_plan() -> _Server:
+    """Return a server whose one stored part stands the session on ``_PLAN``."""
+    cut = AssistantMessage(
+        content="long",
+        extra=immutable({NOTE: {"omitted_bytes": 1}}),
+    )
+    plan = UncategorizedRecord(
+        kind="model",
+        payload=immutable({"model": _PLAN, "cache": [], "standing": "model"}),
+    )
+    return _OneSession(
+        version=1,
+        parts=[PartBody(part=0, name="a.jsonl", format="sagent", records=2)],
+        stored=[
+            RecordBody.of(
+                SessionRecordRow.of(session_id=_SESSION, part=0, idx=idx, record=r),
+            )
+            for idx, r in enumerate((cut, plan))
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("remote", "allowed", "joined", "stood"),
+    [
+        (True, "openai,anthropic", "", "anthropic/opus-5.5+highthink"),
+        (True, "openai", "", "openai/sol-6.2"),
+        (True, "openai", "anthropic", "anthropic/opus-5.5+highthink"),
+        (True, "", "", _PLAN),
+        (False, "openai,anthropic", "", _PLAN),
+    ],
+    ids=[
+        "the key its plan extends",
+        "no such key: the fallback",
+        "$SAGENT_PROVIDER joins the allowed",
+        "every provider allowed",
+        "own host",
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_remote_agent_resumes_on_what_its_providers_offer_and_says_so(
+    opened: _Opened,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    remote: bool,
+    allowed: str,
+    joined: str,
+    stood: str,
+) -> None:
+    """Chat hears of a switch before the model is first asked; own hosts keep sign-ins."""
+    # The shell's would stand for an allow list the start does not give.
+    monkeypatch.delenv("SAGENT_ALLOW_PROVIDERS", raising=False)
+    monkeypatch.delenv("SAGENT_PROVIDER", raising=False)
+    if joined:
+        monkeypatch.setenv("SAGENT_PROVIDER", joined)
+    opened.replies = [reply("hi")]
+
+    async with (
+        _relayed() as relay,
+        _serving(
+            relay,
+            server=_stood_on_plan(),
+            args=("--allow-providers", allowed) if allowed else (),
+            remote=remote,
+        ) as (task, _),
+    ):
+        _ = await relay.seen(_is("settings"))
+        _ = await relay.send("UserMessage", _line("hi"))
+        _ = await relay.seen(_is("event", event="ModelResponseCompleted"))
+        events = [
+            "told" if _tells_user(each) else each["kind"]
+            for each in relay.every(_is("event"))
+        ]
+        told = [each for each in relay.every(_is("event")) if _tells_user(each)]
+        await relay.close(CLOSE_ENDED)
+        _ = await _exited(task)
+
+    journal = opened.flags[-1].session
+    assert journal is not None
+    # The first is the restored one; the stand-in agent stands its own after it.
+    record = next(
+        r
+        for r in (read_record(line) for line in journal.read_bytes().splitlines())
+        if isinstance(r, UncategorizedRecord) and r.kind == "model"
+    )
+    assert record.payload["model"] == stood
+    switched = stood != _PLAN
+    assert [each["payload"] for each in told] == (
+        [
+            event_payload(
+                AgentMessage(
+                    sender="KnowOp",
+                    recipient="user",
+                    content=(
+                        "Your provider anthropic-sub was switched to scripted because"
+                        " KnowOp's cloud cannot sign in to anthropic-sub. This chat now"
+                        " runs on scripted/scripted, billed to this chat's owner. To"
+                        " switch back, resume it on a host signed in to anthropic-sub."
+                    ),
+                ),
+            ),
+        ]
+        if switched
+        else []
+    )
+    assert events.index("ModelResponseStarted") > (
+        events.index("told") if switched else -1
+    )
+
+
+def _tells_user(frame: dict[str, object]) -> bool:
+    """Say whether an event frame is a message to the person, as Chat draws one."""
+    payload = frame.get("payload")
+    return (
+        frame.get("kind") == "AgentMessage"
+        and isinstance(payload, dict)
+        and cast("dict[str, object]", payload).get("recipient") == "user"
     )
 
 
