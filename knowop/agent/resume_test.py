@@ -363,6 +363,179 @@ class TestTheJournalAProcessWrites:
         )
 
 
+_PLAN: Final = "work@anthropic-sub/opus-5.5+fullcontext+highthink"
+"""A model line of a subscription, which a host that holds keys alone does not offer."""
+
+_SOL: Final = "openai/sol-6.2+fullcontext+highthink"
+
+
+class TestAHostThatLacksTheSessionsSignIn:
+    """A restore on a host that offers only some providers, as a remote agent's."""
+
+    def test_any_host_by_default_restores_the_model_as_it_stood(self) -> None:
+        choice, stood = _restored_on(_PLAN, cache=(_SOL,))
+
+        assert stood == {"model": _PLAN, "cache": [_SOL], "standing": "model"}
+        assert choice.unoffered == ""
+
+    def test_a_model_the_host_lacks_falls_back_on_sol_unless_another_is_named(
+        self,
+    ) -> None:
+        choice, stood = _restored_on(_PLAN, offered=("anthropic", "openai"))
+
+        assert stood == {"model": "openai/sol-6.2", "cache": [], "standing": "model"}
+        assert choice.unoffered == "anthropic-sub"
+
+    def test_a_cached_model_the_host_lacks_is_forgotten_at_no_charge(self) -> None:
+        """Its settings serve no switch here; left in, sagent refuses the whole resume."""
+        choice, stood = _restored_on(
+            _SOL,
+            cache=(_PLAN, "anthropic/haiku-4.5"),
+            offered=("anthropic", "openai"),
+        )
+
+        assert stood == {
+            "model": _SOL,
+            "cache": ["anthropic/haiku-4.5"],
+            "standing": "model",
+        }
+        assert choice.unoffered == ""
+
+    def test_a_model_the_host_lacks_stays_on_the_key_its_provider_extends(
+        self,
+    ) -> None:
+        """``AnthropicSub`` is an ``Anthropic``: the same model, settings and account."""
+        choice, stood = _restored_on(
+            _PLAN,
+            cache=(_SOL,),
+            offered=("anthropic", "openai"),
+            keyed=(("anthropic-sub", "anthropic"),),
+            fallback="openai/sol-6.2",
+        )
+
+        assert stood == {
+            "model": "work@anthropic/opus-5.5+fullcontext+highthink",
+            "cache": [_SOL],
+            "standing": "model",
+        }
+        assert choice.unoffered == "anthropic-sub"
+
+    @pytest.mark.parametrize(
+        ("cache", "model", "kept"),
+        [
+            ((_SOL,), _SOL, []),
+            (("openai/sol-6.2 budget=auto",), "openai/sol-6.2 budget=auto", []),
+            ((), "openai/sol-6.2", []),
+            (
+                ("openai/astra-6.2+highthink",),
+                "openai/sol-6.2",
+                ["openai/astra-6.2+highthink"],
+            ),
+        ],
+        ids=["as its cache left it", "with its choices", "as named", "another kept"],
+    )
+    def test_with_no_key_of_the_vendor_s_it_falls_back_on_the_model_named(
+        self,
+        cache: tuple[str, ...],
+        model: str,
+        kept: list[str],
+    ) -> None:
+        choice, stood = _restored_on(
+            _PLAN,
+            cache=cache,
+            offered=("openai",),
+            fallback="openai/sol-6.2",
+        )
+
+        assert stood == {"model": model, "cache": kept, "standing": "model"}
+        assert choice.unoffered == "anthropic-sub"
+
+    def test_a_session_that_stood_no_model_restores_as_it_stood(self) -> None:
+        stored = _Stored(parts={0: (f"{uuid4().hex}.jsonl", "sagent", list(_SAID))})
+
+        choice = session_journal(
+            _SESSION_ID,
+            stored.listed(),
+            client=stored,
+            lossy=False,
+            offered=frozenset({"openai"}),
+        )
+
+        assert (_journal_lines(choice.path), choice.unoffered) == (list(_SAID), "")
+
+    def test_only_the_model_standing_last_is_asked_about(self) -> None:
+        """Sagent resumes on the last; an earlier one it no longer uses is no refusal."""
+        stored = _Stored(
+            parts={
+                0: (f"{uuid4().hex}.jsonl", "sagent", [_model(_PLAN), _model(_SOL)]),
+            },
+        )
+
+        choice = session_journal(
+            _SESSION_ID,
+            stored.listed(),
+            client=stored,
+            lossy=False,
+            offered=frozenset({"openai"}),
+        )
+
+        assert [_stood(r) for r in _journal_lines(choice.path)] == [
+            {"model": _PLAN, "cache": [], "standing": "model"},
+            {"model": _SOL, "cache": [], "standing": "model"},
+        ]
+
+
+def _model(line: str, *, cache: tuple[str, ...] = ()) -> UncategorizedRecord:
+    """Return the record sagent stands its model on."""
+    return UncategorizedRecord(
+        kind="model",
+        payload=immutable({"model": line, "cache": list(cache), "standing": "model"}),
+    )
+
+
+def _stood(record: SessionRecord) -> dict[str, PlainTree]:
+    """Return a ``model`` record's payload, its cache a list as it was written."""
+    assert isinstance(record, UncategorizedRecord)
+    return {
+        key: list(value) if isinstance(value, tuple) else value
+        for key, value in record.payload.items()
+    }
+
+
+def _restored_on(
+    line: str,
+    *,
+    cache: tuple[str, ...] = (),
+    offered: tuple[str, ...] = (),
+    keyed: tuple[tuple[str, str], ...] = (),
+    fallback: str = "",
+) -> tuple[JournalChoice, dict[str, PlainTree]]:
+    """Restore a session standing on ``line`` where ``offered`` are; return its model."""
+    stored = _Stored(
+        parts={
+            0: (
+                f"{uuid4().hex}.jsonl",
+                "sagent",
+                [_SAID[0], _model(line, cache=cache)],
+            ),
+        },
+    )
+    # Named only when given, so a refusal is the default's.
+    choice = session_journal(
+        _SESSION_ID,
+        stored.listed(),
+        client=stored,
+        lossy=False,
+        offered=frozenset(offered),
+        keyed=keyed,
+        **({"fallback": fallback} if fallback else {}),
+    )
+    said, stood = _journal_lines(choice.path)
+    assert said == _SAID[0]
+    assert choice.start == 2
+    return choice, _stood(stood)
+
+
 def _text(record: SessionRecord) -> str:
     assert isinstance(record, UserMessage | AssistantMessage)
     return record.content or ""

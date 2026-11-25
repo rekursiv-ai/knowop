@@ -65,6 +65,7 @@ from sagent.journal.types import (
     now_timestamp,
     pairings,
 )
+from sagent.providers.catalog import ModelCatalog, cache_key, listings
 from sagent.runtime import types
 from sagent.tools.agent_spawn import AgentSpawn
 from sagent.tools.function import tool
@@ -151,6 +152,7 @@ if TYPE_CHECKING:
         AsyncIterator,
         Awaitable,
         Callable,
+        Collection,
         Coroutine,
         Iterable,
         Sequence,
@@ -376,14 +378,22 @@ async def serve(
       remote: Whether the server placed it for a remote agent, which starts and links
         no sagent daemon of its own and runs only the slash lines
         :data:`~knowop.process.remote_commands.REMOTE_AGENT` lists; else
-        it is on a person's own host, with its daemon and every slash line.
+        it is on a person's own host, with its daemon and every slash line. It
+        resumes a model its providers lack on our key, billed to the session's
+        owner: the same model on the keyed provider its provider extends, else
+        ``openai/sol-6.2``.
 
     Returns:
       code: The exit code, as the module's docstring lists them.
 
     """
     try:
-        choice = await asyncio.to_thread(_journal, client, session_id)
+        choice = await asyncio.to_thread(
+            _journal,
+            client,
+            session_id,
+            offered=_offered(args) if remote else frozenset(),
+        )
     except (ClientError, NotResumableError, LossyConversionError) as error:
         sys.stderr.write(f"Error: {error}\n")
         return 1
@@ -881,14 +891,50 @@ async def _within_signals(served: Awaitable[int]) -> int:
         return await served
 
 
-def _journal(client: ServeClient, session_id: UUID) -> JournalChoice:
+def _journal(
+    client: ServeClient,
+    session_id: UUID,
+    *,
+    offered: Collection[str],
+) -> JournalChoice:
     """Return the journal this process writes the session in."""
     return session_journal(
         session_id,
         client.read_session_parts(session_id),
         client=client,
         lossy=True,
+        offered=offered,
+        keyed=_keyed(offered),
     )
+
+
+# A subscription's provider class extends its vendor's keyed one (``AnthropicSub`` is
+# an ``Anthropic``), so it serves the same models under the same names. Read here, in
+# the agent process: the rest of the shipped client has no sagent runtime to read.
+def _keyed(offered: Collection[str]) -> tuple[tuple[str, str], ...]:
+    """Return each provider ``offered`` lacks, with the offered one its class extends."""
+    listed = listings()
+    return tuple(
+        (each.section, base.section)
+        for each in listed
+        if each.section not in offered
+        for base in listed
+        if base.section in offered
+        and isinstance(each, type)
+        and isinstance(base, type)
+        and issubclass(each, base)
+    )
+
+
+# Sagent joins ``$SAGENT_PROVIDER`` to ``--allow-providers`` (its flag's help says so).
+def _offered(args: Sequence[str]) -> frozenset[str]:
+    """Return the providers sagent's ``args`` let it use, by their own names; empty for all."""
+    flags, _ = parse_flags(args)
+    named = [each.strip() for each in flags.allow_providers.split(",") if each.strip()]
+    joined = os.environ.get("SAGENT_PROVIDER", "")
+    if not named:
+        return frozenset()
+    return frozenset(ModelCatalog().allow([*named, *([joined] if joined else [])]))
 
 
 async def _live(
@@ -916,6 +962,16 @@ async def _live(
         send=socket.send,
     )
     o.agent.runtime.observers.append(publisher)
+    # A message to the person, not a note: Chat bands it amber, where a note is grey.
+    if choice.unoffered:
+        publisher.to_user(
+            "KnowOp",
+            f"Your provider {choice.unoffered} was switched to"
+            f" {o.agent.model.provider.name} because KnowOp's cloud cannot sign in to"
+            f" {choice.unoffered}. This chat now runs on {cache_key(o.agent.model)},"
+            " billed to this chat's owner. To switch back, resume it on a host signed"
+            f" in to {choice.unoffered}.",
+        )
     # After the publisher listens: the save each answer asks for uploads it at once,
     # where before it would wait for the person's next turn.
     for member in o.team.values():
