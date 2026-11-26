@@ -11,7 +11,7 @@ import pytest
 
 from knowop.watch_pr.github import GhOutput
 from knowop.watch_pr.github_test import URL, check, printed, view
-from knowop.watch_pr.news import unreadable
+from knowop.watch_pr.news import UNANSWERED_SEC, unreadable
 from knowop.watch_pr.rows import DISMISSED, LABEL
 from knowop.watch_pr.rows_test import (
     FIXER,
@@ -243,18 +243,61 @@ def test_anothers_pull_request_is_fixed_only_when_its_switch_asks() -> None:
 
 LOGGED_OUT: Final = GhOutput(returncode=4, stdout="", stderr="gh auth login")
 
+UNANSWERED: Final = GhOutput(
+    returncode=1,
+    stdout="",
+    stderr="error connecting to api.github.com",
+)
+
 
 def test_a_read_that_fails_is_kept_on_the_row_and_told_once_to_each_watcher() -> None:
     server = Server()
     row = server.row(app={"knowop": {"pr": {"state": "OPEN"}}}, peers=TWO)
     watching = watch(server, Gh(LOGGED_OUT))
     _ = watching.sweep()
-    assert (row.pr["error"], row.status) == ("gh auth login", "active")
+    reason = "gh on laptop is logged out; `gh auth login` there fixes it."
+    assert (row.pr["error"], row.status) == (reason, "active")
     assert [session for session, _ in server.lines] == [FIXER, OTHER]
-    assert server.lines[0][1] == unreadable(URL, host="laptop", error="gh auth login")
+    assert server.lines[0][1] == unreadable(URL, reason=reason, said="gh auth login")
     _ = watching.sweep()
     _ = watch(server, Gh(LOGGED_OUT)).sweep()
     assert len(server.lines) == 2
+
+
+def test_a_read_github_leaves_unanswered_is_held_until_it_lasts() -> None:
+    server = Server()
+    row = server.row(app={"knowop": {"pr": {"state": "OPEN"}}}, peers=TWO)
+    clock = Clock()
+    watching = watch(server, Gh(UNANSWERED), clock)
+    _ = watching.sweep()
+    clock.now += UNANSWERED_SEC - 1
+    _ = watching.sweep()
+    assert ("error" in row.pr, server.lines, server.writes) == (False, [], 0)
+    clock.now += 1
+    _ = watching.sweep()
+    reason = (
+        "laptop couldn't reach GitHub for 5 minutes; a watch on another host reads it."
+    )
+    assert row.pr["error"] == reason
+    assert [line for _, line in server.lines] == [
+        unreadable(URL, reason=reason, said="error connecting to api.github.com"),
+    ] * 2
+
+
+def test_a_read_github_answers_starts_the_hold_over() -> None:
+    server = Server()
+    row = server.row()
+    clock = Clock()
+    gh = Gh(UNANSWERED)
+    watching = watch(server, gh, clock)
+    _ = watching.sweep()
+    clock.now += UNANSWERED_SEC - 1
+    gh.answer = view()
+    _ = watching.sweep()
+    gh.answer = UNANSWERED
+    clock.now += 1
+    _ = watching.sweep()
+    assert (row.pr["error"], server.lines) == (None, [])
 
 
 def test_a_row_gone_meanwhile_tells_nothing_read_or_not() -> None:
@@ -450,6 +493,9 @@ def test_an_ask_github_refuses_is_kept_and_one_github_already_did_needs_no_call(
         "not allowed",
         True,
     )
+    # Done once: the refusal stands, and the next pass asks nothing.
+    _ = watch(server, gh).sweep()
+    assert (len(gh.merges()), row.pr["automerge_error"]) == (1, "not allowed")
     server = Server()
     row = server.row(
         app={"knowop": {"pr": {"automerge_ask": {"on": True, "at": "t2"}}}},
@@ -460,11 +506,41 @@ def test_an_ask_github_refuses_is_kept_and_one_github_already_did_needs_no_call(
     assert (row.pr["automerge_done"], row.pr["automerge_error"]) == ("t2", None)
 
 
+def test_an_ask_github_leaves_unanswered_stays_asked_and_is_tried_next_pass(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server = Server()
+    row = server.row(
+        app={"knowop": {"pr": {"automerge_ask": {"on": True, "at": "t1"}}}},
+    )
+    gh = Gh(view())
+    gh.merge = UNANSWERED
+    watching = watch(server, gh)
+    _ = watching.sweep()
+    assert ("automerge_done" in row.pr, "automerge_error" in row.pr) == (False, False)
+    assert [each.getMessage() for each in caplog.records] == [
+        (
+            f"knowop watch-pr: could not ask auto-merge of {URL}: "
+            "error connecting to api.github.com"
+        ),
+    ]
+    gh.merge = GhOutput(returncode=0, stdout="", stderr="")
+    _ = watching.sweep()
+    assert len(gh.merges()) == 2
+    pr = row.pr
+    assert (pr["automerge_done"], pr["automerge_error"], pr["auto_merge"]) == (
+        "t1",
+        None,
+        True,
+    )
+
+
 def test_no_ask_and_no_preference_and_a_closed_one_need_no_call() -> None:
     server = Server()
-    _ = server.row()
+    row = server.row()
     gh = Gh(view())
     _ = watch(server, gh).sweep()
+    assert (gh.merges(), "automerge_done" in row.pr) == ([], False)
     server = Server()
     _ = server.row(app={"knowop": {"pr": {"automerge_ask": {"on": True, "at": "t"}}}})
     _ = watch(server, gh := Gh(view(state="CLOSED"))).sweep()

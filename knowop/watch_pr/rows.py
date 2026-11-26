@@ -10,7 +10,8 @@ Chat's x writes too. Chat's pill, and the Pull requests page (the server's
 
 ``app.knowop.pr`` holds what GitHub last said, and the watch's own state:
 
-- ``error``: why the last read failed; ``None`` once one succeeds.
+- ``error``: why the watch cannot read it, and the fix, in plain words
+  (``news.unread_reason``); ``None`` once a read succeeds.
 - ``authored``: whether the person opened it, once their GitHub login is known.
 - ``autofix``: the person's switch: true, false, or absent for their ``autofix``
   preference, which a pull request they did not open never takes.

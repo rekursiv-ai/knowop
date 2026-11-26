@@ -1,8 +1,10 @@
 """Read a pull request through ``gh``, and turn GitHub's auto-merge on or off.
 
 ``gh`` runs on the host that serves the watch, with that host's own login: the one
-credential the watch reads with. A read that fails says why (:class:`GhError`), and the
-watch keeps that on the pull request's row.
+credential the watch reads with. A read that fails says why (:class:`GhError`): GitHub
+left it unanswered (:class:`GhUnansweredError`), ``gh`` has no login GitHub takes
+(:class:`GhLoggedOutError`), or another reason; the watch words it on the pull
+request's row.
 """
 
 from __future__ import annotations
@@ -24,8 +26,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "GhError",
+    "GhLoggedOutError",
     "GhOutput",
     "GhRunner",
+    "GhUnansweredError",
     "PullRequest",
     "link",
     "read_pull_request",
@@ -84,9 +88,28 @@ _FAILED: Final = frozenset(
 _RUNNING: Final = frozenset({"PENDING", "EXPECTED"})
 """A commit status's states while it has no verdict yet."""
 
+# `gh` exits 1 for nearly every failure, so its first line is what tells them apart: its
+# words for a DNS failure; Go's for a request that got no response (``Post "URL": dial
+# tcp ...``); a 5xx; GraphQL's for a query GitHub failed to run; and our own timeout.
+_UNANSWERED: Final = re.compile(
+    r'error connecting to |[A-Z][a-z]+ "https?://[^"]*": |HTTP 5[0-9]{2}\b'
+    r"|GraphQL: Something went wrong while executing your query|gh took over ",
+)
+
 
 class GhError(Exception):
     """``gh`` could not read a pull request; the message is its first line of why."""
+
+
+class GhUnansweredError(GhError):
+    """GitHub left a read unanswered: the network, DNS, a timeout, or its own 5xx.
+
+    A later read may succeed: octokit's retry plugin retries every failure but a 4xx.
+    """
+
+
+class GhLoggedOutError(GhError):
+    """``gh`` has no login, or GitHub refused its token: ``gh auth login`` fixes it."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -274,12 +297,14 @@ def read_pull_request(run: GhRunner, url: str) -> PullRequest:
       pull_request: What GitHub says of it now.
 
     Raises:
-      GhError: ``gh`` failed, found none, or printed what is no pull request.
+      GhUnansweredError: GitHub left it unanswered.
+      GhLoggedOutError: ``gh`` has no login GitHub takes.
+      GhError: ``gh`` failed otherwise, found none, or printed what is no pull request.
 
     """
     out = run(["pr", "view", url, "--json", _FIELDS, "--jq", _JQ])
     if out.returncode != 0:
-        raise GhError(_why(out))
+        raise _failure(out)
     try:
         view = json_loads(out.stdout, _View)
     # Not JSON (``JSONDecodeError``), or JSON of another shape (``ReadError``).
@@ -331,10 +356,18 @@ def set_auto_merge(run: GhRunner, *, url: str, on: bool) -> str | None:
     Returns:
       error: The first line of why GitHub refused, or ``None`` once it took it.
 
+    Raises:
+      GhUnansweredError: GitHub left the ask unanswered: no refusal, so ask again.
+
     """
     flags = ("--auto", "--squash") if on else ("--disable-auto",)
     out = run(["pr", "merge", url, *flags])
-    return None if out.returncode == 0 else _why(out)
+    if out.returncode == 0:
+        return None
+    failed = _failure(out)
+    if isinstance(failed, GhUnansweredError):
+        raise failed
+    return str(failed)
 
 
 def read_login(run: GhRunner) -> str:
@@ -411,6 +444,17 @@ def _name(check: _Check) -> str:
     """Name a check as the Checks tab does: its workflow, then its job."""
     name = check["name"] or "(unnamed check)"
     return f"{check['workflow']} / {name}" if check["workflow"] else name
+
+
+def _failure(out: GhOutput) -> GhError:
+    """Return what a failed read raises, by what ``gh`` says went wrong."""
+    why = _why(out)
+    if _UNANSWERED.match(why):
+        return GhUnansweredError(why)
+    # `gh` names this fix itself, for no login and for a token GitHub refused (401).
+    if "gh auth login" in out.stderr:
+        return GhLoggedOutError(why)
+    return GhError(why)
 
 
 def _why(out: GhOutput) -> str:

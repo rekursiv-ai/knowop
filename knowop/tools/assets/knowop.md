@@ -85,8 +85,9 @@ the others are told who, and must not push. `knowop watch-pr status` says
 who watches, who fixes, and when a serve last read it; if no serve read it
 for minutes (its host went away), run `knowop watch-pr serve --detach` on
 another host with `gh`. When `add` is refused or a `<knowop-unreadable>` line
-arrives (`gh` missing or logged out), tell the person which host and what
-fixes it. `knowop watch-pr --help` has the rest.
+arrives (`gh` missing or logged out, or GitHub unreachable from that host for 5
+minutes), tell the person which host and what fixes it. `knowop watch-pr --help`
+has the rest.
 
 ## Records
 

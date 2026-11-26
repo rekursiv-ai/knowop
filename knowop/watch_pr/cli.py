@@ -43,10 +43,12 @@ from treekle import from_plain
 from knowop.hosts import host_name
 from knowop.watch_pr.github import (
     GhError,
+    GhUnansweredError,
     link,
     read_pull_request,
     run_gh,
 )
+from knowop.watch_pr.news import unread_reason
 from knowop.watch_pr.rows import PullRequestRows, Stored, Watcher
 from knowop.watch_pr.serve import (
     ServingError,
@@ -223,12 +225,16 @@ def _session_command(
         case "add":
             try:
                 read = read_pull_request(gh, url)
+            # Not held as a serve holds it: the agent that ran add tries again.
+            except GhUnansweredError as error:
+                raise GhError(
+                    f"{host} couldn't reach GitHub: {error}\nNothing is watched. Run "
+                    "add again; if GitHub stays out of reach, add it from another host.",
+                ) from error
             except GhError as error:
                 raise GhError(
-                    f"gh on {host} cannot read {url}: {error}\nNothing is watched. "
-                    f"Tell the person, naming {host}: there `gh auth login` fixes a "
-                    "gh logged out, and a gh missing needs installing; or add it "
-                    "from another host whose gh is logged in.",
+                    f"{unread_reason(error, host=host)}\nNothing is watched. Tell the "
+                    "person; or add it from another host whose gh is logged in.",
                 ) from error
             row = rows.made(url, me=me, title=f"{read.name} {read.title}")
             rows.watch(row, watcher=watcher)

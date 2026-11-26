@@ -14,7 +14,9 @@ import pytest
 from knowop.watch_pr import github
 from knowop.watch_pr.github import (
     GhError,
+    GhLoggedOutError,
     GhOutput,
+    GhUnansweredError,
     link,
     read_login,
     read_pull_request,
@@ -101,7 +103,8 @@ def test_a_read_sorts_the_heads_checks_and_names_each_once() -> None:
         ),
     )
     pr = read_pull_request(gh, URL)
-    assert gh.calls[0][:3] == ["pr", "view", URL]
+    argv = gh.calls[0]
+    assert (argv[:4], argv[5]) == (["pr", "view", URL, "--json"], "--jq")
     assert (pr.repo, pr.number, pr.name) == ("acme/app", 7, "acme/app#7")
     assert pr.failed == ("CI / lint", "deploy", "ci/y")
     assert pr.pending == ("CI / types", "ci/x")
@@ -159,6 +162,81 @@ def test_a_read_that_fails_says_why(output: GhOutput, said: str) -> None:
         _ = read_pull_request(Gh(output), URL)
 
 
+def test_what_gh_printed_is_cut_short_in_why() -> None:
+    with pytest.raises(GhError) as shapeless:
+        _ = read_pull_request(Gh(printed(["z" * 400])), URL)
+    assert len(str(shapeless.value)) == 300
+    elsewhere = f"https://gitlab.com/{'a' * 300}"
+    with pytest.raises(GhError) as named:
+        _ = read_pull_request(Gh(printed(view(url=elsewhere))), URL)
+    assert str(named.value) == f"gh named no GitHub pull request: {elsewhere[:200]}"
+
+
+# What gh 2.101 printed, measured: offline (DNS, a refused connection), a 5xx, GitHub's
+# own GraphQL failure (a serve's log), a token GitHub refused, and no login at all.
+@pytest.mark.parametrize(
+    ("stderr", "failure"),
+    [
+        (
+            (
+                "error connecting to api.github.com\n"
+                "check your internet connection or https://githubstatus.com"
+            ),
+            GhUnansweredError,
+        ),
+        (
+            (
+                'Post "https://api.github.com/graphql": proxyconnect tcp: dial tcp '
+                "127.0.0.1:9: connect: connection refused"
+            ),
+            GhUnansweredError,
+        ),
+        ("HTTP 502: Bad Gateway (https://api.github.com/graphql)", GhUnansweredError),
+        (
+            (
+                "GraphQL: Something went wrong while executing your query on "
+                "2026-11-25T11:21:30Z. Please include `E23E:F7B88` when reporting this "
+                "issue."
+            ),
+            GhUnansweredError,
+        ),
+        (
+            (
+                "HTTP 401: Bad credentials (https://api.github.com/graphql)\n"
+                "Try authenticating with:  gh auth login -h github.com"
+            ),
+            GhLoggedOutError,
+        ),
+        (
+            (
+                "To get started with GitHub CLI, please run:  gh auth login\n"
+                "Alternatively, populate the GH_TOKEN environment variable with a GitHub "
+                "API authentication token."
+            ),
+            GhLoggedOutError,
+        ),
+        ("HTTP 404: Not Found (https://api.github.com/graphql)", GhError),
+        ("gh is not on this host's PATH", GhError),
+    ],
+)
+def test_a_failed_read_says_whether_github_answered_and_whether_gh_is_logged_in(
+    stderr: str,
+    failure: type[GhError],
+) -> None:
+    with pytest.raises(GhError) as raised:
+        _ = read_pull_request(Gh(GhOutput(returncode=1, stdout="", stderr=stderr)), URL)
+    assert (type(raised.value), str(raised.value)) == (failure, stderr.splitlines()[0])
+
+
+def test_gh_out_of_time_is_a_read_github_left_unanswered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shutil, "which", on_path)
+    monkeypatch.setattr(subprocess, "run", slow)
+    with pytest.raises(GhUnansweredError, match="gh took over 30s"):
+        _ = read_pull_request(run_gh, URL)
+
+
 def test_a_link_is_read_up_to_its_number() -> None:
     assert link(f" {URL}/files#diff ") == URL
     with pytest.raises(ValueError, match="is no GitHub pull request") as raised:
@@ -182,6 +260,17 @@ def test_auto_merge_turns_on_by_squash_and_off_and_says_a_refusal() -> None:
     ]
 
 
+def test_auto_merge_github_leaves_unanswered_is_no_refusal() -> None:
+    gh = Gh(
+        GhOutput(returncode=1, stdout="", stderr="error connecting to api.github.com"),
+    )
+    with pytest.raises(
+        GhUnansweredError,
+        match=r"error connecting to api\.github\.com",
+    ):
+        _ = set_auto_merge(gh, url=URL, on=True)
+
+
 def test_the_login_is_gh_apis_user() -> None:
     gh = Gh(
         GhOutput(returncode=0, stdout="ada\n", stderr=""),
@@ -199,6 +288,11 @@ def on_path(name: str) -> str:
 
 def nowhere(name: str) -> None:
     del name
+
+
+def slow(argv: list[str], **options: object) -> None:
+    del options
+    raise subprocess.TimeoutExpired(argv, 30)
 
 
 def test_gh_runs_without_a_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -232,11 +326,6 @@ def test_gh_that_is_missing_slow_or_unstartable_is_a_failed_call(
         stderr="gh is not on this host's PATH",
     )
     monkeypatch.setattr(shutil, "which", on_path)
-
-    def slow(argv: list[str], **options: object) -> None:
-        del options
-        raise subprocess.TimeoutExpired(argv, 30)
-
     monkeypatch.setattr(subprocess, "run", slow)
     assert run_gh(["pr"]) == GhOutput(
         returncode=-1,
