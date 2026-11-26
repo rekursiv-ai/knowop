@@ -306,6 +306,7 @@ def _serving(
     wake: Wake | None = None,
     stop: Callable[[uuid.UUID], None] = _stops_none,
     running: Callable[[], Iterable[uuid.UUID]] = tuple,
+    reports_output: bool = True,
 ) -> SessionServing:
     return SessionServing(
         _URL,
@@ -320,6 +321,7 @@ def _serving(
         wake=wake,
         stop=stop,
         running=running,
+        reports_output=reports_output,
     )
 
 
@@ -327,10 +329,16 @@ def _ends(
     *starts: ServeSession,
     place: Callable[[ServeSession], Place] = own_place,
     command: Sequence[str] = (),
+    reports_output: bool = True,
 ) -> list[ProcessEnded]:
     """Serve ``starts`` in order; return each end reported, in the order reported."""
     client = _Client()
-    serving = _serving(client, place=place, command=command)
+    serving = _serving(
+        client,
+        place=place,
+        command=command,
+        reports_output=reports_output,
+    )
     for start in starts:
         client.answers.put(start)
     serving.start(_HOST, _INSTANCE)
@@ -998,6 +1006,80 @@ def test_a_start_its_place_refuses_is_reported_and_starts_nothing(
     ) in echoes.said()
 
 
+# -- A remote agent service, whose folders are not for the people it serves ----------
+
+
+_UNSTARTED: Final = "the agent could not start; the service's log says why"
+
+
+def test_a_service_s_start_that_cannot_run_names_no_path_and_its_log_says_why(
+    tmp_path: Path,
+    echoes: _Echoes,
+) -> None:
+    start = _start()
+    missing = tmp_path / "missing"
+
+    [ended] = _ends(
+        start,
+        place=_confined,
+        command=(str(missing),),
+        reports_output=False,
+    )
+
+    assert ended == ProcessEnded(
+        process_id=start.process_id,
+        exit_code=None,
+        reason=_UNSTARTED,
+    )
+    assert (
+        (
+            f"knowop: agent process not started: process={start.process_id}: "
+            f"[Errno 2] No such file or directory: '{missing}'"
+        ),
+        True,
+    ) in echoes.said()
+
+
+def test_a_service_s_refusal_is_its_own_words_still(echoes: _Echoes) -> None:
+    """The place wrote it for the person: it names no folder."""
+    start = _start()
+
+    [ended] = _ends(start, place=_refusing, reports_output=False)
+
+    assert ended.reason == f"no room for {start.process_id}"
+    assert not [line for line, _ in echoes.said() if "not started" in line]
+
+
+def test_a_service_s_process_ends_by_its_code_and_its_output_goes_to_its_log(
+    echoes: _Echoes,
+) -> None:
+    start = _start()
+    shout = (
+        "import sys; sys.stdout.write('Error: /srv/stack/loop/.venv/x.py'); "
+        "raise SystemExit(7)"
+    )
+
+    [ended] = _ends(
+        start,
+        place=_confined,
+        command=(sys.executable, "-I", "-S", "-c", shout),
+        reports_output=False,
+    )
+
+    assert ended == ProcessEnded(
+        process_id=start.process_id,
+        exit_code=7,
+        reason="exited with code 7",
+    )
+    assert (
+        (
+            f"knowop: agent process output: process={start.process_id}\n"
+            "Error: /srv/stack/loop/.venv/x.py"
+        ),
+        True,
+    ) in echoes.said()
+
+
 def _broken(serve: ServeSession, *, failing: uuid.UUID) -> Place:
     """Fail for the start ``failing`` as a bug does; place any other as one's own."""
     if serve.process_id == failing:
@@ -1229,8 +1311,36 @@ def test_a_process_gets_a_scope_of_its_own_where_systemd_run_works(
 # -- A daemon that restarts while its processes run ---------------------------------
 
 
-_READS_ITS_FIFO: Final = "import sys; open(sys.argv[1]).read()"
-"""A process that runs until its fifo, its first argument, is opened and closed."""
+def _reads_its_fifo(*, bound_sec: float) -> str:
+    """Return a process that ends once its fifo is released, or after ``bound_sec``."""
+    return (
+        "import signal, sys; "
+        f"signal.setitimer(signal.ITIMER_REAL, {bound_sec}); "
+        "open(sys.argv[1]).read()"
+    )
+
+
+def test_the_process_that_reads_its_fifo_ends_by_itself_once_its_time_is_up(
+    tmp_path: Path,
+) -> None:
+    """A test that fails before it opens the fifo, or a runner killed mid-test, leaves
+    nothing else to end it: it ran on, in a session of its own, for days.
+    """
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    codes: queue.Queue[int] = queue.Queue()
+
+    pid = spawn_detached(
+        (sys.executable, "-I", "-S", "-c", _reads_its_fifo(bound_sec=0.05), str(fifo)),
+        log=tmp_path / "log",
+        exited=codes.put,
+    )
+
+    try:
+        assert codes.get(timeout=_PATIENCE_SEC) == -signal.SIGALRM
+    except queue.Empty:
+        os.kill(pid, signal.SIGKILL)
+        raise
 
 
 def _outliving(
@@ -1246,7 +1356,15 @@ def _outliving(
     serving = _serving(
         client,
         place=_confined,
-        command=(sys.executable, "-I", "-S", "-c", _READS_ITS_FIFO, str(fifo)),
+        command=(
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            # Pytest's own timeout: no test waits on it longer.
+            _reads_its_fifo(bound_sec=60.0),
+            str(fifo),
+        ),
     )
     exited = threading.Event()
 
@@ -1329,6 +1447,41 @@ def _written(path: Path, *, host_id: uuid.UUID, pid: int) -> None:
     held = session_serving._held(path, host_id=host_id, owned=None)
     session_serving._write(held, host_id=host_id, owned=None, pid=pid)
     os.close(held)
+
+
+@pytest.mark.parametrize(
+    "reports_output",
+    [True, False],
+    ids=["a person's daemon", "a remote agent service"],
+)
+def test_a_new_daemon_reports_a_process_that_ended_while_it_was_away_by_its_kind(
+    echoes: _Echoes,
+    *,
+    reports_output: bool,
+) -> None:
+    """A remote agent service's end tells nothing of the output, which its log keeps."""
+    process = uuid.uuid4()
+    folder = state_dir() / "rekursiv-ai" / "knowop" / "processes" / str(process)
+    _written(folder / "process.json", host_id=_HOST, pid=0)
+    printed = "Error: /srv/stack/loop/.venv/x.py"
+    _ = (folder / "output.log").write_text(printed)
+    client = _Client()
+    serving = _serving(client, reports_output=reports_output)
+
+    serving.start(_HOST, _INSTANCE)
+    try:
+        ended = client.end()
+    finally:
+        serving.stop()
+
+    assert ended == ProcessEnded(
+        process_id=process,
+        exit_code=None,
+        reason="it ended while its daemon was away",
+        output=printed if reports_output else "",
+    )
+    logged = (f"knowop: agent process output: process={process}\n{printed}", True)
+    assert (logged in echoes.said()) is not reports_output
 
 
 @pytest.mark.parametrize(

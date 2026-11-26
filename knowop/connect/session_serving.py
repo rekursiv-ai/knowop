@@ -215,6 +215,11 @@ class SessionServing:
       running: Returns the processes the place runs now. A start of the serving stops
         each one no record names: its launcher is gone, so no one waits on it or
         reports its end.
+      reports_output: Whether a process's end is reported in its own words: why its
+        start failed, and the end of its output. The remote agent service says
+        neither, since both name its folders, which are not the people's it serves;
+        its log keeps them. A place's refusal, written for the person, is told all
+        the same.
 
     """
 
@@ -232,6 +237,7 @@ class SessionServing:
         wake: Wake | None = None,
         stop: Callable[[uuid.UUID], None] = _stops_none,
         running: Callable[[], Iterable[uuid.UUID]] = tuple,
+        reports_output: bool = True,
     ) -> None:
         self._url = url
         self._credential = credential
@@ -245,6 +251,7 @@ class SessionServing:
         self._wake = wake
         self._stopper = stop
         self._running = running
+        self._reports_output = reports_output
         self._stop = threading.Event()
 
     def start(self, host_id: uuid.UUID, instance: uuid.UUID) -> None:
@@ -398,12 +405,18 @@ class SessionServing:
             shutil.rmtree(place.owned, ignore_errors=True)
         for folder in made:
             shutil.rmtree(folder, ignore_errors=True)
+        said = self._reports_output or isinstance(failure, RefusedError)
+        if not said:
+            echo(
+                f"knowop: agent process not started: process={process}: {failure}",
+                err=True,
+            )
         self._report(
             host_id,
             ProcessEnded(
                 process_id=serve.process_id,
                 exit_code=None,
-                reason=str(failure)[:MAX_REASON_CHARS],
+                reason=str(failure)[:MAX_REASON_CHARS] if said else _UNSTARTED,
             ),
         )
 
@@ -465,6 +478,12 @@ class SessionServing:
             shutil.rmtree(owned, ignore_errors=True)
         output = _tail(log)
         shutil.rmtree(log.parent, ignore_errors=True)
+        if output and not self._reports_output:
+            echo(
+                f"knowop: agent process output: process={process_id}\n{output}",
+                err=True,
+            )
+            output = ""
         self._report(
             host_id,
             ProcessEnded(
@@ -497,6 +516,9 @@ class SessionServing:
                 err=True,
             )
 
+
+_UNSTARTED: Final = "the agent could not start; the service's log says why"
+"""Why a start failed, as a service that reports no output says it (``reports_output``)."""
 
 _RECORD: Final = "process.json"
 """Beside a process's log: its host and owned folder, locked for as long as it runs."""
