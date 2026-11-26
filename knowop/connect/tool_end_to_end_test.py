@@ -703,26 +703,28 @@ def _relay_test_fd_budget() -> Iterator[None]:
 
 
 @pytest.mark.usefixtures("_relay_test_fd_budget")
-async def test_more_than_32_activated_agents_keep_native_state_on_one_mux(
+async def test_more_agents_than_active_call_permits_keep_native_state_on_one_mux(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     _ = _local(monkeypatch, Read=Read())
+    # Two permits, not the default 32: one agent past them crosses the same line.
+    monkeypatch.setenv("KNOWOP_TOOL_ACTIVE_CALLS", "2")
     evidence = tmp_path / "evidence.txt"
     evidence.write_text("from the daemon\n")
     now = 0.0
     async with (
-        _serving(clock=lambda: now, streams=40) as relay,
+        _serving(clock=lambda: now, streams=4) as relay,
         _hosting(relay, host := relay.host()),
         AsyncExitStack() as stack,
     ):
         sessions = [
-            await stack.enter_async_context(_agent(_link(relay))) for _ in range(33)
+            await stack.enter_async_context(_agent(_link(relay))) for _ in range(3)
         ]
         endpoints = await asyncio.gather(*(_up(session) for session in sessions))
         transport = relay.mux[host.id]
         sockets = relay.agent_sockets()
-        assert len(sockets) == len(transport._streams) == 33
+        assert len(sockets) == len(transport._streams) == 3
         result = await _call(endpoints[0], "Read", file_path=str(evidence))
         assert "from the daemon" in _text(result)
         assert "from the daemon" in _text(
@@ -734,23 +736,20 @@ async def test_more_than_32_activated_agents_keep_native_state_on_one_mux(
         await relay.relay.sweep()
         assert relay.agent_sockets() == sockets
         assert relay.mux[host.id] is transport
-        assert len(transport._streams) == 33
+        assert len(transport._streams) == 3
         assert "unchanged since last read" in _text(
             await _call(endpoints[0], "Read", file_path=str(evidence)),
         )
 
 
 @pytest.mark.usefixtures("_relay_test_fd_budget")
-@pytest.mark.parametrize(
-    "limit",
-    [4, Config().tool_agent_sockets_per_host],
-    ids=["small", "default"],
-)
 async def test_full_agent_socket_budget_recovers_without_interrupting_work(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    limit: int,
 ) -> None:
+    # Four, not the default 1,024: the refusal and the recovery take the same path at
+    # any budget, and ``config_test`` pins the default.
+    limit = 4
     gate = _Gated()
     _local(monkeypatch, Bash=gate, Read=Read())
     path = tmp_path / "evidence.txt"
