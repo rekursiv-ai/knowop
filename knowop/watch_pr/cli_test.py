@@ -149,18 +149,45 @@ def test_no_session_is_refused(run: Run, capsys: pytest.CaptureFixture[str]) -> 
     assert run.server.rows == {}
 
 
-def test_add_refuses_a_pull_request_this_hosts_gh_cannot_read(
+@pytest.mark.parametrize(
+    ("stderr", "said"),
+    [
+        (
+            "gh auth login",
+            (
+                "gh on laptop is logged out; `gh auth login` there fixes it.\n"
+                "Nothing is watched. Tell the person; or add it from another host "
+                "whose gh is logged in."
+            ),
+        ),
+        (
+            "HTTP 404: Not Found (https://api.github.com/graphql)",
+            (
+                "The watch on laptop can't read it: HTTP 404: Not Found "
+                "(https://api.github.com/graphql)\nNothing is watched. Tell the "
+                "person; or add it from another host whose gh is logged in."
+            ),
+        ),
+        # A blip is no login to fix: the agent tries again.
+        (
+            "error connecting to api.github.com",
+            (
+                "laptop couldn't reach GitHub: error connecting to api.github.com\n"
+                "Nothing is watched. Run add again; if GitHub stays out of reach, add "
+                "it from another host."
+            ),
+        ),
+    ],
+)
+def test_add_refuses_a_pull_request_this_hosts_gh_cannot_read_and_says_why(
     run: Run,
     capsys: pytest.CaptureFixture[str],
+    stderr: str,
+    said: str,
 ) -> None:
-    run.gh_answer = GhOutput(returncode=1, stdout="", stderr="gh auth login")
+    run.gh_answer = GhOutput(returncode=1, stdout="", stderr=stderr)
     assert run("add", URL, "--session", "401") == 1
-    assert capsys.readouterr().err == (
-        f"knowop watch-pr: gh on laptop cannot read {URL}: gh auth login\n"
-        "Nothing is watched. Tell the person, naming laptop: there `gh auth login` "
-        "fixes a gh logged out, and a gh missing needs installing; or add it from "
-        "another host whose gh is logged in.\n"
-    )
+    assert capsys.readouterr().err == f"knowop watch-pr: {said}\n"
     assert (run.server.rows, run.detached) == ({}, [])
 
 

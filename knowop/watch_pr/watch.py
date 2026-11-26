@@ -9,7 +9,9 @@ nothing: the line is dropped, as a message to a stopped agent is. One with none 
 :data:`AWAY_DAYS` lets go of what it watches, as a subscription with no subscriber
 expires; the row's ``away`` keeps since when, so a serve that restarts or moves to
 another host times it on. A pull request this host's ``gh`` cannot read is news too,
-so the agents tell the person.
+so the agents tell the person; one GitHub leaves unanswered (the network, DNS, a
+timeout, its 5xx) only once reads have gone unanswered for
+:data:`~knowop.watch_pr.news.UNANSWERED_SEC`, so a blip tells nothing.
 
 Only the write that names news in ``told`` tells it, so a second watch, on this host
 or another, that read the same state tells nothing twice. A watch that stopped leaves
@@ -40,12 +42,20 @@ from treekle import from_plain
 
 from knowop.watch_pr.github import (
     GhError,
+    GhUnansweredError,
     read_login,
     read_pull_request,
     run_gh,
     set_auto_merge,
 )
-from knowop.watch_pr.news import Audience, News, news, unreadable
+from knowop.watch_pr.news import (
+    UNANSWERED_SEC,
+    Audience,
+    News,
+    news,
+    unread_reason,
+    unreadable,
+)
 from knowop.watch_pr.rows import (
     Profile,
     PullRequestRows,
@@ -121,7 +131,8 @@ class Watch:
       client: The server.
       host: This host's name, which the rows it writes name.
       gh: Runs ``gh``.
-      clock: Monotonic seconds, which hold a failure for its workflow.
+      clock: Monotonic seconds, which hold a failure for its workflow, and reads GitHub
+        left unanswered.
       wall: Seconds since the epoch, which ``read_at`` records.
 
     """
@@ -147,6 +158,7 @@ class Watch:
         self._first_failed: dict[str, tuple[str, float]] = {}
         self._numbers: dict[UUID, int] = {}
         self._said: set[str] = set()
+        self._unanswered: dict[str, float] = {}
         self._unreadable: set[str] = set()
 
     def sweep(self) -> int:
@@ -200,8 +212,9 @@ class Watch:
         try:
             pull_request = read_pull_request(self._gh, stored.url)
         except GhError as failed:
-            self._unread(stored, error=str(failed))
+            self._unread(stored, failed=failed)
             return
+        self._unanswered.pop(stored.url, None)
         self._unreadable.discard(stored.url)
         enacted = self._auto_merge(pull_request, kept=stored.pr, default=automerge)
         written = self._rows.write_pr(
@@ -270,11 +283,17 @@ class Watch:
 
     # Told where the row had no error, so two serves tell it once; and once a serve
     # until it reads the pull request again, so a serve whose gh fails, beside one
-    # whose gh reads, does not tell it each pass as the other clears the error.
-    def _unread(self, stored: Stored, *, error: str) -> None:
+    # whose gh reads, does not tell it each pass as the other clears the error. A blip
+    # of the network leaves the row as last read, and tells nothing.
+    def _unread(self, stored: Stored, *, failed: GhError) -> None:
         """Write that this host's ``gh`` cannot read the PR, and tell its watchers."""
-        self._say(f"could not read {stored.url}: {error}")
-        written = self._rows.write_pr(stored, partial(self._errored, error=error))
+        self._say(f"could not read {stored.url}: {failed}")
+        if isinstance(failed, GhUnansweredError):
+            now = self._clock()
+            if now - self._unanswered.setdefault(stored.url, now) < UNANSWERED_SEC:
+                return
+        reason = unread_reason(failed, host=self._host)
+        written = self._rows.write_pr(stored, partial(self._errored, error=reason))
         if written is None or stored.url in self._unreadable:
             return
         landed, newly = written[1]
@@ -284,7 +303,7 @@ class Watch:
         for each in landed.watchers:
             self._send(
                 each.session,
-                unreadable(stored.url, host=self._host, error=error),
+                unreadable(stored.url, reason=reason, said=str(failed)),
             )
 
     def _errored(
@@ -407,7 +426,8 @@ class Watch:
     # Run before the row is written, and not in ``_changed``, which a lost write runs
     # again: ``gh`` is called once a read. An ask is done once, so GitHub's own state
     # rules after it, a change on github.com too; a draft's ask waits, as GitHub turns
-    # no draft's auto-merge on.
+    # no draft's auto-merge on; and one GitHub left unanswered is not done, so the next
+    # pass asks again.
     def _auto_merge(
         self,
         pull_request: PullRequest,
@@ -416,7 +436,7 @@ class Watch:
         default: bool,
     ) -> dict[str, object]:
         """Do the Auto-merge ask due on a pull request; return what the row keeps of it."""
-        done = from_plain(kept.get("automerge_done"), str, default="")
+        done = kept.get("automerge_done")
         ask = from_plain(kept.get("automerge_ask"), _MergeAsk, default=None)
         stamp, on = (ask["at"], ask["on"]) if ask else ("default", default)
         if (
@@ -428,7 +448,11 @@ class Watch:
             return {}
         if on == pull_request.auto_merge:
             return {"automerge_done": stamp, "automerge_error": None}
-        error = set_auto_merge(self._gh, url=pull_request.url, on=on)
+        try:
+            error = set_auto_merge(self._gh, url=pull_request.url, on=on)
+        except GhUnansweredError as failed:
+            self._say(f"could not ask auto-merge of {pull_request.url}: {failed}")
+            return {}
         return {
             "automerge_done": stamp,
             "automerge_error": error,
