@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Final
 import fnmatch
 
 from sagent.agent.agent import Agent
+from sagent.agent.summarizer import Summarizer
 from sagent.agent.team import Team
 from sagent.model.scripted import ScriptedProvider
 from sagent.providers.catalog import ModelCatalog
@@ -48,6 +49,12 @@ _REFUSED: Final = frozenset(
         "host",
         "host.*",
         "remote.*",
+        # The daemon's embedder, which every session on the machine shares; its
+        # model is fetched from the hub repo it names.
+        "embed.*",
+        # A prompt read from a file of the machine's.
+        "summarize.summary_prompt",
+        "summarize.vignette_prompt",
     },
 )
 """What a remote agent refuses, by the reason it may not run: everything else."""
@@ -70,7 +77,11 @@ def _dropped(output: CommandOutput) -> None:
 async def _registry() -> list[str]:
     """Return every name a remote agent's lines run: its commands', its watcher's, ``spawn``."""
     catalog = ModelCatalog(factories={"scripted": ScriptedProvider})
-    agent = Agent(model=catalog["scripted"]["scripted"], tools=[Read()])
+    agent = Agent(
+        model=catalog["scripted"]["scripted"],
+        tools=[Read()],
+        summarizer=Summarizer,
+    )
     async with Team(catalog=catalog) as team:
         _ = team.join(agent)
         commands = Commands(
