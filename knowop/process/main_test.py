@@ -1442,6 +1442,7 @@ async def test_a_person_s_line_reaches_the_agent_it_names_or_says_none_took_it(
         for m in pushed
         if isinstance(m, AgentMessage)
     ] == [("ada@x.y", "helper", "status?")]
+    assert opened.team.owes("helper") == {}
     assert said["payload"] == event_payload(
         CommandOutput(text="No agent 'ghost' here took this line.", tone="error"),
     )
