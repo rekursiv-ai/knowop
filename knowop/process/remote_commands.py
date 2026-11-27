@@ -59,15 +59,6 @@ REMOTE_AGENT: Final = Allowed(
             "model.cache_ttl_sec",
             "model.manage_context_server_side",
             "model.compaction",
-            # Its own summaries and vignettes: whether, how often, and by which model
-            # among the providers it was started with.
-            "summarize.enabled",
-            "summarize.summary_tokens",
-            "summarize.vignettes",
-            "summarize.vignette_tokens",
-            "summarize.quota_floor",
-            "summarize.model",
-            "summarize.children",
             # How its own calls wait, and how they show.
             "runtime.detach",
             "runtime.detach.*",
