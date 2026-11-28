@@ -65,6 +65,7 @@ from sagent.journal.types import (
     now_timestamp,
     pairings,
 )
+from sagent.model.exceptions import UnknownProviderError
 from sagent.providers.catalog import ModelCatalog, cache_key, listings
 from sagent.runtime import types
 from sagent.tools.agent_spawn import AgentSpawn
@@ -378,10 +379,10 @@ async def serve(
       remote: Whether the server placed it for a remote agent, which starts and links
         no sagent daemon of its own and runs only the slash lines
         :data:`~knowop.process.remote_commands.REMOTE_AGENT` lists; else
-        it is on a person's own host, with its daemon and every slash line. It
-        resumes a model its providers lack on our key, billed to the session's
-        owner: the same model on the keyed provider its provider extends, else
-        ``openai/sol-6.2``.
+        it is on a person's own host, with its daemon and every slash line. Either
+        resumes a model its allowed providers lack on the same-vendor counterpart
+        they offer, else ``openai/sol-6.2`` (or the first offered provider's
+        ``default`` when ``openai`` is not offered).
 
     Returns:
       code: The exit code, as the module's docstring lists them.
@@ -392,9 +393,14 @@ async def serve(
             _journal,
             client,
             session_id,
-            offered=_offered(args) if remote else frozenset(),
+            offered=_offered(args),
         )
-    except (ClientError, NotResumableError, LossyConversionError) as error:
+    except (
+        ClientError,
+        NotResumableError,
+        LossyConversionError,
+        UnknownProviderError,
+    ) as error:
         sys.stderr.write(f"Error: {error}\n")
         return 1
     # The skill folders a remote agent's service names, merged into its user's, which
@@ -461,6 +467,7 @@ async def serve(
                     history=flags.history,
                     time_limit=time_limit,
                     allowed=REMOTE_AGENT if remote else None,
+                    remote=remote,
                     canvas=canvas,
                 )
     except SocketClosedError as closed:
@@ -895,7 +902,7 @@ def _journal(
     client: ServeClient,
     session_id: UUID,
     *,
-    offered: Collection[str],
+    offered: Sequence[str],
 ) -> JournalChoice:
     """Return the journal this process writes the session in."""
     return session_journal(
@@ -904,37 +911,48 @@ def _journal(
         client=client,
         lossy=True,
         offered=offered,
-        keyed=_keyed(offered),
+        keyed=_paired(offered),
+        fallback=_fallback(offered),
     )
 
 
 # A subscription's provider class extends its vendor's keyed one (``AnthropicSub`` is
-# an ``Anthropic``), so it serves the same models under the same names. Read here, in
-# the agent process: the rest of the shipped client has no sagent runtime to read.
-def _keyed(offered: Collection[str]) -> tuple[tuple[str, str], ...]:
-    """Return each provider ``offered`` lacks, with the offered one its class extends."""
+# an ``Anthropic``), so either serves the same models under the same names. Read here,
+# in the agent process: the rest of the shipped client has no sagent runtime to read.
+def _paired(offered: Collection[str]) -> tuple[tuple[str, str], ...]:
+    """Return each provider ``offered`` lacks, paired with its first offered counterpart."""
     listed = listings()
-    return tuple(
-        (each.section, base.section)
-        for each in listed
-        if each.section not in offered
-        for base in listed
-        if base.section in offered
-        and isinstance(each, type)
-        and isinstance(base, type)
-        and issubclass(each, base)
-    )
+    pairs: list[tuple[str, str]] = []
+    for each in listed:
+        assert isinstance(each, type)
+        if each.section in offered:
+            continue
+        for other in listed:
+            assert isinstance(other, type)
+            if other.section in offered and (
+                issubclass(each, other) or issubclass(other, each)
+            ):
+                pairs.append((each.section, other.section))
+                break
+    return tuple(pairs)
+
+
+def _fallback(offered: Sequence[str]) -> str:
+    """Return the fallback ``PROVIDER/MODEL`` when ``offered`` lacks a provider and its counterpart."""
+    if not offered or "openai" in offered:
+        return "openai/sol-6.2"
+    return f"{offered[0]}/default"
 
 
 # Sagent joins ``$SAGENT_PROVIDER`` to ``--allow-providers`` (its flag's help says so).
-def _offered(args: Sequence[str]) -> frozenset[str]:
+def _offered(args: Sequence[str]) -> tuple[str, ...]:
     """Return the providers sagent's ``args`` let it use, by their own names; empty for all."""
     flags, _ = parse_flags(args)
     named = [each.strip() for each in flags.allow_providers.split(",") if each.strip()]
     joined = os.environ.get("SAGENT_PROVIDER", "")
     if not named:
-        return frozenset()
-    return frozenset(ModelCatalog().allow([*named, *([joined] if joined else [])]))
+        return ()
+    return tuple(ModelCatalog().allow([*named, *([joined] if joined else [])]))
 
 
 async def _live(
@@ -949,6 +967,7 @@ async def _live(
     history: Path | None,
     time_limit: timedelta | None,
     allowed: Allowed | None,
+    remote: bool,
     canvas: CanvasTools,
 ) -> Ended:
     """Run the open agent live until a stop, its time limit, a quit, or an answer that ends it."""
@@ -966,11 +985,13 @@ async def _live(
     if choice.unoffered:
         publisher.to_user(
             "KnowOp",
-            f"Your provider {choice.unoffered} was switched to"
-            f" {o.agent.model.provider.name} because KnowOp's cloud cannot sign in to"
-            f" {choice.unoffered}. This chat now runs on {cache_key(o.agent.model)},"
-            " billed to this chat's owner. To switch back, resume it on a host signed"
-            f" in to {choice.unoffered}.",
+            _switched_notice(
+                choice.unoffered,
+                to=o.agent.model.provider.name,
+                model=cache_key(o.agent.model),
+                host=host,
+                remote=remote,
+            ),
         )
     # After the publisher listens: the save each answer asks for uploads it at once,
     # where before it would wait for the person's next turn.
@@ -1080,6 +1101,27 @@ async def _live(
         # Closed twice at a terminal, by the screen first, which a close allows.
         if commands.done():
             await commands.result().aclose()
+
+
+def _switched_notice(
+    was: str,
+    *,
+    to: str,
+    model: str,
+    host: str,
+    remote: bool,
+) -> str:
+    """Return the Chat notice when a restored session moves off ``was``."""
+    if remote:
+        return (
+            f"Your provider {was} was switched to {to} because KnowOp's cloud cannot"
+            f" sign in to {was}. This chat now runs on {model}, billed to this chat's"
+            f" owner. To switch back, resume it on a host signed in to {was}."
+        )
+    return (
+        f"Your provider {was} was switched to {to} because {host} does not offer"
+        f" {was}. This chat now runs on {model}."
+    )
 
 
 # One ``Commands`` for the root agent, whoever sends the line: a slash line from Chat

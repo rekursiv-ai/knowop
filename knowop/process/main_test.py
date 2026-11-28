@@ -1462,15 +1462,15 @@ class _OneSession(_Server):
 
 
 # A capture cut its first record, which a process restores all the same.
-def _stood_on_plan() -> _Server:
-    """Return a server whose one stored part stands the session on ``_PLAN``."""
+def _stood_on_model(model: str = _PLAN) -> _Server:
+    """Return a server whose one stored part stands the session on ``model``."""
     cut = AssistantMessage(
         content="long",
         extra=immutable({NOTE: {"omitted_bytes": 1}}),
     )
     plan = UncategorizedRecord(
         kind="model",
-        payload=immutable({"model": _PLAN, "cache": [], "standing": "model"}),
+        payload=immutable({"model": model, "cache": [], "standing": "model"}),
     )
     return _OneSession(
         version=1,
@@ -1485,20 +1485,49 @@ def _stood_on_plan() -> _Server:
 
 
 @pytest.mark.parametrize(
-    ("remote", "allowed", "joined", "stood"),
+    ("remote", "was", "allowed", "env_allowed", "joined", "stood"),
     [
-        (True, "openai,anthropic", "", "anthropic/opus-5.5+highthink"),
-        (True, "openai", "", "openai/sol-6.2"),
-        (True, "openai", "anthropic", "anthropic/opus-5.5+highthink"),
-        (True, "", "", _PLAN),
-        (False, "openai,anthropic", "", _PLAN),
+        (True, _PLAN, "openai,anthropic", "", "", "anthropic/opus-5.5+highthink"),
+        (True, _PLAN, "openai", "", "", "openai/sol-6.2"),
+        (True, _PLAN, "openai", "", "anthropic", "anthropic/opus-5.5+highthink"),
+        (True, _PLAN, "", "", "", _PLAN),
+        (False, _PLAN, "", "", "", _PLAN),
+        (False, _PLAN, "openai,anthropic", "", "", "anthropic/opus-5.5+highthink"),
+        (
+            False,
+            "openai/sol-6.2+fullcontext+lowthink",
+            "",
+            "asub,acli,osub,gsub,gcli",
+            "",
+            "openai-sub/sol-6.2+fullcontext+lowthink",
+        ),
+        (
+            False,
+            "openai/sol-6.2+fullcontext+lowthink",
+            "anthropic-sub",
+            "",
+            "",
+            "anthropic-sub/default",
+        ),
+        (
+            False,
+            "google/gemini-pro",
+            "google-sub,vertex",
+            "",
+            "",
+            "google-sub/gemini-pro",
+        ),
     ],
     ids=[
         "the key its plan extends",
         "no such key: the fallback",
         "$SAGENT_PROVIDER joins the allowed",
         "every provider allowed",
-        "own host",
+        "own host, every provider allowed",
+        "own host, plan to key",
+        "own host, key to plan via $SAGENT_ALLOW_PROVIDERS",
+        "own host, no counterpart and no openai: first offered default",
+        "own host, google prefers google-sub over vertex",
     ],
 )
 @pytest.mark.asyncio
@@ -1507,14 +1536,18 @@ async def test_a_remote_agent_resumes_on_what_its_providers_offer_and_says_so(
     monkeypatch: pytest.MonkeyPatch,
     *,
     remote: bool,
+    was: str,
     allowed: str,
+    env_allowed: str,
     joined: str,
     stood: str,
 ) -> None:
-    """Chat hears of a switch before the model is first asked; own hosts keep sign-ins."""
+    """Chat hears of a switch before the model is first asked on remote and local hosts."""
     # The shell's would stand for an allow list the start does not give.
     monkeypatch.delenv("SAGENT_ALLOW_PROVIDERS", raising=False)
     monkeypatch.delenv("SAGENT_PROVIDER", raising=False)
+    if env_allowed:
+        monkeypatch.setenv("SAGENT_ALLOW_PROVIDERS", env_allowed)
     if joined:
         monkeypatch.setenv("SAGENT_PROVIDER", joined)
     opened.replies = [reply("hi")]
@@ -1523,7 +1556,7 @@ async def test_a_remote_agent_resumes_on_what_its_providers_offer_and_says_so(
         _relayed() as relay,
         _serving(
             relay,
-            server=_stood_on_plan(),
+            server=_stood_on_model(was),
             args=("--allow-providers", allowed) if allowed else (),
             remote=remote,
         ) as (task, _),
@@ -1548,19 +1581,25 @@ async def test_a_remote_agent_resumes_on_what_its_providers_offer_and_says_so(
         if isinstance(r, UncategorizedRecord) and r.kind == "model"
     )
     assert record.payload["model"] == stood
-    switched = stood != _PLAN
+    switched = stood != was
+    was_provider = was.partition("/")[0]
+    expected_notice = (
+        f"Your provider {was_provider} was switched to scripted because"
+        f" KnowOp's cloud cannot sign in to {was_provider}. This chat now"
+        " runs on scripted/scripted, billed to this chat's owner. To"
+        f" switch back, resume it on a host signed in to {was_provider}."
+        if remote
+        else f"Your provider {was_provider} was switched to scripted because"
+        f" {_HOST} does not offer {was_provider}. This chat now runs on"
+        " scripted/scripted."
+    )
     assert [each["payload"] for each in told] == (
         [
             event_payload(
                 AgentMessage(
                     sender="KnowOp",
                     recipient="user",
-                    content=(
-                        "Your provider anthropic-sub was switched to scripted because"
-                        " KnowOp's cloud cannot sign in to anthropic-sub. This chat now"
-                        " runs on scripted/scripted, billed to this chat's owner. To"
-                        " switch back, resume it on a host signed in to anthropic-sub."
-                    ),
+                    content=expected_notice,
                 ),
             ),
         ]
@@ -1580,6 +1619,25 @@ def _tells_user(frame: dict[str, object]) -> bool:
         and isinstance(payload, dict)
         and cast("dict[str, object]", payload).get("recipient") == "user"
     )
+
+
+@pytest.mark.asyncio
+async def test_serve_refuses_an_unknown_allowed_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("SAGENT_ALLOW_PROVIDERS", raising=False)
+    monkeypatch.delenv("SAGENT_PROVIDER", raising=False)
+    code = await serve(
+        ("--allow-providers", "not-a-provider"),
+        session_id=_SESSION,
+        process_id=_PROCESS,
+        client=_Server(version=1),
+        tui=False,
+        host=_HOST,
+    )
+    assert code == 1
+    assert "unknown providers not-a-provider" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
